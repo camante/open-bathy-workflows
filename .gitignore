@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# Environments
+.venv/
+venv/
+.env
+*.conda
+*.mamba
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Outputs / caches
+output/
+cache/
+*.tif
+*.tiff
+*.gpkg
+*.geojson
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.aux.xml
+*.log
+
+# Large binaries
+*.pkl
+*.joblib

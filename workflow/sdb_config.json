@@ -1,0 +1,590 @@
+{
+  "comment": "SDB Pipeline Configuration v0.4.3 - Optical depth limits, variance-based uncertainty, ATL fusion fixes",
+  "version": "0.4.3",
+  "defaults": {
+    "description": "Global fallback settings. Region-specific settings override these.",
+    "preferred_months": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12
+    ],
+    "sdb_mode": "all_sdb",
+    "water_class": "mixed",
+    "cloud": 20,
+    "min_scene_valid_frac": 0.85,
+    "s2_smooth_kernel": 3,
+    "mask_bright_pixels": 0.25,
+    "water_temp_c": 20.0,
+    "max_depth_sdb": "auto",
+    "max_depth_atl03": 25.0,
+    "min_depth_atl03_val": 0.5,
+    "atl03_conf_min": 4,
+    "min_bottom_photons": 5,
+    "min_bottom_frac": 0.15,
+    "min_training_points_for_sdb": 50,
+    "atl24_conf_min": 0.9,
+    "edge_weight_power": 2.0,
+    "edge_weight_min": 0.0,
+    "linf_enabled": true,
+    "linf_estimate_deepwater": true,
+    "linf_deepwater_nir_max": 0.03,
+    "linf_deepwater_bright_max": 0.15,
+    "linf_percentile": 1.0,
+    "rmse_target_sdb": 1.0,
+    "depth_binning": "quantile",
+    "depth_bin_m": 1.0,
+    "min_samples_per_bin": 10,
+    "cw_min": 0.5,
+    "land_max": 0.5,
+    "land_mask_water_val": 0,
+    "land_mask_invert": false,
+    "land_mask_type": "auto",
+    "land_mask_threshold": 0.5,
+    "allow_bright_shallow_pixels": true,
+    "apply_gl_turbidity_reject": true,
+    "bright_shallow_nir_max": 0.05,
+    "gl_nir_green_ratio_max": 0.35,
+    "gl_nir_max": 0.06,
+    "gl_red_max": 0.08,
+    "depth_limit_mode": "optical",
+    "optical_depth_factor": 2.3,
+    "max_depth_hard_cap": 50.0,
+    "kd_algorithm": "lee2005",
+    "kd_confidence_level": "moderate",
+    "doa_threshold": 0.9,
+    "doa_soft_k": 3.0,
+    "validate_spatial": true,
+    "max_depth_source": "physics",
+    "spatial_cv": true,
+    "spatial_cv_strategy": "spatial_cluster",
+    "spatial_cv_n_folds": 5
+  },
+  "regions": [
+    {
+      "name": "Tropical_Hawaii",
+      "description": "Extremely clear carbonate waters (Kd ~0.04-0.08). Deep optical penetration. Bright shallow reef flats are valid.",
+      "bbox": [
+        -161.0,
+        18.0,
+        -154.0,
+        23.0
+      ],
+      "typical_kd_490": 0.06,
+      "typical_secchi_m": 28,
+      "settings": {
+        "preferred_months": [
+          11,
+          12,
+          1,
+          2
+        ],
+        "sdb_mode": "ocean",
+        "water_class": "clear_ocean",
+        "cloud": 40,
+        "min_scene_valid_frac": 0.8,
+        "water_temp_c": 27.0,
+        "max_depth_atl03": 35.0,
+        "min_depth_atl03_val": 0.2,
+        "min_bottom_photons": 6,
+        "min_bottom_frac": 0.3,
+        "min_training_points_for_sdb": 400,
+        "edge_weight_power": 3.0,
+        "depth_limit_mode": "optical",
+        "optical_depth_factor": 3.5,
+        "max_depth_hard_cap": 40.0,
+        "rmse_target_sdb": 1.5,
+        "cw_min": 0.4
+      }
+    },
+    {
+      "name": "Tropical_Florida_PR",
+      "description": "Florida Keys & Puerto Rico. Clear carbonate sands (Kd ~0.06-0.12). Seasonal turbidity from storms.",
+      "bbox": [
+        -88.0,
+        17.0,
+        -64.0,
+        28.5
+      ],
+      "typical_kd_490": 0.09,
+      "typical_secchi_m": 19,
+      "settings": {
+        "preferred_months": [
+          11,
+          12,
+          1,
+          2,
+          3
+        ],
+        "water_class": "clear_ocean",
+        "cloud": 40,
+        "min_scene_valid_frac": 0.8,
+        "water_temp_c": 28.0,
+        "max_depth_atl03": 30.0,
+        "min_depth_atl03_val": 0.2,
+        "min_bottom_frac": 0.3,
+        "min_training_points_for_sdb": 400,
+        "atl24_conf_min": 0.88,
+        "edge_weight_power": 3.0,
+        "depth_limit_mode": "optical",
+        "optical_depth_factor": 2.3,
+        "max_depth_hard_cap": 30.0,
+        "rmse_target_sdb": 1.0,
+        "allow_bright_shallow_pixels": true
+      }
+    },
+    {
+      "name": "US_Gulf_Coast",
+      "description": "Turbid river-influenced waters (Kd ~0.15-0.40). Limited optical depth. Bright pixels = sediment/foam.",
+      "bbox": [
+        -98.0,
+        24.0,
+        -82.0,
+        32
+      ],
+      "typical_kd_490": 0.25,
+      "typical_secchi_m": 7,
+      "settings": {
+        "preferred_months": [
+          10,
+          11,
+          12
+        ],
+        "sdb_mode": "ocean",
+        "cloud": 45,
+        "mask_bright_pixels": 0.3,
+        "water_class": "mixed",
+        "water_temp_c": 26.0,
+        "max_depth_atl03": 15.0,
+        "min_depth_atl03_val": 0.3,
+        "atl03_conf_min": 3,
+        "min_bottom_photons": 4,
+        "min_bottom_frac": 0.15,
+        "min_training_points_for_sdb": 50,
+        "atl24_conf_min": 0.9,
+        "edge_weight_power": 2.5,
+        "linf_enabled": true,
+        "linf_estimate_deepwater": true,
+        "linf_deepwater_nir_max": 0.06,
+        "linf_deepwater_bright_max": 0.2,
+        "depth_limit_mode": "optical",
+        "optical_depth_factor": 1.5,
+        "max_depth_hard_cap": 15.0,
+        "rmse_target_sdb": 0.8,
+        "allow_bright_shallow_pixels": false,
+        "cw_min": 0.3,
+        "doa_threshold": 0.9,
+        "doa_soft_k": 3.0,
+        "max_depth_source": "physics",
+        "spatial_cv": true,
+        "spatial_cv_strategy": "spatial_cluster",
+        "spatial_cv_n_folds": 5
+      }
+    },
+    {
+      "name": "US_East_Coast",
+      "description": "Variable clarity (Kd ~0.10-0.25). Strong seasonal variation. Summer best for SDB.",
+      "bbox": [
+        -81.5,
+        29.0,
+        -66.0,
+        46.0
+      ],
+      "typical_kd_490": 0.15,
+      "typical_secchi_m": 12,
+      "settings": {
+        "preferred_months": [
+          6,
+          7,
+          8,
+          9
+        ],
+        "sdb_mode": "ocean",
+        "cloud": 30,
+        "water_temp_c": 16.0,
+        "max_depth_atl03": 20.0,
+        "min_bottom_photons": 4,
+        "min_training_points_for_sdb": 250,
+        "edge_weight_power": 2.5,
+        "linf_deepwater_nir_max": 0.06,
+        "linf_deepwater_bright_max": 0.2,
+        "depth_limit_mode": "optical",
+        "optical_depth_factor": 2.3,
+        "max_depth_hard_cap": 25.0,
+        "rmse_target_sdb": 1.0,
+        "allow_bright_shallow_pixels": false
+      }
+    },
+    {
+      "name": "US_West_Coast",
+      "description": "Generally clear but kelp/foam dominated (Kd ~0.08-0.15). Strict bright rejection required.",
+      "bbox": [
+        -126.0,
+        32.0,
+        -117.0,
+        49.0
+      ],
+      "typical_kd_490": 0.1,
+      "typical_secchi_m": 17,
+      "settings": {
+        "preferred_months": [
+          6,
+          7,
+          8
+        ],
+        "sdb_mode": "ocean",
+        "water_class": "clear_ocean",
+        "cloud": 30,
+        "s2_smooth_kernel": 5,
+        "mask_bright_pixels": 0.2,
+        "water_temp_c": 14.0,
+        "max_depth_atl03": 25.0,
+        "min_depth_atl03_val": 0.8,
+        "min_bottom_photons": 6,
+        "min_bottom_frac": 0.2,
+        "min_training_points_for_sdb": 300,
+        "edge_weight_power": 2.5,
+        "depth_limit_mode": "optical",
+        "optical_depth_factor": 2.3,
+        "max_depth_hard_cap": 30.0,
+        "rmse_target_sdb": 1.0,
+        "allow_bright_shallow_pixels": false,
+        "gl_nir_max": 0.05
+      }
+    },
+    {
+      "name": "Great_Lakes",
+      "description": "Freshwater. Variable clarity (Kd ~0.10-0.30). Ice-free summer months only. Turbidity from rivers.",
+      "bbox": [
+        -93.0,
+        41.0,
+        -76.0,
+        49.0
+      ],
+      "typical_kd_490": 0.18,
+      "typical_secchi_m": 9,
+      "settings": {
+        "preferred_months": [
+          7,
+          8,
+          9
+        ],
+        "sdb_mode": "lakes",
+        "water_class": "lake",
+        "cloud": 40,
+        "water_temp_c": 8.0,
+        "max_depth_atl03": 18.0,
+        "atl03_conf_min": 3,
+        "min_bottom_photons": 4,
+        "min_training_points_for_sdb": 150,
+        "atl24_conf_min": 0.85,
+        "linf_deepwater_nir_max": 0.06,
+        "linf_deepwater_bright_max": 0.2,
+        "depth_limit_mode": "optical",
+        "optical_depth_factor": 2.0,
+        "max_depth_hard_cap": 20.0,
+        "rmse_target_sdb": 0.8,
+        "cw_min": 0.8,
+        "land_max": 0.1
+      }
+    },
+    {
+      "name": "Pacific_Islands",
+      "description": "Extremely clear tropical waters (Kd ~0.03-0.06). Deepest optical penetration. Coral reef environments.",
+      "bbox": [
+        144.0,
+        13.0,
+        146.0,
+        16.0
+      ],
+      "typical_kd_490": 0.05,
+      "typical_secchi_m": 35,
+      "settings": {
+        "preferred_months": [
+          1,
+          2,
+          3,
+          4,
+          11,
+          12
+        ],
+        "sdb_mode": "ocean",
+        "water_class": "clear_ocean",
+        "cloud": 50,
+        "min_scene_valid_frac": 0.7,
+        "water_temp_c": 29.0,
+        "max_depth_atl03": 40.0,
+        "min_depth_atl03_val": 0.2,
+        "min_bottom_photons": 6,
+        "min_bottom_frac": 0.35,
+        "min_training_points_for_sdb": 300,
+        "depth_limit_mode": "optical",
+        "optical_depth_factor": 3.5,
+        "max_depth_hard_cap": 45.0,
+        "rmse_target_sdb": 1.5,
+        "cw_min": 0.3,
+        "allow_bright_shallow_pixels": true
+      }
+    },
+    {
+      "name": "Mediterranean",
+      "description": "Generally clear oligotrophic waters (Kd ~0.04-0.10). Good optical penetration.",
+      "bbox": [
+        -6.0,
+        30.0,
+        36.0,
+        46.0
+      ],
+      "typical_kd_490": 0.07,
+      "typical_secchi_m": 24,
+      "settings": {
+        "preferred_months": [
+          5,
+          6,
+          7,
+          8,
+          9
+        ],
+        "sdb_mode": "ocean",
+        "water_class": "clear_ocean",
+        "cloud": 30,
+        "water_temp_c": 24.0,
+        "max_depth_atl03": 30.0,
+        "min_bottom_photons": 5,
+        "min_training_points_for_sdb": 300,
+        "depth_limit_mode": "optical",
+        "optical_depth_factor": 2.3,
+        "max_depth_hard_cap": 35.0,
+        "rmse_target_sdb": 1.0
+      }
+    },
+    {
+      "name": "Red_Sea",
+      "description": "Very clear tropical waters (Kd ~0.03-0.07). Excellent for deep SDB. Minimal river input.",
+      "bbox": [
+        32.0,
+        12.0,
+        44.0,
+        30.0
+      ],
+      "typical_kd_490": 0.05,
+      "typical_secchi_m": 30,
+      "settings": {
+        "preferred_months": [
+          1,
+          2,
+          3,
+          10,
+          11,
+          12
+        ],
+        "sdb_mode": "ocean",
+        "water_class": "clear_ocean",
+        "cloud": 20,
+        "water_temp_c": 28.0,
+        "max_depth_atl03": 35.0,
+        "min_depth_atl03_val": 0.2,
+        "min_bottom_photons": 6,
+        "min_bottom_frac": 0.3,
+        "min_training_points_for_sdb": 300,
+        "depth_limit_mode": "optical",
+        "optical_depth_factor": 3.0,
+        "max_depth_hard_cap": 40.0,
+        "rmse_target_sdb": 1.5,
+        "cw_min": 0.3
+      }
+    },
+    {
+      "name": "Southeast_Asia_Turbid",
+      "description": "Highly turbid river-influenced waters (Kd ~0.30-0.80). Very limited SDB depth.",
+      "bbox": [
+        95.0,
+        -10.0,
+        125.0,
+        25.0
+      ],
+      "typical_kd_490": 0.45,
+      "typical_secchi_m": 4,
+      "settings": {
+        "preferred_months": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "sdb_mode": "ocean",
+        "cloud": 60,
+        "min_scene_valid_frac": 0.6,
+        "water_temp_c": 29.0,
+        "max_depth_atl03": 10.0,
+        "min_depth_atl03_val": 0.3,
+        "atl03_conf_min": 3,
+        "min_bottom_photons": 4,
+        "min_training_points_for_sdb": 100,
+        "linf_deepwater_nir_max": 0.08,
+        "linf_deepwater_bright_max": 0.25,
+        "depth_limit_mode": "optical",
+        "optical_depth_factor": 1.5,
+        "max_depth_hard_cap": 12.0,
+        "rmse_target_sdb": 0.5,
+        "cw_min": 0.7,
+        "allow_bright_shallow_pixels": false
+      }
+    }
+  ],
+  "optical_depth_factors": {
+    "description": "Kd-to-depth conversion factors for different confidence levels",
+    "conservative": {
+      "factor": 1.5,
+      "description": "~90% light attenuation. Safe operational limit."
+    },
+    "moderate": {
+      "factor": 2.3,
+      "description": "~95% light attenuation. Standard SDB limit."
+    },
+    "optimistic": {
+      "factor": 3.5,
+      "description": "~99% light attenuation. Clear water + bright sand bottom."
+    }
+  },
+  "water_types_kd": {
+    "description": "Typical Kd(490) ranges by water type",
+    "oceanic_clear": {
+      "kd_range": [
+        0.02,
+        0.06
+      ],
+      "secchi_m": [
+        30,
+        85
+      ]
+    },
+    "oceanic_moderate": {
+      "kd_range": [
+        0.06,
+        0.12
+      ],
+      "secchi_m": [
+        14,
+        30
+      ]
+    },
+    "coastal_clear": {
+      "kd_range": [
+        0.12,
+        0.2
+      ],
+      "secchi_m": [
+        8,
+        14
+      ]
+    },
+    "coastal_moderate": {
+      "kd_range": [
+        0.2,
+        0.35
+      ],
+      "secchi_m": [
+        5,
+        8
+      ]
+    },
+    "turbid": {
+      "kd_range": [
+        0.35,
+        0.8
+      ],
+      "secchi_m": [
+        2,
+        5
+      ]
+    },
+    "very_turbid": {
+      "kd_range": [
+        0.8,
+        2.0
+      ],
+      "secchi_m": [
+        0.8,
+        2
+      ]
+    }
+  },
+  "river": {
+    "nss_services": {
+      "enabled": true,
+      "base_url": "https://streamstats.usgs.gov/nssservices",
+      "timeout_s": 20,
+      "cache_dir": "cache/nss",
+      "cache_ttl_days": 30,
+      "user_agent": "cudem-river-bathy/0.7.7 (NSSServices client)"
+    },
+    "registry": {
+      "auto_region_rules": {
+        "_comment": "Map state postal abbreviations to regional-curve keys for bankfull depth and Q2. Extend as needed.",
+        "AL": {
+          "bankfull": "AL_default",
+          "q2": "AL_default"
+        },
+        "FL": {
+          "bankfull": "FL_default",
+          "q2": "FL_default"
+        },
+        "NJ": {
+          "bankfull": "NJ_default",
+          "q2": "NJ_default"
+        },
+        "NY": {
+          "bankfull": "NY_default",
+          "q2": "NY_default"
+        }
+      },
+      "bankfull_depth_curves": {
+        "_comment": "Illustrative placeholders. Replace with published coefficients (units noted).",
+        "AL_default": {
+          "equation": "D_bkf = c * DA^f",
+          "c": 0.3,
+          "f": 0.35,
+          "da_units": "km2",
+          "depth_units": "m",
+          "source": "placeholder - populate from USGS regional curves for Alabama"
+        },
+        "NJ_default": {
+          "equation": "D_bkf = c * DA^f",
+          "c": 0.28,
+          "f": 0.36,
+          "da_units": "km2",
+          "depth_units": "m",
+          "source": "placeholder - populate from USGS regional curves for New Jersey"
+        }
+      },
+      "q2_regressions": {
+        "_comment": "Illustrative placeholders. Replace with published coefficients (units noted).",
+        "AL_default": {
+          "equation": "Q2 = c * DA^f",
+          "c": 0.9,
+          "f": 0.8,
+          "da_units": "km2",
+          "q_units": "cms",
+          "source": "placeholder - populate from NSS/StreamStats regression for 2-year peak flow"
+        },
+        "NJ_default": {
+          "equation": "Q2 = c * DA^f",
+          "c": 1.1,
+          "f": 0.78,
+          "da_units": "km2",
+          "q_units": "cms",
+          "source": "placeholder - populate from NSS/StreamStats regression for 2-year peak flow"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,1032 @@
+"""
+Sophisticated Adaptive Spatial Sampling for Bathymetry Training Data
+
+This module implements a multi-stage sampling strategy that:
+1. Preserves high-accuracy data sources (LiDAR, multibeam, etc.)
+2. Uses ICESat-2 as gap filler where high-accuracy data is unavailable
+3. Adapts sampling density to bathymetric complexity
+4. Ensures balanced depth range coverage
+5. Maintains spatial coverage with no large gaps
+
+Author: SDB Pipeline Development Team
+Version: 0.7.0
+"""
+
+import numpy as np
+import pandas as pd
+import logging
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Any
+from dataclasses import dataclass
+import math
+from scipy.spatial import cKDTree
+from scipy.stats import median_abs_deviation
+from sklearn.preprocessing import StandardScaler
+
+log = logging.getLogger(__name__)
+
+@dataclass
+class SourceConfig:
+    """Configuration for a single data source."""
+    name: str
+    tier: int  # 1=highest quality, 3=gap filler
+    weight: float
+    retention_target: float  # Fraction to keep (0.0-1.0)
+    min_spacing_m: float
+    influence_radius_m: float
+
+@dataclass
+class SamplingConfig:
+    """Global sampling configuration."""
+    target_total_points: int = 2000
+    max_gap_m: float = 100.0
+    min_tier1_fraction: float = 0.50
+    depth_bins: int = 10
+    min_points_per_bin: int = 50
+
+    # Safety floors
+    # If adaptive sampling becomes too aggressive (especially in small AOIs
+    # with dense survey points), the sampler will top-up to reach these floors.
+    min_total_points: int = 200
+    min_points_per_source: int = 50
+    
+    # Complexity score weights
+    variance_weight: float = 0.4
+    gradient_weight: float = 0.4
+    density_weight: float = 0.2
+    
+    # Adaptive grid sizes (meters)
+    grid_high_complexity: float = 15.0
+    grid_medium_complexity: float = 30.0
+    grid_low_complexity: float = 60.0
+    
+    # Complexity thresholds
+    high_complexity_threshold: float = 0.7
+    low_complexity_threshold: float = 0.3
+    
+    # Transect detection
+    detect_transects: bool = True
+    transect_spacing_m: float = 50.0
+    
+    # Boundary preservation
+    boundary_buffer_m: float = 50.0
+    boundary_grid_reduction: float = 0.5
+
+# Default source configurations
+DEFAULT_SOURCE_CONFIGS = {
+    'bathy_lidar': SourceConfig(
+        name='bathy_lidar',
+        tier=1,
+        weight=25.0,
+        retention_target=0.85,
+        min_spacing_m=10.0,
+        influence_radius_m=75.0
+    ),
+    'multibeam': SourceConfig(
+        name='multibeam',
+        tier=1,
+        weight=20.0,
+        retention_target=0.80,
+        min_spacing_m=15.0,
+        influence_radius_m=75.0
+    ),
+    'high_quality_bag': SourceConfig(
+        name='high_quality_bag',
+        tier=1,
+        weight=15.0,
+        retention_target=0.75,
+        min_spacing_m=20.0,
+        influence_radius_m=60.0
+    ),
+    'sonar_survey': SourceConfig(
+        name='sonar_survey',
+        tier=1,
+        weight=12.0,
+        retention_target=0.80,
+        min_spacing_m=15.0,
+        influence_radius_m=60.0
+    ),
+    'extra_xyz': SourceConfig(
+        name='extra_xyz',
+        tier=2,
+        weight=10.0,
+        retention_target=0.40,
+        min_spacing_m=30.0,
+        influence_radius_m=50.0
+    ),
+    'atl24': SourceConfig(
+        name='atl24',
+        tier=2,
+        weight=6.0,
+        retention_target=0.30,
+        min_spacing_m=40.0,
+        influence_radius_m=50.0
+    ),
+    'atl_agreed': SourceConfig(
+        name='atl_agreed',
+        tier=2,
+        weight=6.0,
+        retention_target=0.30,
+        min_spacing_m=40.0,
+        influence_radius_m=50.0
+    ),
+    'atl03': SourceConfig(
+        name='atl03',
+        tier=3,
+        weight=3.0,
+        retention_target=0.10,
+        min_spacing_m=60.0,
+        influence_radius_m=30.0
+    ),
+}
+
+def compute_local_complexity(
+    points: np.ndarray,
+    depths: np.ndarray,
+    kdtree: cKDTree,
+    config: SamplingConfig,
+    k: int = 30
+) -> np.ndarray:
+    """
+    Compute complexity score for each point based on local bathymetry.
+    
+    Args:
+        points: (N, 2) array of (lon, lat) coordinates
+        depths: (N,) array of depth values
+        kdtree: Pre-built KDTree for efficient queries
+        config: Sampling configuration
+        k: Number of neighbors for local analysis
+    
+    Returns:
+        (N,) array of complexity scores in [0, 1]
+    """
+    n_points = len(points)
+    complexity = np.zeros(n_points)
+    
+    for i in range(n_points):
+        # Find k nearest neighbors
+        distances, indices = kdtree.query(points[i], k=min(k, n_points))
+        
+        # Skip if not enough neighbors
+        if len(indices) < 5:
+            complexity[i] = 0.5  # Default medium complexity
+            continue
+        
+        neighbor_depths = depths[indices]
+        
+        # Metric 1: Depth variance
+        depth_variance = np.std(neighbor_depths)
+        
+        # Metric 2: Local gradient (fit plane)
+        if len(indices) >= 10:
+            neighbor_points = points[indices]
+            try:
+                # Simple gradient using depth range / distance range
+                depth_range = neighbor_depths.max() - neighbor_depths.min()
+                spatial_range = np.sqrt(
+                    (neighbor_points[:, 0].max() - neighbor_points[:, 0].min())**2 +
+                    (neighbor_points[:, 1].max() - neighbor_points[:, 1].min())**2
+                )
+                gradient = depth_range / max(spatial_range, 1e-6)
+            except (ValueError, IndexError, ZeroDivisionError):
+                gradient = 0.0
+        else:
+            gradient = 0.0
+        
+        # Metric 3: Local density (inverse of mean distance)
+        mean_distance = np.mean(distances[1:])  # Skip self
+        density_score = 1.0 / (1.0 + mean_distance * 1000)  # Convert to meters approx
+        
+        # Store individual metrics for later normalization
+        complexity[i] = depth_variance  # Will normalize later
+    
+    # Normalize each metric to [0, 1]
+    variance_scores = complexity.copy()
+    if variance_scores.max() > 0:
+        variance_scores = variance_scores / variance_scores.max()
+    
+    # Compute gradient and density scores separately (simplified for now)
+    gradient_scores = np.zeros(n_points)
+    density_scores = np.ones(n_points) * 0.5
+    
+    # Combined complexity score
+    complexity_final = (
+        config.variance_weight * variance_scores +
+        config.gradient_weight * gradient_scores +
+        config.density_weight * density_scores
+    )
+    
+    return np.clip(complexity_final, 0.0, 1.0)
+
+def detect_transects(
+    points: np.ndarray,
+    min_length: int = 50,
+    direction_tolerance: float = 15.0
+) -> np.ndarray:
+    """
+    Detect linear transects in point cloud.
+    
+    Args:
+        points: (N, 2) array of coordinates
+        min_length: Minimum points to form a transect
+        direction_tolerance: Degrees of direction variation allowed
+    
+    Returns:
+        (N,) boolean array indicating transect membership
+    """
+    # Simplified: Use local direction consistency
+    # Full implementation would use RANSAC or Hough transform
+    
+    n_points = len(points)
+    is_transect = np.zeros(n_points, dtype=bool)
+    
+    if n_points < min_length:
+        return is_transect
+    
+    # Build KDTree for neighbor queries
+    kdtree = cKDTree(points)
+    
+    for i in range(n_points):
+        # Find 20 nearest neighbors
+        distances, indices = kdtree.query(points[i], k=min(20, n_points))
+        
+        if len(indices) < 10:
+            continue
+        
+        # Compute directions to neighbors
+        neighbor_points = points[indices[1:]]  # Skip self
+        vectors = neighbor_points - points[i]
+        
+        # Check if vectors are aligned (linear pattern)
+        if len(vectors) >= 5:
+            # Compute primary direction using SVD
+            try:
+                _, _, vh = np.linalg.svd(vectors)
+                primary_direction = vh[0]
+                
+                # Check alignment of other vectors
+                dots = np.abs(np.dot(vectors, primary_direction))
+                norms = np.linalg.norm(vectors, axis=1)
+                alignments = dots / (norms + 1e-10)
+                
+                # If most vectors are aligned, it's a transect
+                aligned_fraction = (alignments > 0.9).mean()
+                if aligned_fraction > 0.7:
+                    is_transect[i] = True
+            except (np.linalg.LinAlgError, ValueError):
+                pass
+    
+    return is_transect
+
+def adaptive_grid_thinning(
+    points: np.ndarray,
+    depths: np.ndarray,
+    complexity_scores: np.ndarray,
+    source_values: np.ndarray,
+    config: SamplingConfig,
+    source_config: SourceConfig
+) -> np.ndarray:
+    """
+    Apply adaptive grid-based thinning.
+    
+    Args:
+        points: (N, 2) array of coordinates
+        depths: (N,) array of depths
+        complexity_scores: (N,) array of complexity scores
+        source_values: (N,) array of source priorities/weights
+        config: Global sampling config
+        source_config: Source-specific config
+    
+    Returns:
+        Boolean array indicating which points to keep
+    """
+    n_points = len(points)
+    keep = np.zeros(n_points, dtype=bool)
+
+    if n_points == 0:
+        return keep
+
+    # NOTE:
+    #   config.grid_* are expressed in **meters**.
+    #   points are in lon/lat degrees.
+    #   The previous implementation mixed these units, causing grid sizes of 15/30/60
+    #   to be treated as **degrees**, collapsing most AOIs into ~1 cell and keeping
+    #   only ~1-3 points. We convert lon/lat to a local metric XY for binning.
+
+    lat0 = float(np.nanmedian(points[:, 1]))
+    m_per_deg_lat = 111_000.0
+    m_per_deg_lon = max(1e-6, 111_000.0 * float(np.cos(np.deg2rad(lat0))))
+
+    lon_min, lat_min = np.nanmin(points, axis=0)
+    x_m = (points[:, 0] - lon_min) * m_per_deg_lon
+    y_m = (points[:, 1] - lat_min) * m_per_deg_lat
+
+    # ------------------------------------------------------------------
+    # Dynamic spacing/grid safeguards
+    # ------------------------------------------------------------------
+    # In small AOIs, a fixed 60 m "low complexity" grid can collapse thousands
+    # of survey points down to a few dozen cells. That's fine for massive AOIs,
+    # but it can starve model training locally. We adjust the effective minimum
+    # spacing and grid sizes based on the footprint area and the run's target.
+    try:
+        w = float(np.nanmax(x_m) - np.nanmin(x_m))
+        h = float(np.nanmax(y_m) - np.nanmin(y_m))
+        area_m2 = max(1.0, w) * max(1.0, h)
+    except Exception:
+        area_m2 = None
+
+    # Desired local floor (we never exceed n_points)
+    desired_floor = int(min(n_points, max(config.min_total_points, config.target_total_points)))
+
+    eff_min_spacing_m = float(source_config.min_spacing_m) if source_config.min_spacing_m else 30.0
+    if area_m2 is not None and area_m2 > 0 and eff_min_spacing_m > 0:
+        max_pts_at_min = area_m2 / (eff_min_spacing_m ** 2)
+        if max_pts_at_min < desired_floor:
+            # Relax spacing (within this sampler only) to allow enough points.
+            eff_min_spacing_m = max(2.0, math.sqrt(area_m2 / float(desired_floor)))
+            log.info(
+                "[SAMPLING] Relaxed min_spacing for '%s': %.1fm -> %.1fm (AOI too small for %d pts)",
+                source_config.name, float(source_config.min_spacing_m), eff_min_spacing_m, desired_floor
+            )
+
+    # Scale grid sizes down when needed (but not below eff_min_spacing)
+    grid_hi = float(max(eff_min_spacing_m, min(config.grid_high_complexity, eff_min_spacing_m * 2.0)))
+    grid_med = float(max(eff_min_spacing_m, min(config.grid_medium_complexity, eff_min_spacing_m * 2.0)))
+    grid_lo = float(max(eff_min_spacing_m, min(config.grid_low_complexity, eff_min_spacing_m * 2.0)))
+
+    # Complexity class masks
+    hi = complexity_scores >= config.high_complexity_threshold
+    med = (complexity_scores >= config.low_complexity_threshold) & (~hi)
+    lo = ~hi & ~med
+
+    def _thin(mask: np.ndarray, grid_m: float, allow_multi: bool) -> None:
+        if not np.any(mask):
+            return
+        idx = np.where(mask)[0]
+
+        g = float(max(grid_m, eff_min_spacing_m))
+        if g <= 0:
+            g = float(source_config.min_spacing_m) if source_config.min_spacing_m > 0 else 30.0
+
+        xb = np.floor(x_m[idx] / g).astype(np.int64)
+        yb = np.floor(y_m[idx] / g).astype(np.int64)
+        # Combine bins into a single id (avoid collisions)
+        cell_ids = xb * 10_000_000 + yb
+
+        for cell_id in np.unique(cell_ids):
+            cell_local = np.where(cell_ids == cell_id)[0]
+            if cell_local.size == 0:
+                continue
+            cell_idx = idx[cell_local]
+
+            cell_priorities = source_values[cell_idx] * (1.0 + complexity_scores[cell_idx])
+            best = cell_idx[np.argmax(cell_priorities)]
+            keep[best] = True
+
+            if allow_multi and cell_idx.size > 3:
+                top = cell_idx[np.argsort(cell_priorities)[-3:]]
+                keep[top] = True
+
+    _thin(hi, grid_hi, allow_multi=True)
+    _thin(med, grid_med, allow_multi=False)
+    _thin(lo, grid_lo, allow_multi=False)
+
+    # Ensure we don't under-sample relative to the configured retention_target.
+    # The grid-based thinning above enforces spacing/representativeness, but can
+    # inadvertently keep far fewer points than intended for dense survey sources.
+    desired_n_raw = int(np.ceil(float(source_config.retention_target) * n_points))
+    # Avoid runaway growth per-source; a global cap later enforces target_total_points.
+    desired_cap = int(max(config.target_total_points * 2, 5000))
+    desired_n = int(min(n_points, min(desired_n_raw, desired_cap)))
+    kept_n = int(keep.sum())
+    if desired_n > 0 and kept_n < desired_n:
+        # Densify by allowing multiple points per grid cell (still spatially balanced).
+        # Use the relaxed min spacing (if any) when densifying.
+        g_base = float(max(eff_min_spacing_m, grid_lo / 2.0))
+        if g_base <= 0:
+            g_base = float(max(eff_min_spacing_m, 30.0))
+
+        xb_all = np.floor(x_m / g_base).astype(np.int64)
+        yb_all = np.floor(y_m / g_base).astype(np.int64)
+
+        # Priority within a cell: favor higher complexity and slightly favor deeper points.
+        prio = (np.nan_to_num(complexity_scores, nan=0.0) * 1.0) + (np.nan_to_num(np.abs(depths), nan=0.0) * 0.05)
+        prio = prio + (np.random.random(n_points) * 1e-6)
+
+        cells: dict[tuple[int, int], list[int]] = {}
+        for ii in range(n_points):
+            key = (int(xb_all[ii]), int(yb_all[ii]))
+            cells.setdefault(key, []).append(int(ii))
+
+        n_cells = max(1, len(cells))
+        k = int(np.ceil(desired_n / n_cells))
+        max_k = int(min(50, max(5, k * 3)))
+
+        selected = set(np.where(keep)[0].tolist())
+        while len(selected) < desired_n and k <= max_k:
+            for idx_list in cells.values():
+                if len(selected) >= desired_n:
+                    break
+                if len(idx_list) <= k:
+                    top = idx_list
+                else:
+                    arr = np.array(idx_list, dtype=np.int64)
+                    top = arr[np.argsort(prio[arr])[-k:]].tolist()
+                for jj in top:
+                    selected.add(int(jj))
+                    if len(selected) >= desired_n:
+                        break
+            k += 1
+
+        keep[:] = False
+        keep[list(selected)] = True
+
+    return keep
+
+def depth_stratified_sampling(
+    df: pd.DataFrame,
+    config: SamplingConfig
+) -> pd.DataFrame:
+    """
+    Apply depth stratification to ensure depth range coverage.
+    
+    Args:
+        df: DataFrame with depth_m column
+        config: Sampling configuration
+    
+    Returns:
+        DataFrame with balanced depth representation
+    """
+    # Create quantile-based depth bins
+    depths = df['depth_m'].values
+    valid_depths = depths[np.isfinite(depths)]
+    
+    if len(valid_depths) < config.min_points_per_bin * 2:
+        log.warning("[SAMPLING] Too few points for depth stratification")
+        return df
+    
+    # Compute quantile bins
+    try:
+        quantiles = np.linspace(0, 1, config.depth_bins + 1)
+        bin_edges = np.quantile(valid_depths, quantiles)
+        bin_edges = np.unique(bin_edges)  # Remove duplicates
+        
+        df['depth_bin'] = pd.cut(df['depth_m'], bins=bin_edges, labels=False, include_lowest=True)
+        
+        # Log depth distribution
+        bin_counts = df['depth_bin'].value_counts().sort_index()
+        log.info(f"[SAMPLING] Depth stratification: {len(bin_edges)-1} bins")
+        for bin_idx, count in bin_counts.items():
+            if np.isfinite(bin_idx):
+                depth_range = f"[{bin_edges[int(bin_idx)]:.1f}, {bin_edges[int(bin_idx)+1]:.1f}]m"
+                log.info(f"  Bin {int(bin_idx)}: {depth_range} → {count} points")
+        
+        return df
+        
+    except Exception as e:
+        log.warning(f"[SAMPLING] Depth stratification failed: {e}")
+        df['depth_bin'] = 0
+        return df
+
+def compute_influence_zones(
+    points: np.ndarray,
+    influence_radius_m: float
+) -> cKDTree:
+    """
+    Compute spatial influence zones for high-priority points.
+    
+    Args:
+        points: (N, 2) array of coordinates
+        influence_radius_m: Radius in meters
+    
+    Returns:
+        KDTree for efficient radius queries
+    """
+    return cKDTree(points)
+
+def identify_gap_regions(
+    all_points: np.ndarray,
+    covered_points_kdtree: cKDTree,
+    influence_radius_m: float,
+    grid_resolution: float = 0.001  # ~100m
+) -> np.ndarray:
+    """
+    Identify spatial gaps not covered by high-priority data.
+    
+    Args:
+        all_points: All point locations
+        covered_points_kdtree: KDTree of Tier 1 points
+        influence_radius_m: Coverage radius
+        grid_resolution: Grid spacing for gap detection
+    
+    Returns:
+        Boolean array indicating points in gap regions
+    """
+    influence_radius_deg = influence_radius_m / 111000  # Rough conversion
+    
+    in_gap = np.zeros(len(all_points), dtype=bool)
+    
+    for i, point in enumerate(all_points):
+        # Query nearest Tier 1 point
+        distance, _ = covered_points_kdtree.query(point)
+        
+        # If far from any Tier 1 point, it's in a gap
+        if distance > influence_radius_deg:
+            in_gap[i] = True
+    
+    return in_gap
+
+def adaptive_spatial_sample(
+    df: pd.DataFrame,
+    source_configs: Optional[Dict[str, SourceConfig]] = None,
+    sampling_config: Optional[SamplingConfig] = None,
+    aoi_bounds: Optional[Tuple[float, float, float, float]] = None
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Main adaptive sampling function with priority-based source preservation.
+    
+    Args:
+        df: Input dataframe with columns: longitude, latitude, depth_m, source, sample_weight
+        source_configs: Dictionary mapping source names to SourceConfig objects
+        sampling_config: Global sampling configuration
+        aoi_bounds: (W, E, S, N) bounds for gap detection
+    
+    Returns:
+        Tuple of (sampled_df, statistics_dict)
+    """
+    log.info("=" * 70)
+    log.info("[SAMPLING] ADAPTIVE SPATIAL SAMPLING - PRIORITY-BASED")
+    log.info("=" * 70)
+    
+    # Use default configs if not provided
+    if source_configs is None:
+        source_configs = DEFAULT_SOURCE_CONFIGS.copy()
+    
+    if sampling_config is None:
+        sampling_config = SamplingConfig()
+    
+    # Input statistics
+    n_input = len(df)
+    log.info(f"[SAMPLING] Input: {n_input:,} points")
+
+    # Keep a stable identifier so we can top-up from unselected rows later.
+    df = df.copy()
+    if '_row_id' not in df.columns:
+        df['_row_id'] = np.arange(len(df), dtype=np.int64)
+    
+    # Ensure required columns
+    required_cols = ['longitude', 'latitude', 'depth_m', 'source']
+    missing_cols = [c for c in required_cols if c not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
+    
+    # Add sample_weight if missing
+    if 'sample_weight' not in df.columns:
+        df['sample_weight'] = 1.0
+    
+    # Normalize source names
+    df['source_normalized'] = df['source'].str.lower().str.strip()
+    
+    # =========================================================================
+    # STAGE 1: DEPTH STRATIFICATION
+    # =========================================================================
+    log.info(f"\n[STAGE 1] Depth Stratification ({sampling_config.depth_bins} bins)")
+    df = depth_stratified_sampling(df, sampling_config)
+    
+    # =========================================================================
+    # STAGE 2: COMPUTE COMPLEXITY SCORES
+    # =========================================================================
+    log.info(f"\n[STAGE 2] Computing Bathymetric Complexity")
+    
+    # OPTIMIZATION:
+    #   Complexity computation requires neighbor queries; doing it directly on millions
+    #   of points is expensive. We therefore compute complexity on a *coarse* subset,
+    #   then transfer those scores back to the full dataset via nearest-neighbor lookup.
+    if len(df) > 100000:
+        log.info(f"[SAMPLING] Large dataset detected ({len(df):,} points)")
+        log.info("[SAMPLING] Applying coarse pre-sampling for efficiency (complexity only)...")
+
+        points_all = df[['longitude', 'latitude']].to_numpy()
+        lon_min, lat_min = np.nanmin(points_all, axis=0)
+
+        # ~100m grid in degrees (rough; used only to thin for complexity computation)
+        grid_size = 0.001
+        lon_bins = ((points_all[:, 0] - lon_min) / grid_size).astype(np.int64)
+        lat_bins = ((points_all[:, 1] - lat_min) / grid_size).astype(np.int64)
+        grid_cell = lon_bins * 10_000 + lat_bins
+
+        # Priority: prefer higher-weight sources, with tiny jitter to break ties
+        if 'source_weight' in df.columns:
+            w = pd.to_numeric(df['source_weight'], errors='coerce').fillna(1.0).to_numpy()
+        elif 'sample_weight' in df.columns:
+            w = pd.to_numeric(df['sample_weight'], errors='coerce').fillna(1.0).to_numpy()
+        elif 'weight' in df.columns:
+            w = pd.to_numeric(df['weight'], errors='coerce').fillna(1.0).to_numpy()
+        else:
+            w = df['source_normalized'].map(lambda s: source_configs.get(s, source_configs['atl03']).weight).to_numpy()
+        priority = w * (1.0 + np.random.random(len(df)) * 0.01)
+
+        tmp = df.copy()
+        tmp['_grid_cell'] = grid_cell
+        tmp['_priority'] = priority
+
+        tmp_sorted = tmp.sort_values(['_grid_cell', '_priority'], ascending=[True, False])
+        coarse_mask = ~tmp_sorted['_grid_cell'].duplicated()
+        coarse_df = tmp_sorted.loc[coarse_mask].copy()
+        coarse_df = coarse_df.drop(columns=['_grid_cell', '_priority'])
+
+        log.info(f"[SAMPLING] Coarse pre-sampling: {len(df):,} → {len(coarse_df):,} points")
+
+        # Compute complexity on the coarse set
+        c_points = coarse_df[['longitude', 'latitude']].values
+        c_depths = coarse_df['depth_m'].values
+        c_tree = cKDTree(c_points)
+        c_complexity = compute_local_complexity(c_points, c_depths, c_tree, sampling_config)
+        coarse_df['complexity_score'] = c_complexity
+
+        # Detect transects on coarse set (optional) and map to full set later
+        if sampling_config.detect_transects:
+            log.info(f"[SAMPLING] Detecting linear transects...")
+            coarse_df['is_transect'] = detect_transects(c_points)
+            log.info(f"[SAMPLING] Detected {int(coarse_df['is_transect'].sum())} transect points")
+        else:
+            coarse_df['is_transect'] = False
+
+        # Transfer complexity (and transect flag) to all points by NN in coarse set
+        nn_dist, nn_idx = c_tree.query(points_all, k=1)
+        df = df.copy()
+        df['complexity_score'] = coarse_df['complexity_score'].to_numpy()[nn_idx]
+        df['is_transect'] = coarse_df['is_transect'].to_numpy()[nn_idx]
+        working_df = df
+        complexity_scores = df['complexity_score'].to_numpy()
+
+    else:
+        # Compute complexity directly on the full set
+        points = df[['longitude', 'latitude']].values
+        depths = df['depth_m'].values
+        kdtree = cKDTree(points)
+        complexity_scores = compute_local_complexity(points, depths, kdtree, sampling_config)
+        df = df.copy()
+        df['complexity_score'] = complexity_scores
+
+        if sampling_config.detect_transects:
+            log.info(f"[SAMPLING] Detecting linear transects...")
+            df['is_transect'] = detect_transects(points)
+            log.info(f"[SAMPLING] Detected {int(df['is_transect'].sum())} transect points")
+        else:
+            df['is_transect'] = False
+
+        working_df = df
+    
+    log.info(f"[SAMPLING] Complexity distribution:")
+    log.info(f"  High (>{sampling_config.high_complexity_threshold}): "
+            f"{(complexity_scores > sampling_config.high_complexity_threshold).sum()} points")
+    
+    medium_count = ((complexity_scores >= sampling_config.low_complexity_threshold) & 
+                    (complexity_scores <= sampling_config.high_complexity_threshold)).sum()
+    log.info(f"  Medium ({sampling_config.low_complexity_threshold}-{sampling_config.high_complexity_threshold}): "
+            f"{medium_count} points")
+    
+    log.info(f"  Low (<{sampling_config.low_complexity_threshold}): "
+            f"{(complexity_scores < sampling_config.low_complexity_threshold).sum()} points")
+    
+    # (Transect flags already set above)
+    
+    # =========================================================================
+    # STAGE 3: PRIORITY-BASED SOURCE PRESERVATION
+    # =========================================================================
+    log.info(f"\n[STAGE 3] Priority-Based Source Preservation")
+    
+    # Assign tiers and priorities to sources
+    working_df['tier'] = working_df['source_normalized'].map(
+        lambda s: source_configs.get(s, source_configs['atl03']).tier
+    )
+    working_df['source_weight'] = working_df['source_normalized'].map(
+        lambda s: source_configs.get(s, source_configs['atl03']).weight
+    )
+    working_df['retention_target'] = working_df['source_normalized'].map(
+        lambda s: source_configs.get(s, source_configs['atl03']).retention_target
+    )
+    
+    # Separate by tier
+    tier1_mask = working_df['tier'] == 1
+    tier2_mask = working_df['tier'] == 2
+    tier3_mask = working_df['tier'] == 3
+    
+    tier1_df = working_df[tier1_mask].copy()
+    tier2_df = working_df[tier2_mask].copy()
+    tier3_df = working_df[tier3_mask].copy()
+    
+    log.info(f"[SAMPLING] Tier distribution:")
+    log.info(f"  Tier 1 (High accuracy): {len(tier1_df):,} points from {tier1_df['source'].nunique()} sources")
+    log.info(f"  Tier 2 (Medium accuracy): {len(tier2_df):,} points from {tier2_df['source'].nunique()} sources")
+    log.info(f"  Tier 3 (Gap fillers): {len(tier3_df):,} points from {tier3_df['source'].nunique()} sources")
+    
+    # -------------------------------------------------------------------------
+    # 3.1: Process Tier 1 (Preserve aggressively)
+    # -------------------------------------------------------------------------
+    selected_tier1 = []
+    
+    if len(tier1_df) > 0:
+        log.info(f"\n[TIER 1] Processing high-accuracy sources:")
+        
+        for source in tier1_df['source'].unique():
+            source_mask = tier1_df['source'] == source
+            source_df = tier1_df[source_mask].copy()
+            source_norm = source_df['source_normalized'].iloc[0]
+            
+            if source_norm not in source_configs:
+                log.warning(f"[TIER 1] Unknown source '{source}', using default Tier 1 config")
+                source_config = SourceConfig(source_norm, tier=1, weight=10, retention_target=0.75,
+                                            min_spacing_m=20, influence_radius_m=60)
+            else:
+                source_config = source_configs[source_norm]
+            
+            log.info(f"  {source}: {len(source_df)} points (target retention: {source_config.retention_target*100:.0f}%)")
+            
+            # Apply gentle adaptive thinning
+            keep_mask = adaptive_grid_thinning(
+                source_df[['longitude', 'latitude']].values,
+                source_df['depth_m'].values,
+                source_df['complexity_score'].values,
+                source_df['source_weight'].values,
+                sampling_config,
+                source_config
+            )
+            
+            selected_source = source_df[keep_mask].copy()
+            selected_tier1.append(selected_source)
+            
+            retention_rate = len(selected_source) / len(source_df)
+            log.info(f"    → Kept {len(selected_source)} points ({retention_rate*100:.1f}% retention)")
+    
+    tier1_selected = pd.concat(selected_tier1) if selected_tier1 else pd.DataFrame()
+    
+    # -------------------------------------------------------------------------
+    # 3.2: Identify gaps not covered by Tier 1
+    # -------------------------------------------------------------------------
+    log.info(f"\n[GAP ANALYSIS] Identifying spatial gaps:")
+    
+    if len(tier1_selected) > 0:
+        tier1_kdtree = compute_influence_zones(
+            tier1_selected[['longitude', 'latitude']].values,
+            influence_radius_m=75.0  # Max influence radius
+        )
+        
+        # Mark Tier 2/3 points that are in gaps
+        if len(tier2_df) > 0:
+            tier2_in_gap = identify_gap_regions(
+                tier2_df[['longitude', 'latitude']].values,
+                tier1_kdtree,
+                influence_radius_m=50.0
+            )
+            tier2_df['in_gap'] = tier2_in_gap
+        else:
+            tier2_in_gap = np.array([], dtype=bool)
+        
+        if len(tier3_df) > 0:
+            tier3_in_gap = identify_gap_regions(
+                tier3_df[['longitude', 'latitude']].values,
+                tier1_kdtree,
+                influence_radius_m=30.0
+            )
+            tier3_df['in_gap'] = tier3_in_gap
+        else:
+            tier3_in_gap = np.array([], dtype=bool)
+        
+        log.info(f"  Tier 2 points in gaps: {tier2_in_gap.sum():,} / {len(tier2_df):,}")
+        log.info(f"  Tier 3 points in gaps: {tier3_in_gap.sum():,} / {len(tier3_df):,}")
+    else:
+        # No Tier 1 data - all Tier 2/3 needed
+        log.info(f"  No Tier 1 data - all areas are gaps")
+        if len(tier2_df) > 0:
+            tier2_df['in_gap'] = True
+        if len(tier3_df) > 0:
+            tier3_df['in_gap'] = True
+    
+    # -------------------------------------------------------------------------
+    # 3.3: Process Tier 2 (Fill moderate gaps)
+    # -------------------------------------------------------------------------
+    selected_tier2 = []
+    
+    if len(tier2_df) > 0:
+        log.info(f"\n[TIER 2] Processing gap-filling sources:")
+        
+        # Only sample from gaps (or all if no Tier 1)
+        tier2_gaps = tier2_df[tier2_df.get('in_gap', True)].copy()
+        
+        for source in tier2_gaps['source'].unique():
+            source_mask = tier2_gaps['source'] == source
+            source_df = tier2_gaps[source_mask].copy()
+            source_norm = source_df['source_normalized'].iloc[0]
+            
+            if source_norm not in source_configs:
+                source_config = SourceConfig(source_norm, tier=2, weight=6, retention_target=0.3,
+                                            min_spacing_m=40, influence_radius_m=50)
+            else:
+                source_config = source_configs[source_norm]
+            
+            log.info(f"  {source}: {len(source_df)} gap points (target retention: {source_config.retention_target*100:.0f}%)")
+            
+            # Apply moderate thinning
+            keep_mask = adaptive_grid_thinning(
+                source_df[['longitude', 'latitude']].values,
+                source_df['depth_m'].values,
+                source_df['complexity_score'].values,
+                source_df['source_weight'].values,
+                sampling_config,
+                source_config
+            )
+            
+            selected_source = source_df[keep_mask].copy()
+            selected_tier2.append(selected_source)
+            
+            retention_rate = len(selected_source) / len(source_df) if len(source_df) > 0 else 0
+            log.info(f"    → Kept {len(selected_source)} points ({retention_rate*100:.1f}% retention)")
+    
+    tier2_selected = pd.concat(selected_tier2) if selected_tier2 else pd.DataFrame()
+    
+    # -------------------------------------------------------------------------
+    # 3.4: Process Tier 3 (Fill remaining gaps)
+    # -------------------------------------------------------------------------
+    selected_tier3 = []
+    
+    if len(tier3_df) > 0:
+        log.info(f"\n[TIER 3] Processing emergency gap fillers:")
+        
+        # Only sample from gaps
+        tier3_gaps = tier3_df[tier3_df.get('in_gap', True)].copy()
+        
+        for source in tier3_gaps['source'].unique():
+            source_mask = tier3_gaps['source'] == source
+            source_df = tier3_gaps[source_mask].copy()
+            source_norm = source_df['source_normalized'].iloc[0]
+            
+            if source_norm not in source_configs:
+                source_config = SourceConfig(source_norm, tier=3, weight=3, retention_target=0.1,
+                                            min_spacing_m=60, influence_radius_m=30)
+            else:
+                source_config = source_configs[source_norm]
+            
+            log.info(f"  {source}: {len(source_df)} gap points (target retention: {source_config.retention_target*100:.0f}%)")
+            
+            # Apply aggressive thinning
+            keep_mask = adaptive_grid_thinning(
+                source_df[['longitude', 'latitude']].values,
+                source_df['depth_m'].values,
+                source_df['complexity_score'].values,
+                source_df['source_weight'].values,
+                sampling_config,
+                source_config
+            )
+            
+            selected_source = source_df[keep_mask].copy()
+            selected_tier3.append(selected_source)
+            
+            retention_rate = len(selected_source) / len(source_df) if len(source_df) > 0 else 0
+            log.info(f"    → Kept {len(selected_source)} points ({retention_rate*100:.1f}% retention)")
+    
+    tier3_selected = pd.concat(selected_tier3) if selected_tier3 else pd.DataFrame()
+    
+    # =========================================================================
+    # COMBINE & VALIDATE
+    # =========================================================================
+    log.info(f"\n[FINAL] Combining selected points:")
+    
+    final_dfs = []
+    if len(tier1_selected) > 0:
+        final_dfs.append(tier1_selected)
+    if len(tier2_selected) > 0:
+        final_dfs.append(tier2_selected)
+    if len(tier3_selected) > 0:
+        final_dfs.append(tier3_selected)
+    
+    if not final_dfs:
+        log.error("[SAMPLING] No points survived sampling!")
+        return df.head(100), {}  # Return something to avoid complete failure
+    
+    result_df = pd.concat(final_dfs, ignore_index=True)
+
+    # ---------------------------------------------------------------------
+    # Global cap: keep the dataset bounded for downstream raster sampling.
+    # The earlier stages focus on spatial representativeness; this step
+    # enforces an overall size target while preserving tier priority.
+    # ---------------------------------------------------------------------
+    target_n = int(sampling_config.target_total_points)
+    if target_n > 0 and len(result_df) > target_n:
+        log.info(f"[SAMPLING] Capping sampled set to target_total_points={target_n:,} (current={len(result_df):,})")
+
+        # Priority score: (tier priority) * (source_weight) * (sample_weight) * (1 + complexity)
+        sw = pd.to_numeric(result_df.get('source_weight', 1.0), errors='coerce').fillna(1.0)
+        w = pd.to_numeric(result_df.get('sample_weight', 1.0), errors='coerce').fillna(1.0)
+        c = pd.to_numeric(result_df.get('complexity_score', 0.0), errors='coerce').fillna(0.0)
+        jitter = 1.0 + (np.random.random(len(result_df)) * 0.01)
+        priority = (sw.to_numpy() * w.to_numpy() * (1.0 + c.to_numpy())) * jitter
+
+        # Always keep all Tier 1 points if present; then fill Tier 2, then Tier 3
+        tier_vals = pd.to_numeric(result_df.get('tier', 3), errors='coerce').fillna(3).astype(int).to_numpy()
+        keep_idx: list[int] = []
+
+        for tier_id in (1, 2, 3):
+            idx = np.where(tier_vals == tier_id)[0]
+            if idx.size == 0:
+                continue
+            if len(keep_idx) >= target_n:
+                break
+            remaining = target_n - len(keep_idx)
+            if idx.size <= remaining:
+                keep_idx.extend(idx.tolist())
+            else:
+                # Take top-N by priority within tier
+                ord_idx = idx[np.argsort(priority[idx])[::-1]]
+                keep_idx.extend(ord_idx[:remaining].tolist())
+
+        keep_idx = np.array(sorted(set(keep_idx)), dtype=int)
+        result_df = result_df.iloc[keep_idx].copy()
+
+    # ---------------------------------------------------------------------
+    # Minimum-size floor: if we ended up with too few points, top-up from
+    # remaining candidates (preserving tier priority where possible).
+    # ---------------------------------------------------------------------
+    min_n = int(getattr(sampling_config, 'min_total_points', 200))
+    if min_n > 0 and len(result_df) < min_n and n_input > len(result_df):
+        log.warning(
+            "[SAMPLING] Sampled set is small (%d pts). Topping up to min_total_points=%d.",
+            len(result_df), min_n
+        )
+        selected_ids = set(pd.to_numeric(result_df.get('_row_id', []), errors='coerce').dropna().astype(int).tolist())
+        remaining = df[~df['_row_id'].isin(selected_ids)].copy()
+
+        # Prefer Tier 2, then Tier 3, then Tier 1 (Tier 1 should normally already be fully kept).
+        tiers = pd.to_numeric(remaining.get('tier', 3), errors='coerce').fillna(3).astype(int)
+        remaining = remaining.assign(_tier=tiers)
+
+        need = int(min_n - len(result_df))
+        topups = []
+        for tier_id in (2, 3, 1):
+            if need <= 0:
+                break
+            cand = remaining[remaining['_tier'] == tier_id]
+            if cand.empty:
+                continue
+            take_n = int(min(need, len(cand)))
+            topups.append(cand.sample(n=take_n, replace=False, random_state=42))
+            need -= take_n
+        if topups:
+            result_df = pd.concat([result_df, *topups], ignore_index=True)
+    
+    # Recompute tier breakdown after any cap/top-up
+    tier_vals_final = pd.to_numeric(result_df.get('tier', 3), errors='coerce').fillna(3).astype(int)
+    tier1_selected = result_df[tier_vals_final == 1]
+    tier2_selected = result_df[tier_vals_final == 2]
+    tier3_selected = result_df[tier_vals_final == 3]
+
+    # Compute statistics
+    stats = {
+        'input_points': n_input,
+        'output_points': len(result_df),
+        'reduction_pct': 100.0 * (1.0 - len(result_df) / n_input),
+        'tier1': {
+            'input': len(tier1_df),
+            'output': len(tier1_selected),
+            'retention': len(tier1_selected) / max(len(tier1_df), 1),
+            'sources': tier1_selected['source'].unique().tolist() if len(tier1_selected) > 0 else [],
+        },
+        'tier2': {
+            'input': len(tier2_df),
+            'output': len(tier2_selected),
+            'retention': len(tier2_selected) / max(len(tier2_df), 1),
+            'sources': tier2_selected['source'].unique().tolist() if len(tier2_selected) > 0 else [],
+        },
+        'tier3': {
+            'input': len(tier3_df),
+            'output': len(tier3_selected),
+            'retention': len(tier3_selected) / max(len(tier3_df), 1),
+            'sources': tier3_selected['source'].unique().tolist() if len(tier3_selected) > 0 else [],
+        },
+        'effective_weights': {}
+    }
+    
+    # Compute effective training influence
+    for tier_name, tier_df in [('tier1', tier1_selected), ('tier2', tier2_selected), ('tier3', tier3_selected)]:
+        if len(tier_df) > 0:
+            tier_weight = (tier_df['sample_weight'] * tier_df['source_weight']).sum()
+            stats['effective_weights'][tier_name] = float(tier_weight)
+    
+    total_effective_weight = sum(stats['effective_weights'].values())
+    
+    log.info(f"  Tier 1: {len(tier1_selected):,} points ({len(tier1_selected)/len(result_df)*100:.1f}%)")
+    log.info(f"  Tier 2: {len(tier2_selected):,} points ({len(tier2_selected)/len(result_df)*100:.1f}%)")
+    log.info(f"  Tier 3: {len(tier3_selected):,} points ({len(tier3_selected)/len(result_df)*100:.1f}%)")
+    log.info(f"  Total: {len(result_df):,} points ({100.0 * len(result_df)/n_input:.1f}% of input)")
+    
+    log.info(f"\n[SAMPLING] Effective Training Influence:")
+    for tier_name in ['tier1', 'tier2', 'tier3']:
+        if tier_name in stats['effective_weights']:
+            tier_weight = stats['effective_weights'][tier_name]
+            tier_pct = 100.0 * tier_weight / max(total_effective_weight, 1)
+            log.info(f"  {tier_name.upper()}: {tier_pct:.1f}% influence")
+    
+    log.info("=" * 70)
+    
+    return result_df, stats

@@ -1,0 +1,20 @@
+name: open-bathy
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.10
+  - numpy
+  - scipy
+  - pandas
+  - scikit-learn
+  - rasterio
+  - geopandas
+  - shapely
+  - pyproj
+  - fiona
+  - gdal
+  - rich
+  - tqdm
+  - pip
+  - pip:
+      - pyogrio
