@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-measured_mask_from_points.py
+measured_mask_from_points.py – Create a DEM-aligned preserve mask from measured bathymetry points
 
 Create a DEM-aligned "measured bathy preserve" mask GeoTIFF from measured depth points
 (sonar / bathymetric lidar / trusted survey points). This mask is intended to be used
@@ -38,8 +38,7 @@ python measured_mask_from_points.py \
   --buffer-m 5
 
 Then:
-python cudem_river_burn.py ... --measured-mask output/measured_bathy_mask.tif
-"""
+python cudem_river_burn.py ... --measured-mask output/measured_bathy_mask.tif"""
 
 from __future__ import annotations
 

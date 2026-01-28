@@ -1,4 +1,4 @@
-"""usgs_nwis.py
+"""usgs_nwis.py – Fetch USGS NWIS site metadata and discharge measurement records (RDB parser)
 
 Lightweight helpers to fetch USGS NWIS site metadata and discharge measurement records.
 
@@ -15,7 +15,6 @@ Design goals:
 Refs:
 - NWIS Water Services: https://waterservices.usgs.gov/
 """
-
 from __future__ import annotations
 
 import io
@@ -294,4 +293,3 @@ def _compute_slope_proxy(xs_param: pd.DataFrame, cfg: Optional[InferConfig] = No
         out.loc[gg.index] = slope
 
     return out
-

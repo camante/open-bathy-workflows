@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-river_network.py
+river_network.py – Download/prepare a river network for cross-section generation (TNM/NHD with HydroRIVERS fallback)
 
 One-stop script: download (TNM/NHD) → ingest → AOI subset/clip → reach graph/topology.
 
@@ -11,8 +11,8 @@ By default the script ONLY attempts TNMAccess (NHD/NHDPlus-ish) acquisition.
 HydroRIVERS is downloaded ONLY if no NHD flowlines can be obtained.
 
 Download sources:
-- TNMAccess (USGS The National Map API) for NHD-ish hydrography. citeturn0search0turn0search11
-- HydroSHEDS / HydroRIVERS download server (regional shapefile zips). citeturn0search0turn0search15
+- TNMAccess (USGS The National Map API) for NHD-ish hydrography.
+- HydroSHEDS / HydroRIVERS download server (regional shapefile zips).
 
 Outputs (GeoPackage layers)
 ---------------------------
@@ -33,8 +33,7 @@ Dependencies
 - shapely
 - fiona
 - pyproj
-- numpy
-"""
+- numpy"""
 
 from __future__ import annotations
 
@@ -68,7 +67,7 @@ TNM_PRODUCTS_URL = "https://tnmaccess.nationalmap.gov/api/v1/products"
 TNM_DATASETS_URL = "https://tnmaccess.nationalmap.gov/api/v1/datasets"
 
 # HydroRIVERS regional zip pattern (continent extracts; v10)
-# Examples include ..._eu_shp.zip, ..._na_shp.zip, etc. citeturn0search15turn0search0
+# Examples include ..._eu_shp.zip, ..._na_shp.zip, etc.
 HYDRORIVERS_ZIP_TEMPLATE = "https://data.hydrosheds.org/file/HydroRIVERS/HydroRIVERS_v10_{region}_shp.zip"
 HYDRORIVERS_REGIONS = {"af", "as", "au", "eu", "na", "sa"}
 
@@ -96,7 +95,7 @@ def arcgis_query_layer_geojson(
 
     Notes
     -----
-    NHD and NHDPlus_HR MapServers publish layers like Flowline / NetworkNHDFlowline. citeturn4view0turn4view1
+    NHD and NHDPlus_HR MapServers publish layers like Flowline / NetworkNHDFlowline.
     """
     lonmin, lonmax, latmin, latmax = bbox_lonlat
 
@@ -160,8 +159,8 @@ def try_arcgis_nhd_flowlines(
     Try to fetch flowlines via ArcGIS REST as a fallback when TNMAccess download returns 0.
 
     Priority:
-      1) NHDPlus_HR NetworkNHDFlowline (layer 3) 
-      2) NHD Flowline - Large Scale (layer 6) 
+      1) NHDPlus_HR NetworkNHDFlowline (layer 3)
+      2) NHD Flowline - Large Scale (layer 6)
 
     Returns GeoDataFrame in projected CRS (out_crs or auto-UTM).
     """
@@ -1002,7 +1001,7 @@ def main() -> None:
             log.warning("[TNM] No products found for AOI.")
 
     # 3) ArcGIS REST fallback (still NHD-derived): if TNM download yields nothing usable,
-    # try querying NHDPlus_HR / NHD MapServers directly for flowlines. citeturn4view0turn4view1
+    # try querying NHDPlus_HR / NHD MapServers directly for flowlines.
     if (gdf is None or gdf.empty) and (not args.nhd_flowlines):
         gdf_arc = try_arcgis_nhd_flowlines(aoi=aoi, out_crs=args.out_crs, timeout_s=int(getattr(args, "arcgis_timeout", 120)))
         if gdf_arc is not None and not gdf_arc.empty:

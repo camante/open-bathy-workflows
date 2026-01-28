@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-xs_infer_bathy_raster.py
+xs_infer_bathy_raster.py – Infer river bathymetry from cross-sections and rasterize a DEM-aligned bed patch
 
 Infer approximate river bathymetry from cross-sections (XS) + bank elevations,
 optionally calibrated by nearby measured depths (sonar / bathy lidar).
@@ -41,7 +41,6 @@ Notes on CRS & nodata
 - If template CRS is geographic (degrees), interpolation distances are computed in a local UTM
   CRS (auto-estimated from data), while outputs remain in the template CRS.
 - Nodata is propagated and treated consistently; default nodata=-9999.0 for float rasters.
-
 """
 
 from __future__ import annotations
@@ -92,7 +91,7 @@ try:
 except ImportError:
     # Fallback values with documentation
     log.warning("[xs_infer] constants module not found, using local defaults")
-    
+
     # Leopold & Maddock (1953) coefficients
     HYDRAULIC_GEOMETRY_A = 0.18
     HYDRAULIC_GEOMETRY_B = 0.50
@@ -1105,12 +1104,12 @@ def _utm_crs_from_lonlat(lon: float, lat: float) -> CRS:
 
 def _utm_crs_for_point(x: float, y: float, source_crs: CRS) -> CRS:
     """Return a WGS84 UTM CRS for a point, handling both geographic and projected input CRS.
-    
+
     Args:
         x: X coordinate (longitude if geographic, easting if projected)
         y: Y coordinate (latitude if geographic, northing if projected)
         source_crs: CRS of the input coordinates
-        
+
     Returns:
         CRS object for the appropriate UTM zone
     """
@@ -1679,7 +1678,7 @@ def _continuous_surface(
             pts_xy = np.vstack([pts_xy, pts_xy_thal])
             pts_val = np.concatenate([pts_val, thal_val_rep])
 
-    
+
     # Interpolate (continuous modes)
     method_l = str(method).lower()
     if method_l in ("aniso", "walid_aniso"):
@@ -2637,7 +2636,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--width-stage-max-dist-m", type=float, default=5000.0, help="Max distance (m) from station to XS center for applying width-stage anchor.")
     p.add_argument("--width-stage-min-n", type=int, default=6, help="Minimum number of width-stage observations to fit the stage-width slope.")
     p.add_argument("--width-stage-min-r2", type=float, default=0.25, help="Minimum R^2 for the width–stage fit to be trusted.")
-    
+
     # Optional Manning inversion prior (secondary, blended; requires Q + W + S)
     p.add_argument("--manning-enabled", action="store_true", help="Alias: enable Manning prior using --manning-mode=q2_regional.")
     p.add_argument("--manning-mode", choices=["off","constant","from_field","q2_regional"], default="off",

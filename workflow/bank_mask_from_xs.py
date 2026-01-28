@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-bank_mask_from_xs.py
+bank_mask_from_xs.py – Create a DEM-aligned bank-preservation mask from XS outputs
 
 Create a DEM-aligned bank-preservation mask GeoTIFF (1=bank/preserve, 0=else)
-from xs_builder.py outputs. 
+from xs_builder.py outputs.
 
-UPDATED: Automatically handles Geographic (Degrees) vs Projected (Meters) CRS.
-"""
+UPDATED: Automatically handles Geographic (Degrees) vs Projected (Meters) CRS."""
 
 from __future__ import annotations
 
@@ -88,18 +87,18 @@ def build_bank_mask(
         if tcrs.is_geographic:
             bounds = tmpl.bounds
             lat_center = (bounds.bottom + bounds.top) / 2.0
-            
+
             # 1 degree lat approx 111,000 meters
             deg_per_m_lat = 1.0 / 111000.0
             # Longitude scaling depends on latitude
             deg_per_m_lon = 1.0 / (111000.0 * np.cos(np.radians(lat_center)))
-            
+
             # Use conservative scaling factor
             scaling = max(deg_per_m_lat, deg_per_m_lon)
             bank_buf_val = bank_buffer_m * scaling
             corr_buf_val = corridor_buffer_m * scaling
-            
-            log.warning("[CRS] Template is GCS (degrees). Converted buffers: bank=%.8f deg, corridor=%.8f deg", 
+
+            log.warning("[CRS] Template is GCS (degrees). Converted buffers: bank=%.8f deg, corridor=%.8f deg",
                         bank_buf_val, corr_buf_val)
         else:
             bank_buf_val = bank_buffer_m

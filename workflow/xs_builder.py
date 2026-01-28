@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-xs_builder.py
+xs_builder.py – Build river cross-sections (XS) from a river network + DEM/topo rasters
 
 Build river cross-sections (XS) for CUDEM-style coastal river bathymetry workflows.
 
@@ -42,8 +42,7 @@ Outputs
 
 Dependencies
 ------------
-pip install geopandas rasterio shapely numpy pandas pyproj
-"""
+pip install geopandas rasterio shapely numpy pandas pyproj"""
 
 from __future__ import annotations
 

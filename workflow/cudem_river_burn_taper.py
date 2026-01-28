@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-cudem_river_burn_taper.py
+cudem_river_burn_taper.py – Burn/fuse a river bed patch raster into a base DEM with guardrails
 
 Fuses river bed patches into a base DEM with guardrails.
-FIXED: GCS-Aware distance calculation and strict nodata protection.
-"""
+FIXED: GCS-Aware distance calculation and strict nodata protection."""
 
 from __future__ import annotations
 import argparse
@@ -58,7 +57,7 @@ def fuse(
     # 1. DEFINE STRICT VALIDITY (Critical for fixing large negatives)
     base_valid = np.isfinite(base) & (base != b_nd) if b_nd is not None else np.isfinite(base)
     patch_valid = np.isfinite(patch) & (patch != p_nd) if p_nd is not None else np.isfinite(patch)
-    
+
     # Only allow updates where the patch has valid bathy data
     allow = patch_valid & (pmask == 1)
     prov = np.zeros(base.shape, dtype=np.uint8)
@@ -92,7 +91,7 @@ def fuse(
 
     # 3. FUSION LOGIC (Safe from Nodata)
     fused = base.copy()
-    
+
     # CASE A: Patch applied where base DEM has valid data (Blended/Tapered)
     blend_idx = allow & base_valid
     if w_blend is not None:
@@ -110,7 +109,7 @@ def fuse(
     prov[fill_idx] = 1
 
     # 4. WRITE OUTPUTS
-    for path, arr, prof, dtype in [(out_dem_path, fused, p_base, p_base['dtype']), 
+    for path, arr, prof, dtype in [(out_dem_path, fused, p_base, p_base['dtype']),
                                    (out_prov_path, prov, p_base, 'uint8')]:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         out_prof = prof.copy()

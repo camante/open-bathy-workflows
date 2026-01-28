@@ -4,6 +4,10 @@ A production-ready pipeline for deriving bathymetry from **Sentinel-2 imagery** 
 
 > For an end-to-end description of both SDB and the river workflow (including Option A USGS anchors), see **README_DETAILED.md** (recommended) or **README_WORKFLOW.md**.
 
+## Script inventory
+
+For a generated inventory of **all scripts** in this folder (with one-line summaries and a CLI flag), see **README_SCRIPTS.md**.
+
 ## Quick Start
 
 ```bash

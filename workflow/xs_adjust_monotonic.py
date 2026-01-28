@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-xs_adjust_monotonic.py
+xs_adjust_monotonic.py – Enforce a downstream-monotonic bed profile along river stationing
 
 Enforce a downstream-monotonic bed profile along river stationing, producing
 adjusted columns:
@@ -27,7 +27,6 @@ Monotonic rule
 --------------
 We enforce that (downstream) depth does not decrease (i.e., bed does not rise),
 allowing small violations up to epsilon.
-
 """
 
 from __future__ import annotations

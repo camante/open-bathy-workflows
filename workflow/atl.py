@@ -1,7 +1,60 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-atl.py – ICESat‑2 (ATL03/ATL24) utilities for SDB
+atl.py – ICESat‑2 (ATL03/ATL24) utilities for the Open Bathy Workflows
+
+This module provides the ICESat‑2 side of the bathymetry workflows:
+
+- **Data discovery + download (cache‑first)** via NASA Harmony/CMR:
+  downloads ATL03/ATL24 granules intersecting an AOI + time range, caching them
+  under a stable directory fingerprint so repeated runs do not re-download data.
+
+- **Training‑point extraction**:
+  converts ATL03 photon data (and ATL24 bathymetry points) into tabular training
+  points usable by the SDB model (`sdb_main.py` / `train_sdb_model`), with
+  optional land/water masking.
+
+- **Refraction correction helpers** (ATL03):
+  utilities to correct underwater photons using a water refractive index
+  appropriate for the green ICESat‑2 laser (~532 nm). Keep this consistent with
+  the refraction model used elsewhere in the pipeline.
+
+- **External XYZ ingestion**:
+  `load_extra_xyz()` loads additional soundings (sonar/lidar/surveys) in common
+  formats (CSV/XYZ/GPKG), clips to the AOI, and standardizes columns
+  (`longitude`, `latitude`, `depth_m`, `source`).
+
+Typical outputs consumed downstream
+---------------------------------
+- CSV of training points (columns vary by method but generally include lon/lat and a depth/elevation field)
+- Cached ATL03/ATL24 granules (HDF5) under the chosen cache directory
+
+Standalone CLI (for quick testing)
+---------------------------------
+This file can be run directly to fetch points into a single CSV.
+
+Examples:
+    # ATL03 photons -> training points CSV
+    python atl.py \
+      --aoi "-74.5/-74.25/40.25/40.5" \
+      --start 2025-01-01 --end 2026-01-01 \
+      --product atl03 \
+      --cache-dir cache/icesat2 \
+      --out-csv output/atl03_points.csv
+
+    # ATL24 bathymetry points -> training points CSV
+    python atl.py \
+      --aoi "-74.5/-74.25/40.25/40.5" \
+      --start 2025-01-01 --end 2026-01-01 \
+      --product atl24 \
+      --cache-dir cache/icesat2 \
+      --out-csv output/atl24_points.csv
+
+Notes
+-----
+- AOI format is **W/E/S/N** (lon/lat degrees), matching the rest of the workflow.
+- This module is imported by higher-level entry points (e.g., `sdb_main.py`),
+  so avoid adding heavy imports at module import time unless necessary.
 """
 
 import os
@@ -11,6 +64,7 @@ import time
 import logging
 import hashlib
 import argparse
+import textwrap
 import shlex
 from pathlib import Path
 from datetime import datetime, date, timezone
@@ -141,7 +195,7 @@ def transform_xyz_dataframe_crs(
     IMPORTANT: This performs HORIZONTAL-ONLY transformation (lon/lat).
     The z_col (depth_m) is NOT transformed because depth is a relative measurement
     (water depth below surface), not a geodetic/orthometric height.
-    
+
     Applying vertical datum transforms (e.g., EGM2008 -> NAVD88) to depth values
     would corrupt them by introducing location-dependent biases.
 
@@ -154,7 +208,7 @@ def transform_xyz_dataframe_crs(
         return df
     if (not src_srs) or (not dst_srs):
         return df
-    
+
     # Extract just the horizontal CRS components for transformation
     # Strip any vertical component (e.g., "EPSG:4326+5703" -> "EPSG:4326")
     def _horizontal_crs(crs_str: str) -> str:
@@ -163,10 +217,10 @@ def transform_xyz_dataframe_crs(
             # Compound CRS like "EPSG:4326+5703" - take first part
             return s.split("+")[0].strip()
         return s
-    
+
     src_h = _horizontal_crs(src_srs)
     dst_h = _horizontal_crs(dst_srs)
-    
+
     if src_h.lower() == dst_h.lower():
         return df
 
@@ -437,7 +491,7 @@ def _filter_points_by_mask(
                     else:
                         keep_v = sampled_v == wv
 
-            
+
             # Sanity rescue: if we kept nothing, try a safe fallback for common continuous masks.
             if int(np.count_nonzero(keep_v)) == 0 and sampled_v.size > 0:
                 sv_min = float(np.nanmin(sampled_v))
@@ -661,24 +715,24 @@ def infer_bottom_from_atl03_binned(binned, ws_height_df, height_res=0.25, percen
         if v.empty: continue
         lat_mid = v["latitude"].median()
         if not np.isfinite(lat_mid): continue
-        
+
         # Local surface fallback
         cnt_full = v.groupby("height_bins", observed=False).size().reset_index(name="count")
         surf_h_local = float(cnt_full.loc[cnt_full["count"].idxmax(), "height_bins"])
-        
+
         idx_nn = (np.abs(surf_lat - lat_mid)).argmin()
         ws_h_global = float(surf_h[idx_nn])
         ws_h = ws_h_global if abs(ws_h_global - surf_h_local) <= (2.0 * height_res) else surf_h_local
-        
+
         v_sub = v[v["photon_height"] < ws_h - (height_res * 2.0)]
         if v_sub.empty: continue
-        
+
         new_df = pd.DataFrame(v_sub.groupby("height_bins", observed=False).count())
         if new_df.empty: continue
         bath_bin = new_df["latitude"].argmax()
         n_bottom = int(new_df.iloc[bath_bin]["latitude"])
         if n_bottom < min_bottom_photons_local: continue
-        
+
         pts = v_sub[v_sub["height_bins"] == new_df.index[bath_bin]][["longitude", "latitude", "photon_height"]].copy()
         pts["depth_app"] = (ws_h - pts["photon_height"]).astype(np.float32)
         pts["ws_h"] = ws_h; pts["n_bottom"] = n_bottom; pts["n_subsurface"] = len(v_sub)
@@ -695,19 +749,19 @@ def infer_bottom_from_atl03_binned(binned, ws_height_df, height_res=0.25, percen
 def _collect_points_from_atl24_file(h5_path, conf_min, segment_length_m=5.0):
     """
     Collect bathymetry points from ATL24 file.
-    
+
     ATL24 stores photon-level data, but we need segment-level aggregates
     to match ATL03's binned approach. This function:
     1. Reads bathymetry-classified photons (class_ph == 40)
     2. Groups them into along-track segments (~5m, matching ATL03 lat_res)
     3. Returns median position and depth per segment
     4. Captures delta_time for tidal correction
-    
+
     This ensures ATL24 points can be properly collocated with ATL03 points
     during fusion (they'll have similar spatial density and positions).
     """
     all_segments = []
-    
+
     with h5py.File(h5_path, "r") as f:
         # Try to get granule-level time metadata
         granule_start_delta_time = None
@@ -718,17 +772,17 @@ def _collect_points_from_atl24_file(h5_path, conf_min, segment_length_m=5.0):
                 granule_start_delta_time = f["orbit_info"]["sc_orient_time"][0]
         except Exception:
             pass
-            
+
         for beam_key in [k for k in f.keys() if k.startswith("gt")]:
             g = f.get(beam_key)
             if g is None:
                 continue
-                
+
             # Check for required datasets
             required = {"lat_ph", "lon_ph", "ortho_h", "surface_h", "class_ph"}
             if not required.issubset(g.keys()):
                 continue
-            
+
             # Read photon-level data
             lat = g["lat_ph"][:]
             lon = g["lon_ph"][:]
@@ -736,10 +790,10 @@ def _collect_points_from_atl24_file(h5_path, conf_min, segment_length_m=5.0):
             surface_h = g["surface_h"][:]  # Surface elevation
             class_ph = g["class_ph"][:]
             conf = g["confidence"][:] if "confidence" in g else None
-            
+
             # Try to get delta_time for tidal correction
             delta_time = g["delta_time"][:] if "delta_time" in g else None
-            
+
             # Ensure same length
             n = min(len(lat), len(lon), len(ortho_h), len(surface_h), len(class_ph))
             lat = lat[:n]
@@ -751,21 +805,21 @@ def _collect_points_from_atl24_file(h5_path, conf_min, segment_length_m=5.0):
                 conf = conf[:n]
             if delta_time is not None:
                 delta_time = delta_time[:n]
-            
+
             # Filter to bathymetry photons (class 40) with valid data
             mask = (
-                (class_ph == 40) & 
-                np.isfinite(lat) & 
-                np.isfinite(lon) & 
-                np.isfinite(ortho_h) & 
+                (class_ph == 40) &
+                np.isfinite(lat) &
+                np.isfinite(lon) &
+                np.isfinite(ortho_h) &
                 np.isfinite(surface_h)
             )
             if conf is not None:
                 mask &= (conf >= conf_min)
-            
+
             if not np.any(mask):
                 continue
-            
+
             # Extract valid photons
             lat_v = lat[mask]
             lon_v = lon[mask]
@@ -775,7 +829,7 @@ def _collect_points_from_atl24_file(h5_path, conf_min, segment_length_m=5.0):
             surface_h_v = surface_h[mask]
             ortho_h_v = ortho_h[mask]
             delta_time_v = delta_time[mask] if delta_time is not None else None
-            
+
             # Group into ~segment_length_m-meter along-track segments.
             # NOTE: Do NOT bin by latitude; tracks are not necessarily N-S.
             # We approximate along-track ordering using delta_time when available, otherwise a PCA axis
@@ -864,15 +918,15 @@ def _collect_points_from_atl24_file(h5_path, conf_min, segment_length_m=5.0):
                     "beam": beam_key,
                     "delta_time": seg_delta_time,
                 })
-    
+
     if not all_segments:
         return pd.DataFrame(columns=["latitude", "longitude", "depth_m", "conf", "source", "delta_time"])
-    
+
     df = pd.DataFrame(all_segments)
     df["source"] = "atl24"
-    
+
     log.info(f"[ATL24] Collected {len(df)} segment-aggregated points from {Path(h5_path).name}")
-    
+
     return df
 
 
@@ -967,7 +1021,7 @@ def collect_training_points_from_atl03(
 
                 m_geo = (np.isfinite(lat) & np.isfinite(lon) & np.isfinite(h_ph) & np.isfinite(conf))
                 lat = lat[m_geo]; lon = lon[m_geo]; h_ph = h_ph[m_geo]; conf = conf[m_geo]
-                
+
                 m_aoi = (lon >= W) & (lon <= E) & (lat >= S) & (lat <= N)
                 lat = lat[m_aoi]; lon = lon[m_aoi]; h_ph = h_ph[m_aoi]; conf = conf[m_aoi]
                 if lat.size == 0: continue
@@ -996,9 +1050,9 @@ def collect_training_points_from_atl03(
 
                 bath_df = bath_df[(bath_df["depth_m"] <= -min_depth_m) & (bath_df["depth_m"] >= -max_depth_m)]
                 bath_df = bath_df[(bath_df["n_bottom"] >= min_bottom_photons) & (bath_df["frac_bottom"] >= min_bottom_frac)]
-                
+
                 bath_df["granule"] = Path(atl03_path).stem; bath_df["beam"] = f"gt{laser_num}"; bath_df["source"] = "atl03"
-                
+
                 all_rows.append(bath_df[["longitude", "latitude", "depth_m", "ws_h", "photon_height", "n_bottom", "n_subsurface", "frac_bottom", "granule", "beam", "source"]])
 
         except Exception as exc:
@@ -1126,7 +1180,7 @@ def collect_training_points_from_atl24(
     if limit_train_samples and len(train_df) > limit_train_samples:
         train_df = train_df.sample(limit_train_samples, random_state=seed)
         _log_depth_funnel("atl24.points.sample_limit", train_df, rr=rr)
-    
+
     # Filter by Land Mask
     if land_mask_path and os.path.exists(land_mask_path):
         train_df = _filter_points_by_mask(train_df, land_mask_path, water_val=land_mask_water_val, invert=land_mask_invert, mask_type=land_mask_type, threshold=land_mask_threshold, rr=rr)
@@ -1181,14 +1235,14 @@ def build_atl03_track_lines(atl03_files: List[str], aoi_str: str, out_shp: str):
                     orientation = h5["/orbit_info/sc_orient"][0]
                     orientDict = {0: "l", 1: "r", 21: "l"}
                     beam_key = f"gt{laser}{orientDict.get(orientation, 'l')}"
-                    
+
                     lats = h5[f"/{beam_key}/heights/lat_ph"][::100] # Subsample heavily
                     lons = h5[f"/{beam_key}/heights/lon_ph"][::100]
-                    
+
                 # Clip
                 m = (lons >= W) & (lons <= E) & (lats >= S) & (lats <= N)
                 if not np.any(m): continue
-                
+
                 # Make line
                 pts = list(zip(lons[m], lats[m]))
                 if len(pts) > 1:
@@ -1196,7 +1250,7 @@ def build_atl03_track_lines(atl03_files: List[str], aoi_str: str, out_shp: str):
                     names.append(Path(f).name)
                     beams.append(f"gt{laser}")
         except Exception: pass
-        
+
     if lines:
         gdf = gpd.GeoDataFrame({"granule": names, "beam": beams, "geometry": lines}, crs="EPSG:4326")
         gdf.to_file(out_shp)
@@ -1204,31 +1258,31 @@ def build_atl03_track_lines(atl03_files: List[str], aoi_str: str, out_shp: str):
 def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.DataFrame:
     """
     Load external XYZ bathymetry data from multiple files.
-    
+
     FIXES in v0.6.1:
     - Implement proper CRS transformation using pyproj
     - Set source to "extra_xyz" directly
     - Add sanity checks and diagnostic logging
     - Support multiple file formats (CSV, TXT, GPKG)
-    
+
     Args:
         xyz_files: List of file paths
         crs: Input CRS (e.g., "EPSG:4326", "EPSG:32617")
         aoi_str: AOI string "W/E/S/N" in EPSG:4326
-    
+
     Returns:
         DataFrame with columns: longitude, latitude, depth_m, source
     """
     from pyproj import Transformer, CRS
     import geopandas as gpd
-    
+
     dfs = []
     W, E, S, N = [float(x) for x in aoi_str.split("/")]
-    
+
     log.info(f"[load_extra_xyz] Loading XYZ data from {len(xyz_files)} file(s)")
     log.info(f"[load_extra_xyz] Target AOI: W={W:.4f}, E={E:.4f}, S={S:.4f}, N={N:.4f}")
     log.info(f"[load_extra_xyz] Input CRS: {crs}")
-    
+
     # Setup coordinate transformation
     transformer = None
     if crs.upper() != "EPSG:4326":
@@ -1240,15 +1294,15 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
             log.error(f"[load_extra_xyz] Failed to create CRS transformer: {e}")
             log.error(f"[load_extra_xyz] Assuming data is already in EPSG:4326")
             transformer = None
-    
+
     for i, f in enumerate(xyz_files):
         try:
             filepath = Path(f)
             log.info(f"[load_extra_xyz] Processing file {i+1}/{len(xyz_files)}: {filepath.name}")
-            
+
             # Try different file formats
             tmp = None
-            
+
             # Try GeoPackage/Shapefile first
             if filepath.suffix.lower() in ['.gpkg', '.shp', '.geojson']:
                 try:
@@ -1265,27 +1319,27 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
                     log.info(f"[load_extra_xyz]   Loaded as vector file: {len(tmp)} points")
                 except Exception as e:
                     log.debug(f"[load_extra_xyz]   Not a vector file: {e}")
-            
+
             # Try CSV/TXT
             if tmp is None:
                 tmp = pd.read_csv(f)
-                
+
                 # Try whitespace delimiter if comma fails
                 if len(tmp.columns) == 1:
-                    tmp = pd.read_csv(f, sep=r'\s+', header=None, 
+                    tmp = pd.read_csv(f, sep=r'\s+', header=None,
                                      names=['x', 'y', 'z'])
-                
+
                 log.info(f"[load_extra_xyz]   Loaded as CSV/TXT: {len(tmp)} points, {len(tmp.columns)} columns")
-            
+
             # Normalize column names
             tmp.columns = [c.lower() for c in tmp.columns]
-            
+
             # Map columns to standard names with robust matching
             # FIX: Case-insensitive exact matches first, then substring matching
             rename_map = {}
             for c in tmp.columns:
                 cl = str(c).lower().strip()
-                
+
                 # Exact matches first (most reliable)
                 if cl in ('lon', 'longitude', 'x'):
                     rename_map[c] = 'x_orig'
@@ -1300,15 +1354,15 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
                     rename_map[c] = 'y_orig'
                 elif ('depth' in cl or 'bathy' in cl) and 'depth_m' not in rename_map.values():
                     rename_map[c] = 'depth_m'
-            
+
             tmp = tmp.rename(columns=rename_map)
-            
+
             # Check required columns
             if 'x_orig' not in tmp.columns or 'y_orig' not in tmp.columns:
                 log.warning(f"[load_extra_xyz] Skipping {filepath.name}: missing x/y columns")
                 log.warning(f"[load_extra_xyz]   Available columns: {list(tmp.columns)}")
                 continue
-            
+
             if 'depth_m' not in tmp.columns:
                 # Safety: do not silently treat elevations as depths. If the file appears to contain
                 # elevation/height (e.g., NAVD88 orthometric heights), you must convert to *depth below surface*
@@ -1321,18 +1375,18 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
                     log.warning(f"[load_extra_xyz] Skipping {filepath.name}: missing depth column")
                 log.warning(f"[load_extra_xyz]   Available columns: {list(tmp.columns)}")
                 continue
-            
+
             # Apply CRS transformation if needed
             if transformer is not None:
                 log.info(f"[load_extra_xyz]   Transforming coordinates...")
                 x_in = tmp['x_orig'].values
                 y_in = tmp['y_orig'].values
-                
+
                 # Transform
                 lon, lat = transformer.transform(x_in, y_in)
                 tmp['longitude'] = lon
                 tmp['latitude'] = lat
-                
+
                 # Sanity check: log range before/after
                 log.info(f"[load_extra_xyz]   Input range: X=[{x_in.min():.2f}, {x_in.max():.2f}], "
                         f"Y=[{y_in.min():.2f}, {y_in.max():.2f}]")
@@ -1342,23 +1396,23 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
                 # No transformation needed
                 tmp['longitude'] = tmp['x_orig']
                 tmp['latitude'] = tmp['y_orig']
-            
+
             # Ensure depths are negative (below surface)
             # FIX: Robust depth sign detection for mixed datasets
             depth_vals = tmp['depth_m'].values
             finite_depths = depth_vals[np.isfinite(depth_vals)]
-            
+
             if len(finite_depths) == 0:
                 log.warning(f"[load_extra_xyz]   No finite depth values in {filepath.name}")
                 continue
-            
+
             pct_positive = (finite_depths > 0).sum() / len(finite_depths)
             depth_min, depth_max = finite_depths.min(), finite_depths.max()
-            
+
             log.info(f"[load_extra_xyz]   Depth statistics: "
                     f"min={depth_min:.2f}, max={depth_max:.2f}, "
                     f"pct_positive={pct_positive*100:.1f}%")
-            
+
             # Robust sign conversion logic
             if pct_positive >= 0.9:
                 # Mostly positive -> assume depths below surface, convert to negative
@@ -1374,28 +1428,28 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
                     f"Not auto-converting. Please verify depth convention or add --xyz-depth-convention flag."
                 )
                 log.warning(f"[load_extra_xyz]   Depth range: [{depth_min:.2f}, {depth_max:.2f}] m")
-            
+
             # === NEW: XYZ QC GUARDRAILS ===
             # Protect against outliers/bad data before high weighting (10x)
             depth_vals_clean = tmp['depth_m'].values
             depth_vals_clean = depth_vals_clean[np.isfinite(depth_vals_clean)]
-            
+
             if len(depth_vals_clean) > 0:
                 # MAD-based outlier detection (robust to extreme values)
                 median_depth = np.median(depth_vals_clean)
                 # Robust MAD without scipy (1.4826 scales MAD to ~sigma for normal)
                 mad_raw = np.median(np.abs(depth_vals_clean - median_depth))
                 mad = 1.4826 * mad_raw
-                
+
                 # Define reasonable depth range (configurable)
                 # Default: typical bathymetry 0-50m depth
                 expected_min_depth = -60.0  # 60m max depth
                 expected_max_depth = 5.0    # 5m above surface (for tidal variation)
-                
+
                 # Check for gross outliers
                 n_too_deep = (depth_vals_clean < expected_min_depth).sum()
                 n_too_shallow = (depth_vals_clean > expected_max_depth).sum()
-                
+
                 if n_too_deep > 0 or n_too_shallow > 0:
                     log.warning(
                         f"[load_extra_xyz] QC WARNING: Potential outliers detected in {filepath.name}"
@@ -1404,16 +1458,16 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
                         log.warning(f"  {n_too_deep} points deeper than {expected_min_depth}m")
                     if n_too_shallow > 0:
                         log.warning(f"  {n_too_shallow} points shallower than {expected_max_depth}m")
-                
+
                 # MAD-based outlier clipping (5-sigma equivalent)
                 if mad > 0:
                     threshold = 5.0 * mad
                     lower_bound = median_depth - threshold
                     upper_bound = median_depth + threshold
-                    
+
                     outlier_mask = (tmp['depth_m'] < lower_bound) | (tmp['depth_m'] > upper_bound)
                     n_outliers = outlier_mask.sum()
-                    
+
                     if n_outliers > 0:
                         pct_outliers = 100.0 * n_outliers / len(tmp)
                         log.warning(
@@ -1422,18 +1476,18 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
                             f"(median={median_depth:.2f}, MAD={mad:.2f})"
                         )
                         tmp = tmp[~outlier_mask].copy()
-                
+
                 # Sanity check: AOI coordinate range
                 lon_range = tmp['longitude'].max() - tmp['longitude'].min()
                 lat_range = tmp['latitude'].max() - tmp['latitude'].min()
-                
+
                 if lon_range > 10.0 or lat_range > 10.0:
                     log.warning(
                         f"[load_extra_xyz] QC WARNING: Very large coordinate range "
                         f"(lon_range={lon_range:.2f}°, lat_range={lat_range:.2f}°). "
                         f"Check CRS transformation!"
                     )
-            
+
             # Clip to AOI
             n_before = len(tmp)
             tmp = tmp[
@@ -1441,34 +1495,34 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
                 (tmp.latitude >= S) & (tmp.latitude <= N)
             ]
             n_after = len(tmp)
-            
+
             log.info(f"[load_extra_xyz]   AOI clipping: {n_before} → {n_after} points ({n_after/max(n_before,1)*100:.1f}%)")
-            
+
             if not tmp.empty:
                 # CRITICAL: Set source to "extra_xyz" directly
                 tmp["source"] = "extra_xyz"
-                
+
                 # Keep only required columns
                 tmp = tmp[['longitude', 'latitude', 'depth_m', 'source']].copy()
-                
+
                 # Log depth statistics
                 depth_stats = tmp['depth_m'].describe()
                 log.info(f"[load_extra_xyz]   Depth stats: min={depth_stats['min']:.2f}, "
                         f"median={depth_stats['50%']:.2f}, max={depth_stats['max']:.2f} m")
-                
+
                 dfs.append(tmp)
             else:
                 log.warning(f"[load_extra_xyz]   No points within AOI after clipping")
-                
+
         except Exception as e:
             log.error(f"[load_extra_xyz] Failed to load {f}: {e}")
             import traceback
             log.debug(traceback.format_exc())
-    
+
     if not dfs:
         log.warning("[load_extra_xyz] No XYZ data loaded from any file")
         return pd.DataFrame()
-    
+
     result = pd.concat(dfs, ignore_index=True)
     log.info("=" * 60)
     log.info(f"[load_extra_xyz] TOTAL XYZ DATA LOADED: {len(result)} points")
@@ -1476,37 +1530,53 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
     log.info(f"[load_extra_xyz]   Lat range: [{result.latitude.min():.4f}, {result.latitude.max():.4f}]")
     log.info(f"[load_extra_xyz]   Depth range: [{result.depth_m.min():.2f}, {result.depth_m.max():.2f}] m")
     log.info("=" * 60)
-    
+
     return result
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Standalone ATL03/ATL24 fetcher")
-    parser.add_argument("--aoi", required=True, help="W/E/S/N")
-    parser.add_argument("--start", required=True)
-    parser.add_argument("--end", required=True)
-    parser.add_argument("--product", default="atl03", choices=["atl03", "atl24"])
-    parser.add_argument("--cache-dir", default="cache/icesat2")
-    parser.add_argument("--out-csv", required=True)
-    parser.add_argument("--land-mask", default=None)
+    parser = argparse.ArgumentParser(
+        description="Fetch ICESat‑2 ATL03/ATL24 granules and extract training points to a CSV.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""            Examples:
+              # ATL03 photons -> CSV
+              python atl.py --product atl03 --aoi "-74.5/-74.25/40.25/40.5" --start 2025-01-01 --end 2026-01-01 \
+                --cache-dir cache/icesat2 --out-csv output/atl03_points.csv
+
+              # ATL24 bathymetry points -> CSV
+              python atl.py --product atl24 --aoi "-74.5/-74.25/40.25/40.5" --start 2025-01-01 --end 2026-01-01 \
+                --cache-dir cache/icesat2 --out-csv output/atl24_points.csv
+
+            Notes:
+              - AOI format is W/E/S/N (lon/lat degrees).
+              - Use --land-mask to exclude obvious land contamination.
+            """),
+    )
+    parser.add_argument("--aoi", required=True, help="Bounding box W/E/S/N (lon/lat degrees).")
+    parser.add_argument("--start", required=True, help="Start date (YYYY-MM-DD).")
+    parser.add_argument("--end", required=True, help="End date (YYYY-MM-DD).")
+    parser.add_argument("--product", default="atl03", choices=["atl03", "atl24"], help="ICESat‑2 product to use.")
+    parser.add_argument("--cache-dir", default="cache/icesat2", help="Cache directory for granules.")
+    parser.add_argument("--out-csv", required=True, help="Output CSV path.")
+    parser.add_argument("--land-mask", default=None, help="Optional land/water mask raster; interpreted by downstream filters.")
     args = parser.parse_args()
 
     w, e, s, n = [float(x) for x in args.aoi.split("/")]
     bbox = [w, s, e, n]
-    
+
     cache_path = Path(args.cache_dir)
     files, _, status = ensure_icesat_files_harmony_cachefirst(cache_path, args.product.upper(), bbox, args.start, args.end)
-    
+
     if args.product == "atl03":
         df = collect_training_points_from_atl03(
-            files, 0.00005, 0.25, args.aoi, 4, 90.0, True, 20.0, 532.0, 
+            files, 0.00005, 0.25, args.aoi, 4, 90.0, True, 20.0, 532.0,
             3, 0.1, 0.1, 40.0, False, land_mask_path=args.land_mask
         )
     else:
         df = collect_training_points_from_atl24(
             files, args.aoi, 40.0, 0.0, None, 42, 0.8, land_mask_path=args.land_mask
         )
-        
+
     df.to_csv(args.out_csv, index=False)
     log.info(f"Wrote {len(df)} points to {args.out_csv}")
 

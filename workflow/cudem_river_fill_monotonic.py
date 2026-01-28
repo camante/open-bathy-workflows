@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-cudem_river_fill_monotonic.py
+cudem_river_fill_monotonic.py – End-to-end river bed patch workflow (network → XS → patch → burn)
 
 End-to-end river bed patch workflow:
   1) river_network.py
@@ -14,8 +14,7 @@ End-to-end river bed patch workflow:
 
 Enhancements:
   - Optional waffles-derived channel mask (coastline module; want_nhd=True)
-  - OPTIONAL refinement: (waffles water mask) ∧ (buffer(flowlines)) to remove stray water polygons
-"""
+  - OPTIONAL refinement: (waffles water mask) ∧ (buffer(flowlines)) to remove stray water polygons"""
 
 from __future__ import annotations
 

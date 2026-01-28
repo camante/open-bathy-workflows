@@ -1,4 +1,4 @@
-"""river_wse.py
+"""river_wse.py – Fit a smoothed longitudinal water-surface elevation (WSE) profile along river stationing
 
 Longitudinal Water Surface Elevation (WSE) profile fitting.
 
@@ -22,7 +22,6 @@ table (xs_param) and used as:
 * A physically plausible WSE curve for diagnostics and future SWOT/ICESat-2
   constraints
 """
-
 from __future__ import annotations
 
 from dataclasses import dataclass

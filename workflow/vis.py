@@ -1,12 +1,51 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-vis.py – Visual QC for ICESat-2 (ATL03) vs Training Data (with plot linkage GeoPackages)
+vis.py – Visual QC utilities for ICESat‑2 (ATL03) and training/prediction artifacts
+
+`vis.py` is the plotting and “sanity‑check” companion to the SDB workflow. It is
+intended to answer practical questions like:
+
+- Are the ATL03 photons / refraction‑corrected depths reasonable in this AOI?
+- Do the training points cover the full depth range the model is asked to predict?
+- Are there obvious outliers (e.g., land contamination, shallow-water bias)?
+- Do model meta parameters (e.g., max_depth_sdb) align with observed depths?
+
+What it produces
+----------------
+- PNG plots written to a user-specified directory (Matplotlib, headless "Agg").
+- Optional GeoPackages that link plots to features/points, if GeoPandas is available.
+
+Integration points
+------------------
+- Uses `atl.read_atl03_basic()` to read photons from ATL03 granules.
+- Designed to work with the output artifacts written by `sdb_main.py`
+  (e.g., model metadata JSON, training/test point exports).
+
+Standalone usage
+---------------
+Run with `--help` to see options; the most common pattern is to point it at:
+
+- one or more ATL03 files, and
+- a CSV/GPKG of training points (ATL24/ATL03/XYZ)
+
+Example:
+    python vis.py \
+      --atl03 cache/icesat2/ATL03/*.h5 \
+      --training-csv output/data/training_points.csv \
+      --out-dir output/plots/vis
+
+Notes
+-----
+- This module sets Matplotlib to the non-interactive backend by default so it
+  can run on servers and CI runners without a display.
+- Keep refraction index behavior consistent with `atl.py`.
 """
 
 import sys
 import logging
 import argparse
+import textwrap
 from pathlib import Path
 from typing import List, Optional, Sequence
 import numpy as np
@@ -137,12 +176,12 @@ def _read_photons_for_plot(h5_path, laser_num, aoi_bbox, conf_min):
 
 def _estimate_alongtrack_dist(lon, lat):
     """Returns distance in meters from the first point in the array."""
-    if lon.size == 0: 
+    if lon.size == 0:
         return np.array([], dtype=np.float32), None, (0,0)
-        
+
     mean_lat = float(np.nanmean(lat))
     mean_lon = float(np.nanmean(lon))
-    
+
     # Select UTM zone dynamically
     if mean_lat >= 0:
         utm_zone = int(((mean_lon + 180.0) % 360) // 6) + 1
@@ -152,13 +191,13 @@ def _estimate_alongtrack_dist(lon, lat):
         utm_zone = int(((mean_lon + 180.0) % 360) // 6) + 1
         utm_zone = min(max(utm_zone, 1), 60)  # Fixed: handle edge cases
         utm_epsg = 32700 + utm_zone
-    
+
     tfm = Transformer.from_crs("EPSG:4326", f"EPSG:{utm_epsg}", always_xy=True)
     x, y = tfm.transform(lon, lat)
-    
+
     x0, y0 = x[0], y[0]
     dist = np.sqrt((x - x0)**2 + (y - y0)**2).astype(np.float32)
-    
+
     return dist, tfm, (x0, y0)
 
 def generate_atl03_debug_plots(training_df, atl03_files, aoi_bbox, plots_dir,
@@ -204,11 +243,11 @@ def generate_atl03_debug_plots(training_df, atl03_files, aoi_bbox, plots_dir,
     for _, row in unique_pairs.iterrows():
         granule = str(row["granule"])
         beam_name = str(row["beam"])
-        
+
         matching_files = [f for f in atl03_files if granule in Path(f).stem]
         if not matching_files: continue
         h5_path = matching_files[0]
-        
+
         if not beam_name.startswith("gt"): continue
         laser_num = beam_name[2]
 
@@ -249,16 +288,16 @@ def generate_atl03_debug_plots(training_df, atl03_files, aoi_bbox, plots_dir,
 
         df_24_local = pd.DataFrame()
         if atl24_df is not None and not atl24_df.empty:
-            pad = 0.01 
+            pad = 0.01
             lat_min, lat_max = df_raw["latitude"].min() - pad, df_raw["latitude"].max() + pad
             lon_min, lon_max = df_raw["longitude"].min() - pad, df_raw["longitude"].max() + pad
-            
+
             mask_24 = (
                 (atl24_df["latitude"] >= lat_min) & (atl24_df["latitude"] <= lat_max) &
                 (atl24_df["longitude"] >= lon_min) & (atl24_df["longitude"] <= lon_max)
             )
             subset_24 = atl24_df[mask_24].copy()
-            
+
             if not subset_24.empty:
                 subset_24["dist_m"] = project_to_track(subset_24["longitude"].values, subset_24["latitude"].values)
                 df_24_local = subset_24
@@ -268,14 +307,14 @@ def generate_atl03_debug_plots(training_df, atl03_files, aoi_bbox, plots_dir,
 
         for start_m in np.arange(0.0, max_dist, float(chunk_size_m)):
             end_m = start_m + chunk_size_m
-            
+
             sub_raw = df_raw[(df_raw["dist_m"] >= start_m) & (df_raw["dist_m"] < end_m)]
             sub_picks = df_picks[(df_picks["dist_m"] >= start_m) & (df_picks["dist_m"] < end_m)]
-            
+
             if sub_picks.empty: continue
 
             fig, ax = plt.subplots(figsize=(10, 5))
-            
+
             # 1. ATL24 (Cyan Diamonds)
             if not df_24_local.empty:
                 sub_24 = df_24_local[(df_24_local["dist_m"] >= start_m) & (df_24_local["dist_m"] < end_m)]
@@ -283,8 +322,8 @@ def generate_atl03_debug_plots(training_df, atl03_files, aoi_bbox, plots_dir,
                     if len(sub_picks) > 1:
                         sorted_picks = sub_picks.sort_values("dist_m")
                         surface_h_at_24 = np.interp(
-                            sub_24["dist_m"].values, 
-                            sorted_picks["dist_m"].values, 
+                            sub_24["dist_m"].values,
+                            sorted_picks["dist_m"].values,
                             sorted_picks["ws_h"].values
                         )
                     else:
@@ -301,13 +340,13 @@ def generate_atl03_debug_plots(training_df, atl03_files, aoi_bbox, plots_dir,
                     else:
                          atl24_elev_vis = surface_h_at_24 - d24
 
-                    ax.scatter(sub_24["dist_m"], atl24_elev_vis, s=40, c="cyan", 
+                    ax.scatter(sub_24["dist_m"], atl24_elev_vis, s=40, c="cyan",
                                edgecolors="none", marker="d", label="ATL24 Depth", zorder=1, alpha=0.8)
 
             # 2. Raw Photons (Gray dots)
             if not sub_raw.empty:
                 ax.scatter(sub_raw["dist_m"], sub_raw["photon_height"], s=1, c="gray", alpha=0.3, label="Raw Photons", zorder=2)
-            
+
             # 3. ATL03 Picks (Red Surface / Black Bottom)
             ax.scatter(sub_picks["dist_m"], sub_picks["ws_h"], s=12, c="red", marker="_", label="ATL03 Surface", zorder=3)
             ax.scatter(sub_picks["dist_m"], sub_picks["bottom_h_vis"], s=12, c="black", marker="_", label="ATL03 Bottom", zorder=3)
@@ -333,15 +372,15 @@ def generate_atl03_debug_plots(training_df, atl03_files, aoi_bbox, plots_dir,
                     pass
 
             ax.set_title(f"{granule} – {beam_name} – {int(start_m)}-{int(end_m)} m")
-            
+
             y_vals = np.concatenate([sub_picks["bottom_h_vis"].values, sub_picks["ws_h"].values])
             ax.set_ylim(float(np.nanmin(y_vals)) - 3.0, float(np.nanmax(y_vals)) + 3.0)
-            
+
             ax.legend(loc="upper right", markerscale=2.0)
             ax.set_xlabel("Along-Track Distance (m)")
             ax.set_ylabel("Elevation (m)")
             ax.grid(True, alpha=0.3)
-            
+
             fig.tight_layout()
             plot_png = str(out_dir / f"{granule}_{beam_name}_{int(start_m)}m.png")
             # Annotate picks in this chunk with the plot they appear in
@@ -358,25 +397,44 @@ def generate_atl03_debug_plots(training_df, atl03_files, aoi_bbox, plots_dir,
     log.info("[VIS] Plots complete.")
 
 def main():
-    parser = argparse.ArgumentParser(description="Standalone visualizer")
-    parser.add_argument("--csv", required=True)
-    parser.add_argument("--atl03-dir", required=True)
-    parser.add_argument("--out-dir", required=True)
+    parser = argparse.ArgumentParser(
+        description="Generate quick-look QC plots for ATL03 photons and a training-points CSV.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""            The input CSV is expected to include at least:
+              - longitude (deg)
+              - latitude (deg)
+              - depth_m (meters; sign convention depends on your upstream preparation)
+
+            Examples:
+              # Using the workflow's exported training points and a directory of ATL03 granules
+              python vis.py --csv output/data/training_points.csv --atl03-dir cache/icesat2/ATL03 --out-dir output/plots/vis
+
+              # Override AOI (otherwise derived from CSV extent)
+              python vis.py --csv output/data/training_points.csv --atl03-dir cache/icesat2/ATL03 --out-dir output/plots/vis \
+                --aoi "-74.5/-74.25/40.25/40.5"
+
+            Notes:
+              - GeoPackage outputs require geopandas + shapely. Use --no-gpkg to disable.
+            """),
+    )
+    parser.add_argument("--csv", "--training-csv", dest="csv", required=True, help="Training points CSV path.")
+    parser.add_argument("--atl03-dir", required=True, help="Directory containing ATL03 .h5 granules.")
+    parser.add_argument("--out-dir", required=True, help="Directory to write plots (PNG).")
     parser.add_argument("--gpkg-full", default=None, help="Output full GeoPackage path (includes plot_png linkage).")
     parser.add_argument("--gpkg-slim", default=None, help="Output slim GeoPackage path (only source, depth_m, geometry).")
     parser.add_argument("--no-gpkg", action="store_true", default=False, help="Do not write GeoPackages.")
-    parser.add_argument("--water-temp-c", type=float, default=20.0, help="Water temperature (°C).")
-    parser.add_argument("--wavelength-nm", type=float, default=532.0, help="Laser wavelength (nm).")
+    parser.add_argument("--water-temp-c", type=float, default=20.0, help="Water temperature (°C) for refraction index helper.")
+    parser.add_argument("--wavelength-nm", type=float, default=532.0, help="Laser wavelength (nm) for refraction index helper.")
     parser.add_argument("--depth-mode", default="true", choices=["true","legacy_n_multiplier"], help="Depth conversion mode.")
     parser.add_argument("--max-depth-sdb", default=None,
                     help="Depth-of-support annotation (m). Use a number (e.g., 6) or 'auto' to read from model_meta.json.")
     parser.add_argument("--model-meta", default=None,
                     help="Optional path to model_meta.json (used when --max-depth-sdb auto).")
-    parser.add_argument("--aoi", default=None, help="W/E/S/N override")
+    parser.add_argument("--aoi", default=None, help="Optional AOI override (W/E/S/N). If omitted, derived from CSV extent.")
     args = parser.parse_args()
 
     df = pd.read_csv(args.csv)
-    
+
     if args.aoi:
         w, e, s, n = [float(x) for x in args.aoi.split("/")]
         bbox = [w, s, e, n]
@@ -385,7 +443,7 @@ def main():
 
     h5_files = list(Path(args.atl03_dir).glob("*.h5"))
     h5_strs = [str(f) for f in h5_files]
-    
+
     generate_atl03_debug_plots(
         df, h5_strs, bbox, Path(args.out_dir),
         water_temp_c=float(args.water_temp_c),
