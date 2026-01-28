@@ -23,7 +23,9 @@ venv/
 Thumbs.db
 
 # Outputs / caches
+downloads/
 output/
+.cudem_cache/
 cache/
 *.tif
 *.tiff
@@ -37,6 +39,14 @@ cache/
 *.aux.xml
 *.log
 
+
 # Large binaries
 *.pkl
 *.joblib
+
+
+# Large artifacts
+*.zip
+*.tif
+*.vrt
+*.nc
