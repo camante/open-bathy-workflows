@@ -50,3 +50,4 @@ cache/
 *.tif
 *.vrt
 *.nc
+bootstrap_repo.sh
