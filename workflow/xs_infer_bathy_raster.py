@@ -166,9 +166,11 @@ class InferConfig:
     # Computes a signed curvature proxy from the sequence of XS center points (per component),
     # then shifts the trapezoid "flat bottom" toward the outer bend. This approximates the
     # thalweg skew using only planform geometry (see Liang & Merwade, 2026).
-    curv_asymmetry_enabled: bool = False
+    curv_asymmetry_enabled: bool = True
     curv_window_m: float = 500.0          # half-window for local polynomial fit (meters)
     curv_min_points: int = 7              # minimum XS points per fit window
+    curv_use_dimensionless: bool = True     # if True, use dimensionless curvature κ* = κ×W
+    curv_kappa_star_scale: float = 1.0   # scale applied to κ* before tanh mapping
     curv_kappa_scale_1pm: float = 0.002   # curvature scale (1/m) for tanh mapping
     curv_max_offset_frac: float = 0.25    # maximum shift fraction of width (0..0.45)
     curv_lag_m: float = 0.0               # evaluate curvature at s+lag (meters), optional
@@ -379,8 +381,13 @@ def _trapezoid_depth_profile(
     Wb = float(np.clip(bottom_frac, 0.0, 0.95) * W)
     Wb = max(Wb, 1e-6)
 
-    # Clamp the flat-bottom center so the plateau stays within [0, W]
-    off = float(np.clip(offset_frac, -0.45, 0.45))
+    # Clamp the flat-bottom center so the plateau stays within [0, W].
+    # Constrain offset based on bottom_frac so the flat section always remains inside-channel,
+    # leaving a small margin.
+    bottom = float(np.clip(bottom_frac, 0.0, 0.95))
+    max_off = (1.0 - bottom) / 2.0 - 0.05  # leave 5% margin
+    max_off = float(np.clip(max_off, 0.0, 0.45))
+    off = float(np.clip(offset_frac, -max_off, max_off))
     center = (W / 2.0) + (off * W)
     center = float(np.clip(center, Wb / 2.0, W - (Wb / 2.0)))
 
@@ -500,12 +507,20 @@ def _attach_curvature_asymmetry(
 
     Curvature is computed per `component_id` from the sequence of cross-section center points,
     ordered by `s_center_m` (if available). The trapezoid flat-bottom is shifted toward the
-    outer bend using:
+    outer bend using a smooth mapping:
 
-        offset_frac = tanh(kappa / kappa_scale) * max_offset_frac
+        offset_frac = tanh(kappa_scaled) * max_offset_frac
 
-    where positive kappa indicates a left-turning centerline, and we shift deeper toward the
-    right bank (positive offset) to approximate the outer-bank thalweg tendency.
+    where `kappa_scaled` is either:
+      - κ / κ_scale (1/m)  (fixed scaling), or
+      - (κ × W) / κ*_scale (dimensionless scaling; adapts to local width)
+
+    Positive κ indicates a left-turning centerline; we shift deeper toward the right bank
+    (positive offset) to approximate the outer-bank thalweg tendency.
+
+    Reference:
+        Liang & Merwade (2026), Journal of Hydrology 664:134450,
+        "Predicting river bathymetry in data sparse regions using a generative deep learning model".
     """
     xs_param = xs_param.copy()
     xs_param["curv_kappa_1pm"] = np.nan
@@ -568,6 +583,8 @@ def _attach_curvature_asymmetry(
     half_w = float(max(1.0, getattr(cfg, "curv_window_m", 500.0))) / 2.0
     min_pts = int(max(5, getattr(cfg, "curv_min_points", 7)))
     kscale = float(max(1e-9, getattr(cfg, "curv_kappa_scale_1pm", 0.002)))
+    use_dim = bool(getattr(cfg, "curv_use_dimensionless", True))
+    kstar_scale = float(max(1e-9, getattr(cfg, "curv_kappa_star_scale", 1.0)))
     max_off = float(np.clip(getattr(cfg, "curv_max_offset_frac", 0.25), 0.0, 0.45))
     lag_m = float(getattr(cfg, "curv_lag_m", 0.0))
 
@@ -578,6 +595,7 @@ def _attach_curvature_asymmetry(
         x = gg.geometry.x.to_numpy(dtype="float64")
         y = gg.geometry.y.to_numpy(dtype="float64")
         if len(s) < min_pts:
+            log.debug("[CURVATURE] component %s skipped: %d points < %d required", str(cid), int(len(s)), int(min_pts))
             continue
         kappa = _compute_signed_curvature_1pm(s, x, y, half_window_m=half_w, min_pts=min_pts)
 
@@ -586,7 +604,16 @@ def _attach_curvature_asymmetry(
             kappa = np.interp(s + lag_m, s, kappa, left=np.nan, right=np.nan)
 
         # Map curvature to offset fraction
-        off = np.tanh(kappa / kscale) * max_off
+        width = pd.to_numeric(gg["width_m"], errors="coerce").to_numpy(dtype="float64")
+        if use_dim:
+            # Dimensionless curvature κ* = κ×W (scaled), adapts to local width.
+            kappa_scaled = (kappa * width) / kstar_scale
+            kappa_scaled = np.where(np.isfinite(kappa_scaled), kappa_scaled, kappa / kscale)
+        else:
+            # Fixed scaling in 1/m.
+            kappa_scaled = kappa / kscale
+
+        off = np.tanh(kappa_scaled) * max_off
         off = np.where(np.isfinite(off), off, 0.0)
 
         # Determine side label for QA/debug
@@ -2404,34 +2431,38 @@ def infer_bathy(
             log.warning("[RIVER][ATTR] failed to attach river attributes from %s:%s (%s)", river_gpkg, rivers_layer, e)
 
 
-# ------------------------
-# Optional SWOT (or other) WSE anchoring (stage)
-# ------------------------
-# If provided, blend/replace the DEM/topo-derived WSE proxy with observed WSE (e.g., SWOT)
-# BEFORE we fit a longitudinal WSE profile and BEFORE any anchor that uses WSE.
-if getattr(cfg, "swot_wse", None) is not None:
-    try:
-        swot = _load_wse_obs(
-            path=Path(cfg.swot_wse),
-            target_crs=xs_lines.crs,
-            wse_col=str(getattr(cfg, "swot_wse_col", "wse_m")),
-            x_col=getattr(cfg, "swot_x_col", None),
-            y_col=getattr(cfg, "swot_y_col", None),
-            csv_crs=str(getattr(cfg, "swot_csv_crs", "EPSG:4326")),
-        )
-        if swot is not None and not swot.empty:
-            xs_param, wse_by_xs = _attach_swot_wse_to_xs(xs_lines, xs_param, swot, cfg)
-            log.info("[SWOT][WSE] Attached/blended WSE observations: n_xs=%d", int(np.isfinite(xs_param["swot_wse_m"]).sum()))
-        else:
-            log.info("[SWOT][WSE] WSE observations empty; using DEM/topo proxy.")
-    except Exception as e:
-        log.warning("[SWOT][WSE] Failed to load/attach WSE observations (%s). Using DEM/topo proxy.", e)
+    # ------------------------
+    # Optional SWOT (or other) WSE anchoring (stage)
+    # ------------------------
+    # If provided, blend/replace the DEM/topo-derived WSE proxy with observed WSE (e.g., SWOT)
+    # BEFORE we fit a longitudinal WSE profile and BEFORE any anchor that uses WSE.
+    if getattr(cfg, "swot_wse", None) is not None:
+        try:
+            swot = _load_wse_obs(
+                path=Path(cfg.swot_wse),
+                target_crs=xs_lines.crs,
+                wse_col=str(getattr(cfg, "swot_wse_col", "wse_m")),
+                x_col=getattr(cfg, "swot_x_col", None),
+                y_col=getattr(cfg, "swot_y_col", None),
+                csv_crs=str(getattr(cfg, "swot_csv_crs", "EPSG:4326")),
+            )
+            if swot is not None and not swot.empty:
+                xs_param, wse_by_xs = _attach_swot_wse_to_xs(xs_lines, xs_param, swot, cfg)
+                log.info(
+                    "[SWOT][WSE] Attached/blended WSE observations: n_xs=%d",
+                    int(np.isfinite(xs_param.get("swot_wse_m", np.nan)).sum()),
+                )
+            else:
+                log.info("[SWOT][WSE] WSE observations empty; using DEM/topo proxy.")
+        except Exception as e:
+            log.warning("[SWOT][WSE] Failed to load/attach WSE observations (%s). Using DEM/topo proxy.", e)
 
-# If requested, keep observed stage for bed elevations but do NOT let it drive slope fitting.
-if (getattr(cfg, "swot_wse", None) is not None) and (not bool(getattr(cfg, "swot_use_for_slope", True))):
-    xs_param["_wse_blended_m"] = xs_param["wse_m"]
-    if "wse_proxy_m" in xs_param.columns:
-        xs_param["wse_m"] = xs_param["wse_proxy_m"]
+    # If requested, keep observed stage for bed elevations but do NOT let it drive slope fitting.
+    if (getattr(cfg, "swot_wse", None) is not None) and (not bool(getattr(cfg, "swot_use_for_slope", True))):
+        xs_param["_wse_blended_m"] = xs_param.get("wse_m", np.nan)
+        if "wse_proxy_m" in xs_param.columns:
+            xs_param["wse_m"] = xs_param["wse_proxy_m"]
+
     # If slope was not provided, estimate a stabilized water-surface slope from a fitted
     # longitudinal WSE profile (preferred) and fall back to the legacy slope proxy.
     xs_param["wse_fit_m"] = np.nan
@@ -2466,14 +2497,13 @@ if (getattr(cfg, "swot_wse", None) is not None) and (not bool(getattr(cfg, "swot
         else:
             xs_param["slope_mpm"] = xs_param["slope_proxy_mpm"]
 
-
-# Restore blended WSE after slope estimation if we suppressed SWOT stage during slope fitting.
-if "_wse_blended_m" in xs_param.columns:
-    xs_param["wse_m"] = xs_param["_wse_blended_m"]
-    xs_param = xs_param.drop(columns=["_wse_blended_m"])
-    # Upgrade prior if requested
-    if str(cfg.prior_mode).lower().strip() == "multivariate":
-        xs_param["dmax_prior_m"] = xs_param.apply(lambda r: _compute_dmax_prior_multivariate(r, cfg), axis=1)
+    # Restore blended WSE after slope estimation if we suppressed SWOT stage during slope fitting.
+    if "_wse_blended_m" in xs_param.columns:
+        xs_param["wse_m"] = xs_param["_wse_blended_m"]
+        xs_param = xs_param.drop(columns=["_wse_blended_m"])
+        # Upgrade prior if requested
+        if str(cfg.prior_mode).lower().strip() == "multivariate":
+            xs_param["dmax_prior_m"] = xs_param.apply(lambda r: _compute_dmax_prior_multivariate(r, cfg), axis=1)
 
     # ---- Optional soft priors (blended into dmax_prior_m) ----
     # 1) Regional hydraulic geometry curves (DA -> bankfull depth)
@@ -3229,6 +3259,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--no-swot-use-for-slope", dest="swot_use_for_slope", action="store_false", help="Do NOT use WSE observations for slope fitting; only shift bed elevations.")
     p.set_defaults(swot_use_for_slope=True)
 
+
     # Curvature-driven XS asymmetry (optional; thalweg skew proxy)
     p.add_argument(
         "--curv-asymmetry-enabled",
@@ -3236,9 +3267,23 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable curvature-driven skew of the XS depth profile (shift trapezoid flat-bottom toward outer bend).",
     )
+    p.add_argument(
+        "--no-curv-asymmetry",
+        dest="curv_asymmetry_enabled",
+        action="store_false",
+        help="Disable curvature-driven XS asymmetry.",
+    )
+    p.set_defaults(curv_asymmetry_enabled=True)
+
     p.add_argument("--curv-window-m", type=float, default=500.0, help="Along-channel window length (m) for local curvature estimation.")
     p.add_argument("--curv-min-points", type=int, default=7, help="Minimum XS points required in the curvature fit window.")
-    p.add_argument("--curv-kappa-scale-1pm", type=float, default=0.002, help="Curvature scale (1/m) for tanh mapping to offset.")
+    p.add_argument("--curv-use-dimensionless", dest="curv_use_dimensionless", action="store_true",
+                   help="Use dimensionless curvature κ* = κ×W (default).")
+    p.add_argument("--no-curv-use-dimensionless", dest="curv_use_dimensionless", action="store_false",
+                   help="Use fixed κ/κ_scale (1/m) scaling.")
+    p.set_defaults(curv_use_dimensionless=True)
+    p.add_argument("--curv-kappa-star-scale", type=float, default=1.0, help="Scale applied to κ* before tanh mapping (default 1.0).")
+    p.add_argument("--curv-kappa-scale-1pm", type=float, default=0.002, help="Curvature scale (1/m) for tanh mapping to offset (used when --no-curv-use-dimensionless).")
     p.add_argument("--curv-max-offset-frac", type=float, default=0.25, help="Max shift as fraction of width (0..0.45).")
     p.add_argument("--curv-lag-m", type=float, default=0.0, help="Evaluate curvature at s+lag (m) to model downstream thalweg response.")
 
@@ -3378,9 +3423,11 @@ def main() -> None:
         swot_vertical_offset_m=float(args.swot_vertical_offset_m),
         swot_outlier_mad_z=float(args.swot_outlier_mad_z),
         swot_use_for_slope=bool(getattr(args, "swot_use_for_slope", True)),
-        curv_asymmetry_enabled=bool(getattr(args, "curv_asymmetry_enabled", False)),
+        curv_asymmetry_enabled=bool(getattr(args, "curv_asymmetry_enabled", True)),
         curv_window_m=float(getattr(args, "curv_window_m", 500.0)),
         curv_min_points=int(getattr(args, "curv_min_points", 7)),
+        curv_use_dimensionless=bool(getattr(args, "curv_use_dimensionless", True)),
+        curv_kappa_star_scale=float(getattr(args, "curv_kappa_star_scale", 1.0)),
         curv_kappa_scale_1pm=float(getattr(args, "curv_kappa_scale_1pm", 0.002)),
         curv_max_offset_frac=float(getattr(args, "curv_max_offset_frac", 0.25)),
         curv_lag_m=float(getattr(args, "curv_lag_m", 0.0)),
