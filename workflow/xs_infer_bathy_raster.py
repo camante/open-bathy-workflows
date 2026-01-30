@@ -87,6 +87,17 @@ from shapely.ops import unary_union
 from pyproj import CRS, Transformer
 
 log = logging.getLogger("xs_infer_bathy")
+
+
+def _union_all(geoms):
+    """Compatibility helper for Shapely 1.x vs 2.x.
+
+    GeoPandas/Shapely 2 exposes `GeoSeries.union_all()`, while older stacks use `GeoSeries.unary_union`.
+    """
+    try:
+        return geoms.union_all()
+    except Exception:
+        return geoms.unary_union
 if not log.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
@@ -166,12 +177,13 @@ class InferConfig:
     # Computes a signed curvature proxy from the sequence of XS center points (per component),
     # then shifts the trapezoid "flat bottom" toward the outer bend. This approximates the
     # thalweg skew using only planform geometry (see Liang & Merwade, 2026).
+    # Curvature-based thalweg asymmetry proxy (Liang & Merwade, 2026; J. Hydrology 664:134450)
     curv_asymmetry_enabled: bool = True
     curv_window_m: float = 500.0          # half-window for local polynomial fit (meters)
     curv_min_points: int = 7              # minimum XS points per fit window
-    curv_use_dimensionless: bool = True     # if True, use dimensionless curvature κ* = κ×W
-    curv_kappa_star_scale: float = 1.0   # scale applied to κ* before tanh mapping
-    curv_kappa_scale_1pm: float = 0.002   # curvature scale (1/m) for tanh mapping
+    curv_kappa_scale_1pm: float = 0.002   # curvature scale (1/m) for tanh mapping (legacy)
+    curv_use_dimensionless: bool = True   # if True, use κ* = κ×W (dimensionless) instead of κ/kscale
+    curv_kappa_star_scale: float = 1.0    # multiplier on κ* before tanh; tune per river type
     curv_max_offset_frac: float = 0.25    # maximum shift fraction of width (0..0.45)
     curv_lag_m: float = 0.0               # evaluate curvature at s+lag (meters), optional
 
@@ -381,11 +393,10 @@ def _trapezoid_depth_profile(
     Wb = float(np.clip(bottom_frac, 0.0, 0.95) * W)
     Wb = max(Wb, 1e-6)
 
-    # Clamp the flat-bottom center so the plateau stays within [0, W].
-    # Constrain offset based on bottom_frac so the flat section always remains inside-channel,
-    # leaving a small margin.
-    bottom = float(np.clip(bottom_frac, 0.0, 0.95))
-    max_off = (1.0 - bottom) / 2.0 - 0.05  # leave 5% margin
+    # Clamp the flat-bottom center so the plateau stays within [0, W]
+    # Clamp based on geometry so the flat-bottom section stays within the channel.
+    # Leave a small margin (5%) so that the trapezoid does not "flip" at high offsets.
+    max_off = (1.0 - float(bottom_frac)) / 2.0 - 0.05
     max_off = float(np.clip(max_off, 0.0, 0.45))
     off = float(np.clip(offset_frac, -max_off, max_off))
     center = (W / 2.0) + (off * W)
@@ -505,22 +516,21 @@ def _attach_curvature_asymmetry(
 ) -> pd.DataFrame:
     """Attach curvature proxy and thalweg offset fraction to xs_param.
 
-    Curvature is computed per `component_id` from the sequence of cross-section center points,
-    ordered by `s_center_m` (if available). The trapezoid flat-bottom is shifted toward the
-    outer bend using a smooth mapping:
+    Curvature is estimated per `component_id` from the sequence of cross-section center points,
+    ordered by `s_center_m` (if available). We map curvature to a signed thalweg offset fraction,
+    shifting the flat-bottom portion of the trapezoid toward the outer bend.
 
-        offset_frac = tanh(kappa_scaled) * max_offset_frac
+    By default we use a dimensionless curvature κ* = κ×W (Liang & Merwade, 2026):
 
-    where `kappa_scaled` is either:
-      - κ / κ_scale (1/m)  (fixed scaling), or
-      - (κ × W) / κ*_scale (dimensionless scaling; adapts to local width)
+        offset_frac = tanh(κ* * curv_kappa_star_scale) * curv_max_offset_frac
 
-    Positive κ indicates a left-turning centerline; we shift deeper toward the right bank
-    (positive offset) to approximate the outer-bank thalweg tendency.
+    If `curv_use_dimensionless` is False, we fall back to the legacy scaling:
+
+        offset_frac = tanh(κ / curv_kappa_scale_1pm) * curv_max_offset_frac
 
     Reference:
         Liang & Merwade (2026), Journal of Hydrology 664:134450,
-        "Predicting river bathymetry in data sparse regions using a generative deep learning model".
+        "Predicting river bathymetry in data sparse regions using a generative deep learning model"
     """
     xs_param = xs_param.copy()
     xs_param["curv_kappa_1pm"] = np.nan
@@ -583,8 +593,6 @@ def _attach_curvature_asymmetry(
     half_w = float(max(1.0, getattr(cfg, "curv_window_m", 500.0))) / 2.0
     min_pts = int(max(5, getattr(cfg, "curv_min_points", 7)))
     kscale = float(max(1e-9, getattr(cfg, "curv_kappa_scale_1pm", 0.002)))
-    use_dim = bool(getattr(cfg, "curv_use_dimensionless", True))
-    kstar_scale = float(max(1e-9, getattr(cfg, "curv_kappa_star_scale", 1.0)))
     max_off = float(np.clip(getattr(cfg, "curv_max_offset_frac", 0.25), 0.0, 0.45))
     lag_m = float(getattr(cfg, "curv_lag_m", 0.0))
 
@@ -595,7 +603,6 @@ def _attach_curvature_asymmetry(
         x = gg.geometry.x.to_numpy(dtype="float64")
         y = gg.geometry.y.to_numpy(dtype="float64")
         if len(s) < min_pts:
-            log.debug("[CURVATURE] component %s skipped: %d points < %d required", str(cid), int(len(s)), int(min_pts))
             continue
         kappa = _compute_signed_curvature_1pm(s, x, y, half_window_m=half_w, min_pts=min_pts)
 
@@ -604,14 +611,20 @@ def _attach_curvature_asymmetry(
             kappa = np.interp(s + lag_m, s, kappa, left=np.nan, right=np.nan)
 
         # Map curvature to offset fraction
-        width = pd.to_numeric(gg["width_m"], errors="coerce").to_numpy(dtype="float64")
+        use_dim = bool(getattr(cfg, "curv_use_dimensionless", False))
         if use_dim:
-            # Dimensionless curvature κ* = κ×W (scaled), adapts to local width.
-            kappa_scaled = (kappa * width) / kstar_scale
-            kappa_scaled = np.where(np.isfinite(kappa_scaled), kappa_scaled, kappa / kscale)
+            # κ* = κ×W (dimensionless); adapt to local width
+            scale_star = float(getattr(cfg, "curv_kappa_star_scale", 1.0))
+            w = pd.to_numeric(gg.get("width_m"), errors="coerce").to_numpy(dtype=float)
+            if np.isfinite(w).any():
+                w_fill = float(np.nanmedian(w))
+            else:
+                w_fill = 0.0
+            w = np.where(np.isfinite(w), w, w_fill)
+            kappa_scaled = kappa * w * scale_star
         else:
-            # Fixed scaling in 1/m.
-            kappa_scaled = kappa / kscale
+            # Legacy: κ/kscale (kscale in 1/m)
+            kappa_scaled = kappa / max(kscale, 1e-12)
 
         off = np.tanh(kappa_scaled) * max_off
         off = np.where(np.isfinite(off), off, 0.0)
@@ -649,13 +662,20 @@ def _compute_dmax_prior(W: float, cfg: InferConfig) -> float:
     return float(np.clip(D, cfg.dmin_m, cfg.dmax_m))
 def _guess_field(columns, candidates):
     """Return the first candidate present in columns (case-insensitive), else None."""
-    if not columns:
+    if columns is None:
         return None
-    lower = {str(c).lower(): str(c) for c in columns}
+    try:
+        if len(columns) == 0:
+            return None
+    except Exception:
+        return None
+    lower = {str(c).lower(): str(c) for c in list(columns)}
     for c in candidates:
-        if str(c).lower() in lower:
-            return lower[str(c).lower()]
+        key = str(c).lower()
+        if key in lower:
+            return lower[key]
     return None
+
 
 
 def _compute_slope_proxy(
@@ -1110,6 +1130,49 @@ def _dmax_from_width_stage(beta: float, Wtop: float, bottom_frac: float) -> floa
 # Soundings (optional)
 # --------------------------------------------------------------------------------------
 
+
+
+def _looks_like_lonlat(x, y) -> bool:
+    """Heuristic: do x/y look like lon/lat degrees?"""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if not (np.isfinite(x).any() and np.isfinite(y).any()):
+        return False
+    xmax = float(np.nanmax(x))
+    xmin = float(np.nanmin(x))
+    ymax = float(np.nanmax(y))
+    ymin = float(np.nanmin(y))
+    # Standard lon/lat ranges
+    if xmin >= -180.0 and xmax <= 180.0 and ymin >= -90.0 and ymax <= 90.0:
+        return True
+    # 0..360 longitudes
+    if xmin >= 0.0 and xmax <= 360.0 and ymin >= -90.0 and ymax <= 90.0:
+        return True
+    return False
+
+
+def _guess_xy_crs(x, y, target_crs, x_name: str | None = None, y_name: str | None = None) -> CRS:
+    """Guess source CRS for x/y point columns.
+
+    If values look like lon/lat degrees, returns EPSG:4326. Otherwise, if the target CRS is
+    projected, assumes x/y are already in target CRS (common for pre-projected XYZs in this pipeline).
+    """
+    # Column-name hint (best-effort)
+    if x_name and y_name:
+        xn = x_name.lower()
+        yn = y_name.lower()
+        if ("lon" in xn or "long" in xn) and ("lat" in yn):
+            return CRS.from_epsg(4326)
+
+    if _looks_like_lonlat(x, y):
+        return CRS.from_epsg(4326)
+
+    t = CRS.from_user_input(target_crs)
+    if t.is_projected:
+        return t
+
+    # Fall back: we can't safely infer a projected CRS when target is geographic
+    return CRS.from_epsg(4326)
 def _load_soundings(
     path: Path,
     target_crs,
@@ -1132,7 +1195,8 @@ def _load_soundings(
         if x_col is None or y_col is None:
             raise RuntimeError("Soundings CSV requires --soundings-x-col/--soundings-y-col (or lon/lat columns).")
 
-        gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df[x_col], df[y_col]), crs="EPSG:4326")
+        src_crs = _guess_xy_crs(df[x_col].to_numpy(), df[y_col].to_numpy(), target_crs, x_col, y_col)
+        gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df[x_col], df[y_col]), crs=src_crs)
     elif path.suffix.lower() in (".xyz", ".txt", ".dat"):
         # USACE eHydro and similar XYZ soundings are commonly whitespace or comma-delimited
         # with 3 columns: x y z (or lon lat depth). Support optional header.
@@ -1165,7 +1229,8 @@ def _load_soundings(
             # Fall back to first two columns
             x_col, y_col = df.columns[0], df.columns[1]
 
-        gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df[x_col], df[y_col]), crs="EPSG:4326")
+        src_crs = _guess_xy_crs(df[x_col].to_numpy(), df[y_col].to_numpy(), target_crs, x_col, y_col)
+        gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df[x_col], df[y_col]), crs=src_crs)
     else:
         gdf = gpd.read_file(path)
         if gdf.empty:
@@ -1691,7 +1756,7 @@ def _build_corridor_mask_from_lines(
 
     # Buffer in meters: project to local UTM, buffer, project back to raster CRS.
     try:
-        centroid = g.geometry.unary_union.centroid
+        centroid = _union_all(g.geometry).centroid
         utm_crs = _utm_crs_for_point(float(centroid.x), float(centroid.y), g.crs)
     except Exception:
         # Fall back to buffering in raster CRS units if UTM inference fails.
@@ -1701,11 +1766,11 @@ def _build_corridor_mask_from_lines(
         g_utm = g.to_crs(utm_crs)
         buffered = g_utm.geometry.buffer(float(buffer_m))
         buffered = gpd.GeoSeries(buffered, crs=utm_crs)
-        poly = buffered.unary_union
+        poly = _union_all(buffered)
         poly = gpd.GeoSeries([poly], crs=utm_crs).to_crs(template_ds.crs).iloc[0]
     else:
         # WARNING: units may not be meters (e.g., degrees). This is a last resort.
-        poly = g.geometry.buffer(float(buffer_m)).unary_union
+        poly = _union_all(g.geometry.buffer(float(buffer_m)))
 
     mask = rasterize(
         [(mapping(poly), 1)],
@@ -2431,10 +2496,10 @@ def infer_bathy(
             log.warning("[RIVER][ATTR] failed to attach river attributes from %s:%s (%s)", river_gpkg, rivers_layer, e)
 
 
-    # ------------------------
-    # Optional SWOT (or other) WSE anchoring (stage)
-    # ------------------------
-    # If provided, blend/replace the DEM/topo-derived WSE proxy with observed WSE (e.g., SWOT)
+# ------------------------
+# Optional SWOT (or other) WSE anchoring (stage)
+# ------------------------
+# If provided, blend/replace the DEM/topo-derived WSE proxy with observed WSE (e.g., SWOT)
     # BEFORE we fit a longitudinal WSE profile and BEFORE any anchor that uses WSE.
     if getattr(cfg, "swot_wse", None) is not None:
         try:
@@ -2448,10 +2513,7 @@ def infer_bathy(
             )
             if swot is not None and not swot.empty:
                 xs_param, wse_by_xs = _attach_swot_wse_to_xs(xs_lines, xs_param, swot, cfg)
-                log.info(
-                    "[SWOT][WSE] Attached/blended WSE observations: n_xs=%d",
-                    int(np.isfinite(xs_param.get("swot_wse_m", np.nan)).sum()),
-                )
+                log.info("[SWOT][WSE] Attached/blended WSE observations: n_xs=%d", int(np.isfinite(xs_param["swot_wse_m"]).sum()))
             else:
                 log.info("[SWOT][WSE] WSE observations empty; using DEM/topo proxy.")
         except Exception as e:
@@ -2459,43 +2521,43 @@ def infer_bathy(
 
     # If requested, keep observed stage for bed elevations but do NOT let it drive slope fitting.
     if (getattr(cfg, "swot_wse", None) is not None) and (not bool(getattr(cfg, "swot_use_for_slope", True))):
-        xs_param["_wse_blended_m"] = xs_param.get("wse_m", np.nan)
+        xs_param["_wse_blended_m"] = xs_param["wse_m"]
         if "wse_proxy_m" in xs_param.columns:
             xs_param["wse_m"] = xs_param["wse_proxy_m"]
+        # If slope was not provided, estimate a stabilized water-surface slope from a fitted
+        # longitudinal WSE profile (preferred) and fall back to the legacy slope proxy.
+        xs_param["wse_fit_m"] = np.nan
+        xs_param["slope_wse_mpm"] = np.nan
+        if bool(getattr(cfg, "wse_profile_enabled", True)):
+            try:
+                wcfg = WSEFitConfig(
+                    enabled=True,
+                    window=int(getattr(cfg, "wse_profile_window", cfg.slope_proxy_window)),
+                    min_n=int(getattr(cfg, "wse_profile_min_n", cfg.slope_proxy_min_n)),
+                    enforce_monotonic=bool(getattr(cfg, "wse_profile_monotonic", True)),
+                    slope_min=float(cfg.slope_min),
+                    slope_max=float(cfg.slope_max),
+                )
+                wse_fit, slope_fit = fit_wse_profile(xs_param, cfg=wcfg)
+                xs_param["wse_fit_m"] = wse_fit
+                xs_param["slope_wse_mpm"] = slope_fit
+            except Exception as e:
+                log.warning("[RIVER][WSE] WSE profile fit failed, falling back to slope proxy (%s)", e)
 
-    # If slope was not provided, estimate a stabilized water-surface slope from a fitted
-    # longitudinal WSE profile (preferred) and fall back to the legacy slope proxy.
-    xs_param["wse_fit_m"] = np.nan
-    xs_param["slope_wse_mpm"] = np.nan
-    if bool(getattr(cfg, "wse_profile_enabled", True)):
-        try:
-            wcfg = WSEFitConfig(
-                enabled=True,
-                window=int(getattr(cfg, "wse_profile_window", cfg.slope_proxy_window)),
-                min_n=int(getattr(cfg, "wse_profile_min_n", cfg.slope_proxy_min_n)),
-                enforce_monotonic=bool(getattr(cfg, "wse_profile_monotonic", True)),
-                slope_min=float(cfg.slope_min),
-                slope_max=float(cfg.slope_max),
-            )
-            wse_fit, slope_fit = fit_wse_profile(xs_param, cfg=wcfg)
-            xs_param["wse_fit_m"] = wse_fit
-            xs_param["slope_wse_mpm"] = slope_fit
-        except Exception as e:
-            log.warning("[RIVER][WSE] WSE profile fit failed, falling back to slope proxy (%s)", e)
+        xs_param["slope_proxy_mpm"] = _compute_slope_proxy(
+            xs_param,
+            window=cfg.slope_proxy_window,
+            slope_min=cfg.slope_min,
+            slope_max=cfg.slope_max,
+            min_n=cfg.slope_proxy_min_n,
+        )
+        # Prefer slope from WSE profile if available; otherwise fallback to slope_proxy
+        if xs_param["slope_mpm"].isna().all():
+            if xs_param["slope_wse_mpm"].notna().any():
+                xs_param["slope_mpm"] = xs_param["slope_wse_mpm"]
+            else:
+                xs_param["slope_mpm"] = xs_param["slope_proxy_mpm"]
 
-    xs_param["slope_proxy_mpm"] = _compute_slope_proxy(
-        xs_param,
-        window=cfg.slope_proxy_window,
-        slope_min=cfg.slope_min,
-        slope_max=cfg.slope_max,
-        min_n=cfg.slope_proxy_min_n,
-    )
-    # Prefer slope from WSE profile if available; otherwise fallback to slope_proxy
-    if xs_param["slope_mpm"].isna().all():
-        if xs_param["slope_wse_mpm"].notna().any():
-            xs_param["slope_mpm"] = xs_param["slope_wse_mpm"]
-        else:
-            xs_param["slope_mpm"] = xs_param["slope_proxy_mpm"]
 
     # Restore blended WSE after slope estimation if we suppressed SWOT stage during slope fitting.
     if "_wse_blended_m" in xs_param.columns:
@@ -2505,603 +2567,602 @@ def infer_bathy(
         if str(cfg.prior_mode).lower().strip() == "multivariate":
             xs_param["dmax_prior_m"] = xs_param.apply(lambda r: _compute_dmax_prior_multivariate(r, cfg), axis=1)
 
-    # ---- Optional soft priors (blended into dmax_prior_m) ----
-    # 1) Regional hydraulic geometry curves (DA -> bankfull depth)
-    xs_param["dmax_regional_curve_m"] = np.nan
-    xs_param["regional_curve_wt"] = 0.0
-    xs_param["regional_curve_detail"] = ""
-    if bool(getattr(cfg, "regional_curve_enabled", False)):
-        def _rc_apply(r):
-            d, w, det = _compute_dmax_regional_curve(r, cfg)
-            return pd.Series({"dmax_regional_curve_m": d, "regional_curve_wt": w, "regional_curve_detail": det})
-        rc = xs_param.apply(_rc_apply, axis=1)
-        xs_param[["dmax_regional_curve_m", "regional_curve_wt", "regional_curve_detail"]] = rc
-        # Blend
-        w = xs_param["regional_curve_wt"].astype("float64").clip(0.0, 1.0)
-        d0 = xs_param["dmax_prior_m"].astype("float64")
-        d1 = xs_param["dmax_regional_curve_m"].astype("float64")
-        use = np.isfinite(d0) & np.isfinite(d1) & (w > 0)
-        xs_param.loc[use, "dmax_prior_m"] = (1.0 - w[use]) * d0[use] + w[use] * d1[use]
+        # ---- Optional soft priors (blended into dmax_prior_m) ----
+        # 1) Regional hydraulic geometry curves (DA -> bankfull depth)
+        xs_param["dmax_regional_curve_m"] = np.nan
+        xs_param["regional_curve_wt"] = 0.0
+        xs_param["regional_curve_detail"] = ""
+        if bool(getattr(cfg, "regional_curve_enabled", False)):
+            def _rc_apply(r):
+                d, w, det = _compute_dmax_regional_curve(r, cfg)
+                return pd.Series({"dmax_regional_curve_m": d, "regional_curve_wt": w, "regional_curve_detail": det})
+            rc = xs_param.apply(_rc_apply, axis=1)
+            xs_param[["dmax_regional_curve_m", "regional_curve_wt", "regional_curve_detail"]] = rc
+            # Blend
+            w = xs_param["regional_curve_wt"].astype("float64").clip(0.0, 1.0)
+            d0 = xs_param["dmax_prior_m"].astype("float64")
+            d1 = xs_param["dmax_regional_curve_m"].astype("float64")
+            use = np.isfinite(d0) & np.isfinite(d1) & (w > 0)
+            xs_param.loc[use, "dmax_prior_m"] = (1.0 - w[use]) * d0[use] + w[use] * d1[use]
 
-    # 2) Manning inversion prior (requires Q, width, slope)
-    xs_param["manning_q_cms_used"] = np.nan
-    xs_param["manning_depth_mean_m"] = np.nan
-    xs_param["manning_dmax_m"] = np.nan
-    xs_param["manning_conf"] = 0.0
-    xs_param["manning_wt"] = 0.0
-    xs_param["manning_flags"] = ""
+        # 2) Manning inversion prior (requires Q, width, slope)
+        xs_param["manning_q_cms_used"] = np.nan
+        xs_param["manning_depth_mean_m"] = np.nan
+        xs_param["manning_dmax_m"] = np.nan
+        xs_param["manning_conf"] = 0.0
+        xs_param["manning_wt"] = 0.0
+        xs_param["manning_flags"] = ""
 
-    if str(cfg.manning_mode).lower().strip() != "off":
-        m_mode = str(cfg.manning_mode).lower().strip()
-        def _m_apply(r):
-            W = float(r.get("width_m", np.nan))
-            S = float(r.get("slope_mpm", np.nan))
-            if not (np.isfinite(W) and W > 0 and np.isfinite(S) and S > 0):
-                return pd.Series({"manning_q_cms_used": np.nan, "manning_depth_mean_m": np.nan, "manning_dmax_m": np.nan, "manning_conf": 0.0, "manning_wt": 0.0, "manning_flags": ""})
+        if str(cfg.manning_mode).lower().strip() != "off":
+            m_mode = str(cfg.manning_mode).lower().strip()
+            def _m_apply(r):
+                W = float(r.get("width_m", np.nan))
+                S = float(r.get("slope_mpm", np.nan))
+                if not (np.isfinite(W) and W > 0 and np.isfinite(S) and S > 0):
+                    return pd.Series({"manning_q_cms_used": np.nan, "manning_depth_mean_m": np.nan, "manning_dmax_m": np.nan, "manning_conf": 0.0, "manning_wt": 0.0, "manning_flags": ""})
 
-            # Guard weight (simple slope/mouth filters)
-            w_guard = _compute_manning_weight(r, cfg)
-            if w_guard <= 0:
-                return pd.Series({"manning_q_cms_used": np.nan, "manning_depth_mean_m": np.nan, "manning_dmax_m": np.nan, "manning_conf": 0.0, "manning_wt": 0.0, "manning_flags": "guard"})
+                # Guard weight (simple slope/mouth filters)
+                w_guard = _compute_manning_weight(r, cfg)
+                if w_guard <= 0:
+                    return pd.Series({"manning_q_cms_used": np.nan, "manning_depth_mean_m": np.nan, "manning_dmax_m": np.nan, "manning_conf": 0.0, "manning_wt": 0.0, "manning_flags": "guard"})
 
-            # Discharge
-            Q = np.nan
-            qsrc = ""
-            if m_mode == "constant":
-                Q = float(cfg.manning_q_cms) if cfg.manning_q_cms is not None else np.nan
-                qsrc = "constant"
-            elif m_mode == "from_field":
-                Q = float(r.get("manning_q_cms", np.nan))
-                qsrc = "field"
-            elif m_mode == "q2_regional":
-                # Estimate bankfull discharge Q2 from drainage area (requires manning_inversion module)
-                da = float("nan")
-                for _k in ["drain_area_km2","drainage_area_km2","TotDASqKM","totdasqkm","DA_sqkm","DA_KM2","DrainArKm2","DrainArea","drain_area","DA"]:
-                    if _k in r.index:
-                        da = float(r.get(_k, np.nan))
-                        break
-                if estimate_q2_from_drainage_area is None or not (np.isfinite(da) and da > 0):
-                    Q = np.nan
-                else:
-                    q2 = estimate_q2_from_drainage_area(da, region=str(getattr(cfg, "manning_region", "default")))
-                    Q = float(getattr(q2, "q2_m3s", np.nan))
-                    qsrc = f"q2_{str(getattr(cfg, 'manning_region', 'default'))}"
-
-            if not (np.isfinite(Q) and Q > 0):
-                return pd.Series({"manning_q_cms_used": Q, "manning_depth_mean_m": np.nan, "manning_dmax_m": np.nan, "manning_conf": 0.0, "manning_wt": 0.0, "manning_flags": f"noQ_{qsrc}"})
-
-            # Depth estimate
-            conf = 0.7  # default
-            tidal = False
-            backwater = False
-            if invert_manning_for_depth is not None:
-                res = invert_manning_for_depth(discharge_m3s=Q, width_m=W, slope=S, manning_n=float(cfg.manning_n), discharge_source=qsrc)
-                y = float(getattr(res, "depth_m", np.nan))
-                conf = float(getattr(res, "confidence", 0.0) or 0.0)
-                tidal = bool(getattr(res, "tidal_flag", False))
-                backwater = bool(getattr(res, "backwater_flag", False))
-            else:
-                # Fallback to simple wide-channel inversion (mean depth)
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    y = ((float(cfg.manning_n) * Q) / (W * np.sqrt(S))) ** (3.0 / 5.0)
-
-            if not (np.isfinite(y) and y > 0):
-                return pd.Series({"manning_q_cms_used": Q, "manning_depth_mean_m": y, "manning_dmax_m": np.nan, "manning_conf": 0.0, "manning_wt": 0.0, "manning_flags": f"badY_{qsrc}"})
-
-            mean_to_dmax = float(2.0 / (1.0 + float(cfg.bottom_width_frac)))
-            dmax = float(np.clip(y * mean_to_dmax, cfg.dmin_m, cfg.dmax_m))
-
-            # Final weight: guard * max_weight * confidence
-            min_conf = float(getattr(cfg, "manning_min_confidence", 0.30))
-            if conf < min_conf:
-                w = 0.0
-            else:
-                w = float(np.clip(w_guard * float(cfg.manning_max_weight) * float(conf), 0.0, 1.0))
-
-            flags = qsrc
-            if tidal:
-                flags += "|tidal"
-            if backwater:
-                flags += "|backwater"
-            return pd.Series({"manning_q_cms_used": Q, "manning_depth_mean_m": y, "manning_dmax_m": dmax, "manning_conf": conf, "manning_wt": w, "manning_flags": flags})
-
-        mm = xs_param.apply(_m_apply, axis=1)
-        xs_param[["manning_q_cms_used", "manning_depth_mean_m", "manning_dmax_m", "manning_conf", "manning_wt", "manning_flags"]] = mm
-
-        # Blend
-        w = xs_param["manning_wt"].astype("float64").clip(0.0, 1.0)
-        d0 = xs_param["dmax_prior_m"].astype("float64")
-        d1 = xs_param["manning_dmax_m"].astype("float64")
-        use = np.isfinite(d0) & np.isfinite(d1) & (w > 0)
-        xs_param.loc[use, "dmax_prior_m"] = (1.0 - w[use]) * d0[use] + w[use] * d1[use]
-
-    # ------------------------
-    # Calibration anchors
-    # ------------------------
-    # Soundings calibration (optional)
-    calib_df = pd.DataFrame(columns=["xs_id", "calib_n", "calib_depth_stat"])
-    if soundings_path:
-        soundings = _load_soundings_many(
-            soundings_path,
-            target_crs=xs_lines.crs,
-            depth_col=soundings_depth_col,
-            elev_col=soundings_elev_col,
-            x_col=soundings_x_col,
-            y_col=soundings_y_col,
-        )
-        if soundings is not None and not soundings.empty:
-            log.info("[CALIB] Loaded soundings: n=%d", len(soundings))
-            calib_df = _calibrate_dmax_from_soundings(xs_lines[["xs_id", "geometry"]].copy(), soundings, wse_by_xs, cfg)
-            log.info("[CALIB] Matched XS: %d", len(calib_df))
-        else:
-            log.info("[CALIB] Soundings empty; will use other anchors / priors.")
-    else:
-        log.info("[CALIB] No soundings provided; will use other anchors / priors.")
-
-    xs_param = xs_param.merge(calib_df, on="xs_id", how="left")
-    xs_param["soundings_n"] = xs_param["calib_n"].fillna(0).astype(int)
-    xs_param["soundings_dmax_m"] = pd.to_numeric(xs_param["calib_depth_stat"], errors="coerce")
-    xs_param = xs_param.drop(columns=["calib_n", "calib_depth_stat"])
-
-    # Final selection fields
-    xs_param["calib_src"] = "prior"
-    xs_param["calib_n"] = 0
-    xs_param["dmax_raw_m"] = xs_param["dmax_prior_m"]
-
-    # Apply soundings where available
-    m_snd = xs_param["soundings_n"] > 0
-    xs_param.loc[m_snd, "dmax_raw_m"] = xs_param.loc[m_snd, "soundings_dmax_m"]
-    xs_param.loc[m_snd, "calib_src"] = "soundings"
-    xs_param.loc[m_snd, "calib_n"] = xs_param.loc[m_snd, "soundings_n"]
-
-    # Build station/gage assignment (used by width-stage and USGS anchors)
-    # IMPORTANT: do not overwrite upstream gage linkage if already present.
-    if "gage_site_no" not in xs_param.columns:
-        xs_param["gage_site_no"] = pd.NA
-    if "gage_dist_m" not in xs_param.columns:
-        xs_param["gage_dist_m"] = np.nan
-
-    # Flatten sites list
-    usgs_sites_flat = []
-    if usgs_sites:
-        for s in usgs_sites:
-            if s is None:
-                continue
-            for part in str(s).split(","):
-                part = part.strip()
-                if part:
-                    usgs_sites_flat.append(part)
-
-    # Load width-stage observations (optional)
-    ws_df = _load_width_stage_csvs(width_stage_csv)
-
-    # If width-stage CSV has no site_no and there is exactly one USGS site, assume that site
-    if (not ws_df.empty) and ws_df["site_no"].isna().all() and len(usgs_sites_flat) == 1:
-        ws_df["site_no"] = usgs_sites_flat[0]
-
-    # Determine which station sites we need locations for
-    sites_for_loc = set(usgs_sites_flat)
-    if not ws_df.empty:
-        for s in ws_df["site_no"].dropna().astype(str).unique().tolist():
-            sites_for_loc.add(s)
-
-    gage_gdf = None
-    cache_dir = None
-    if sites_for_loc:
-        try:
-            import datetime
-            from usgs_nwis import fetch_site_locations
-
-            cache_dir = Path(usgs_cache_dir) if usgs_cache_dir is not None else (Path(out_gpkg).parent / "usgs_cache")
-            cache_dir.mkdir(parents=True, exist_ok=True)
-
-            site_df = fetch_site_locations(sorted(list(sites_for_loc)), cache_dir=cache_dir)
-            if not site_df.empty:
-                gage_gdf = gpd.GeoDataFrame(
-                    site_df,
-                    geometry=gpd.points_from_xy(site_df["dec_long_va"], site_df["dec_lat_va"]),
-                    crs="EPSG:4326",
-                ).to_crs(xs_lines.crs)
-
-                # OPTIONAL: reduce wrong-gage assignment by snapping gages to the river network and
-                # restricting XS->gage matching by river_id when available.
-                if river_gpkg is not None and "river_id" in xs_param.columns:
-                    try:
-                        rivers_net = _read_layer(Path(river_gpkg), layer=rivers_layer).to_crs(xs_lines.crs)
-                        if "river_id" in rivers_net.columns and not rivers_net.empty:
-                            sidx = rivers_net.sindex
-                            gage_rids = []
-                            max_snap = float(cfg.gage_snap_max_dist_m)
-                            for pt in gage_gdf.geometry:
-                                rid_val = pd.NA
-                                if pt is None or pt.is_empty:
-                                    gage_rids.append(rid_val)
-                                    continue
-                                cand_idx = list(sidx.intersection(pt.buffer(max_snap).bounds))
-                                if cand_idx:
-                                    cand = rivers_net.iloc[cand_idx]
-                                    d = cand.geometry.distance(pt)
-                                    jmin = int(d.idxmin())
-                                    if float(d.loc[jmin]) <= max_snap:
-                                        rid_val = rivers_net.loc[jmin, "river_id"]
-                                gage_rids.append(rid_val)
-                            gage_gdf["river_id"] = gage_rids
-                        else:
-                            log.info("[CALIB][GAGE] rivers layer has no river_id; using nearest-gage matching.")
-                    except Exception as e:
-                        log.info("[CALIB][GAGE] could not snap gages to river network: %s", e)
-
-                centers = xs_lines.set_index("xs_id").geometry.interpolate(0.5, normalized=True)
-                gage_cols = ["site_no", "geometry"] + (["river_id"] if "river_id" in gage_gdf.columns else [])
-                gage_sites = gage_gdf[gage_cols].copy()
-                for i, r in xs_param.iterrows():
-                    xsid = r["xs_id"]
-                    if xsid not in centers.index:
-                        continue
-                    cgeom = centers.loc[xsid]
-                    gage_candidates = gage_sites
-                    if ('river_id' in xs_param.columns) and ('river_id' in gage_sites.columns):
-                        rid = xs_param.at[i, 'river_id']
-                        if pd.notna(rid):
-                            cand = gage_sites[gage_sites['river_id'].astype(str) == str(rid)]
-                            if not cand.empty:
-                                gage_candidates = cand
-                    dists = gage_candidates.geometry.distance(cgeom)
-                    if len(dists) == 0:
-                        continue
-                    j = int(dists.idxmin())
-                    new_site = str(gage_candidates.loc[j, "site_no"])
-                    new_dist = float(dists.loc[j])
-                    cur_site = xs_param.at[i, "gage_site_no"] if "gage_site_no" in xs_param.columns else pd.NA
-                    cur_dist = xs_param.at[i, "gage_dist_m"] if "gage_dist_m" in xs_param.columns else np.nan
-                    # Only fill if missing, or if we found a closer site.
-                    if (pd.isna(cur_site) or str(cur_site).lower() in ("nan", "none", "")) or (not np.isfinite(cur_dist)) or (new_dist < float(cur_dist)):
-                        xs_param.at[i, "gage_site_no"] = new_site
-                        xs_param.at[i, "gage_dist_m"] = new_dist
-        except Exception as e:
-            log.warning("[CALIB][USGS] Failed to fetch station locations: %s", e)
-
-    # Width-stage inversion anchor (optional)
-    if (gage_gdf is not None) and (ws_df is not None) and (not ws_df.empty):
-        xs_param["width_stage_beta"] = np.nan
-        xs_param["width_stage_dmax_m"] = np.nan
-        xs_param["width_stage_r2"] = np.nan
-        xs_param["width_stage_wt"] = np.nan
-
-        for site_no, gws in ws_df.groupby("site_no", dropna=True):
-            site_no = str(site_no)
-            m_site = (
-                (xs_param["gage_site_no"].astype(str) == site_no)
-                & (pd.to_numeric(xs_param["gage_dist_m"], errors="coerce") <= float(cfg.width_stage_max_dist_m))
-            )
-            if m_site.sum() < 3:
-                continue
-            Wtop = float(pd.to_numeric(xs_param.loc[m_site, "width_m"], errors="coerce").median())
-            if not np.isfinite(Wtop) or Wtop <= 0:
-                continue
-
-            gws2 = gws.copy()
-            m_in = (gws2["width_m"] > 0) & (gws2["width_m"] <= (1.15 * Wtop))
-            gws2 = gws2.loc[m_in]
-            if len(gws2) < int(cfg.width_stage_min_n):
-                continue
-
-            beta, nfit, r2 = _fit_width_stage_beta(gws2)
-            if beta is None:
-                continue
-            w_ws = _width_stage_weight(int(nfit), float(r2) if r2 is not None else float("nan"), cfg)
-            if w_ws <= 0:
-                continue
-            dmax_ws = _dmax_from_width_stage(beta, Wtop, cfg.bottom_width_frac)
-            if not np.isfinite(dmax_ws) or dmax_ws <= 0:
-                continue
-            dmax_ws = float(np.clip(dmax_ws, cfg.dmin_m, cfg.dmax_m))
-
-            m_apply = m_site & (xs_param["calib_src"] == "prior")
-            # Soft blend toward width-stage inferred Dmax
-            d_cur = pd.to_numeric(xs_param.loc[m_apply, "dmax_raw_m"], errors="coerce")
-            d_new = (1.0 - float(w_ws)) * d_cur + float(w_ws) * float(dmax_ws)
-            xs_param.loc[m_apply, "dmax_raw_m"] = pd.to_numeric(d_new, errors="coerce")
-            xs_param.loc[m_apply, "calib_src"] = "width_stage"
-            xs_param.loc[m_apply, "calib_n"] = int(nfit)
-            xs_param.loc[m_apply, "width_stage_beta"] = float(beta)
-            xs_param.loc[m_apply, "width_stage_dmax_m"] = float(dmax_ws)
-            xs_param.loc[m_apply, "width_stage_r2"] = float(r2)
-            xs_param.loc[m_apply, "width_stage_wt"] = float(w_ws)
-
-            log.info(
-                "[CALIB][WIDTH_STAGE] site=%s n=%d r2=%.3f beta=%.6f w=%.2f Wtop=%.1f Dmax=%.2f (applied=%d)",
-                site_no,
-                nfit,
-                float(beta),
-                float(Wtop),
-                float(dmax_ws),
-                int(m_apply.sum()),
-            )
-
-    # USGS discharge-measurement anchor (Option A)
-    # Uses velocity-area discharge measurements (width+area -> mean depth) to fit a local 'a_site'
-    # for Dmax ≈ a_site * W^b, then applies as a *soft* constraint to nearby cross-sections.
-    if (gage_gdf is not None) and usgs_sites_flat:
-        import datetime
-        start_dt = usgs_start or "1900-01-01"
-        end_dt = usgs_end or datetime.date.today().isoformat()
-
-        try:
-            from usgs_nwis import fetch_discharge_measurements, normalize_units_us_to_si, compute_site_a_from_measurements
-
-            cache_dir = cache_dir or (Path(out_gpkg).parent / "usgs_cache")
-            cache_dir.mkdir(parents=True, exist_ok=True)
-
-            if "calib_src_detail" not in xs_param.columns:
-                xs_param["calib_src_detail"] = xs_param["calib_src"].astype(str)
-
-            xs_param["usgs_a_site"] = np.nan
-            xs_param["usgs_n_meas"] = 0
-            xs_param["usgs_wt"] = np.nan
-            xs_param["usgs_a_cv"] = np.nan
-            xs_param["usgs_width_med_m"] = np.nan
-            xs_param["usgs_width_ratio"] = np.nan
-
-            q_lo = float(cfg.usgs_q_quantile_lo)
-            q_hi = float(cfg.usgs_q_quantile_hi)
-            q_range = (q_lo, q_hi) if (0.0 <= q_lo < q_hi <= 1.0) else None
-
-            # If requested, derive mean→max conversion from your trapezoid assumption.
-            mean_to_dmax = float(cfg.usgs_mean_to_dmax)
-            if (not np.isfinite(mean_to_dmax)) or (mean_to_dmax <= 0):
-                mean_to_dmax = 2.0 / (1.0 + float(cfg.bottom_width_frac))
-                log.info("[CALIB][USGS] mean_to_dmax=auto -> %.3f (bottom_width_frac=%.2f)", mean_to_dmax, float(cfg.bottom_width_frac))
-
-            for site_no in usgs_sites_flat:
-                meas = fetch_discharge_measurements([site_no], start_dt, end_dt, cache_dir=cache_dir)
-                if meas is None or meas.empty:
-                    continue
-                meas_si = normalize_units_us_to_si(meas)
-
-                a_site, n_meas, meta = compute_site_a_from_measurements(
-                    meas_si,
-                    b=float(cfg.b),
-                    mean_to_dmax=float(mean_to_dmax),
-                    stat=str(cfg.usgs_a_stat),
-                    q_quantile_range=q_range,
-                )
-                if a_site is None or (not np.isfinite(a_site)) or int(n_meas) < 3:
-                    continue
-
-                # Warn on instability in the derived a-values
-                a_cv = float(meta.get("a_cv", float("nan")))
-                if np.isfinite(a_cv) and a_cv > float(cfg.usgs_a_cv_warn):
-                    log.warning(
-                        "[CALIB][USGS] site=%s unstable a-values (cv=%.3f > %.3f). Using as soft prior only.",
-                        str(site_no), a_cv, float(cfg.usgs_a_cv_warn)
-                    )
-
-                # Candidate XS near this site
-                m_site = (
-                    (xs_param["gage_site_no"].astype(str) == str(site_no))
-                    & (pd.to_numeric(xs_param["gage_dist_m"], errors="coerce") <= float(cfg.usgs_max_dist_m))
-                )
-                if m_site.sum() == 0:
-                    continue
-
-                # Apply to prior or width-stage results (soundings remain highest priority)
-                m_apply = m_site & (xs_param["calib_src"].isin(["prior", "width_stage"]))
-                if m_apply.sum() == 0:
-                    continue
-
-                # Width-mismatch guard: bank-to-bank width can be far larger than wet width during USGS measurements.
-                w_meas = float(meta.get("width_med_m", float("nan")))
-                w_bank = float(pd.to_numeric(xs_param.loc[m_site, "width_m"], errors="coerce").median())
-                w_ratio = (w_bank / w_meas) if (np.isfinite(w_bank) and np.isfinite(w_meas) and w_meas > 0) else float("nan")
-
-                w_usgs = 1.0
-
-                if np.isfinite(w_ratio) and (w_ratio > float(cfg.usgs_width_ratio_max)):
-                    if bool(cfg.usgs_width_ratio_blend):
-                        w_usgs *= max(0.0, float(cfg.usgs_width_ratio_max) / float(w_ratio))
-                        log.info(
-                            "[CALIB][USGS] site=%s width ratio=%.2f > %.2f; blending weight=%.2f",
-                            str(site_no), float(w_ratio), float(cfg.usgs_width_ratio_max), float(w_usgs)
-                        )
+                # Discharge
+                Q = np.nan
+                qsrc = ""
+                if m_mode == "constant":
+                    Q = float(cfg.manning_q_cms) if cfg.manning_q_cms is not None else np.nan
+                    qsrc = "constant"
+                elif m_mode == "from_field":
+                    Q = float(r.get("manning_q_cms", np.nan))
+                    qsrc = "field"
+                elif m_mode == "q2_regional":
+                    # Estimate bankfull discharge Q2 from drainage area (requires manning_inversion module)
+                    da = float("nan")
+                    for _k in ["drain_area_km2","drainage_area_km2","TotDASqKM","totdasqkm","DA_sqkm","DA_KM2","DrainArKm2","DrainArea","drain_area","DA"]:
+                        if _k in r.index:
+                            da = float(r.get(_k, np.nan))
+                            break
+                    if estimate_q2_from_drainage_area is None or not (np.isfinite(da) and da > 0):
+                        Q = np.nan
                     else:
-                        log.info(
-                            "[CALIB][USGS] site=%s width ratio=%.2f > %.2f; skipping anchor",
-                            str(site_no), float(w_ratio), float(cfg.usgs_width_ratio_max)
-                        )
-                        continue
+                        q2 = estimate_q2_from_drainage_area(da, region=str(getattr(cfg, "manning_region", "default")))
+                        Q = float(getattr(q2, "q2_m3s", np.nan))
+                        qsrc = f"q2_{str(getattr(cfg, 'manning_region', 'default'))}"
 
-                # Reduce weight further if a-values are unstable
-                if np.isfinite(a_cv) and a_cv > 0:
-                    w_usgs *= min(1.0, float(cfg.usgs_a_cv_warn) / float(a_cv))
+                if not (np.isfinite(Q) and Q > 0):
+                    return pd.Series({"manning_q_cms_used": Q, "manning_depth_mean_m": np.nan, "manning_dmax_m": np.nan, "manning_conf": 0.0, "manning_wt": 0.0, "manning_flags": f"noQ_{qsrc}"})
 
-                # Compute USGS-implied Dmax at each XS using bank width (consistent with current parameterization)
-                W = pd.to_numeric(xs_param.loc[m_apply, "width_m"], errors="coerce")
-                dmax_usgs = float(a_site) * (W ** float(cfg.b))
-                dmax_usgs = dmax_usgs.clip(cfg.dmin_m, cfg.dmax_m)
+                # Depth estimate
+                conf = 0.7  # default
+                tidal = False
+                backwater = False
+                if invert_manning_for_depth is not None:
+                    res = invert_manning_for_depth(discharge_m3s=Q, width_m=W, slope=S, manning_n=float(cfg.manning_n), discharge_source=qsrc)
+                    y = float(getattr(res, "depth_m", np.nan))
+                    conf = float(getattr(res, "confidence", 0.0) or 0.0)
+                    tidal = bool(getattr(res, "tidal_flag", False))
+                    backwater = bool(getattr(res, "backwater_flag", False))
+                else:
+                    # Fallback to simple wide-channel inversion (mean depth)
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        y = ((float(cfg.manning_n) * Q) / (W * np.sqrt(S))) ** (3.0 / 5.0)
 
-                # Blend with current estimate (prior or width-stage). Keep soundings untouched.
+                if not (np.isfinite(y) and y > 0):
+                    return pd.Series({"manning_q_cms_used": Q, "manning_depth_mean_m": y, "manning_dmax_m": np.nan, "manning_conf": 0.0, "manning_wt": 0.0, "manning_flags": f"badY_{qsrc}"})
+
+                mean_to_dmax = float(2.0 / (1.0 + float(cfg.bottom_width_frac)))
+                dmax = float(np.clip(y * mean_to_dmax, cfg.dmin_m, cfg.dmax_m))
+
+                # Final weight: guard * max_weight * confidence
+                min_conf = float(getattr(cfg, "manning_min_confidence", 0.30))
+                if conf < min_conf:
+                    w = 0.0
+                else:
+                    w = float(np.clip(w_guard * float(cfg.manning_max_weight) * float(conf), 0.0, 1.0))
+
+                flags = qsrc
+                if tidal:
+                    flags += "|tidal"
+                if backwater:
+                    flags += "|backwater"
+                return pd.Series({"manning_q_cms_used": Q, "manning_depth_mean_m": y, "manning_dmax_m": dmax, "manning_conf": conf, "manning_wt": w, "manning_flags": flags})
+
+            mm = xs_param.apply(_m_apply, axis=1)
+            xs_param[["manning_q_cms_used", "manning_depth_mean_m", "manning_dmax_m", "manning_conf", "manning_wt", "manning_flags"]] = mm
+
+            # Blend
+            w = xs_param["manning_wt"].astype("float64").clip(0.0, 1.0)
+            d0 = xs_param["dmax_prior_m"].astype("float64")
+            d1 = xs_param["manning_dmax_m"].astype("float64")
+            use = np.isfinite(d0) & np.isfinite(d1) & (w > 0)
+            xs_param.loc[use, "dmax_prior_m"] = (1.0 - w[use]) * d0[use] + w[use] * d1[use]
+
+        # ------------------------
+        # Calibration anchors
+        # ------------------------
+        # Soundings calibration (optional)
+        calib_df = pd.DataFrame(columns=["xs_id", "calib_n", "calib_depth_stat"])
+        if soundings_path:
+            soundings = _load_soundings_many(
+                soundings_path,
+                target_crs=xs_lines.crs,
+                depth_col=soundings_depth_col,
+                elev_col=soundings_elev_col,
+                x_col=soundings_x_col,
+                y_col=soundings_y_col,
+            )
+            if soundings is not None and not soundings.empty:
+                log.info("[CALIB] Loaded soundings: n=%d", len(soundings))
+                calib_df = _calibrate_dmax_from_soundings(xs_lines[["xs_id", "geometry"]].copy(), soundings, wse_by_xs, cfg)
+                log.info("[CALIB] Matched XS: %d", len(calib_df))
+            else:
+                log.info("[CALIB] Soundings empty; will use other anchors / priors.")
+        else:
+            log.info("[CALIB] No soundings provided; will use other anchors / priors.")
+
+        xs_param = xs_param.merge(calib_df, on="xs_id", how="left")
+        xs_param["soundings_n"] = pd.to_numeric(xs_param["calib_n"], errors="coerce").fillna(0).astype("int64")
+        xs_param["soundings_dmax_m"] = pd.to_numeric(xs_param["calib_depth_stat"], errors="coerce")
+        xs_param = xs_param.drop(columns=["calib_n", "calib_depth_stat"])
+
+        # Final selection fields
+        xs_param["calib_src"] = "prior"
+        xs_param["calib_n"] = 0
+        xs_param["dmax_raw_m"] = xs_param["dmax_prior_m"]
+
+        # Apply soundings where available
+        m_snd = xs_param["soundings_n"] > 0
+        xs_param.loc[m_snd, "dmax_raw_m"] = xs_param.loc[m_snd, "soundings_dmax_m"]
+        xs_param.loc[m_snd, "calib_src"] = "soundings"
+        xs_param.loc[m_snd, "calib_n"] = xs_param.loc[m_snd, "soundings_n"]
+
+        # Build station/gage assignment (used by width-stage and USGS anchors)
+        # IMPORTANT: do not overwrite upstream gage linkage if already present.
+        if "gage_site_no" not in xs_param.columns:
+            xs_param["gage_site_no"] = pd.NA
+        if "gage_dist_m" not in xs_param.columns:
+            xs_param["gage_dist_m"] = np.nan
+
+        # Flatten sites list
+        usgs_sites_flat = []
+        if usgs_sites:
+            for s in usgs_sites:
+                if s is None:
+                    continue
+                for part in str(s).split(","):
+                    part = part.strip()
+                    if part:
+                        usgs_sites_flat.append(part)
+
+        # Load width-stage observations (optional)
+        ws_df = _load_width_stage_csvs(width_stage_csv)
+
+        # If width-stage CSV has no site_no and there is exactly one USGS site, assume that site
+        if (not ws_df.empty) and ws_df["site_no"].isna().all() and len(usgs_sites_flat) == 1:
+            ws_df["site_no"] = usgs_sites_flat[0]
+
+        # Determine which station sites we need locations for
+        sites_for_loc = set(usgs_sites_flat)
+        if not ws_df.empty:
+            for s in ws_df["site_no"].dropna().astype(str).unique().tolist():
+                sites_for_loc.add(s)
+
+        gage_gdf = None
+        cache_dir = None
+        if sites_for_loc:
+            try:
+                import datetime
+                from usgs_nwis import fetch_site_locations
+
+                cache_dir = Path(usgs_cache_dir) if usgs_cache_dir is not None else (Path(out_gpkg).parent / "usgs_cache")
+                cache_dir.mkdir(parents=True, exist_ok=True)
+
+                site_df = fetch_site_locations(sorted(list(sites_for_loc)), cache_dir=cache_dir)
+                if not site_df.empty:
+                    gage_gdf = gpd.GeoDataFrame(
+                        site_df,
+                        geometry=gpd.points_from_xy(site_df["dec_long_va"], site_df["dec_lat_va"]),
+                        crs="EPSG:4326",
+                    ).to_crs(xs_lines.crs)
+
+                    # OPTIONAL: reduce wrong-gage assignment by snapping gages to the river network and
+                    # restricting XS->gage matching by river_id when available.
+                    if river_gpkg is not None and "river_id" in xs_param.columns:
+                        try:
+                            rivers_net = _read_layer(Path(river_gpkg), layer=rivers_layer).to_crs(xs_lines.crs)
+                            if "river_id" in rivers_net.columns and not rivers_net.empty:
+                                sidx = rivers_net.sindex
+                                gage_rids = []
+                                max_snap = float(cfg.gage_snap_max_dist_m)
+                                for pt in gage_gdf.geometry:
+                                    rid_val = pd.NA
+                                    if pt is None or pt.is_empty:
+                                        gage_rids.append(rid_val)
+                                        continue
+                                    cand_idx = list(sidx.intersection(pt.buffer(max_snap).bounds))
+                                    if cand_idx:
+                                        cand = rivers_net.iloc[cand_idx]
+                                        d = cand.geometry.distance(pt)
+                                        jmin = int(d.idxmin())
+                                        if float(d.loc[jmin]) <= max_snap:
+                                            rid_val = rivers_net.loc[jmin, "river_id"]
+                                    gage_rids.append(rid_val)
+                                gage_gdf["river_id"] = gage_rids
+                            else:
+                                log.info("[CALIB][GAGE] rivers layer has no river_id; using nearest-gage matching.")
+                        except Exception as e:
+                            log.info("[CALIB][GAGE] could not snap gages to river network: %s", e)
+
+                    centers = xs_lines.set_index("xs_id").geometry.interpolate(0.5, normalized=True)
+                    gage_cols = ["site_no", "geometry"] + (["river_id"] if "river_id" in gage_gdf.columns else [])
+                    gage_sites = gage_gdf[gage_cols].copy()
+                    for i, r in xs_param.iterrows():
+                        xsid = r["xs_id"]
+                        if xsid not in centers.index:
+                            continue
+                        cgeom = centers.loc[xsid]
+                        gage_candidates = gage_sites
+                        if ('river_id' in xs_param.columns) and ('river_id' in gage_sites.columns):
+                            rid = xs_param.at[i, 'river_id']
+                            if pd.notna(rid):
+                                cand = gage_sites[gage_sites['river_id'].astype(str) == str(rid)]
+                                if not cand.empty:
+                                    gage_candidates = cand
+                        dists = gage_candidates.geometry.distance(cgeom)
+                        if len(dists) == 0:
+                            continue
+                        j = int(dists.idxmin())
+                        new_site = str(gage_candidates.loc[j, "site_no"])
+                        new_dist = float(dists.loc[j])
+                        cur_site = xs_param.at[i, "gage_site_no"] if "gage_site_no" in xs_param.columns else pd.NA
+                        cur_dist = xs_param.at[i, "gage_dist_m"] if "gage_dist_m" in xs_param.columns else np.nan
+                        # Only fill if missing, or if we found a closer site.
+                        if (pd.isna(cur_site) or str(cur_site).lower() in ("nan", "none", "")) or (not np.isfinite(cur_dist)) or (new_dist < float(cur_dist)):
+                            xs_param.at[i, "gage_site_no"] = new_site
+                            xs_param.at[i, "gage_dist_m"] = new_dist
+            except Exception as e:
+                log.warning("[CALIB][USGS] Failed to fetch station locations: %s", e)
+
+        # Width-stage inversion anchor (optional)
+        if (gage_gdf is not None) and (ws_df is not None) and (not ws_df.empty):
+            xs_param["width_stage_beta"] = np.nan
+            xs_param["width_stage_dmax_m"] = np.nan
+            xs_param["width_stage_r2"] = np.nan
+            xs_param["width_stage_wt"] = np.nan
+
+            for site_no, gws in ws_df.groupby("site_no", dropna=True):
+                site_no = str(site_no)
+                m_site = (
+                    (xs_param["gage_site_no"].astype(str) == site_no)
+                    & (pd.to_numeric(xs_param["gage_dist_m"], errors="coerce") <= float(cfg.width_stage_max_dist_m))
+                )
+                if m_site.sum() < 3:
+                    continue
+                Wtop = float(pd.to_numeric(xs_param.loc[m_site, "width_m"], errors="coerce").median())
+                if not np.isfinite(Wtop) or Wtop <= 0:
+                    continue
+
+                gws2 = gws.copy()
+                m_in = (gws2["width_m"] > 0) & (gws2["width_m"] <= (1.15 * Wtop))
+                gws2 = gws2.loc[m_in]
+                if len(gws2) < int(cfg.width_stage_min_n):
+                    continue
+
+                beta, nfit, r2 = _fit_width_stage_beta(gws2)
+                if beta is None:
+                    continue
+                w_ws = _width_stage_weight(int(nfit), float(r2) if r2 is not None else float("nan"), cfg)
+                if w_ws <= 0:
+                    continue
+                dmax_ws = _dmax_from_width_stage(beta, Wtop, cfg.bottom_width_frac)
+                if not np.isfinite(dmax_ws) or dmax_ws <= 0:
+                    continue
+                dmax_ws = float(np.clip(dmax_ws, cfg.dmin_m, cfg.dmax_m))
+
+                m_apply = m_site & (xs_param["calib_src"] == "prior")
+                # Soft blend toward width-stage inferred Dmax
                 d_cur = pd.to_numeric(xs_param.loc[m_apply, "dmax_raw_m"], errors="coerce")
-                d_new = (1.0 - w_usgs) * d_cur + w_usgs * dmax_usgs
-
+                d_new = (1.0 - float(w_ws)) * d_cur + float(w_ws) * float(dmax_ws)
                 xs_param.loc[m_apply, "dmax_raw_m"] = pd.to_numeric(d_new, errors="coerce")
-                xs_param.loc[m_apply, "calib_src_detail"] = xs_param.loc[m_apply, "calib_src"].astype(str) + "+usgs"
-                xs_param.loc[m_apply, "calib_src"] = "usgs"
-                xs_param.loc[m_apply, "calib_n"] = int(n_meas)
-                xs_param.loc[m_apply, "usgs_a_site"] = float(a_site)
-                xs_param.loc[m_apply, "usgs_n_meas"] = int(n_meas)
-                xs_param.loc[m_apply, "usgs_wt"] = float(w_usgs)
-                xs_param.loc[m_apply, "usgs_a_cv"] = float(a_cv) if np.isfinite(a_cv) else np.nan
-                xs_param.loc[m_apply, "usgs_width_med_m"] = float(w_meas) if np.isfinite(w_meas) else np.nan
-                xs_param.loc[m_apply, "usgs_width_ratio"] = float(w_ratio) if np.isfinite(w_ratio) else np.nan
+                xs_param.loc[m_apply, "calib_src"] = "width_stage"
+                xs_param.loc[m_apply, "calib_n"] = int(nfit)
+                xs_param.loc[m_apply, "width_stage_beta"] = float(beta)
+                xs_param.loc[m_apply, "width_stage_dmax_m"] = float(dmax_ws)
+                xs_param.loc[m_apply, "width_stage_r2"] = float(r2)
+                xs_param.loc[m_apply, "width_stage_wt"] = float(w_ws)
 
                 log.info(
-                    "[CALIB][USGS] site=%s n=%d a_site=%.6f w=%.2f applied=%d (q_range=%s)",
-                    str(site_no), int(n_meas), float(a_site), float(w_usgs), int(m_apply.sum()), str(q_range)
+                    "[CALIB][WIDTH_STAGE] site=%s n=%d r2=%.3f beta=%.6f w=%.2f Wtop=%.1f Dmax=%.2f (applied=%d)",
+                    site_no,
+                    nfit,
+                    float(beta),
+                    float(Wtop),
+                    float(dmax_ws),
+                    int(m_apply.sum()),
                 )
-        except Exception as e:
-            log.warning("[CALIB][USGS] failed to apply USGS measurement calibration: %s", e)
 
-# Clip and proceed
-    xs_param["dmax_raw_m"] = pd.to_numeric(xs_param["dmax_raw_m"], errors="coerce").clip(cfg.dmin_m, cfg.dmax_m)
+        # USGS discharge-measurement anchor (Option A)
+        # Uses velocity-area discharge measurements (width+area -> mean depth) to fit a local 'a_site'
+        # for Dmax ≈ a_site * W^b, then applies as a *soft* constraint to nearby cross-sections.
+        if (gage_gdf is not None) and usgs_sites_flat:
+            import datetime
+            start_dt = usgs_start or "1900-01-01"
+            end_dt = usgs_end or datetime.date.today().isoformat()
 
-    # Smooth along stationing within component
-    xs_param = xs_param.sort_values(["component_id", "s_center_m", "xs_id"]).reset_index(drop=True)
-    xs_param["dmax_smooth_m"] = xs_param.groupby("component_id", dropna=False)["dmax_raw_m"].apply(
-        lambda s: _rolling_smooth(s, cfg.smooth_window)
-    ).reset_index(level=0, drop=True)
-    xs_param["dmax_smooth_m"] = xs_param["dmax_smooth_m"].where(np.isfinite(xs_param["dmax_smooth_m"]), xs_param["dmax_raw_m"])
+            try:
+                from usgs_nwis import fetch_discharge_measurements, normalize_units_us_to_si, compute_site_a_from_measurements
 
-    xs_param["uncert_m"] = xs_param.apply(
-        lambda r: _uncertainty_for_row(r, cfg),
-        axis=1
-    )
+                cache_dir = cache_dir or (Path(out_gpkg).parent / "usgs_cache")
+                cache_dir.mkdir(parents=True, exist_ok=True)
 
-    param_map = xs_param.set_index("xs_id").to_dict(orient="index")
+                if "calib_src_detail" not in xs_param.columns:
+                    xs_param["calib_src_detail"] = xs_param["calib_src"].astype(str)
 
-    # Build predicted points inside banks only
-    keep_cols = ["xs_id", "dist_m", "z_dem", "z_topo", "is_bank_left", "is_bank_right", "river_id", "component_id", "geometry"]
-    for c in keep_cols:
-        if c not in xs_pts.columns:
-            xs_pts[c] = np.nan
-    xs_pts_geom = xs_pts[keep_cols].copy()
-    xs_pts_geom["xs_id"] = xs_pts_geom["xs_id"].astype(str)
+                xs_param["usgs_a_site"] = np.nan
+                xs_param["usgs_n_meas"] = 0
+                xs_param["usgs_wt"] = np.nan
+                xs_param["usgs_a_cv"] = np.nan
+                xs_param["usgs_width_med_m"] = np.nan
+                xs_param["usgs_width_ratio"] = np.nan
 
-    pred_rows = []
-    for _, r in xs_pts_geom.iterrows():
-        xsid = str(r["xs_id"])
-        p = param_map.get(xsid)
-        if p is None:
-            continue
+                q_lo = float(cfg.usgs_q_quantile_lo)
+                q_hi = float(cfg.usgs_q_quantile_hi)
+                q_range = (q_lo, q_hi) if (0.0 <= q_lo < q_hi <= 1.0) else None
 
-        bl = p["bank_left_dist_m"]
-        br = p["bank_right_dist_m"]
-        if not np.isfinite(bl) or not np.isfinite(br):
-            continue
+                # If requested, derive mean→max conversion from your trapezoid assumption.
+                mean_to_dmax = float(cfg.usgs_mean_to_dmax)
+                if (not np.isfinite(mean_to_dmax)) or (mean_to_dmax <= 0):
+                    mean_to_dmax = 2.0 / (1.0 + float(cfg.bottom_width_frac))
+                    log.info("[CALIB][USGS] mean_to_dmax=auto -> %.3f (bottom_width_frac=%.2f)", mean_to_dmax, float(cfg.bottom_width_frac))
 
-        left = float(min(bl, br))
-        right = float(max(bl, br))
-        W = float(right - left)
-        if not np.isfinite(W) or W <= 0:
-            continue
+                for site_no in usgs_sites_flat:
+                    meas = fetch_discharge_measurements([site_no], start_dt, end_dt, cache_dir=cache_dir)
+                    if meas is None or meas.empty:
+                        continue
+                    meas_si = normalize_units_us_to_si(meas)
 
-        d = float(r["dist_m"])
-        if not (left <= d <= right):
-            continue
+                    a_site, n_meas, meta = compute_site_a_from_measurements(
+                        meas_si,
+                        b=float(cfg.b),
+                        mean_to_dmax=float(mean_to_dmax),
+                        stat=str(cfg.usgs_a_stat),
+                        q_quantile_range=q_range,
+                    )
+                    if a_site is None or (not np.isfinite(a_site)) or int(n_meas) < 3:
+                        continue
 
-        dist_from_left = d - left
-        Dmax = float(p["dmax_smooth_m"])
-        wse = float(p["wse_m"])
+                    # Warn on instability in the derived a-values
+                    a_cv = float(meta.get("a_cv", float("nan")))
+                    if np.isfinite(a_cv) and a_cv > float(cfg.usgs_a_cv_warn):
+                        log.warning(
+                            "[CALIB][USGS] site=%s unstable a-values (cv=%.3f > %.3f). Using as soft prior only.",
+                            str(site_no), a_cv, float(cfg.usgs_a_cv_warn)
+                        )
 
-        depth = _trapezoid_depth_profile(
-            np.array([dist_from_left], dtype="float64"),
-            W=W,
-            Dmax=Dmax,
-            bottom_frac=cfg.bottom_width_frac,
-            offset_frac=float(p.get("thalweg_offset_frac", 0.0)),
-        )[0]
-        if not np.isfinite(depth):
-            continue
+                    # Candidate XS near this site
+                    m_site = (
+                        (xs_param["gage_site_no"].astype(str) == str(site_no))
+                        & (pd.to_numeric(xs_param["gage_dist_m"], errors="coerce") <= float(cfg.usgs_max_dist_m))
+                    )
+                    if m_site.sum() == 0:
+                        continue
 
-        z_bed = wse - depth if np.isfinite(wse) else np.nan
+                    # Apply to prior or width-stage results (soundings remain highest priority)
+                    m_apply = m_site & (xs_param["calib_src"].isin(["prior", "width_stage"]))
+                    if m_apply.sum() == 0:
+                        continue
 
-        # guardrail: keep bed below lower bank by 5 cm
-        bank_min = np.nanmin([p.get("bank_left_z_m", np.nan), p.get("bank_right_z_m", np.nan)])
-        if np.isfinite(bank_min) and np.isfinite(z_bed):
-            z_bed = min(z_bed, bank_min - 0.05)
+                    # Width-mismatch guard: bank-to-bank width can be far larger than wet width during USGS measurements.
+                    w_meas = float(meta.get("width_med_m", float("nan")))
+                    w_bank = float(pd.to_numeric(xs_param.loc[m_site, "width_m"], errors="coerce").median())
+                    w_ratio = (w_bank / w_meas) if (np.isfinite(w_bank) and np.isfinite(w_meas) and w_meas > 0) else float("nan")
 
-        pred_rows.append(
-            dict(
-                xs_id=xsid,
-                river_id=p.get("river_id", np.nan),
-                component_id=int(p.get("component_id", -1)),
-                s_center_m=float(p.get("s_center_m", np.nan)),
-                curv_kappa_1pm=float(p.get("curv_kappa_1pm", np.nan)),
-                thalweg_offset_frac=float(p.get("thalweg_offset_frac", 0.0)),
-                dist_m=d,
-                width_m=W,
-                wse_m=wse,
-                dmax_raw_m=float(p.get("dmax_raw_m", np.nan)),
-                dmax_smooth_m=Dmax,
-                uncert_m=float(p.get("uncert_m", np.nan)),
-                depth_pred_m=float(depth),
-                z_bed_pred_m=float(z_bed) if np.isfinite(z_bed) else np.nan,
-                geometry=r["geometry"],
-            )
+                    w_usgs = 1.0
+
+                    if np.isfinite(w_ratio) and (w_ratio > float(cfg.usgs_width_ratio_max)):
+                        if bool(cfg.usgs_width_ratio_blend):
+                            w_usgs *= max(0.0, float(cfg.usgs_width_ratio_max) / float(w_ratio))
+                            log.info(
+                                "[CALIB][USGS] site=%s width ratio=%.2f > %.2f; blending weight=%.2f",
+                                str(site_no), float(w_ratio), float(cfg.usgs_width_ratio_max), float(w_usgs)
+                            )
+                        else:
+                            log.info(
+                                "[CALIB][USGS] site=%s width ratio=%.2f > %.2f; skipping anchor",
+                                str(site_no), float(w_ratio), float(cfg.usgs_width_ratio_max)
+                            )
+                            continue
+
+                    # Reduce weight further if a-values are unstable
+                    if np.isfinite(a_cv) and a_cv > 0:
+                        w_usgs *= min(1.0, float(cfg.usgs_a_cv_warn) / float(a_cv))
+
+                    # Compute USGS-implied Dmax at each XS using bank width (consistent with current parameterization)
+                    W = pd.to_numeric(xs_param.loc[m_apply, "width_m"], errors="coerce")
+                    dmax_usgs = float(a_site) * (W ** float(cfg.b))
+                    dmax_usgs = dmax_usgs.clip(cfg.dmin_m, cfg.dmax_m)
+
+                    # Blend with current estimate (prior or width-stage). Keep soundings untouched.
+                    d_cur = pd.to_numeric(xs_param.loc[m_apply, "dmax_raw_m"], errors="coerce")
+                    d_new = (1.0 - w_usgs) * d_cur + w_usgs * dmax_usgs
+
+                    xs_param.loc[m_apply, "dmax_raw_m"] = pd.to_numeric(d_new, errors="coerce")
+                    xs_param.loc[m_apply, "calib_src_detail"] = xs_param.loc[m_apply, "calib_src"].astype(str) + "+usgs"
+                    xs_param.loc[m_apply, "calib_src"] = "usgs"
+                    xs_param.loc[m_apply, "calib_n"] = int(n_meas)
+                    xs_param.loc[m_apply, "usgs_a_site"] = float(a_site)
+                    xs_param.loc[m_apply, "usgs_n_meas"] = int(n_meas)
+                    xs_param.loc[m_apply, "usgs_wt"] = float(w_usgs)
+                    xs_param.loc[m_apply, "usgs_a_cv"] = float(a_cv) if np.isfinite(a_cv) else np.nan
+                    xs_param.loc[m_apply, "usgs_width_med_m"] = float(w_meas) if np.isfinite(w_meas) else np.nan
+                    xs_param.loc[m_apply, "usgs_width_ratio"] = float(w_ratio) if np.isfinite(w_ratio) else np.nan
+
+                    log.info(
+                        "[CALIB][USGS] site=%s n=%d a_site=%.6f w=%.2f applied=%d (q_range=%s)",
+                        str(site_no), int(n_meas), float(a_site), float(w_usgs), int(m_apply.sum()), str(q_range)
+                    )
+            except Exception as e:
+                log.warning("[CALIB][USGS] failed to apply USGS measurement calibration: %s", e)
+
+    # Clip and proceed
+        xs_param["dmax_raw_m"] = pd.to_numeric(xs_param["dmax_raw_m"], errors="coerce").clip(cfg.dmin_m, cfg.dmax_m)
+
+        # Smooth along stationing within component
+        xs_param = xs_param.sort_values(["component_id", "s_center_m", "xs_id"]).reset_index(drop=True)
+        xs_param["dmax_smooth_m"] = xs_param.groupby("component_id", dropna=False)["dmax_raw_m"].apply(
+            lambda s: _rolling_smooth(s, cfg.smooth_window)
+        ).reset_index(level=0, drop=True)
+        xs_param["dmax_smooth_m"] = xs_param["dmax_smooth_m"].where(np.isfinite(xs_param["dmax_smooth_m"]), xs_param["dmax_raw_m"])
+
+        xs_param["uncert_m"] = xs_param.apply(
+            lambda r: _uncertainty_for_row(r, cfg),
+            axis=1
         )
 
-    pred_gdf = gpd.GeoDataFrame(pred_rows, crs=xs_pts.crs)
-    if pred_gdf.empty:
-        raise RuntimeError("No predicted points generated (check bank picks and WSE estimation).")
+        param_map = xs_param.set_index("xs_id").to_dict(orient="index")
 
-    # XS summary
-    xs_summary = xs_param.merge(xs_lines[["xs_id", "geometry"]], on="xs_id", how="left")
-    xs_summary_gdf = gpd.GeoDataFrame(xs_summary, geometry="geometry", crs=xs_lines.crs)
+        # Build predicted points inside banks only
+        keep_cols = ["xs_id", "dist_m", "z_dem", "z_topo", "is_bank_left", "is_bank_right", "river_id", "component_id", "geometry"]
+        for c in keep_cols:
+            if c not in xs_pts.columns:
+                xs_pts[c] = np.nan
+        xs_pts_geom = xs_pts[keep_cols].copy()
+        xs_pts_geom["xs_id"] = xs_pts_geom["xs_id"].astype(str)
 
-    # Write GPKG
-    out_gpkg = Path(out_gpkg)
-    out_gpkg.parent.mkdir(parents=True, exist_ok=True)
-    log.info("[WRITE] %s (xs_bathy_points=%d, xs_bathy_xs=%d)", out_gpkg, len(pred_gdf), len(xs_summary_gdf))
-    pred_gdf.to_file(out_gpkg, layer="xs_bathy_points", driver="GPKG")
-    xs_summary_gdf.to_file(out_gpkg, layer="xs_bathy_xs", driver="GPKG")
+        pred_rows = []
+        for _, r in xs_pts_geom.iterrows():
+            xsid = str(r["xs_id"])
+            p = param_map.get(xsid)
+            if p is None:
+                continue
 
-    # Optional rasters
-    if out_bathy_raster or out_mask_raster or out_uncert_raster:
-        tmpl_path = template_raster or dem_path
-        if tmpl_path is None:
-            raise RuntimeError("Raster outputs requested but no template raster available. Provide --template-raster or --dem.")
-        with _open_template_raster(Path(tmpl_path)) as tmpl:
-            if continuous_buffer_m is None:
-                # Use a larger buffer to ensure continuity between cross-sections
-                # Buffer should be large enough to span gaps between XS transects
-                continuous_buffer_m = max(3.0 * _template_pixel_size_m(tmpl), 150.0, 20.0)
+            bl = p["bank_left_dist_m"]
+            br = p["bank_right_dist_m"]
+            if not np.isfinite(bl) or not np.isfinite(br):
+                continue
 
-            if continuous.lower() == "median":
-                bed_arr = _rasterize_points_reduce(
-                    pred_gdf, raster_value_col, tmpl, nodata=nodata, reducer=str(overlap_reducer)
+            left = float(min(bl, br))
+            right = float(max(bl, br))
+            W = float(right - left)
+            if not np.isfinite(W) or W <= 0:
+                continue
+
+            d = float(r["dist_m"])
+            if not (left <= d <= right):
+                continue
+
+            dist_from_left = d - left
+            Dmax = float(p["dmax_smooth_m"])
+            wse = float(p["wse_m"])
+
+            depth = _trapezoid_depth_profile(
+                np.array([dist_from_left], dtype="float64"),
+                W=W,
+                Dmax=Dmax,
+                bottom_frac=cfg.bottom_width_frac,
+                offset_frac=float(p.get("thalweg_offset_frac", 0.0)),
+            )[0]
+            if not np.isfinite(depth):
+                continue
+
+            z_bed = wse - depth if np.isfinite(wse) else np.nan
+
+            # guardrail: keep bed below lower bank by 5 cm
+            bank_min = np.nanmin([p.get("bank_left_z_m", np.nan), p.get("bank_right_z_m", np.nan)])
+            if np.isfinite(bank_min) and np.isfinite(z_bed):
+                z_bed = min(z_bed, bank_min - 0.05)
+
+            pred_rows.append(
+                dict(
+                    xs_id=xsid,
+                    river_id=p.get("river_id", np.nan),
+                    component_id=int(p.get("component_id", -1)),
+                    s_center_m=float(p.get("s_center_m", np.nan)),
+                    curv_kappa_1pm=float(p.get("curv_kappa_1pm", np.nan)),
+                    thalweg_offset_frac=float(p.get("thalweg_offset_frac", 0.0)),
+                    dist_m=d,
+                    width_m=W,
+                    wse_m=wse,
+                    dmax_raw_m=float(p.get("dmax_raw_m", np.nan)),
+                    dmax_smooth_m=Dmax,
+                    uncert_m=float(p.get("uncert_m", np.nan)),
+                    depth_pred_m=float(depth),
+                    z_bed_pred_m=float(z_bed) if np.isfinite(z_bed) else np.nan,
+                    geometry=r["geometry"],
                 )
-                mask_arr = _make_mask(bed_arr, nodata=nodata).astype("uint8")
-            else:
-                bed_arr, mask_arr = _continuous_surface(
-                    pts_gdf=pred_gdf,
-                    value_col=raster_value_col,
-                    template_ds=tmpl,
-                    method=continuous.lower(),
-                    buffer_m=float(continuous_buffer_m),
-                    k=int(continuous_k),
-                    idw_power=float(idw_power),
-                    aniso_along_scale_m=float(aniso_along_scale_m),
-                    aniso_cross_scale_m=float(aniso_cross_scale_m),
-                    thalweg_weight=float(thalweg_weight),
-                    nodata=float(nodata),
-                    overlap_reducer=str(overlap_reducer),
-                    corridor_lines_gdf=xs_lines,
-                )
+            )
 
-            if out_bathy_raster:
-                _write_geotiff(Path(out_bathy_raster), bed_arr, tmpl, nodata=float(nodata), dtype="float32")
-                log.info("[WRITE] %s", str(out_bathy_raster))
+        pred_gdf = gpd.GeoDataFrame(pred_rows, crs=xs_pts.crs)
+        if pred_gdf.empty:
+            raise RuntimeError("No predicted points generated (check bank picks and WSE estimation).")
 
-            if out_mask_raster:
-                _write_geotiff(Path(out_mask_raster), mask_arr.astype("uint8"), tmpl, nodata=0.0, dtype="uint8")
-                log.info("[WRITE] %s", str(out_mask_raster))
+        # XS summary
+        xs_summary = xs_param.merge(xs_lines[["xs_id", "geometry"]], on="xs_id", how="left")
+        xs_summary_gdf = gpd.GeoDataFrame(xs_summary, geometry="geometry", crs=xs_lines.crs)
 
-            if out_uncert_raster:
+        # Write GPKG
+        out_gpkg = Path(out_gpkg)
+        out_gpkg.parent.mkdir(parents=True, exist_ok=True)
+        log.info("[WRITE] %s (xs_bathy_points=%d, xs_bathy_xs=%d)", out_gpkg, len(pred_gdf), len(xs_summary_gdf))
+        pred_gdf.to_file(out_gpkg, layer="xs_bathy_points", driver="GPKG")
+        xs_summary_gdf.to_file(out_gpkg, layer="xs_bathy_xs", driver="GPKG")
+
+        # Optional rasters
+        if out_bathy_raster or out_mask_raster or out_uncert_raster:
+            tmpl_path = template_raster or dem_path
+            if tmpl_path is None:
+                raise RuntimeError("Raster outputs requested but no template raster available. Provide --template-raster or --dem.")
+            with _open_template_raster(Path(tmpl_path)) as tmpl:
+                if continuous_buffer_m is None:
+                    # Use a larger buffer to ensure continuity between cross-sections
+                    # Buffer should be large enough to span gaps between XS transects
+                    continuous_buffer_m = max(3.0 * _template_pixel_size_m(tmpl), 150.0, 20.0)
+
                 if continuous.lower() == "median":
-                    unc_arr = _rasterize_points_median(pred_gdf, raster_uncert_col, tmpl, nodata=float(nodata))
+                    bed_arr = _rasterize_points_reduce(
+                        pred_gdf, raster_value_col, tmpl, nodata=nodata, reducer=str(overlap_reducer)
+                    )
+                    mask_arr = _make_mask(bed_arr, nodata=nodata).astype("uint8")
                 else:
-                    # uncertainty: still rasterize median per pixel; continuous uncertainty can come later
-                    unc_arr = _rasterize_points_median(pred_gdf, raster_uncert_col, tmpl, nodata=float(nodata))
-                _write_geotiff(Path(out_uncert_raster), unc_arr, tmpl, nodata=float(nodata), dtype="float32")
-                log.info("[WRITE] %s", str(out_uncert_raster))
+                    bed_arr, mask_arr = _continuous_surface(
+                        pts_gdf=pred_gdf,
+                        value_col=raster_value_col,
+                        template_ds=tmpl,
+                        method=continuous.lower(),
+                        buffer_m=float(continuous_buffer_m),
+                        k=int(continuous_k),
+                        idw_power=float(idw_power),
+                        aniso_along_scale_m=float(aniso_along_scale_m),
+                        aniso_cross_scale_m=float(aniso_cross_scale_m),
+                        thalweg_weight=float(thalweg_weight),
+                        nodata=float(nodata),
+                        overlap_reducer=str(overlap_reducer),
+                        corridor_lines_gdf=xs_lines,
+                    )
 
-    log.info("[DONE] Inference complete.")
+                if out_bathy_raster:
+                    _write_geotiff(Path(out_bathy_raster), bed_arr, tmpl, nodata=float(nodata), dtype="float32")
+                    log.info("[WRITE] %s", str(out_bathy_raster))
+
+                if out_mask_raster:
+                    _write_geotiff(Path(out_mask_raster), mask_arr.astype("uint8"), tmpl, nodata=0.0, dtype="uint8")
+                    log.info("[WRITE] %s", str(out_mask_raster))
+
+                if out_uncert_raster:
+                    if continuous.lower() == "median":
+                        unc_arr = _rasterize_points_median(pred_gdf, raster_uncert_col, tmpl, nodata=float(nodata))
+                    else:
+                        # uncertainty: still rasterize median per pixel; continuous uncertainty can come later
+                        unc_arr = _rasterize_points_median(pred_gdf, raster_uncert_col, tmpl, nodata=float(nodata))
+                    _write_geotiff(Path(out_uncert_raster), unc_arr, tmpl, nodata=float(nodata), dtype="float32")
+                    log.info("[WRITE] %s", str(out_uncert_raster))
+
+        log.info("[DONE] Inference complete.")
 
 
-# --------------------------------------------------------------------------------------
-# CLI
-# --------------------------------------------------------------------------------------
-
+    # --------------------------------------------------------------------------------------
+    # CLI
+    # --------------------------------------------------------------------------------------
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         "xs_infer_bathy_raster.py – infer river bathy from XS + banks + optional soundings",
@@ -3259,7 +3320,6 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--no-swot-use-for-slope", dest="swot_use_for_slope", action="store_false", help="Do NOT use WSE observations for slope fitting; only shift bed elevations.")
     p.set_defaults(swot_use_for_slope=True)
 
-
     # Curvature-driven XS asymmetry (optional; thalweg skew proxy)
     p.add_argument(
         "--curv-asymmetry-enabled",
@@ -3267,23 +3327,9 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable curvature-driven skew of the XS depth profile (shift trapezoid flat-bottom toward outer bend).",
     )
-    p.add_argument(
-        "--no-curv-asymmetry",
-        dest="curv_asymmetry_enabled",
-        action="store_false",
-        help="Disable curvature-driven XS asymmetry.",
-    )
-    p.set_defaults(curv_asymmetry_enabled=True)
-
     p.add_argument("--curv-window-m", type=float, default=500.0, help="Along-channel window length (m) for local curvature estimation.")
     p.add_argument("--curv-min-points", type=int, default=7, help="Minimum XS points required in the curvature fit window.")
-    p.add_argument("--curv-use-dimensionless", dest="curv_use_dimensionless", action="store_true",
-                   help="Use dimensionless curvature κ* = κ×W (default).")
-    p.add_argument("--no-curv-use-dimensionless", dest="curv_use_dimensionless", action="store_false",
-                   help="Use fixed κ/κ_scale (1/m) scaling.")
-    p.set_defaults(curv_use_dimensionless=True)
-    p.add_argument("--curv-kappa-star-scale", type=float, default=1.0, help="Scale applied to κ* before tanh mapping (default 1.0).")
-    p.add_argument("--curv-kappa-scale-1pm", type=float, default=0.002, help="Curvature scale (1/m) for tanh mapping to offset (used when --no-curv-use-dimensionless).")
+    p.add_argument("--curv-kappa-scale-1pm", type=float, default=0.002, help="Curvature scale (1/m) for tanh mapping to offset.")
     p.add_argument("--curv-max-offset-frac", type=float, default=0.25, help="Max shift as fraction of width (0..0.45).")
     p.add_argument("--curv-lag-m", type=float, default=0.0, help="Evaluate curvature at s+lag (m) to model downstream thalweg response.")
 
@@ -3423,11 +3469,9 @@ def main() -> None:
         swot_vertical_offset_m=float(args.swot_vertical_offset_m),
         swot_outlier_mad_z=float(args.swot_outlier_mad_z),
         swot_use_for_slope=bool(getattr(args, "swot_use_for_slope", True)),
-        curv_asymmetry_enabled=bool(getattr(args, "curv_asymmetry_enabled", True)),
+        curv_asymmetry_enabled=bool(getattr(args, "curv_asymmetry_enabled", False)),
         curv_window_m=float(getattr(args, "curv_window_m", 500.0)),
         curv_min_points=int(getattr(args, "curv_min_points", 7)),
-        curv_use_dimensionless=bool(getattr(args, "curv_use_dimensionless", True)),
-        curv_kappa_star_scale=float(getattr(args, "curv_kappa_star_scale", 1.0)),
         curv_kappa_scale_1pm=float(getattr(args, "curv_kappa_scale_1pm", 0.002)),
         curv_max_offset_frac=float(getattr(args, "curv_max_offset_frac", 0.25)),
         curv_lag_m=float(getattr(args, "curv_lag_m", 0.0)),
