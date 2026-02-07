@@ -142,6 +142,17 @@ class BathyConfig:
     cache_root: Path = Path("cache")
     align_mode: str = "median"
 
+    # Sun-glint correction (Hedley-style) applied to Sentinel-2 composites (SDB only)
+    glint_correct: bool = False
+    glint_nir_band: str = "B08"
+    glint_vis_bands: str = "B02,B03,B04"
+    glint_nir_min_percentile: float = 1.0
+    glint_deepwater_b02_max: float = 0.20
+    glint_min_samples: int = 5000
+    glint_max_samples: int = 2000000
+    glint_clip_min: float = 1e-6
+
+
     # CRS policy
     # working_srs: CRS used internally for meter-based operations (thinning, river DEM warps).
     # If not provided, we attempt to read it from the Sentinel-2 RGB_10m.tif CRS; otherwise
@@ -209,6 +220,18 @@ class BathyConfig:
     # XS params
     xs_spacing_m: float = 200.0
     xs_length_m: float = 1000.0
+
+    # River patch rasterization / interpolation options (passed to xs_infer_bathy_raster.py)
+    # NOTE: xs_infer defaults can be expensive for large networks; expose here for control.
+    river_continuous: str = "walid_aniso"  # median | walid | aidw | aniso | walid_aniso
+    river_continuous_buffer_m: Optional[float] = None
+    river_continuous_k: int = 12
+    river_idw_power: float = 2.0
+    river_aniso_along_scale_m: float = 500.0
+    river_aniso_cross_scale_m: float = 30.0
+    river_thalweg_weight: float = 6.0
+    river_overlap_reducer: str = "min"  # min | median
+    river_nodata: float = -9999.0
 
     # Fusion controls
     fusion_strategy: str = "spatial_taper"  # weighted_overlap | spatial_taper | priority | blend
@@ -1311,6 +1334,29 @@ def run_sdb(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
         # The horizontal transform (WGS84 -> NAD83) is tiny and usually unnecessary.
     ]
 
+    # Forward S2 sun-glint correction flags into SDB, if supported.
+    if getattr(cfg, "glint_correct", False):
+        sdb_main_path = (Path(__file__).parent / "sdb_main.py")
+        supports_glint = False
+        try:
+            if sdb_main_path.exists():
+                txt = sdb_main_path.read_text(encoding="utf-8", errors="ignore")
+                supports_glint = ("--glint-correct" in txt) or ("glint_correct" in txt)
+        except Exception:
+            supports_glint = False
+
+        if not supports_glint:
+            log.warning("[SDB][GLINT] --glint-correct requested, but sdb_main.py does not appear to support glint flags; skipping glint passthrough.")
+        else:
+            cmd.append("--glint-correct")
+            cmd.append(f"--glint-nir-band={cfg.glint_nir_band}")
+            cmd.append(f"--glint-vis-bands={cfg.glint_vis_bands}")
+            cmd.append(f"--glint-nir-min-percentile={cfg.glint_nir_min_percentile}")
+            cmd.append(f"--glint-deepwater-b02-max={cfg.glint_deepwater_b02_max}")
+            cmd.append(f"--glint-min-samples={cfg.glint_min_samples}")
+            cmd.append(f"--glint-max-samples={cfg.glint_max_samples}")
+            cmd.append(f"--glint-clip-min={cfg.glint_clip_min}")
+
     # Forward extra XYZ bathymetry into SDB training/fusion if provided.
     # cfg.river_soundings is a comma-separated list of files produced by --extra-xyz normalization.
     if cfg.river_soundings:
@@ -1551,7 +1597,14 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
         f"--template-raster={cfg.river_dem}",
         f"--out-gpkg={bathy_gpkg}",
         f"--out-bathy-raster={bed_tif}",
-        "--overlap-reducer=min",
+        f"--continuous={getattr(cfg, 'river_continuous', 'walid_aniso')}",
+        f"--continuous-k={getattr(cfg, 'river_continuous_k', 12)}",
+        f"--idw-power={getattr(cfg, 'river_idw_power', 2.0)}",
+        f"--aniso-along-scale-m={getattr(cfg, 'river_aniso_along_scale_m', 500.0)}",
+        f"--aniso-cross-scale-m={getattr(cfg, 'river_aniso_cross_scale_m', 30.0)}",
+        f"--thalweg-weight={getattr(cfg, 'river_thalweg_weight', 6.0)}",
+        f"--nodata={getattr(cfg, 'river_nodata', -9999.0)}",
+        f"--overlap-reducer={getattr(cfg, 'river_overlap_reducer', 'min')}",
     ]
     cmd.append(f"--river-gpkg={network_gpkg}")
     cmd.append(f"--prior-mode={cfg.river_prior_mode}")
@@ -1643,6 +1696,9 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
         cmd.append(f"--regional-curve-unc-pct={cfg.river_regional_curve_unc_pct}")
         cmd.append(f"--regional-curve-max-weight={cfg.river_regional_curve_max_weight}")
         cmd.append(f"--regional-curve-min-da-km2={cfg.river_regional_curve_min_da_km2}")
+    if getattr(cfg, "river_continuous_buffer_m", None) is not None:
+        cmd.append(f"--continuous-buffer-m={cfg.river_continuous_buffer_m}")
+
     if cfg.river_soundings is not None:
         cmd.append(f"--soundings={cfg.river_soundings}")
 
@@ -1656,7 +1712,13 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
         "stderr_tail": err,
     }
     if rc != 0 or not bed_tif.exists():
-        log.error("[RIVER] Failed to infer river bed patch raster.")
+        # Include useful diagnostics inline (command + stderr/stdout tail), so users don't have to open the JSON report.
+        log.error("[RIVER] Failed to infer river bed patch raster (rc=%s, exists=%s).", rc, bed_tif.exists())
+        log.error("[RIVER] Command: %s", cmd_str)
+        if err:
+            log.error("[RIVER] stderr_tail:\n%s", err[-4000:])
+        if out:
+            log.error("[RIVER] stdout_tail:\n%s", out[-4000:])
         report["river"]["status"] = "failed"
         return None
 
@@ -2120,6 +2182,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cache-root", default="cache")
     p.add_argument("--align-mode", default="median")
 
+    # S2 sun-glint correction (Hedley-style). Only used when methods include 'sdb'.
+    p.add_argument("--glint-correct", action="store_true", default=False,
+                   help="Enable Hedley-style sun-glint correction on Sentinel-2 composite reflectance (SDB only).")
+    p.add_argument("--glint-nir-band", default="B08",
+                   help="NIR band used as glint proxy (default B08).")
+    p.add_argument("--glint-vis-bands", default="B02,B03,B04",
+                   help="Comma-separated visible bands to correct (default B02,B03,B04).")
+    p.add_argument("--glint-nir-min-percentile", type=float, default=1.0,
+                   help="Percentile for baseline NIR (R_nir,min) over stable-water mask (default 1.0).")
+    p.add_argument("--glint-deepwater-b02-max", type=float, default=0.20,
+                   help="Max B02 reflectance allowed in deep/stable water mask (default 0.20).")
+    p.add_argument("--glint-min-samples", type=int, default=5000,
+                   help="Minimum number of stable-water pixels required to fit betas (default 5000).")
+    p.add_argument("--glint-max-samples", type=int, default=2000000,
+                   help="Max number of samples used to fit betas (default 2000000).")
+    p.add_argument("--glint-clip-min", type=float, default=1e-6,
+                   help="Clip minimum for corrected reflectance to avoid downstream log/ratio issues (default 1e-6).")
+
+
     # River
     p.add_argument("--river-dem", default=None)
 
@@ -2221,6 +2302,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--snap-m", type=float, default=30.0)
     p.add_argument("--xs-spacing-m", type=float, default=200.0)
     p.add_argument("--xs-length-m", type=float, default=1000.0)
+
+    # River patch rasterization / interpolation options (forwarded to xs_infer_bathy_raster.py)
+    p.add_argument("--river-continuous", choices=["median", "walid", "aidw", "aniso", "walid_aniso"], default="walid_aniso",
+                   help="How to produce the river bed patch raster surface from inferred bathy points (see xs_infer_bathy_raster.py --continuous).")
+    p.add_argument("--river-continuous-buffer-m", type=float, default=None,
+                   help="Buffer (meters) around points used to define interpolation corridor. Default scales with pixel size.")
+    p.add_argument("--river-continuous-k", type=int, default=12, help="K nearest points used for IDW/AIDW/anisotropic modes.")
+    p.add_argument("--river-idw-power", type=float, default=2.0, help="IDW power for --river-continuous modes.")
+    p.add_argument("--river-aniso-along-scale-m", type=float, default=500.0, help="Anisotropic IDW along-channel scale (meters).")
+    p.add_argument("--river-aniso-cross-scale-m", type=float, default=30.0, help="Anisotropic IDW cross-channel scale (meters).")
+    p.add_argument("--river-thalweg-weight", type=float, default=6.0, help="Extra influence for thalweg control points in walid modes.")
+    p.add_argument("--river-overlap-reducer", choices=["min", "median"], default="min",
+                   help="When multiple points fall in the same output pixel, how to collapse them. 'min' keeps the deeper bed.")
+    p.add_argument("--river-nodata", type=float, default=-9999.0, help="Nodata value for river float rasters.")
     # River depth inference priors / anchors (passed through to xs_infer_bathy_raster.py)
     p.add_argument("--river-prior-mode", choices=["powerlaw", "multivariate"], default="powerlaw",
                    help=("River Dmax prior mode. 'powerlaw' uses Dmax=a*W^b. "
@@ -2438,6 +2533,14 @@ def main() -> int:
         sdb_mode=args.sdb_mode,
         cache_root=Path(args.cache_root),
         align_mode=args.align_mode,
+        glint_correct=args.glint_correct,
+        glint_nir_band=args.glint_nir_band,
+        glint_vis_bands=args.glint_vis_bands,
+        glint_nir_min_percentile=args.glint_nir_min_percentile,
+        glint_deepwater_b02_max=args.glint_deepwater_b02_max,
+        glint_min_samples=args.glint_min_samples,
+        glint_max_samples=args.glint_max_samples,
+        glint_clip_min=args.glint_clip_min,
         working_srs=args.working_srs,
         working_vcrs_epsg=args.working_vcrs_epsg,
         final_out_srs=args.final_out_srs,
@@ -2492,6 +2595,15 @@ def main() -> int:
 
         xs_spacing_m=args.xs_spacing_m,
         xs_length_m=args.xs_length_m,
+        river_continuous=args.river_continuous,
+        river_continuous_buffer_m=args.river_continuous_buffer_m,
+        river_continuous_k=args.river_continuous_k,
+        river_idw_power=args.river_idw_power,
+        river_aniso_along_scale_m=args.river_aniso_along_scale_m,
+        river_aniso_cross_scale_m=args.river_aniso_cross_scale_m,
+        river_thalweg_weight=args.river_thalweg_weight,
+        river_overlap_reducer=args.river_overlap_reducer,
+        river_nodata=args.river_nodata,
         fusion_strategy=args.fusion_strategy,
         fusion_primary_weight=args.fusion_primary_weight,
         fusion_secondary_weight=args.fusion_secondary_weight,
@@ -2629,6 +2741,10 @@ def main() -> int:
             log.info("[XYZ] Using %d external bathymetry file(s):", len(xyz_files2))
             for pth in xyz_files2:
                 log.info("   - %s", str(pth))
+    # If glint correction was requested but SDB isn't being run, accept the flag but ignore it.
+    if getattr(cfg, "glint_correct", False) and ("sdb" not in cfg.methods):
+        log.info("[GLINT] --glint-correct set, but methods does not include 'sdb'; ignoring glint options for this run.")
+        cfg.glint_correct = False
 
     report: Dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),

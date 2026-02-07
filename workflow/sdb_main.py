@@ -37,6 +37,7 @@ import argparse
 import json
 import traceback
 import importlib.util
+import inspect
 import shutil
 import hashlib
 import subprocess
@@ -1230,7 +1231,9 @@ def main():
                         coast_mask_raw = None
 
 
-                s2_paths = s2_optics.build_weighted_shared_date_composite(
+                # Build S2 composite (filter kwargs for compatibility with custom s2 modules)
+                glint_vis = [x.strip() for x in re.split(r"[,\s]+", str(getattr(args, "glint_vis_bands", "B02,B03,B04")).strip()) if x.strip()]
+                s2_kwargs = dict(
                     out_dir=s2_out,
                     bbox_wesn=bbox_wesn,
                     start_date=current_start,
@@ -1242,9 +1245,9 @@ def main():
                     stac_max_items=args.stac_max_items,
                     stac_page_limit=args.stac_page_limit,
                     cache_dir=s2_cache_dir,
-                    cache_strict=getattr(args, 'cache_strict', True),
-                    cache_code_strict=getattr(args, 'cache_code_strict', False),
-                    cache_ignore_code=getattr(args, 'cache_ignore_code', True),
+                    cache_strict=getattr(args, "cache_strict", True),
+                    cache_code_strict=getattr(args, "cache_code_strict", False),
+                    cache_ignore_code=getattr(args, "cache_ignore_code", True),
                     min_scene_valid_frac=args.min_scene_valid_frac,
                     edge_weight_power=args.edge_weight_power,
                     edge_weight_min=args.edge_weight_min,
@@ -1258,11 +1261,29 @@ def main():
                     coastline_mask_path=coast_mask_raw,
                     coastline_mask_water_value=0,
                     coastline_mask_invert=False,
-                    coastline_erode_px=getattr(args, 'coastline_erode_px', 3),
+                    coastline_erode_px=getattr(args, "coastline_erode_px", 3),
                     harmonize=True,
                     harmonize_max_abs_offset=0.03,
                     temporal_median_k=args.temporal_median_k,
+                    # Glint correction (optional)
+                    glint_correct=getattr(args, "glint_correct", False),
+                    glint_nir_band=getattr(args, "glint_nir_band", "B08"),
+                    glint_vis_bands=glint_vis if glint_vis else None,
+                    glint_nir_min_percentile=float(getattr(args, "glint_nir_min_percentile", 1.0)),
+                    glint_deepwater_b02_max=float(getattr(args, "glint_deepwater_b02_max", 0.20)),
+                    glint_min_samples=int(getattr(args, "glint_min_samples", 5000)),
+                    glint_max_samples=int(getattr(args, "glint_max_samples", 2000000)),
+                    glint_clip_min=float(getattr(args, "glint_clip_min", 1e-6)),
                 )
+                try:
+                    sig = inspect.signature(s2_optics.build_weighted_shared_date_composite)
+                    allowed = set(sig.parameters.keys())
+                    s2_kwargs = {k: v for k, v in s2_kwargs.items() if k in allowed}
+                except Exception:
+                    pass
+
+                s2_paths = s2_optics.build_weighted_shared_date_composite(**s2_kwargs)
+
 
                 try:
                     if rr is not None and isinstance(s2_paths, dict):
@@ -2081,6 +2102,23 @@ def parse_args():
     p.add_argument("--gl-nir-green-ratio-max", type=float, default=0.35, help="Max (NIR/Green) ratio for turbidity accept.")
     p.add_argument("--gl-red-max", type=float, default=0.08, help="Max Red reflectance for turbidity accept.")
 
+    # Sun-glint correction (Hedley-style; optional)
+    p.add_argument("--glint-correct", action="store_true", default=False,
+                   help="Apply Hedley-style sun-glint correction to visible S2 bands (post-composite).")
+    p.add_argument("--glint-nir-band", default="B08",
+                   help="NIR band used for glint correction regression (default: B08).")
+    p.add_argument("--glint-vis-bands", default="B02,B03,B04",
+                   help="Comma-separated visible bands to correct (default: B02,B03,B04).")
+    p.add_argument("--glint-nir-min-percentile", type=float, default=1.0,
+                   help="NIR percentile over stable water used as nir_min (default: 1).")
+    p.add_argument("--glint-deepwater-b02-max", type=float, default=0.20,
+                   help="Max B02 allowed in stable-water mask for glint fitting (default: 0.20).")
+    p.add_argument("--glint-min-samples", type=int, default=5000,
+                   help="Minimum stable-water samples required for glint fitting.")
+    p.add_argument("--glint-max-samples", type=int, default=2000000,
+                   help="Maximum stable-water samples used for glint fitting (random subset).")
+    p.add_argument("--glint-clip-min", type=float, default=1e-6,
+                   help="Clip corrected reflectance to at least this value.")
 
     # Sentinel-2 selection / STAC pagination (metadata-first)
     p.add_argument("--s2-scene-limit", type=int, default=10,

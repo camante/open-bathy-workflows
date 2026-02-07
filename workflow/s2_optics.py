@@ -1088,6 +1088,177 @@ def deep_water_mask(
         m &= np.isfinite(b02) & (b02 < float(b02_max))
     return m
 
+def _hedley_glint_correct(
+    nir: np.ndarray,
+    vis: Dict[str, np.ndarray],
+    *,
+    scl: Optional[np.ndarray] = None,
+    scl_bad: Optional[set] = None,
+    deepwater_nir_max: float = 0.03,
+    deepwater_bright_max: float = 0.15,
+    deepwater_b02_max: float = 0.20,
+    nir_min_percentile: float = 1.0,
+    min_samples: int = 5000,
+    max_samples: int = 2_000_000,
+    clip_min: float = 1e-6,
+    rng: Optional[np.random.Generator] = None,
+    label: str = "composite",
+) -> Tuple[Dict[str, np.ndarray], dict]:
+    """Apply Hedley-style sun-glint correction to visible bands.
+
+    Corrects each visible band R_vis using:
+        R_vis' = R_vis - beta * (R_nir - R_nir_min)
+
+    beta is fit as the slope of a linear regression of R_vis vs R_nir over a
+    stable-water mask (deep/dark water). R_nir_min is taken as a low percentile
+    of R_nir over that same mask.
+
+    Returns:
+        (corrected_vis_dict, meta_dict)
+    """
+    meta = {
+        "enabled": True,
+        "status": "skipped",
+        "label": str(label),
+        "nir_min_percentile": float(nir_min_percentile),
+        "deepwater_nir_max": float(deepwater_nir_max),
+        "deepwater_bright_max": float(deepwater_bright_max),
+        "deepwater_b02_max": float(deepwater_b02_max),
+        "min_samples": int(min_samples),
+        "max_samples": int(max_samples),
+        "clip_min": float(clip_min),
+        "betas": {},
+        "n_samples": 0,
+        "nir_min": None,
+        "mask_mode": None,
+        "reason": None,
+    }
+
+    if rng is None:
+        rng = np.random.default_rng(0)
+
+    if nir is None or not isinstance(nir, np.ndarray):
+        meta["reason"] = "nir_missing"
+        return vis, meta
+
+    vis_list = [v for v in vis.values() if isinstance(v, np.ndarray)]
+    if not vis_list:
+        meta["reason"] = "no_vis_bands"
+        return vis, meta
+
+    brightness = np.nanmean(np.stack(vis_list, axis=0), axis=0).astype(np.float32)
+
+    b02_arr = vis.get("B02", None)
+    mask0 = deep_water_mask(
+        nir.astype(np.float32),
+        brightness.astype(np.float32),
+        nir_max=float(deepwater_nir_max),
+        bright_max=float(deepwater_bright_max),
+        b02=b02_arr.astype(np.float32) if isinstance(b02_arr, np.ndarray) else None,
+        b02_max=float(deepwater_b02_max) if deepwater_b02_max is not None else None,
+    )
+
+    if scl is not None and scl_bad is not None:
+        try:
+            scl_int = _safe_rint_to_uint8(scl, fill=0)
+            vmask = scl_valid_mask(scl_int, dilate=0, scl_bad=set(scl_bad))
+            mask0 &= vmask
+        except Exception:
+            pass
+
+    mask = mask0
+    mask_mode = "strict"
+
+    n0 = int(np.count_nonzero(mask0))
+    if n0 < int(min_samples):
+        mask1 = deep_water_mask(
+            nir.astype(np.float32),
+            brightness.astype(np.float32),
+            nir_max=float(deepwater_nir_max) * 2.0,
+            bright_max=float(deepwater_bright_max) * 2.0,
+            b02=b02_arr.astype(np.float32) if isinstance(b02_arr, np.ndarray) else None,
+            b02_max=min(float(deepwater_b02_max) * 1.5, 1.0) if deepwater_b02_max is not None else None,
+        )
+        if scl is not None and scl_bad is not None:
+            try:
+                scl_int = _safe_rint_to_uint8(scl, fill=0)
+                vmask = scl_valid_mask(scl_int, dilate=0, scl_bad=set(scl_bad))
+                mask1 &= vmask
+            except Exception:
+                pass
+        n1 = int(np.count_nonzero(mask1))
+        if n1 > n0:
+            mask = mask1
+            mask_mode = "relaxed"
+
+    n = int(np.count_nonzero(mask))
+    meta["mask_mode"] = mask_mode
+    meta["n_samples"] = int(min(n, int(max_samples)))
+
+    if n < int(min_samples):
+        meta["reason"] = f"insufficient_samples_{n}"
+        return vis, meta
+
+    idx = np.flatnonzero(mask)
+    if idx.size > int(max_samples):
+        idx = rng.choice(idx, size=int(max_samples), replace=False)
+
+    nir_s = nir.ravel()[idx].astype(np.float64)
+    good = np.isfinite(nir_s)
+    if np.count_nonzero(good) < int(min_samples):
+        meta["reason"] = "nir_nonfinite"
+        return vis, meta
+    nir_s = nir_s[good]
+    idx = idx[good]
+
+    try:
+        nir_min = float(np.percentile(nir_s, float(nir_min_percentile)))
+    except Exception:
+        nir_min = float(np.nanmin(nir_s))
+    meta["nir_min"] = nir_min
+
+    x = nir_s
+    x_mean = float(np.mean(x))
+    x_var = float(np.var(x))
+    if not np.isfinite(x_var) or x_var <= 1e-12:
+        meta["reason"] = "nir_variance_too_small"
+        return vis, meta
+
+    corrected: Dict[str, np.ndarray] = {}
+
+    for band, arr in vis.items():
+        if arr is None or not isinstance(arr, np.ndarray):
+            continue
+
+        y = arr.ravel()[idx].astype(np.float64)
+        y_good = np.isfinite(y)
+        if np.count_nonzero(y_good) < int(min_samples):
+            continue
+
+        y2 = y[y_good]
+        x2 = x[y_good]
+        y_mean = float(np.mean(y2))
+        beta = float(np.mean((x2 - x_mean) * (y2 - y_mean)) / x_var)
+        if not np.isfinite(beta):
+            continue
+
+        meta["betas"][str(band)] = float(beta)
+
+        out = arr.astype(np.float32, copy=True)
+        m = np.isfinite(out) & np.isfinite(nir)
+        out[m] = out[m] - (beta * (nir[m].astype(np.float32) - float(nir_min)))
+        if clip_min is not None and float(clip_min) > 0:
+            out[m] = np.maximum(out[m], float(clip_min))
+        corrected[str(band)] = out
+
+    if not meta["betas"]:
+        meta["reason"] = "no_valid_betas"
+        return vis, meta
+
+    meta["status"] = "applied"
+    meta["reason"] = None
+    return corrected, meta
+
 def harmonize_offsets_to_reference(
     mosaics_by_tile: Dict[str, Dict[str, np.ndarray]],
     ref_tile: str,
@@ -1358,6 +1529,14 @@ def build_weighted_shared_date_composite(
         harmonize_max_abs_offset=float(harmonize_max_abs_offset),
         deepwater_nir_max=float(deepwater_nir_max),
         deepwater_bright_max=float(deepwater_bright_max),
+        glint_correct=bool(glint_correct),
+        glint_nir_band=str(glint_nir_band),
+        glint_vis_bands=list(glint_vis_bands) if glint_vis_bands is not None else ["B02","B03","B04"],
+        glint_nir_min_percentile=float(glint_nir_min_percentile),
+        glint_deepwater_b02_max=float(glint_deepwater_b02_max),
+        glint_min_samples=int(glint_min_samples),
+        glint_max_samples=int(glint_max_samples),
+        glint_clip_min=float(glint_clip_min),
         b02_thresh=float(b02_thresh),
         allow_bright_shallow_pixels=bool(allow_bright_shallow_pixels),
         bright_shallow_nir_max=float(bright_shallow_nir_max),
@@ -2084,6 +2263,42 @@ def build_weighted_shared_date_composite(
         scl_final = np.nanmedian(np.stack(stacks["SCL"], axis=0), axis=0)
         final["SCL"] = np.where(np.isfinite(scl_final), np.rint(scl_final), np.nan).astype(np.float32)
 
+        # Optional: Hedley-style sun-glint correction (cheap when it helps).
+        glint_meta_comp = None
+        glint_meta_best = None
+        if bool(glint_correct):
+            try:
+                vis_bands = list(glint_vis_bands) if glint_vis_bands is not None else ["B02", "B03", "B04"]
+                vis_bands = [b for b in vis_bands if b in final]
+                if glint_nir_band not in final or not vis_bands:
+                    glint_meta_comp = {"enabled": True, "status": "skipped", "reason": "missing_bands", "nir_band": str(glint_nir_band), "vis_bands": vis_bands}
+                else:
+                    vis_dict = {b: final[b] for b in vis_bands}
+                    corr, meta_g = _hedley_glint_correct(
+                        final[str(glint_nir_band)],
+                        vis_dict,
+                        scl=final.get("SCL"),
+                        scl_bad=SCL_BAD,
+                        deepwater_nir_max=float(deepwater_nir_max),
+                        deepwater_bright_max=float(deepwater_bright_max),
+                        deepwater_b02_max=float(glint_deepwater_b02_max),
+                        nir_min_percentile=float(glint_nir_min_percentile),
+                        min_samples=int(glint_min_samples),
+                        max_samples=int(glint_max_samples),
+                        clip_min=float(glint_clip_min),
+                        label="composite",
+                    )
+                    for b, v in corr.items():
+                        final[b] = v
+                    glint_meta_comp = meta_g
+                    if meta_g.get("status") == "applied":
+                        log.info(f"[S2][GLINT] Applied Hedley correction to {vis_bands} using {meta_g.get('n_samples')} samples (nir_min={meta_g.get('nir_min')})")
+                    else:
+                        log.info(f"[S2][GLINT] Skipped glint correction: {meta_g.get('reason')}")
+            except Exception as exc:
+                glint_meta_comp = {"enabled": True, "status": "skipped", "reason": f"exception: {exc}"}
+                log.warning(f"[S2][GLINT] Glint correction failed; continuing without it: {exc}")
+
         brightness = compute_brightness(final["B02"], final["B03"], final["B04"]).astype(np.float32)
         clear = compute_clear_water_mask(final["B08"], brightness).astype(np.uint8)
         rgb = np.stack([final["B04"], final["B03"], final["B02"]], axis=0).astype(np.float32)
@@ -2119,6 +2334,39 @@ def build_weighted_shared_date_composite(
             best_date = selected_dates[0] if selected_dates else None
             if best_date and best_date in date_mosaics:
                 mos_best = date_mosaics[best_date]
+                # Optional: apply the same glint correction to the best-date stack.
+                if bool(glint_correct):
+                    try:
+                        vis_bands = list(glint_vis_bands) if glint_vis_bands is not None else ["B02", "B03", "B04"]
+                        vis_bands = [b for b in vis_bands if b in mos_best]
+                        if glint_nir_band not in mos_best or not vis_bands:
+                            glint_meta_best = {"enabled": True, "status": "skipped", "reason": "missing_bands", "nir_band": str(glint_nir_band), "vis_bands": vis_bands}
+                        else:
+                            vis_dict = {b: mos_best[b] for b in vis_bands}
+                            corr_b, meta_b = _hedley_glint_correct(
+                                mos_best[str(glint_nir_band)],
+                                vis_dict,
+                                scl=mos_best.get("SCL"),
+                                scl_bad=SCL_BAD,
+                                deepwater_nir_max=float(deepwater_nir_max),
+                                deepwater_bright_max=float(deepwater_bright_max),
+                                deepwater_b02_max=float(glint_deepwater_b02_max),
+                                nir_min_percentile=float(glint_nir_min_percentile),
+                                min_samples=int(glint_min_samples),
+                                max_samples=int(glint_max_samples),
+                                clip_min=float(glint_clip_min),
+                                label="best_date",
+                            )
+                            for b, v in corr_b.items():
+                                mos_best[b] = v
+                            glint_meta_best = meta_b
+                            if meta_b.get("status") == "applied":
+                                log.info(f"[S2][GLINT] Best-date glint correction applied to {vis_bands} using {meta_b.get('n_samples')} samples")
+                            else:
+                                log.info(f"[S2][GLINT] Best-date glint correction skipped: {meta_b.get('reason')}")
+                    except Exception as exc3:
+                        glint_meta_best = {"enabled": True, "status": "skipped", "reason": f"exception: {exc3}"}
+                        log.warning(f"[S2][GLINT] Best-date glint correction failed; continuing without it: {exc3}")
                 # Write best-date full band stack + masks so downstream can compare
                 # (best-date vs temporal composite) in training/validation.
                 try:
@@ -2169,6 +2417,8 @@ def build_weighted_shared_date_composite(
             "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "shared_date_mode_requested": str(shared_date_mode),
             "shared_date_mode_used": str(shared_mode_used),
+            "glint_correction": glint_meta_comp,
+            "glint_correction_best_date": glint_meta_best,
         })
 
         # --- Optional cleanup: delete raw Sentinel-2 downloads after successful composite build ---
@@ -2309,6 +2559,15 @@ def main():
     p.add_argument("--harmonize-max-abs-offset", type=float, default=0.03)
     p.add_argument("--deepwater-nir-max", type=float, default=0.03)
     p.add_argument("--deepwater-bright-max", type=float, default=0.15)
+    # Sun-glint correction (Hedley-style)
+    p.add_argument("--glint-correct", action="store_true", help="Apply Hedley-style sun-glint correction to visible bands (post-composite).")
+    p.add_argument("--glint-nir-band", default="B08", help="NIR band used for glint correction (default: B08).")
+    p.add_argument("--glint-vis-bands", default="B02,B03,B04", help="Comma-separated visible bands to correct (default: B02,B03,B04).")
+    p.add_argument("--glint-nir-min-percentile", type=float, default=1.0, help="NIR percentile over stable water used as nir_min (default: 1).")
+    p.add_argument("--glint-deepwater-b02-max", type=float, default=0.20, help="Max B02 in stable-water mask for glint fitting (default: 0.20).")
+    p.add_argument("--glint-min-samples", type=int, default=5000, help="Minimum stable-water samples for glint fitting.")
+    p.add_argument("--glint-max-samples", type=int, default=2000000, help="Maximum samples used for glint fitting (random subset).")
+    p.add_argument("--glint-clip-min", type=float, default=1e-6, help="Clip corrected reflectance to at least this value.")
     p.add_argument("--b02-thresh", type=float, default=0.25, help="B02 reflectance threshold for glint/brightness reject")
     p.add_argument("--allow-bright-shallow-pixels", action="store_true", help="Allow bright shallow pixels via NIR escape hatch")
     p.add_argument("--bright-shallow-nir-max", type=float, default=0.03, help="If --allow-bright-shallow-pixels, accept pixels with NIR < this value even if B02 is bright")
@@ -2334,6 +2593,8 @@ def main():
     if args.preferred_months.strip():
         pref = [int(x) for x in re.split(r"[,\s]+", args.preferred_months.strip()) if x.strip()]
 
+    glint_vis = [x.strip() for x in re.split(r"[,\s]+", str(getattr(args, "glint_vis_bands", "")).strip()) if x.strip()]
+
     cache_dir = Path(args.cache_dir) if args.cache_dir.strip() else None
 
     build_weighted_shared_date_composite(
@@ -2358,6 +2619,14 @@ def main():
         harmonize_max_abs_offset=args.harmonize_max_abs_offset,
         deepwater_nir_max=args.deepwater_nir_max,
         deepwater_bright_max=args.deepwater_bright_max,
+        glint_correct=args.glint_correct,
+        glint_nir_band=args.glint_nir_band,
+        glint_vis_bands=glint_vis if glint_vis else None,
+        glint_nir_min_percentile=args.glint_nir_min_percentile,
+        glint_deepwater_b02_max=args.glint_deepwater_b02_max,
+        glint_min_samples=args.glint_min_samples,
+        glint_max_samples=args.glint_max_samples,
+        glint_clip_min=args.glint_clip_min,
         b02_thresh=args.b02_thresh,
         allow_bright_shallow_pixels=args.allow_bright_shallow_pixels,
         bright_shallow_nir_max=args.bright_shallow_nir_max,
