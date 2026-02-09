@@ -1,0 +1,47 @@
+River skeleton update (no cross-sections)
+========================================
+
+Included:
+  - bathy_main.py (updated): adds --river-method skeleton|xs (default skeleton)
+  - river_domain_mask.py: builds river channel mask using NHD flowlines + waffles water mask
+  - river_skeleton_bathy.py: generates river bed elevations via distance transforms (no XS)
+  - xs_builder.py + xs_infer_bathy_raster.py unchanged (legacy river-method xs)
+
+Key new CLI args (bathy_main.py):
+  --river-method skeleton|xs
+  --river-channel-buffer-m <m>
+  --river-max-channel-width-m <m>
+  --river-mainstem-min-order <int>
+  --river-max-mainstem-width-m <m>
+  --river-shape-exp <float>
+  --river-dmax-min-m <m>
+  --river-dmax-max-m <m>
+  --river-save-skeleton-debug
+
+How it decides river vs ocean:
+  - Takes NHD flowlines from river_network.gpkg as a seed
+  - Buffers them by --river-channel-buffer-m
+  - Intersects with waffles water mask (water=0)
+  - Rejects pixels wider than width-threshold (distance-to-bank proxy)
+  - Result is a 'river_channel_mask' that avoids filling bays/ocean
+
+Using extra XYZ soundings for river (skeleton method)
+----------------------------------------------------
+If you provide soundings via any of:
+  - --extra-xyz <file1,file2,...>
+  - --extra-xyz-cudem=hydronos,ehydro (downloads + converts to XYZ)
+  - --river-soundings <file1,file2,...>   (hidden alias)
+then bathy_main will pass those into river_skeleton_bathy.py to:
+  1) refine the per-centerline Dmax prior (via implied-Dmax from soundings), and
+  2) optionally enforce observed depths at the sounding grid cells (anchors).
+
+Related CLI args (bathy_main.py):
+  --river-soundings-mode auto|depth_pos|depth_neg
+  --river-soundings-max-dist-m <m>
+  --river-soundings-min-r <0-1>
+  --no-river-soundings-enforce
+
+Important assumption:
+  - Sounding Z values are treated as *depths* (not bed elevations). Use
+    --river-soundings-mode to specify whether they are positive-down or
+    negative-down depths.

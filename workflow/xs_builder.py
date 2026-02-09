@@ -5,54 +5,23 @@ xs_builder.py – Build river cross-sections (XS) from a river network + DEM/top
 
 Build river cross-sections (XS) for CUDEM-style coastal river bathymetry workflows.
 
-What this version fixes
------------------------
-1) "Too many minor streams":
-   - Adds a *component-first* pruning option (recommended for tidal/coastal rivers):
-       keep the largest connected component(s) by total network length.
-   - Then applies attribute filters (stream order / lengthkm / ftype) as a second pass.
+Key Features:
+- **Component-based Pruning**: Keeps largest connected river networks to avoid minor/artificial paths.
+- **Orientation Smoothing**: Uses a rolling window for tangents to fan XS lines around bends.
+- **Overlap Trimming**: Detects and trims intersecting cross-sections to prevent "zipper" artifacts.
 
-   This avoids the common coastal failure mode where the main trunk is encoded as
-   FType=558 "Artificial Path" or has low/odd StreamOrde, and gets filtered out.
+Inputs:
+- river_network.gpkg (from river_network.py)
+- Rasters: --dem (required), --topo-lidar (optional)
 
-2) DEM sampling returning -9999 / NULL:
-   - Cross-sections are built in the projected CRS of rivers_clip (meters).
-   - Rasters may be in a different CRS (e.g., EPSG:4269). We now reproject sample
-     coordinates into each raster's CRS before sampling.
-   - Nodata values (e.g., -9999) are converted to NaN.
-
-Inputs
-------
-- river_network.gpkg (from river_network.py), layers:
-    - rivers_clip   : LineString centerlines clipped to AOI
-    - graph_edges   : edges with component_id and lengths (or geometry)
-
-- Rasters:
-    - --dem         : DEM used to sample elevations (often your bank/topo DEM)
-    - --topo-lidar  : optional higher-quality topo raster; if omitted, banks use --dem
-
-Outputs
--------
-- Output GeoPackage with layers:
-    - xs_lines   : cross-section LineStrings + metadata
-    - xs_points  : sampled points along XS with z_dem/z_topo + bank flags
-
-- Optional CSV:
-    - xs_profiles.csv : long table of xs_points attributes (geometry dropped)
-
-Dependencies
-------------
-pip install geopandas rasterio shapely numpy pandas pyproj"""
+Outputs:
+- Output GPKG with 'xs_lines' and 'xs_points' layers.
+"""
 
 from __future__ import annotations
 
 import argparse
 import logging
-
-
-# Logging is configured by entrypoints (e.g., bathy_main.py / sdb_main.py).
-# Standalone scripts configure logging in __main__.
-
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List, Set
@@ -62,11 +31,10 @@ import pandas as pd
 import geopandas as gpd
 import rasterio
 from shapely.geometry import LineString, Point
-from shapely.ops import linemerge
+from shapely.ops import linemerge, split
 from pyproj import CRS, Transformer
 
-
-# Use centralized logging - get logger, don't configure root here
+# Use centralized logging
 log = logging.getLogger("xs_builder")
 
 
@@ -78,6 +46,9 @@ class XSConfig:
     bank_search_m: float = 40.0
     min_centerline_len_m: float = 50.0
     max_xs_per_reach: int = 2000
+    # New options for overlap handling
+    smoothing_window_m: float = 0.0  # 0.0 means "auto" (use spacing)
+    trim_overlaps: bool = True
 
 
 # --------------------------------------------------------------------------------------
@@ -262,9 +233,19 @@ def _unit_perp(dx: float, dy: float) -> Tuple[float, float]:
 
 
 def _line_tangent(line: LineString, s: float, eps: float) -> Tuple[float, float]:
+    """Calculate unit tangent vector of line at distance s, using a window of +/- eps."""
     L = line.length
+    # Ensure window is valid
     s0 = max(0.0, min(L, s - eps))
     s1 = max(0.0, min(L, s + eps))
+    
+    # If segment is too small (start/end of line), bias the window inward
+    if abs(s1 - s0) < 1e-3:
+        if s0 == 0.0:
+            s1 = min(L, s0 + 1.0) # Look ahead
+        elif s1 == L:
+            s0 = max(0.0, s1 - 1.0) # Look back
+
     p0 = line.interpolate(s0)
     p1 = line.interpolate(s1)
     dx = p1.x - p0.x
@@ -283,6 +264,76 @@ def build_xs_line(center_pt: Point, tan: Tuple[float, float], half_width_m: floa
     x1 = center_pt.x + px * half_width_m
     y1 = center_pt.y + py * half_width_m
     return LineString([(x0, y0), (x1, y1)])
+
+
+def _trim_overlapping_xs(xs_list: List[Dict]) -> List[Dict]:
+    """
+    Check adjacent cross-sections for intersection. If they cross, clip them at the intersection point.
+    xs_list must be sorted by s_center_m.
+    """
+    if len(xs_list) < 2:
+        return xs_list
+
+    modified = 0
+    # Iterate through adjacent pairs
+    # Note: We assume xs_list is sorted by station
+    for i in range(len(xs_list) - 1):
+        curr = xs_list[i]
+        next_xs = xs_list[i+1]
+        
+        g1 = curr['geometry']
+        g2 = next_xs['geometry']
+        
+        if not g1.intersects(g2):
+            continue
+            
+        pt = g1.intersection(g2)
+        
+        # We only handle single point intersections (standard crossing)
+        if pt.geom_type != 'Point':
+            continue
+            
+        # Strategy: The intersection usually happens on the "inside" of the bend.
+        # We want to keep the segment of the line that connects to the centerline.
+        # Since we construct lines as [Left, Right] centered on the centerline,
+        # checking the distance from the centerline point to the intersection vs the endpoints
+        # tells us which side to trim.
+        
+        # Helper to trim a line to the intersection point, keeping the side with the centerline
+        def _trim_line(line_geom, intersect_pt, center_dist_along):
+            # Project intersection onto line to find distance along line
+            d_int = line_geom.project(intersect_pt)
+            d_center = line_geom.project(line_geom.interpolate(0.5, normalized=True))
+            
+            # Reconstruct
+            if d_int < d_center:
+                # Intersection is on the "left" (start) side -> cut the start
+                # New line is [Intersection, End]
+                return LineString([intersect_pt, line_geom.coords[-1]])
+            else:
+                # Intersection is on the "right" (end) side -> cut the end
+                # New line is [Start, Intersection]
+                return LineString([line_geom.coords[0], intersect_pt])
+
+        # Apply trimming
+        try:
+            new_g1 = _trim_line(g1, pt, curr['s_center_m'])
+            new_g2 = _trim_line(g2, pt, next_xs['s_center_m'])
+            
+            # Update geometries in place if valid
+            if not new_g1.is_empty and new_g1.length > 1.0:
+                curr['geometry'] = new_g1
+            if not new_g2.is_empty and new_g2.length > 1.0:
+                next_xs['geometry'] = new_g2
+            
+            modified += 1
+        except Exception:
+            pass # Geometry error, skip trimming this pair
+
+    if modified > 0:
+        log.info(f"[XS] Trimmed {modified} intersecting cross-section pairs.")
+        
+    return xs_list
 
 
 # --------------------------------------------------------------------------------------
@@ -448,6 +499,10 @@ def build_xs_for_river(
         xs_lines_records = []
         xs_points_records = []
         xs_id_counter = 1
+        
+        # Determine smoothing window (use spacing if not explicit)
+        smoothing_eps = (cfg.smoothing_window_m / 2.0) if cfg.smoothing_window_m > 0 else (cfg.spacing_m / 2.0)
+        smoothing_eps = max(smoothing_eps, 0.5)
 
         for i, row in rivers_clip.iterrows():
             geom = _ensure_single_linestring(row.geometry)
@@ -464,17 +519,43 @@ def build_xs_for_river(
             n_xs = int(np.floor(L / cfg.spacing_m)) + 1
             n_xs = min(n_xs, cfg.max_xs_per_reach)
 
+            # 1. Generate XS Geometries first (pre-sampling)
+            xs_batch = []
+            
             for k in range(n_xs):
                 s_center = min(L, k * cfg.spacing_m)
                 center_pt = geom.interpolate(s_center)
 
-                eps = max(0.5, 0.01 * cfg.spacing_m)
-                tan = _line_tangent(geom, s_center, eps=eps)
+                # Use smoothed tangent for orientation
+                tan = _line_tangent(geom, s_center, eps=smoothing_eps)
                 if tan == (0.0, 0.0):
                     continue
 
                 xs_line = build_xs_line(center_pt, tan, cfg.half_width_m)
-
+                
+                xs_id = f"xs_{xs_id_counter:08d}"
+                xs_id_counter += 1
+                
+                xs_batch.append({
+                    "xs_id": xs_id,
+                    "river_id": river_id,
+                    "component_id": component_id,
+                    "s_center_m": float(s_center),
+                    "geometry": xs_line,
+                    "center_pt": center_pt
+                })
+            
+            # 2. Trim overlapping XS if requested
+            if cfg.trim_overlaps and len(xs_batch) > 1:
+                xs_batch = _trim_overlapping_xs(xs_batch)
+            
+            # 3. Sample Rasters along final geometries
+            for rec in xs_batch:
+                xs_line = rec['geometry']
+                # Skip if trimming made it too short
+                if xs_line.length < cfg.bank_search_m:
+                    continue
+                    
                 prof = sample_rasters_along_line(
                     xs_line,
                     dem_ds=dem_ds,
@@ -486,9 +567,6 @@ def build_xs_for_river(
 
                 idx_l, idx_r = pick_banks(prof, bank_search_m=cfg.bank_search_m, prefer_topo=True)
 
-                xs_id = f"xs_{xs_id_counter:08d}"
-                xs_id_counter += 1
-
                 def _bank_z(idx: Optional[int]) -> float:
                     if idx is None:
                         return np.nan
@@ -497,26 +575,25 @@ def build_xs_for_river(
                         return float(zt)
                     zd = prof.loc[idx, "z_dem"]
                     return float(zd) if pd.notna(zd) else np.nan
+                
+                # Add to lines result
+                rec.update({
+                    "xs_len_m": float(xs_line.length),
+                    "bank_left_dist_m": float(prof.loc[idx_l, "dist_m"]) if idx_l is not None else np.nan,
+                    "bank_right_dist_m": float(prof.loc[idx_r, "dist_m"]) if idx_r is not None else np.nan,
+                    "bank_left_z_m": _bank_z(idx_l),
+                    "bank_right_z_m": _bank_z(idx_r)
+                })
+                # Remove temp key
+                if 'center_pt' in rec: del rec['center_pt']
+                
+                xs_lines_records.append(rec)
 
-                xs_lines_records.append(
-                    {
-                        "xs_id": xs_id,
-                        "river_id": river_id,
-                        "component_id": component_id,
-                        "s_center_m": float(s_center),
-                        "xs_len_m": float(xs_line.length),
-                        "bank_left_dist_m": float(prof.loc[idx_l, "dist_m"]) if idx_l is not None else np.nan,
-                        "bank_right_dist_m": float(prof.loc[idx_r, "dist_m"]) if idx_r is not None else np.nan,
-                        "bank_left_z_m": _bank_z(idx_l),
-                        "bank_right_z_m": _bank_z(idx_r),
-                        "geometry": xs_line,
-                    }
-                )
-
+                # Add to points result
                 prof = prof.copy()
-                prof["xs_id"] = xs_id
-                prof["river_id"] = river_id
-                prof["component_id"] = component_id
+                prof["xs_id"] = rec["xs_id"]
+                prof["river_id"] = rec["river_id"]
+                prof["component_id"] = rec["component_id"]
                 prof["is_bank_left"] = False
                 prof["is_bank_right"] = False
                 if idx_l is not None:
@@ -541,6 +618,10 @@ def build_xs_for_river(
 
         out_gpkg = Path(out_gpkg)
         out_gpkg.parent.mkdir(parents=True, exist_ok=True)
+
+        if not xs_lines_records:
+            log.warning("No cross-sections were generated. Check river filtering or DEM coverage.")
+            return
 
         xs_lines_gdf = gpd.GeoDataFrame(xs_lines_records, crs=rivers_clip.crs)
         xs_pts_gdf = gpd.GeoDataFrame(xs_points_records, crs=rivers_clip.crs)
@@ -583,6 +664,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sample-step-m", type=float, default=2.0, help="Sampling step along XS (m)")
     p.add_argument("--bank-search-m", type=float, default=40.0, help="Search window near each XS end for bank peak (m)")
     p.add_argument("--min-centerline-len-m", type=float, default=50.0, help="Skip centerlines shorter than this (m)")
+    
+    # Overlap and smoothing options
+    p.add_argument("--smoothing-window-m", type=float, default=0.0, 
+                   help="Window size for calculating tangent/orientation. 0 = auto (uses spacing-m). Larger values smooth out XS direction at bends.")
+    p.add_argument("--trim-overlaps", action="store_true", default=True, 
+                   help="Trim intersecting cross-sections (default True).")
+    p.add_argument("--no-trim-overlaps", dest="trim_overlaps", action="store_false", help="Disable overlap trimming.")
 
     # Component pruning (ON by default)
     p.add_argument("--disable-component-prune", action="store_true", help="Disable component-first pruning.")
@@ -614,6 +702,8 @@ def main() -> None:
         sample_step_m=float(args.sample_step_m),
         bank_search_m=float(args.bank_search_m),
         min_centerline_len_m=float(args.min_centerline_len_m),
+        smoothing_window_m=float(args.smoothing_window_m),
+        trim_overlaps=bool(args.trim_overlaps)
     )
 
     river_gpkg = Path(args.river_gpkg)

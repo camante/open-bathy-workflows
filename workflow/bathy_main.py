@@ -92,7 +92,11 @@ def _fingerprint_script(name: str) -> Dict[str, Any]:
 
 
 def _river_cache_key_and_manifest(cfg: "BathyConfig") -> tuple[str, Dict[str, Any]]:
-    """Stable cache key for river interpolation products."""
+    """Stable cache key for river interpolation products.
+
+    NOTE: River products are highly sensitive to priors and domain masks. Keep this manifest
+    reasonably complete so cached outputs are not silently reused under different settings.
+    """
     soundings: List[Path] = []
     if cfg.river_soundings:
         for part in str(cfg.river_soundings).split(","):
@@ -102,19 +106,54 @@ def _river_cache_key_and_manifest(cfg: "BathyConfig") -> tuple[str, Dict[str, An
 
     manifest = {
         "aoi": cfg.aoi,
+        "river_method": getattr(cfg, "river_method", "xs"),
         "river_dem": _fingerprint_path(cfg.river_dem),
         "soundings": [_fingerprint_path(p) for p in soundings],
         "snap_m": cfg.snap_m,
+
+        # Legacy XS parameters (only used when river_method == "xs")
         "xs_spacing_m": cfg.xs_spacing_m,
         "xs_length_m": cfg.xs_length_m,
+        "river_continuous": cfg.river_continuous,
+        "river_continuous_buffer_m": cfg.river_continuous_buffer_m,
+        "river_continuous_k": cfg.river_continuous_k,
+        "river_idw_power": cfg.river_idw_power,
+        "river_aniso_along_scale_m": cfg.river_aniso_along_scale_m,
+        "river_aniso_cross_scale_m": cfg.river_aniso_cross_scale_m,
+        "river_thalweg_weight": cfg.river_thalweg_weight,
+        "river_thalweg_only": getattr(cfg, "river_thalweg_only", False),
+        "river_thalweg_densify_factor": getattr(cfg, "river_thalweg_densify_factor", 0.5),
+        "river_thalweg_densify_step_m": getattr(cfg, "river_thalweg_densify_step_m", None),
+        "river_overlap_reducer": cfg.river_overlap_reducer,
+
+        # Skeleton parameters (only used when river_method == "skeleton")
+        "river_channel_buffer_m": getattr(cfg, "river_channel_buffer_m", 400.0),
+        "river_max_channel_width_m": getattr(cfg, "river_max_channel_width_m", 600.0),
+        "river_mainstem_min_order": getattr(cfg, "river_mainstem_min_order", 5),
+        "river_max_mainstem_width_m": getattr(cfg, "river_max_mainstem_width_m", 2500.0),
+        "river_shape_exp": getattr(cfg, "river_shape_exp", 0.5),
+        "river_dmax_min_m": getattr(cfg, "river_dmax_min_m", 0.5),
+        "river_dmax_max_m": getattr(cfg, "river_dmax_max_m", 30.0),
+
+        # Priors (shared)
+        "river_prior_mode": cfg.river_prior_mode,
+        "river_mv_a0": cfg.river_mv_a0,
+        "river_mv_bw": cfg.river_mv_bw,
+        "river_mv_ba": cfg.river_mv_ba,
+        "river_mv_bs": cfg.river_mv_bs,
+        "river_mv_eps_a": cfg.river_mv_eps_a,
+        "river_mv_eps_s": cfg.river_mv_eps_s,
+
         "tnm_enable": bool(cfg.tnm_enable),
         "tnm_dataset": cfg.tnm_dataset,
         "scripts": {
             "river_network.py": _fingerprint_script("river_network.py"),
             "xs_builder.py": _fingerprint_script("xs_builder.py"),
             "xs_infer_bathy_raster.py": _fingerprint_script("xs_infer_bathy_raster.py"),
+            "river_domain_mask.py": _fingerprint_script("river_domain_mask.py"),
+            "river_skeleton_bathy.py": _fingerprint_script("river_skeleton_bathy.py"),
         },
-        "version": "river_cache_v1",
+        "version": "river_cache_v2",
     }
     s = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
     key = hashlib.sha1(s.encode("utf-8")).hexdigest()
@@ -172,6 +211,26 @@ class BathyConfig:
     # River args
     river_dem: Optional[Path] = None
     river_soundings: Optional[str] = None
+    # If river soundings are provided, they can refine the skeleton Dmax prior and optionally be enforced.
+    river_soundings_mode: str = "auto"            # auto | depth_pos | depth_neg
+    river_soundings_max_dist_m: float = 1500.0    # max distance for soundings to influence skeleton prior
+    river_soundings_min_r: float = 0.25           # min r when inverting depth->Dmax
+    river_soundings_enforce: bool = True          # enforce observed depths at sounding pixels
+    # River bathymetry method:
+    # - "skeleton": raster distance-transform "channel skeleton" method (no cross-sections). Recommended for sinuous/tidal channels.
+    # - "xs": legacy vector cross-section method (xs_builder.py + xs_infer_bathy_raster.py)
+    river_method: str = "skeleton"
+
+    # Skeleton (distance-transform) method parameters
+    # These control *where* river bathy is applied (river vs. ocean) and the within-channel depth profile.
+    river_channel_buffer_m: float = 400.0           # buffer around NHD flowlines to define candidate river corridor
+    river_max_channel_width_m: float = 600.0        # max channel width allowed in corridor (prevents filling open bays)
+    river_mainstem_min_order: int = 5               # stream order threshold for allowing larger widths (if available)
+    river_max_mainstem_width_m: float = 2500.0      # max width allowed for mainstem corridor (m)
+    river_shape_exp: float = 0.5                    # depth profile exponent (0.5 ~ U-shaped; 1.0 ~ V-shaped)
+    river_dmax_min_m: float = 0.5                   # clamp Dmax prior (m)
+    river_dmax_max_m: float = 30.0                  # clamp Dmax prior (m)
+    river_save_skeleton_debug: bool = False         # write debug rasters (r, d_bank, d_center, dmax, wse)
     # River depth inference priors / anchors (passed through to xs_infer_bathy_raster.py)
     river_prior_mode: str = "powerlaw"  # powerlaw | multivariate
     river_mv_a0: float = 0.18
@@ -230,6 +289,10 @@ class BathyConfig:
     river_aniso_along_scale_m: float = 500.0
     river_aniso_cross_scale_m: float = 30.0
     river_thalweg_weight: float = 6.0
+
+    river_thalweg_only: bool = False
+    river_thalweg_densify_factor: float = 0.5
+    river_thalweg_densify_step_m: Optional[float] = None
     river_overlap_reducer: str = "min"  # min | median
     river_nodata: float = -9999.0
 
@@ -1417,7 +1480,7 @@ def run_sdb(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
 
 def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
     log.info("=" * 60)
-    log.info("RUNNING RIVER PIPELINE (Cross-Section Interpolation)")
+    log.info("RUNNING RIVER PIPELINE (method=%s)", getattr(cfg, "river_method", "xs"))
     log.info("=" * 60)
 
     if cfg.river_dem is None:
@@ -1555,173 +1618,271 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
 
     log.info(f"[RIVER] Network extracted: {network_gpkg}")
 
-    # Step 2: Generating cross-sections...
-    log.info("[RIVER] Step 2: Generating cross-sections...")
-    xs_gpkg = work_dir / "cross_sections.gpkg"
 
-    # SECURITY FIX: Use list-based command construction
-    cmd = [
-        sys.executable, "xs_builder.py",
-        f"--river-gpkg={network_gpkg}",
-        f"--dem={cfg.river_dem}",
-        f"--out-gpkg={xs_gpkg}",
-        f"--spacing-m={cfg.xs_spacing_m}",
-        f"--half-width-m={cfg.xs_length_m / 2.0}",
-    ]
+    river_method = str(getattr(cfg, "river_method", "xs")).lower().strip()
+    if river_method == "skeleton":
+        # Step 2: Build a river channel mask (river vs. open water) from NHD flowlines + waffles water mask.
+        log.info("[RIVER] Step 2: Building river channel mask (skeleton method)...")
+        channel_mask_tif = work_dir / "river_channel_mask.tif"
+        open_water_mask_tif = work_dir / "open_water_mask.tif"
 
-    rc, out, err = run_command(cmd, cwd=script_dir, prefix="[RIVER] ")
-    cmd_str = " ".join(str(c) for c in cmd)
-    report["river"]["steps"]["xs_builder"] = {
-        "status": "success" if rc == 0 else "failed",
-        "returncode": rc,
-        "command": cmd_str,
-        "stdout_tail": out,
-        "stderr_tail": err,
-    }
-    if rc != 0 or not xs_gpkg.exists():
-        log.error("[RIVER] Failed to build cross-sections.")
-        report["river"]["status"] = "failed"
-        return None
+        wm = _find_latest_waffles_mask(cfg.cache_root)
+        cmd = [
+            sys.executable, "river_domain_mask.py",
+            f"--river-gpkg={network_gpkg}",
+            f"--template-raster={cfg.river_dem}",
+            f"--out-channel-mask={channel_mask_tif}",
+            f"--out-open-water-mask={open_water_mask_tif}",
+            f"--channel-buffer-m={getattr(cfg, 'river_channel_buffer_m', 400.0)}",
+            f"--max-channel-width-m={getattr(cfg, 'river_max_channel_width_m', 600.0)}",
+            f"--mainstem-min-order={getattr(cfg, 'river_mainstem_min_order', 5)}",
+            f"--max-mainstem-width-m={getattr(cfg, 'river_max_mainstem_width_m', 2500.0)}",
+        ]
+        if wm and Path(wm).exists():
+            cmd.append(f"--water-mask={wm}")
+        if getattr(cfg, "river_save_skeleton_debug", False):
+            cmd.append("--write-debug")
 
-    log.info(f"[RIVER] Cross-sections generated: {xs_gpkg}")
+        rc, out, err = run_command(cmd, cwd=script_dir, prefix="[RIVER] ")
+        cmd_str = " ".join(str(c) for c in cmd)
+        report["river"]["steps"]["domain_mask"] = {
+            "status": "success" if rc == 0 else "failed",
+            "returncode": rc,
+            "command": cmd_str,
+            "stdout_tail": out,
+            "stderr_tail": err,
+            "waffles_mask": str(wm) if wm else None,
+        }
+        if rc != 0 or (not channel_mask_tif.exists()):
+            log.error("[RIVER] Failed to build river channel mask.")
+            report["river"]["status"] = "failed"
+            return None
 
-    # Step 3: infer bathymetry (raster + optional GPKG)
-    log.info("[RIVER] Step 3: Inferring bathymetry...")
-    bed_tif = cached_bed_tif
-    bathy_gpkg = work_dir / "river_bathy.gpkg"
+        log.info(f"[RIVER] Channel mask built: {channel_mask_tif}")
 
-    # SECURITY FIX: Use list-based command construction
-    cmd = [
-        sys.executable, "xs_infer_bathy_raster.py",
-        f"--xs-gpkg={xs_gpkg}",
-        f"--template-raster={cfg.river_dem}",
-        f"--out-gpkg={bathy_gpkg}",
-        f"--out-bathy-raster={bed_tif}",
-        f"--continuous={getattr(cfg, 'river_continuous', 'walid_aniso')}",
-        f"--continuous-k={getattr(cfg, 'river_continuous_k', 12)}",
-        f"--idw-power={getattr(cfg, 'river_idw_power', 2.0)}",
-        f"--aniso-along-scale-m={getattr(cfg, 'river_aniso_along_scale_m', 500.0)}",
-        f"--aniso-cross-scale-m={getattr(cfg, 'river_aniso_cross_scale_m', 30.0)}",
-        f"--thalweg-weight={getattr(cfg, 'river_thalweg_weight', 6.0)}",
-        f"--nodata={getattr(cfg, 'river_nodata', -9999.0)}",
-        f"--overlap-reducer={getattr(cfg, 'river_overlap_reducer', 'min')}",
-    ]
-    cmd.append(f"--river-gpkg={network_gpkg}")
-    cmd.append(f"--prior-mode={cfg.river_prior_mode}")
-    cmd.append(f"--mv-a0={cfg.river_mv_a0}")
-    cmd.append(f"--mv-bw={cfg.river_mv_bw}")
-    cmd.append(f"--mv-ba={cfg.river_mv_ba}")
-    cmd.append(f"--mv-bs={cfg.river_mv_bs}")
-    cmd.append(f"--mv-eps-a={cfg.river_mv_eps_a}")
-    cmd.append(f"--mv-eps-s={cfg.river_mv_eps_s}")
-    cmd.append(f"--slope-proxy-window={cfg.river_slope_proxy_window}")
-    cmd.append(f"--slope-min={cfg.river_slope_min}")
-    cmd.append(f"--slope-max={cfg.river_slope_max}")
-    cmd.append(f"--slope-proxy-min-n={cfg.river_slope_proxy_min_n}")
+        # Step 3: Skeleton bathymetry (distance-transform, no cross-sections)
+        log.info("[RIVER] Step 3: Inferring bathymetry (channel skeleton)...")
+        bed_tif = cached_bed_tif
 
-    # Longitudinal WSE profile fit (preferred slope proxy)
-    if bool(getattr(cfg, "river_wse_profile_enabled", True)):
-        cmd.append("--wse-profile-enabled")
+        cmd = [
+            sys.executable, "river_skeleton_bathy.py",
+            f"--river-gpkg={network_gpkg}",
+            f"--template-raster={cfg.river_dem}",
+            f"--dem={cfg.river_dem}",
+            f"--channel-mask={channel_mask_tif}",
+            f"--out-bed={bed_tif}",
+            f"--shape-exp={getattr(cfg, 'river_shape_exp', 0.5)}",
+            f"--dmax-min-m={getattr(cfg, 'river_dmax_min_m', 0.5)}",
+            f"--dmax-max-m={getattr(cfg, 'river_dmax_max_m', 30.0)}",
+            f"--prior-mode={cfg.river_prior_mode}",
+            f"--mv-a0={cfg.river_mv_a0}",
+            f"--mv-bw={cfg.river_mv_bw}",
+            f"--mv-ba={cfg.river_mv_ba}",
+            f"--mv-bs={cfg.river_mv_bs}",
+            f"--mv-eps-a={cfg.river_mv_eps_a}",
+            f"--mv-eps-s={cfg.river_mv_eps_s}",
+        ]
+        if getattr(cfg, "river_save_skeleton_debug", False):
+            cmd.append(f"--debug-dir={work_dir / 'skeleton_debug'}")
+
+        # Optional: use external soundings (extra XYZ) to refine the skeleton prior and enforce depth anchors
+        if getattr(cfg, 'river_soundings', None):
+            snd_list = [s.strip() for s in str(cfg.river_soundings).split(',') if s.strip()]
+            if snd_list:
+                if getattr(cfg, 'extra_xyz_crs', None):
+                    cmd.append(f"--soundings-crs={cfg.extra_xyz_crs}")
+                cmd.append(f"--soundings-mode={getattr(cfg, 'river_soundings_mode', 'auto')}")
+                cmd.append(f"--soundings-max-dist-m={float(getattr(cfg, 'river_soundings_max_dist_m', 1500.0))}")
+                cmd.append(f"--soundings-min-r={float(getattr(cfg, 'river_soundings_min_r', 0.25))}")
+                if not bool(getattr(cfg, 'river_soundings_enforce', True)):
+                    cmd.append('--no-soundings-enforce')
+                cmd.extend(['--soundings'] + snd_list)
+
+        rc, out, err = run_command(cmd, cwd=script_dir, prefix="[RIVER] ")
+        cmd_str = " ".join(str(c) for c in cmd)
+        report["river"]["steps"]["skeleton"] = {
+            "status": "success" if rc == 0 else "failed",
+            "returncode": rc,
+            "command": cmd_str,
+            "stdout_tail": out,
+            "stderr_tail": err,
+        }
+        if rc != 0 or not Path(bed_tif).exists():
+            log.error("[RIVER] Skeleton bathymetry failed.")
+            report["river"]["status"] = "failed"
+            return None
+
+        log.info(f"[RIVER] Skeleton bathymetry raster: {bed_tif}")
+
     else:
-        cmd.append("--no-wse-profile")
-    cmd.append(f"--wse-profile-window={getattr(cfg, 'river_wse_profile_window', cfg.river_slope_proxy_window)}")
-    cmd.append(f"--wse-profile-min-n={getattr(cfg, 'river_wse_profile_min_n', cfg.river_slope_proxy_min_n)}")
-    if bool(getattr(cfg, "river_wse_profile_monotonic", True)):
-        cmd.append("--wse-profile-monotonic")
-    else:
-        cmd.append("--no-wse-profile-monotonic")
+        # Step 2: Generating cross-sections...
+        log.info("[RIVER] Step 2: Generating cross-sections...")
+        xs_gpkg = work_dir / "cross_sections.gpkg"
 
-    # Option A: USGS discharge *measurement* anchors
-    if cfg.river_usgs_sites:
-        cmd.append(f"--usgs-sites={cfg.river_usgs_sites}")
-        if cfg.river_usgs_start:
-            cmd.append(f"--usgs-start={cfg.river_usgs_start}")
-        if cfg.river_usgs_end:
-            cmd.append(f"--usgs-end={cfg.river_usgs_end}")
-        if cfg.river_usgs_cache_dir:
-            cmd.append(f"--usgs-cache-dir={cfg.river_usgs_cache_dir}")
-        cmd.append(f"--usgs-max-dist-m={cfg.river_usgs_max_dist_m}")
-        cmd.append(f"--usgs-mean-to-dmax={cfg.river_usgs_mean_to_dmax}")
-        cmd.append(f"--usgs-a-stat={cfg.river_usgs_a_stat}")
-        cmd.append(f"--usgs-q-quantile-lo={cfg.river_usgs_q_quantile_lo}")
-        cmd.append(f"--usgs-q-quantile-hi={cfg.river_usgs_q_quantile_hi}")
-        cmd.append(f"--usgs-a-cv-warn={cfg.river_usgs_a_cv_warn}")
-        cmd.append(f"--usgs-width-ratio-max={cfg.river_usgs_width_ratio_max}")
-        cmd.append(f"--gage-snap-max-dist-m={cfg.river_gage_snap_max_dist_m}")
-        if cfg.river_usgs_width_ratio_blend:
-            cmd.append("--usgs-width-ratio-blend")
+        # SECURITY FIX: Use list-based command construction
+        cmd = [
+            sys.executable, "xs_builder.py",
+            f"--river-gpkg={network_gpkg}",
+            f"--dem={cfg.river_dem}",
+            f"--out-gpkg={xs_gpkg}",
+            f"--spacing-m={cfg.xs_spacing_m}",
+            f"--half-width-m={cfg.xs_length_m / 2.0}",
+        ]
+
+        rc, out, err = run_command(cmd, cwd=script_dir, prefix="[RIVER] ")
+        cmd_str = " ".join(str(c) for c in cmd)
+        report["river"]["steps"]["xs_builder"] = {
+            "status": "success" if rc == 0 else "failed",
+            "returncode": rc,
+            "command": cmd_str,
+            "stdout_tail": out,
+            "stderr_tail": err,
+        }
+        if rc != 0 or not xs_gpkg.exists():
+            log.error("[RIVER] Failed to build cross-sections.")
+            report["river"]["status"] = "failed"
+            return None
+
+        log.info(f"[RIVER] Cross-sections generated: {xs_gpkg}")
+
+        # Step 3: infer bathymetry (raster + optional GPKG)
+        log.info("[RIVER] Step 3: Inferring bathymetry...")
+        bed_tif = cached_bed_tif
+        bathy_gpkg = work_dir / "river_bathy.gpkg"
+
+        # SECURITY FIX: Use list-based command construction
+        cmd = [
+            sys.executable, "xs_infer_bathy_raster.py",
+            f"--xs-gpkg={xs_gpkg}",
+            f"--template-raster={cfg.river_dem}",
+            f"--out-gpkg={bathy_gpkg}",
+            f"--out-bathy-raster={bed_tif}",
+            f"--continuous={getattr(cfg, 'river_continuous', 'walid_aniso')}",
+            f"--continuous-k={getattr(cfg, 'river_continuous_k', 12)}",
+            f"--idw-power={getattr(cfg, 'river_idw_power', 2.0)}",
+            f"--aniso-along-scale-m={getattr(cfg, 'river_aniso_along_scale_m', 500.0)}",
+            f"--aniso-cross-scale-m={getattr(cfg, 'river_aniso_cross_scale_m', 30.0)}",
+            f"--thalweg-weight={getattr(cfg, 'river_thalweg_weight', 6.0)}",
+            f"--nodata={getattr(cfg, 'river_nodata', -9999.0)}",
+            f"--overlap-reducer={getattr(cfg, 'river_overlap_reducer', 'min')}",
+        ]
+        cmd.append(f"--river-gpkg={network_gpkg}")
+        cmd.append(f"--prior-mode={cfg.river_prior_mode}")
+        cmd.append(f"--mv-a0={cfg.river_mv_a0}")
+        cmd.append(f"--mv-bw={cfg.river_mv_bw}")
+        cmd.append(f"--mv-ba={cfg.river_mv_ba}")
+        cmd.append(f"--mv-bs={cfg.river_mv_bs}")
+        cmd.append(f"--mv-eps-a={cfg.river_mv_eps_a}")
+        cmd.append(f"--mv-eps-s={cfg.river_mv_eps_s}")
+        cmd.append(f"--slope-proxy-window={cfg.river_slope_proxy_window}")
+        cmd.append(f"--slope-min={cfg.river_slope_min}")
+        cmd.append(f"--slope-max={cfg.river_slope_max}")
+        cmd.append(f"--slope-proxy-min-n={cfg.river_slope_proxy_min_n}")
+
+        # Longitudinal WSE profile fit (preferred slope proxy)
+        if bool(getattr(cfg, "river_wse_profile_enabled", True)):
+            cmd.append("--wse-profile-enabled")
         else:
-            cmd.append("--no-usgs-width-ratio-blend")
+            cmd.append("--no-wse-profile")
+        cmd.append(f"--wse-profile-window={getattr(cfg, 'river_wse_profile_window', cfg.river_slope_proxy_window)}")
+        cmd.append(f"--wse-profile-min-n={getattr(cfg, 'river_wse_profile_min_n', cfg.river_slope_proxy_min_n)}")
+        if bool(getattr(cfg, "river_wse_profile_monotonic", True)):
+            cmd.append("--wse-profile-monotonic")
+        else:
+            cmd.append("--no-wse-profile-monotonic")
 
-    # Optional: width-stage inversion anchors
-    if cfg.river_width_stage_csv:
-        cmd.append(f"--width-stage-csv={cfg.river_width_stage_csv}")
-        cmd.append(f"--width-stage-max-dist-m={cfg.river_width_stage_max_dist_m}")
-        cmd.append(f"--width-stage-min-n={cfg.river_width_stage_min_n}")
-        cmd.append(f"--width-stage-min-r2={cfg.river_width_stage_min_r2}")
-        cmd.append(f"--width-stage-max-weight={cfg.river_width_stage_max_weight}")
+        # Option A: USGS discharge *measurement* anchors
+        if cfg.river_usgs_sites:
+            cmd.append(f"--usgs-sites={cfg.river_usgs_sites}")
+            if cfg.river_usgs_start:
+                cmd.append(f"--usgs-start={cfg.river_usgs_start}")
+            if cfg.river_usgs_end:
+                cmd.append(f"--usgs-end={cfg.river_usgs_end}")
+            if cfg.river_usgs_cache_dir:
+                cmd.append(f"--usgs-cache-dir={cfg.river_usgs_cache_dir}")
+            cmd.append(f"--usgs-max-dist-m={cfg.river_usgs_max_dist_m}")
+            cmd.append(f"--usgs-mean-to-dmax={cfg.river_usgs_mean_to_dmax}")
+            cmd.append(f"--usgs-a-stat={cfg.river_usgs_a_stat}")
+            cmd.append(f"--usgs-q-quantile-lo={cfg.river_usgs_q_quantile_lo}")
+            cmd.append(f"--usgs-q-quantile-hi={cfg.river_usgs_q_quantile_hi}")
+            cmd.append(f"--usgs-a-cv-warn={cfg.river_usgs_a_cv_warn}")
+            cmd.append(f"--usgs-width-ratio-max={cfg.river_usgs_width_ratio_max}")
+            cmd.append(f"--gage-snap-max-dist-m={cfg.river_gage_snap_max_dist_m}")
+            if cfg.river_usgs_width_ratio_blend:
+                cmd.append("--usgs-width-ratio-blend")
+            else:
+                cmd.append("--no-usgs-width-ratio-blend")
+
+        # Optional: width-stage inversion anchors
+        if cfg.river_width_stage_csv:
+            cmd.append(f"--width-stage-csv={cfg.river_width_stage_csv}")
+            cmd.append(f"--width-stage-max-dist-m={cfg.river_width_stage_max_dist_m}")
+            cmd.append(f"--width-stage-min-n={cfg.river_width_stage_min_n}")
+            cmd.append(f"--width-stage-min-r2={cfg.river_width_stage_min_r2}")
+            cmd.append(f"--width-stage-max-weight={cfg.river_width_stage_max_weight}")
 
 
-    # Optional: Manning inversion prior (blended)
-    if getattr(cfg, "river_manning_mode", "off") != "off":
-        cmd.append(f"--manning-mode={cfg.river_manning_mode}")
-        if cfg.river_manning_q_cms is not None:
-            cmd.append(f"--manning-q-cms={cfg.river_manning_q_cms}")
-        if cfg.river_manning_q_field:
-            cmd.append(f"--manning-q-field={cfg.river_manning_q_field}")
-        cmd.append(f"--manning-n={cfg.river_manning_n}")
-        cmd.append(f"--manning-region={getattr(cfg, 'river_manning_region', 'default')}")
-        cmd.append(f"--manning-min-confidence={getattr(cfg, 'river_manning_min_confidence', 0.30)}")
-        cmd.append(f"--manning-max-weight={cfg.river_manning_max_weight}")
-        cmd.append(f"--manning-backwater-slope-thresh={cfg.river_manning_backwater_slope_thresh}")
-        if cfg.river_manning_dist_to_mouth_field:
-            cmd.append(f"--manning-dist-to-mouth-field={cfg.river_manning_dist_to_mouth_field}")
-        cmd.append(f"--manning-dist-to-mouth-km-max={cfg.river_manning_dist_to_mouth_km_max}")
+        # Optional: Manning inversion prior (blended)
+        if getattr(cfg, "river_manning_mode", "off") != "off":
+            cmd.append(f"--manning-mode={cfg.river_manning_mode}")
+            if cfg.river_manning_q_cms is not None:
+                cmd.append(f"--manning-q-cms={cfg.river_manning_q_cms}")
+            if cfg.river_manning_q_field:
+                cmd.append(f"--manning-q-field={cfg.river_manning_q_field}")
+            cmd.append(f"--manning-n={cfg.river_manning_n}")
+            cmd.append(f"--manning-region={getattr(cfg, 'river_manning_region', 'default')}")
+            cmd.append(f"--manning-min-confidence={getattr(cfg, 'river_manning_min_confidence', 0.30)}")
+            cmd.append(f"--manning-max-weight={cfg.river_manning_max_weight}")
+            cmd.append(f"--manning-backwater-slope-thresh={cfg.river_manning_backwater_slope_thresh}")
+            if cfg.river_manning_dist_to_mouth_field:
+                cmd.append(f"--manning-dist-to-mouth-field={cfg.river_manning_dist_to_mouth_field}")
+            cmd.append(f"--manning-dist-to-mouth-km-max={cfg.river_manning_dist_to_mouth_km_max}")
 
 
 
-    # Optional: Regional hydraulic geometry curve prior
-    if getattr(cfg, "river_regional_curve_enabled", False):
-        cmd.append("--regional-curve-enabled")
-        cmd.append(f"--regional-curve-region={cfg.river_regional_curve_region}")
-        if cfg.river_regional_curve_c is not None:
-            cmd.append(f"--regional-curve-c={cfg.river_regional_curve_c}")
-        if cfg.river_regional_curve_f is not None:
-            cmd.append(f"--regional-curve-f={cfg.river_regional_curve_f}")
-        cmd.append(f"--regional-curve-da-units={cfg.river_regional_curve_da_units}")
-        cmd.append(f"--regional-curve-depth-units={cfg.river_regional_curve_depth_units}")
-        cmd.append(f"--regional-curve-depth-type={cfg.river_regional_curve_depth_type}")
-        cmd.append(f"--regional-curve-to-dmax={cfg.river_regional_curve_to_dmax}")
-        cmd.append(f"--regional-curve-to-dmax-factor={cfg.river_regional_curve_to_dmax_factor}")
-        cmd.append(f"--regional-curve-unc-pct={cfg.river_regional_curve_unc_pct}")
-        cmd.append(f"--regional-curve-max-weight={cfg.river_regional_curve_max_weight}")
-        cmd.append(f"--regional-curve-min-da-km2={cfg.river_regional_curve_min_da_km2}")
-    if getattr(cfg, "river_continuous_buffer_m", None) is not None:
-        cmd.append(f"--continuous-buffer-m={cfg.river_continuous_buffer_m}")
+        # Optional: Regional hydraulic geometry curve prior
+        if getattr(cfg, "river_regional_curve_enabled", False):
+            cmd.append("--regional-curve-enabled")
+            cmd.append(f"--regional-curve-region={cfg.river_regional_curve_region}")
+            if cfg.river_regional_curve_c is not None:
+                cmd.append(f"--regional-curve-c={cfg.river_regional_curve_c}")
+            if cfg.river_regional_curve_f is not None:
+                cmd.append(f"--regional-curve-f={cfg.river_regional_curve_f}")
+            cmd.append(f"--regional-curve-da-units={cfg.river_regional_curve_da_units}")
+            cmd.append(f"--regional-curve-depth-units={cfg.river_regional_curve_depth_units}")
+            cmd.append(f"--regional-curve-depth-type={cfg.river_regional_curve_depth_type}")
+            cmd.append(f"--regional-curve-to-dmax={cfg.river_regional_curve_to_dmax}")
+            cmd.append(f"--regional-curve-to-dmax-factor={cfg.river_regional_curve_to_dmax_factor}")
+            cmd.append(f"--regional-curve-unc-pct={cfg.river_regional_curve_unc_pct}")
+            cmd.append(f"--regional-curve-max-weight={cfg.river_regional_curve_max_weight}")
+            cmd.append(f"--regional-curve-min-da-km2={cfg.river_regional_curve_min_da_km2}")
+        if getattr(cfg, "river_continuous_buffer_m", None) is not None:
+            cmd.append(f"--continuous-buffer-m={cfg.river_continuous_buffer_m}")
 
-    if cfg.river_soundings is not None:
-        cmd.append(f"--soundings={cfg.river_soundings}")
+        if cfg.river_soundings is not None:
+            cmd.append(f"--soundings={cfg.river_soundings}")
 
-    rc, out, err = run_command(cmd, cwd=script_dir, prefix="[RIVER] ")
-    cmd_str = " ".join(str(c) for c in cmd)
-    report["river"]["steps"]["infer_raster"] = {
-        "status": "success" if rc == 0 else "failed",
-        "returncode": rc,
-        "command": cmd_str,
-        "stdout_tail": out,
-        "stderr_tail": err,
-    }
-    if rc != 0 or not bed_tif.exists():
-        # Include useful diagnostics inline (command + stderr/stdout tail), so users don't have to open the JSON report.
-        log.error("[RIVER] Failed to infer river bed patch raster (rc=%s, exists=%s).", rc, bed_tif.exists())
-        log.error("[RIVER] Command: %s", cmd_str)
-        if err:
-            log.error("[RIVER] stderr_tail:\n%s", err[-4000:])
-        if out:
-            log.error("[RIVER] stdout_tail:\n%s", out[-4000:])
-        report["river"]["status"] = "failed"
-        return None
+        rc, out, err = run_command(cmd, cwd=script_dir, prefix="[RIVER] ")
+        cmd_str = " ".join(str(c) for c in cmd)
+        report["river"]["steps"]["infer_raster"] = {
+            "status": "success" if rc == 0 else "failed",
+            "returncode": rc,
+            "command": cmd_str,
+            "stdout_tail": out,
+            "stderr_tail": err,
+        }
+        if rc != 0 or not bed_tif.exists():
+            # Include useful diagnostics inline (command + stderr/stdout tail), so users don't have to open the JSON report.
+            log.error("[RIVER] Failed to infer river bed patch raster (rc=%s, exists=%s).", rc, bed_tif.exists())
+            log.error("[RIVER] Command: %s", cmd_str)
+            if err:
+                log.error("[RIVER] stderr_tail:\n%s", err[-4000:])
+            if out:
+                log.error("[RIVER] stdout_tail:\n%s", out[-4000:])
+            report["river"]["status"] = "failed"
+            return None
 
+        
     report["river"]["status"] = "success"
     log.info(f"[RIVER] Success: {bed_tif}")
     # Materialize into run output folder for convenience
@@ -2300,8 +2461,45 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-tnm", action="store_true", help="Disable TNM download (if using local flowlines)")
     p.add_argument("--tnm-dataset", default="NHDPlusHR")
     p.add_argument("--snap-m", type=float, default=30.0)
+
+
+    # River bathymetry method selection
+    p.add_argument("--river-method", choices=["skeleton", "xs"], default="skeleton",
+               help=("River bathy method. 'skeleton' uses a raster distance-transform channel skeleton "
+                     "(recommended for meanders/tidal channels). 'xs' uses legacy cross-sections."))
+
+    # Skeleton (distance-transform) parameters: domain mask (river vs ocean) + channel profile
+    p.add_argument("--river-channel-buffer-m", type=float, default=400.0,
+               help="Buffer around NHD flowlines used to define candidate river corridor (meters).")
+    p.add_argument("--river-max-channel-width-m", type=float, default=600.0,
+               help="Maximum channel width allowed inside the corridor (meters). Prevents filling open bays/ocean.")
+    p.add_argument("--river-mainstem-min-order", type=int, default=5,
+               help="Stream order threshold for allowing larger widths (if stream order attribute exists).")
+    p.add_argument("--river-max-mainstem-width-m", type=float, default=2500.0,
+               help="Maximum channel width allowed for mainstem corridor pixels (meters).")
+    p.add_argument("--river-shape-exp", type=float, default=0.5,
+               help="Depth profile exponent for skeleton method (0.5 ~ U-shape; 1.0 ~ V-shape).")
+    p.add_argument("--river-dmax-min-m", type=float, default=0.5, help="Clamp minimum Dmax prior (meters).")
+    p.add_argument("--river-dmax-max-m", type=float, default=30.0, help="Clamp maximum Dmax prior (meters).")
+    p.add_argument("--river-save-skeleton-debug", action="store_true", default=False,
+               help="Write skeleton debug rasters (r, d_bank, d_center, dmax, wse).")
+    p.add_argument("--river-soundings-mode", choices=["auto","depth_pos","depth_neg","bed_elev"], default="auto",
+                   help="How to interpret extra XYZ Z values for river skeleton: auto/depth_pos/depth_neg (depths) or bed_elev (bed elevations, same vertical datum as DEM).")
+    p.add_argument("--river-soundings-max-dist-m", type=float, default=1500.0,
+                   help="Max distance (m) for extra XYZ to influence the skeleton Dmax prior.")
+    p.add_argument("--river-soundings-min-r", type=float, default=0.25,
+                   help="Minimum r used when converting sounding depth -> implied Dmax (stabilizes near banks).")
+    p.add_argument("--no-river-soundings-enforce", dest="river_soundings_enforce", action="store_false", default=True,
+                   help="Disable enforcing observed sounding depths at their grid cells (default enforces).")
     p.add_argument("--xs-spacing-m", type=float, default=200.0)
     p.add_argument("--xs-length-m", type=float, default=1000.0)
+
+    p.add_argument("--river-thalweg-only", action="store_true",
+                   help="Use a thalweg-only control spine (1 control point per cross-section) for river interpolation; also builds corridor from buffered thalweg spine to avoid cross-channel ribbing.")
+    p.add_argument("--river-thalweg-densify-factor", type=float, default=0.5,
+                   help="Densify thalweg spine vertices to this fraction of the river template raster pixel size (default 0.5 => >=2 vertices per pixel).")
+    p.add_argument("--river-thalweg-densify-step-m", type=float, default=None,
+                   help="Explicit thalweg spine densify step in meters. Overrides --river-thalweg-densify-factor if provided.")
 
     # River patch rasterization / interpolation options (forwarded to xs_infer_bathy_raster.py)
     p.add_argument("--river-continuous", choices=["median", "walid", "aidw", "aniso", "walid_aniso"], default="walid_aniso",
@@ -2593,6 +2791,21 @@ def main() -> int:
         tnm_dataset=args.tnm_dataset,
         snap_m=args.snap_m,
 
+
+        river_method=args.river_method,
+        river_channel_buffer_m=args.river_channel_buffer_m,
+        river_max_channel_width_m=args.river_max_channel_width_m,
+        river_mainstem_min_order=args.river_mainstem_min_order,
+        river_max_mainstem_width_m=args.river_max_mainstem_width_m,
+        river_shape_exp=args.river_shape_exp,
+        river_dmax_min_m=args.river_dmax_min_m,
+        river_dmax_max_m=args.river_dmax_max_m,
+        river_save_skeleton_debug=bool(args.river_save_skeleton_debug),
+        river_soundings_mode=args.river_soundings_mode,
+        river_soundings_max_dist_m=args.river_soundings_max_dist_m,
+        river_soundings_min_r=args.river_soundings_min_r,
+        river_soundings_enforce=bool(getattr(args, 'river_soundings_enforce', True)),
+
         xs_spacing_m=args.xs_spacing_m,
         xs_length_m=args.xs_length_m,
         river_continuous=args.river_continuous,
@@ -2602,6 +2815,9 @@ def main() -> int:
         river_aniso_along_scale_m=args.river_aniso_along_scale_m,
         river_aniso_cross_scale_m=args.river_aniso_cross_scale_m,
         river_thalweg_weight=args.river_thalweg_weight,
+        river_thalweg_only=bool(getattr(args,'river_thalweg_only', False)),
+        river_thalweg_densify_factor=float(getattr(args,'river_thalweg_densify_factor', 0.5)),
+        river_thalweg_densify_step_m=(None if getattr(args,'river_thalweg_densify_step_m', None) is None else float(getattr(args,'river_thalweg_densify_step_m'))),
         river_overlap_reducer=args.river_overlap_reducer,
         river_nodata=args.river_nodata,
         fusion_strategy=args.fusion_strategy,
