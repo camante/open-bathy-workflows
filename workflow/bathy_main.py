@@ -216,6 +216,10 @@ class BathyConfig:
     river_soundings_max_dist_m: float = 1500.0    # max distance for soundings to influence skeleton prior
     river_soundings_min_r: float = 0.25           # min r when inverting depth->Dmax
     river_soundings_enforce: bool = True          # enforce observed depths at sounding pixels
+    # Optional authoritative bed elevation raster blending (NAVD88, etc.)
+    river_authoritative_bed: Optional[Path] = None
+    river_authoritative_bed_max_dist_m: float = 2000.0   # max distance for authoritative residual influence (m)
+    river_residual_blend_sigma_m: float = 120.0          # Gaussian sigma for residual blending (m); 0 disables
     # River bathymetry method:
     # - "skeleton": raster distance-transform "channel skeleton" method (no cross-sections). Recommended for sinuous/tidal channels.
     # - "xs": legacy vector cross-section method (xs_builder.py + xs_infer_bathy_raster.py)
@@ -1640,6 +1644,7 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
         ]
         if wm and Path(wm).exists():
             cmd.append(f"--water-mask={wm}")
+
         if getattr(cfg, "river_save_skeleton_debug", False):
             cmd.append("--write-debug")
 
@@ -1681,6 +1686,8 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
             f"--mv-bs={cfg.river_mv_bs}",
             f"--mv-eps-a={cfg.river_mv_eps_a}",
             f"--mv-eps-s={cfg.river_mv_eps_s}",
+            f"--residual-blend-sigma-m={float(getattr(cfg, 'river_residual_blend_sigma_m', 120.0))}",
+            f"--authoritative-bed-max-dist-m={float(getattr(cfg, 'river_authoritative_bed_max_dist_m', 2000.0))}",
         ]
         if getattr(cfg, "river_save_skeleton_debug", False):
             cmd.append(f"--debug-dir={work_dir / 'skeleton_debug'}")
@@ -2485,12 +2492,18 @@ def parse_args() -> argparse.Namespace:
                help="Write skeleton debug rasters (r, d_bank, d_center, dmax, wse).")
     p.add_argument("--river-soundings-mode", choices=["auto","depth_pos","depth_neg","bed_elev"], default="auto",
                    help="How to interpret extra XYZ Z values for river skeleton: auto/depth_pos/depth_neg (depths) or bed_elev (bed elevations, same vertical datum as DEM).")
-    p.add_argument("--river-soundings-max-dist-m", type=float, default=1500.0,
+    p.add_argument("--river-soundings-max-dist-m", type=float, default=10000.0,
                    help="Max distance (m) for extra XYZ to influence the skeleton Dmax prior.")
     p.add_argument("--river-soundings-min-r", type=float, default=0.25,
                    help="Minimum r used when converting sounding depth -> implied Dmax (stabilizes near banks).")
     p.add_argument("--no-river-soundings-enforce", dest="river_soundings_enforce", action="store_false", default=True,
-                   help="Disable enforcing observed sounding depths at their grid cells (default enforces).")
+               help="Disable enforcing observed soundings at their grid cells (default enforces).")
+    p.add_argument("--river-authoritative-bed", default=None,
+                   help="Optional authoritative river bed elevation raster to blend/enforce inside the river mask (same vertical datum as DEM).")
+    p.add_argument("--river-authoritative-bed-max-dist-m", type=float, default=2000.0,
+                   help="Max distance (m) from authoritative bed pixels to influence residual blending.")
+    p.add_argument("--river-residual-blend-sigma-m", type=float, default=600.0,
+                   help="Gaussian sigma (m) for residual blending smoothing. 0 disables smoothing (nearest-only).")
     p.add_argument("--xs-spacing-m", type=float, default=200.0)
     p.add_argument("--xs-length-m", type=float, default=1000.0)
 

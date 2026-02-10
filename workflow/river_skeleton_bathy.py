@@ -39,7 +39,7 @@ from rasterio.features import rasterize
 from rasterio.warp import reproject, Resampling
 from rasterio.transform import rowcol
 from pyproj import CRS, Transformer
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import distance_transform_edt, gaussian_filter
 
 LOG = logging.getLogger("river_skeleton_bathy")
 
@@ -192,6 +192,7 @@ def _coerce_depth(z, mode: str):
     return d
 
 
+
 def _soundings_to_grids(
     sounding_files,
     soundings_crs: str | None,
@@ -206,16 +207,27 @@ def _soundings_to_grids(
     min_r: float,
     wse_map: np.ndarray | None = None,
 ):
-    """Return (depth_obs_grid, dmax_implied_grid, bed_obs_grid) on the template grid (nan where none).
+    """Rasterize external soundings onto the template grid.
 
-    - depth_obs_grid: positive-down depths (m), when derivable.
-    - dmax_implied_grid: implied Dmax at sounding cells based on r-position.
-    - bed_obs_grid: bed elevations (m), only populated when mode == 'bed_elev'.
+    Returns three grids (float32, NaN where empty):
+      - depth_obs_grid (positive-down, meters) when derivable
+      - dmax_implied_grid (meters) inferred from depth and r-position
+      - bed_obs_grid (meters, same vertical datum as DEM) when mode == 'bed_elev'
+
+    Notes:
+      * Only soundings that fall inside the channel mask are used.
+      * For bed elevations: we keep the **minimum** elevation per cell (deeper bed).
+      * For depths: we keep the **maximum** depth per cell (deeper).
+      * dmax inference uses: Dmax = depth / max(r, min_r)^shape_exp, then clamps.
     """
     depth_grid = np.full(channel.shape, np.nan, dtype="float32")
     dmax_grid = np.full(channel.shape, np.nan, dtype="float32")
     bed_grid = np.full(channel.shape, np.nan, dtype="float32")
 
+    if not sounding_files:
+        return depth_grid, dmax_grid, bed_grid
+
+    # Optional CRS transform into template CRS
     xform = None
     if soundings_crs:
         src = CRS.from_user_input(soundings_crs)
@@ -259,6 +271,7 @@ def _soundings_to_grids(
     rr, cc = rowcol(transform, x, y)
     rr = np.asarray(rr, dtype="int64")
     cc = np.asarray(cc, dtype="int64")
+
     inb = (rr >= 0) & (rr < channel.shape[0]) & (cc >= 0) & (cc < channel.shape[1])
     rr, cc, z = rr[inb], cc[inb], z[inb]
     if rr.size == 0:
@@ -271,29 +284,27 @@ def _soundings_to_grids(
 
     mode_l = (mode or "auto").strip().lower()
 
+    # --- Bed elevation mode (NAVD88 bed elevations, etc.) ---
     if mode_l == "bed_elev":
-        # Treat Z as bed elevation in the same vertical datum as DEM/WSE (e.g., NAVD88).
         bed = pd.to_numeric(pd.Series(z), errors="coerce").to_numpy(dtype="float64")
-        m3 = np.isfinite(bed)
-        rr2, cc2, bed = rr[m3], cc[m3], bed[m3]
+        ok = np.isfinite(bed)
+        rr2, cc2, bed = rr[ok], cc[ok], bed[ok]
         if rr2.size == 0:
             return depth_grid, dmax_grid, bed_grid
 
-        # For elevations: "deeper" = lower elevation. Keep the minimum bed elevation per cell.
+        # Minimum elevation per cell = deeper bed
         for r0, c0, bv in zip(rr2, cc2, bed):
             cur = bed_grid[r0, c0]
             if (not np.isfinite(cur)) or (bv < cur):
                 bed_grid[r0, c0] = float(bv)
 
-        # If we have a WSE map, derive observed depths and implied Dmax.
+        # If we have a WSE proxy, infer depth + implied Dmax from bed elevations
         if wse_map is not None:
             wse = wse_map[rr2, cc2].astype("float64")
             d = (wse - bed).astype("float64")
-            # Keep only physically plausible depths
-            ok = np.isfinite(d) & (d >= 0.0)
-            rr3, cc3, d = rr2[ok], cc2[ok], d[ok]
+            ok2 = np.isfinite(d) & (d >= 0.0)
+            rr3, cc3, d = rr2[ok2], cc2[ok2], d[ok2]
             if rr3.size > 0:
-                # Depth obs grid (keep deepest per cell)
                 for r0, c0, dv in zip(rr3, cc3, d):
                     cur = depth_grid[r0, c0]
                     if (not np.isfinite(cur)) or (dv > cur):
@@ -314,46 +325,38 @@ def _soundings_to_grids(
 
         return depth_grid, dmax_grid, bed_grid
 
-    # Otherwise, treat as depths (with sign handling).
-    d = _coerce_depth(z, mode=mode_l)
-    if d.size == 0:
-        return depth_grid, dmax_grid, bed_grid
-
-    # align lengths with finite depths
-    # NOTE: _coerce_depth already drops NaNs but we keep the original rr/cc alignment by re-coercing
-    d2 = pd.to_numeric(pd.Series(z), errors="coerce").to_numpy(dtype="float64")
-    # We'll recompute depth again with the same mode to preserve elementwise alignment:
-    d_aligned = _coerce_depth(d2, mode=mode_l)
-    # The alignment step above isn't safe; instead, re-run with elementwise coercion:
-    # We'll fall back to simple behavior: treat z numeric and apply mode transform elementwise.
+    # --- Depth mode (auto/depth_pos/depth_neg) ---
     z_num = pd.to_numeric(pd.Series(z), errors="coerce").to_numpy(dtype="float64")
-    frac_neg = float((z_num < 0.0).mean()) if np.isfinite(z_num).any() else 0.0
-    if mode_l == "depth_pos":
-        d_elem = z_num
-    elif mode_l == "depth_neg":
-        d_elem = -z_num
-    else:
-        d_elem = (-z_num) if frac_neg >= 0.7 else z_num
-    d_elem = np.abs(d_elem)
-    ok = np.isfinite(d_elem)
-    rr2, cc2, d_elem = rr[ok], cc[ok], d_elem[ok]
+    ok = np.isfinite(z_num)
+    rr2, cc2, z_num = rr[ok], cc[ok], z_num[ok]
     if rr2.size == 0:
         return depth_grid, dmax_grid, bed_grid
 
-    # Depth obs grid (keep deepest per cell)
-    for r0, c0, dv in zip(rr2, cc2, d_elem):
+    if mode_l == "depth_pos":
+        d = z_num
+    elif mode_l == "depth_neg":
+        d = -z_num
+    else:
+        frac_neg = float((z_num < 0.0).mean())
+        d = (-z_num) if frac_neg >= 0.7 else z_num
+    d = np.abs(d).astype("float64")
+    ok2 = np.isfinite(d)
+    rr3, cc3, d = rr2[ok2], cc2[ok2], d[ok2]
+    if rr3.size == 0:
+        return depth_grid, dmax_grid, bed_grid
+
+    for r0, c0, dv in zip(rr3, cc3, d):
         cur = depth_grid[r0, c0]
         if (not np.isfinite(cur)) or (dv > cur):
             depth_grid[r0, c0] = float(dv)
 
-    # Implied Dmax via r-position
-    rvals = r[rr2, cc2].astype("float64")
+    rvals = r[rr3, cc3].astype("float64")
     ruse = np.maximum(rvals, float(min_r))
     denom = np.power(ruse, float(shape_exp)) + 1e-6
-    dmax_imp = (d_elem / denom).astype("float64")
+    dmax_imp = (d / denom).astype("float64")
     dmax_imp = np.clip(dmax_imp, float(dmax_min_m), float(dmax_max_m))
 
-    for r0, c0, dv in zip(rr2, cc2, dmax_imp):
+    for r0, c0, dv in zip(rr3, cc3, dmax_imp):
         cur = dmax_grid[r0, c0]
         if (not np.isfinite(cur)) or (dv > cur):
             dmax_grid[r0, c0] = float(dv)
@@ -361,13 +364,115 @@ def _soundings_to_grids(
     return depth_grid, dmax_grid, bed_grid
 
 
-def main() -> int:
+def _build_residual_adjustment(
+    resid_src: np.ndarray,
+    src_valid_mask: np.ndarray,
+    channel_mask: np.ndarray,
+    max_dist_m: float,
+    blend_sigma_m: float,
+    pixel_size: float,
+) -> np.ndarray:
+    """Build a smooth residual adjustment field from sparse anchors.
+
+    Steps:
+      1) Nearest-neighbor propagate residuals within the channel using EDT indices.
+      2) Apply a distance-decay weight that tapers residuals to 0 at max_dist_m.
+      3) Optionally apply Gaussian normalized-convolution smoothing (num/den) to reduce seams.
+    """
+    if (max_dist_m is None) or (max_dist_m <= 0) or (src_valid_mask is None) or (not np.any(src_valid_mask)):
+        return np.zeros_like(resid_src, dtype="float32")
+
+    inv = np.ones(resid_src.shape, dtype=np.uint8)
+    inv[src_valid_mask] = 0
+    dist, inds = distance_transform_edt(inv, return_indices=True)
+    dist_m = dist.astype("float32") * float(pixel_size)
+
+    ny, nx = inds[0], inds[1]
+    resid_nn = resid_src[ny, nx].astype("float32")
+
+    valid = np.isfinite(resid_nn) & channel_mask & (dist_m <= float(max_dist_m))
+    w = np.clip(1.0 - (dist_m / (float(max_dist_m) + 1e-6)), 0.0, 1.0).astype("float32")
+    w = np.where(valid, w, 0.0).astype("float32")
+    resid_nn = np.where(np.isfinite(resid_nn), resid_nn, 0.0).astype("float32")
+
+    adj = (resid_nn * w).astype("float32")
+
+    if (blend_sigma_m is not None) and (blend_sigma_m > 0):
+        sigma_px = float(blend_sigma_m) / max(float(pixel_size), 1e-9)
+        if sigma_px > 0.01:
+            num = gaussian_filter(adj, sigma=sigma_px, mode="nearest")
+            den = gaussian_filter(w, sigma=sigma_px, mode="nearest")
+            adj = np.where(den > 1e-6, (num / den), 0.0).astype("float32")
+
+    return np.where(channel_mask & (dist_m <= float(max_dist_m)), adj, 0.0).astype("float32")
+
+
+def _build_value_field_from_anchors(
+    val_src: np.ndarray,
+    src_valid_mask: np.ndarray,
+    channel_mask: np.ndarray,
+    max_dist_m: float,
+    blend_sigma_m: float,
+    pixel_size: float,
+) -> np.ndarray:
+    """Build a smooth value field from sparse anchors inside the channel.
+
+    This is like _build_residual_adjustment, but returns a *value* surface rather than an additive adjustment.
+    It uses:
+      1) nearest-neighbor propagation (EDT indices) within the channel,
+      2) distance-decay taper to 0 weight at max_dist_m,
+      3) optional normalized-convolution Gaussian smoothing (num/den) to reduce seams.
+
+    Returns:
+      float32 array with NaN outside the influenced channel region.
+    """
+    if (max_dist_m is None) or (max_dist_m <= 0) or (src_valid_mask is None) or (not np.any(src_valid_mask)):
+        return np.full_like(val_src, np.nan, dtype="float32")
+
+    inv = np.ones(val_src.shape, dtype=np.uint8)
+    inv[src_valid_mask] = 0
+    dist, inds = distance_transform_edt(inv, return_indices=True)
+    dist_m = dist.astype("float32") * float(pixel_size)
+
+    ny, nx = inds[0], inds[1]
+    v_nn = val_src[ny, nx].astype("float32")
+
+    valid = np.isfinite(v_nn) & channel_mask & (dist_m <= float(max_dist_m))
+    w = np.clip(1.0 - (dist_m / (float(max_dist_m) + 1e-6)), 0.0, 1.0).astype("float32")
+    w = np.where(valid, w, 0.0).astype("float32")
+
+    v0 = np.where(np.isfinite(v_nn), v_nn, 0.0).astype("float32")
+
+    if (blend_sigma_m is not None) and (blend_sigma_m > 0):
+        sigma_px = float(blend_sigma_m) / max(float(pixel_size), 1e-9)
+        if sigma_px > 0.01:
+            num = gaussian_filter(v0 * w, sigma=sigma_px, mode="nearest")
+            den = gaussian_filter(w, sigma=sigma_px, mode="nearest")
+            out = np.where(den > 1e-6, (num / den), np.nan).astype("float32")
+        else:
+            out = np.where(w > 0, v_nn.astype("float32"), np.nan).astype("float32")
+    else:
+        out = np.where(w > 0, v_nn.astype("float32"), np.nan).astype("float32")
+
+    out = np.where(channel_mask & (dist_m <= float(max_dist_m)), out, np.nan).astype("float32")
+    return out
+
+
+
+def main(
+) -> int:
     p = argparse.ArgumentParser(description="Generate river bed elevations using a channel-skeleton distance-transform method.")
     p.add_argument("--river-gpkg", required=True, help="river_network.gpkg from river_network.py")
     p.add_argument("--rivers-layer", default="rivers_clip", help="Layer name inside gpkg (default rivers_clip)")
     p.add_argument("--template-raster", required=True, help="Template raster defining output grid (usually river_dem.tif)")
     p.add_argument("--dem", required=True, help="DEM raster (same vertical datum as desired bed elevations)")
     p.add_argument("--channel-mask", required=True, help="River channel mask raster (1=river channel pixels)")
+    p.add_argument("--authoritative-bed-raster", default=None,
+                   help="Optional authoritative bed elevation raster to blend/enforce inside the river mask (same grid/vertical datum as DEM).")
+    p.add_argument("--authoritative-bed-max-dist-m", type=float, default=2000.0,
+                   help="Max distance (m) from authoritative bed pixels to influence residual blending.")
+    p.add_argument("--residual-blend-sigma-m", type=float, default=600.0,
+                   help="Gaussian sigma (m) for residual blending smoothing. 0 disables smoothing (nearest-only).")
     p.add_argument("--out-bed", required=True, help="Output bed elevation raster (GeoTIFF)")
     p.add_argument("--shape-exp", type=float, default=0.5, help="Depth profile exponent (0.5 ~ U-shaped; 1.0 ~ V-shaped)")
     p.add_argument("--dmax-min-m", type=float, default=0.5, help="Clamp minimum Dmax prior (m)")
@@ -390,7 +495,7 @@ def main() -> int:
                    help="CRS of soundings (e.g., EPSG:4326). If omitted, assumes soundings already match the template CRS.")
     p.add_argument("--soundings-mode", choices=["auto","depth_pos","depth_neg","bed_elev"], default="auto",
                    help="Interpret soundings Z as depth (auto/depth_pos/depth_neg) or as bed elevation (bed_elev, same vertical datum as DEM).")
-    p.add_argument("--soundings-max-dist-m", type=float, default=1500.0,
+    p.add_argument("--soundings-max-dist-m", type=float, default=10000.0,
                    help="Max distance (m) from a sounding to influence skeleton Dmax (nearest-sounding within this distance).")
     p.add_argument("--soundings-min-r", type=float, default=0.25,
                    help="Minimum r used when converting sounding depth -> implied Dmax (prevents blow-ups near banks).")
@@ -414,6 +519,18 @@ def main() -> int:
     valid_dem = np.isfinite(dem)
     if dem_nodata is not None:
         valid_dem &= (dem != float(dem_nodata))
+
+    authoritative_bed = None
+    authoritative_bed_nodata = None
+    if args.authoritative_bed_raster:
+        try:
+            authoritative_bed, authoritative_bed_nodata = _warp_to_template(Path(args.authoritative_bed_raster), template_profile, dtype="float32")
+            authoritative_bed = authoritative_bed.astype("float32")
+            if authoritative_bed_nodata is not None:
+                authoritative_bed = np.where(authoritative_bed == float(authoritative_bed_nodata), np.nan, authoritative_bed).astype("float32")
+            LOG.info("Loaded authoritative bed raster: %s", args.authoritative_bed_raster)
+        except Exception as e:
+            LOG.warning("Failed loading authoritative bed raster (%s): %s", args.authoritative_bed_raster, e)
 
     # Load rivers
     rivers = gpd.read_file(args.river_gpkg, layer=args.rivers_layer)
@@ -521,6 +638,7 @@ def main() -> int:
     snd_dmax_grid = None
     snd_bed_grid = None
     snd_dist = None
+    snd_dmax_field = None
     if args.soundings:
         try:
             snd_depth_grid, snd_dmax_grid, snd_bed_grid = _soundings_to_grids(
@@ -538,24 +656,29 @@ def main() -> int:
                 wse_map=wse_map,
             )
             snd_mask = np.isfinite(snd_dmax_grid)
+            snd_dmax_field = None
             if np.any(snd_mask):
-                inv_snd = np.ones(shape, dtype=np.uint8)
-                inv_snd[snd_mask] = 0
-                dist_snd, inds_snd = distance_transform_edt(inv_snd, sampling=pix, return_indices=True)
-                snd_dist = dist_snd.astype("float32")
-                ny_s, nx_s = inds_snd[0], inds_snd[1]
-                snd_dmax_map = snd_dmax_grid[ny_s, nx_s].astype("float32")
+                # Build a *continuous* Dmax field inside the channel from sparse sounding-derived anchors.
+                # This helps remove "seams" where gaps between authoritative clusters were previously reverting to the width prior.
+                snd_dmax_field = _build_value_field_from_anchors(
+                    val_src=snd_dmax_grid.astype("float32"),
+                    src_valid_mask=snd_mask,
+                    channel_mask=channel,
+                    max_dist_m=float(args.soundings_max_dist_m),
+                    blend_sigma_m=float(args.residual_blend_sigma_m),
+                    pixel_size=float(pix),
+                )
 
-                use = skeleton & (snd_dist <= float(args.soundings_max_dist_m)) & np.isfinite(snd_dmax_map)
+                use = skeleton & np.isfinite(snd_dmax_field)
                 n_use = int(np.count_nonzero(use))
                 if n_use > 0:
-                    dmax_skel = np.where(use, np.maximum(dmax_skel, snd_dmax_map), dmax_skel).astype("float32")
+                    dmax_skel = np.where(use, np.maximum(dmax_skel, snd_dmax_field), dmax_skel).astype("float32")
                     LOG.info(
-                        "Soundings: updated Dmax prior on %d skeleton pixels (max_dist=%.1fm, mode=%s).",
-                        n_use, float(args.soundings_max_dist_m), str(args.soundings_mode)
+                        "Soundings: updated Dmax prior on %d skeleton pixels (max_dist=%.1fm, sigma=%.1fm, mode=%s).",
+                        n_use, float(args.soundings_max_dist_m), float(args.residual_blend_sigma_m), str(args.soundings_mode)
                     )
                 else:
-                    LOG.info("Soundings: none within max_dist of skeleton; Dmax prior unchanged.")
+                    LOG.info("Soundings: Dmax anchors did not influence any skeleton pixels; Dmax prior unchanged.")
             else:
                 LOG.info("Soundings provided but no valid points fell inside the channel mask.")
         except Exception as e:
@@ -563,6 +686,15 @@ def main() -> int:
 
     # Propagate Dmax from skeleton to the full channel domain
     dmax_map = dmax_skel[ny, nx].astype("float32")
+
+    # If we built a continuous sounding-informed Dmax field, merge it into the channel Dmax.
+    # This prevents reverting to the (often too-shallow) width prior in data-sparse gaps between authoritative clusters.
+    if snd_dmax_field is not None:
+        n_infl = int(np.count_nonzero(channel & np.isfinite(snd_dmax_field)))
+        if n_infl > 0:
+            dmax_map = np.where(np.isfinite(snd_dmax_field), np.maximum(dmax_map, snd_dmax_field), dmax_map).astype("float32")
+            LOG.info("Soundings: merged continuous Dmax field into channel (influenced_pixels=%d).", n_infl)
+
 
     # Depth field (m, positive downward)
     depth = (dmax_map * np.power(r, float(args.shape_exp))).astype("float32")
@@ -584,40 +716,40 @@ def main() -> int:
     bed = (wse_map - depth).astype("float32")
     bed = np.where(channel, bed, np.nan).astype("float32")
 
+    # Optional: anchor/blend using authoritative bed raster
+    if authoritative_bed is not None:
+        m_auth = np.isfinite(authoritative_bed) & channel
+        n_auth = int(np.count_nonzero(m_auth))
+        if n_auth > 0:
+            resid_auth = (authoritative_bed - bed).astype("float32")
+            adj_auth = _build_residual_adjustment(resid_auth, m_auth, channel, float(args.authoritative_bed_max_dist_m), float(args.residual_blend_sigma_m), float(pix))
+            bed = (bed + adj_auth).astype("float32")
+            # enforce exact authoritative values where present
+            bed[m_auth] = authoritative_bed[m_auth].astype("float32")
+            depth = (wse_map - bed).astype("float32")
+            LOG.info("Authoritative bed: anchored %d cells; blended to %.1fm (sigma=%.1fm).", n_auth, float(args.authoritative_bed_max_dist_m), float(args.residual_blend_sigma_m))
+        else:
+            LOG.info("Authoritative bed raster provided but has no finite data within channel mask.")
+
     # Optional: incorporate bed-elevation soundings (mode=bed_elev).
     # We correct the *bed elevation* surface directly (in DEM's vertical datum), then recompute depth.
+    # Optional: incorporate bed-elevation soundings (mode=bed_elev).
+    # We correct the *bed elevation* surface directly, then recompute depth.
     if (snd_bed_grid is not None) and (str(getattr(args, "soundings_mode", "auto")).strip().lower() == "bed_elev"):
         m_bed = np.isfinite(snd_bed_grid) & channel
         n_bed = int(np.count_nonzero(m_bed))
         if n_bed > 0:
             try:
-                # Residual at sounding cells: observed_bed - predicted_bed
                 resid = (snd_bed_grid - bed).astype("float32")
-
-                # Nearest-neighbor residual propagation (fast, stable). Weight decays linearly to 0 at max_dist.
-                inv_b = np.ones(shape, dtype=np.uint8)
-                inv_b[m_bed] = 0
-                dist_b, inds_b = distance_transform_edt(inv_b, sampling=pix, return_indices=True)
-                nyb, nxb = inds_b[0], inds_b[1]
-                resid_nn = resid[nyb, nxb].astype("float32")
-
                 maxd = float(getattr(args, "soundings_max_dist_m", 1500.0))
-                w = np.clip(1.0 - (dist_b.astype("float32") / (maxd + 1e-6)), 0.0, 1.0).astype("float32")
-
-                apply = channel & np.isfinite(resid_nn) & (dist_b <= maxd)
-                bed = np.where(apply, bed + (w * resid_nn), bed).astype("float32")
-
-                # Optionally enforce exact observed bed at sounding cells
+                adj = _build_residual_adjustment(resid, m_bed, channel, maxd, float(args.residual_blend_sigma_m), float(pix))
+                bed = (bed + adj).astype("float32")
                 if bool(getattr(args, "soundings_enforce", True)):
                     bed[m_bed] = snd_bed_grid[m_bed].astype("float32")
-
-                # Recompute depth from corrected bed
                 depth = (wse_map - bed).astype("float32")
-
-                LOG.info("Soundings: applied bed-elevation correction using %d sounding cells (max_dist=%.1fm).", n_bed, maxd)
+                LOG.info("Soundings: bed-elevation blending using %d cells (max_dist=%.1fm, sigma=%.1fm).", n_bed, maxd, float(args.residual_blend_sigma_m))
             except Exception as e:
-                LOG.warning("Soundings: failed bed-elevation correction: %s", e)
-
+                LOG.warning("Soundings: failed bed-elevation blending: %s", e)
 
     out_bed = Path(args.out_bed)
     out_bed.parent.mkdir(parents=True, exist_ok=True)
