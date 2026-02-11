@@ -98,6 +98,8 @@ def main() -> int:
     p.add_argument("--template-raster", required=True, help="Template raster defining output grid (e.g., river_dem.tif)")
     p.add_argument("--water-mask", default=None,
                    help="Optional water/land mask raster. For waffles mask: water=0 land=1.")
+    p.add_argument("--ocean-mask", default=None,
+                   help="Optional ocean-only waffles coastline mask (land=1, water=0). Used to prevent ocean bleed and to build fallback river domain when NHD water mask is unavailable.")
     p.add_argument("--channel-buffer-m", type=float, default=400.0,
                    help="Buffer around flowlines to define candidate corridor (meters).")
     p.add_argument("--max-channel-width-m", type=float, default=600.0,
@@ -161,14 +163,32 @@ def main() -> int:
             LOG.info("No stream order column found; using only default corridor.")
 
     # Water mask
+    # Water mask(s)
+    ocean = None
+    if args.ocean_mask:
+        om = _warp_mask_to_template(Path(args.ocean_mask), template_profile)
+        ocean = (om == 0)  # waffles convention: water=0 (ocean-only mask)
+        LOG.info("Ocean-only mask loaded: %s (waffles convention water=0 land=1)", args.ocean_mask)
+
     if args.water_mask:
         wm = _warp_mask_to_template(Path(args.water_mask), template_profile)
-        water = (wm == 0)  # waffles convention: water=0
-        LOG.info("Water mask loaded: %s (waffles convention water=0 land=1)", args.water_mask)
+        water_all = (wm == 0)  # waffles convention: water=0
+        if ocean is not None:
+            # Inland-water = (rivers+lakes+ocean) minus ocean-only water
+            water = water_all & (~ocean)
+            LOG.info("Derived inland-water mask: water_mask & ~ocean_mask")
+        else:
+            water = water_all
+            LOG.info("Water mask loaded: %s (waffles convention water=0 land=1)", args.water_mask)
     else:
-        # Fallback: treat corridor as water
-        water = corridor.copy()
-        LOG.warning("No --water-mask supplied; using buffered corridor as 'water' (ocean separation degraded).")
+        if ocean is not None:
+            # Fallback when NHD water mask is unavailable: restrict corridor to non-ocean areas
+            water = corridor & (~ocean)
+            LOG.warning("No --water-mask supplied; using corridor constrained to non-ocean areas from --ocean-mask.")
+        else:
+            # Last-resort fallback: treat corridor as water
+            water = corridor.copy()
+            LOG.warning("No --water-mask or --ocean-mask supplied; using buffered corridor as 'water' (ocean separation degraded).")
 
     # Width proxy from distance to boundary (land)
     d_bank = distance_transform_edt(water, sampling=pix).astype("float32")

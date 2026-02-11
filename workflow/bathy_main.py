@@ -345,6 +345,73 @@ def _find_latest_waffles_mask(cache_root: Path) -> Optional[Path]:
         return None
 
 
+
+def _ensure_waffles_coastline_mask(
+    cache_masks: Path,
+    aoi: str,
+    inc_arcsec: float = 1.0,
+    want_nhd: bool = False,
+    want_lakes: bool = False,
+    prefix: str = "waffles_coastline",
+    log: Optional[logging.Logger] = None,
+) -> Path:
+    """Ensure a waffles coastline mask exists and return the .tif path.
+
+    Waffles coastline masks use the convention: land=1, water=0.
+    When want_nhd=False and want_lakes=False, this should not depend on TNM and is
+    intended to be resilient when TNM is flaky.
+    """
+    logger = log or logging.getLogger(__name__)
+    cache_masks.mkdir(parents=True, exist_ok=True)
+
+    params = f"want_nhd={str(bool(want_nhd))}:want_lakes={str(bool(want_lakes))}"
+    chash = hashlib.sha1(f"{aoi}|{inc_arcsec:.9f}|{params}".encode()).hexdigest()[:12]
+    out_prefix = cache_masks / f"{prefix}_{chash}"
+    out_tif = out_prefix.with_suffix(".tif")
+
+    if out_tif.exists() and out_tif.stat().st_size > 0:
+        return out_tif
+
+    inc_str = f"{inc_arcsec:.9f}s"
+    cmd = [
+        "waffles",
+        "-M",
+        f"coastline:{params}",
+        f"-R={aoi}",
+        "-E",
+        inc_str,
+        "-O",
+        str(out_prefix),
+    ]
+    logger.info("[WAFFLES] Running: %s", " ".join(cmd))
+    try:
+        run_command(cmd, prefix="[WAFFLES] ")
+    except Exception as e:
+        # leave error handling to caller; waffles failures are expected in flaky network conditions
+        raise
+
+    if out_tif.exists() and out_tif.stat().st_size > 0:
+        return out_tif
+
+    # Fallback glob in case waffles varied the output name slightly
+    cands = sorted(cache_masks.glob(f"{prefix}_{chash}*.tif"))
+    if cands:
+        return cands[0]
+
+    raise RuntimeError("Waffles did not produce a coastline raster. Ensure 'waffles' is in your PATH.")
+
+
+def _buffer_aoi(aoi: str, buf_deg: float = 0.0145) -> str:
+    """Return AOI string buffered by buf_deg in degrees.
+
+    AOI format: 'w/e/s/n'. Buffer expands outward (w-buf, e+buf, s-buf, n+buf).
+    """
+    try:
+        w, e, s, n = [float(x) for x in aoi.split('/')[:4]]
+    except Exception as exc:
+        raise ValueError(f"Invalid AOI string: {aoi!r}") from exc
+    return f"{w - buf_deg:.8f}/{e + buf_deg:.8f}/{s - buf_deg:.8f}/{n + buf_deg:.8f}"
+
 def _mask_raster_to_waffles(raster_path: Path, waffles_mask_path: Path, nodata: float = -9999.0) -> bool:
     """Mask a raster *in place* to the waffles coastline mask.
 
@@ -1630,7 +1697,43 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
         channel_mask_tif = work_dir / "river_channel_mask.tif"
         open_water_mask_tif = work_dir / "open_water_mask.tif"
 
-        wm = _find_latest_waffles_mask(cfg.cache_root)
+        # Waffles-derived masks:
+        #   1) ocean-only (want_nhd=False) always attempted first to prevent ocean bleed (resilient if TNM is flaky).
+        #   2) with-NHD (want_nhd=True) attempted second; if it fails we still proceed using corridor+ArcGIS flowlines.
+        cache_masks = Path(cfg.cache_root) / "masks"
+        # Buffer AOI slightly for waffles so the mask fully covers the corridor near edges.
+        aoi_buf = _buffer_aoi(str(cfg.aoi), float(getattr(cfg, 'waffles_aoi_buffer_deg', 0.0145)))
+
+        ocean_mask = None
+        with_nhd_mask = None
+        try:
+            ocean_mask = _ensure_waffles_coastline_mask(
+                cache_masks=cache_masks,
+                aoi=aoi_buf,
+                inc_arcsec=1.0,
+                want_nhd=False,
+                want_lakes=False,
+                prefix="waffles_coastline_ocean_only",
+                log=log,
+            )
+        except Exception as e:
+            log.warning(f"[WAFFLES] Ocean-only mask unavailable; ocean bleed protection degraded: {e}")
+            ocean_mask = None
+
+        try:
+            with_nhd_mask = _ensure_waffles_coastline_mask(
+                cache_masks=cache_masks,
+                aoi=aoi_buf,
+                inc_arcsec=1.0,
+                want_nhd=True,
+                want_lakes=True,
+                prefix="waffles_coastline_with_nhd",
+                log=log,
+            )
+        except Exception as e:
+            log.warning(f"[WAFFLES] With-NHD mask unavailable (TNM flaky?): {e}. Proceeding with corridor+ArcGIS NHD flowlines + ocean-only mask.")
+            with_nhd_mask = None
+
         cmd = [
             sys.executable, "river_domain_mask.py",
             f"--river-gpkg={network_gpkg}",
@@ -1642,11 +1745,20 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
             f"--mainstem-min-order={getattr(cfg, 'river_mainstem_min_order', 5)}",
             f"--max-mainstem-width-m={getattr(cfg, 'river_max_mainstem_width_m', 2500.0)}",
         ]
-        if wm and Path(wm).exists():
-            cmd.append(f"--water-mask={wm}")
-
+        if ocean_mask and Path(ocean_mask).exists():
+            cmd.append(f"--ocean-mask={ocean_mask}")
+        if with_nhd_mask and Path(with_nhd_mask).exists():
+            cmd.append(f"--water-mask={with_nhd_mask}")
         if getattr(cfg, "river_save_skeleton_debug", False):
             cmd.append("--write-debug")
+
+        # For reporting: prefer the more inclusive water mask (with_nhd) if it exists,
+        # otherwise fall back to the ocean-only mask (still useful to prevent ocean bleed).
+        wm = None
+        if with_nhd_mask and Path(with_nhd_mask).exists():
+            wm = with_nhd_mask
+        elif ocean_mask and Path(ocean_mask).exists():
+            wm = ocean_mask
 
         rc, out, err = run_command(cmd, cwd=script_dir, prefix="[RIVER] ")
         cmd_str = " ".join(str(c) for c in cmd)

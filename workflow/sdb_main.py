@@ -18,6 +18,7 @@ UPDATES:
 """
 
 import sys
+import re
 import os
 import logging
 
@@ -453,20 +454,62 @@ def generate_coastline_mask(target_raster_path, aoi, cache_masks, out_mask_tif, 
 
     # 3. Run Waffles if Raw TIF missing
     if (not base_tif.exists()) or base_tif.stat().st_size == 0:
-        cmd = f"waffles -M coastline:{waffles_params} -R={aoi_buf} -E {inc_str} -O {base_prefix}"
-        log.info(f"[WAFFLES] Running: {cmd}")
+        cmd_list = [
+            "waffles",
+            "-M",
+            f"coastline:{waffles_params}",
+            f"-R={aoi_buf}",
+            "-E",
+            inc_str,
+            "-O",
+            str(base_prefix),
+        ]
+        log.info(f"[WAFFLES] Running: {' '.join(cmd_list)}")
         try:
-            _run(cmd)
+            _run_safe(cmd_list)
         except Exception:
             # Fallback check for glob if name varied slightly
             pass
 
         if not base_tif.exists():
-            cands = list(cache_masks.glob(f"waffles_coastline_{chash}*.tif"))
-            if cands:
-                base_tif = cands[0]
+            # Robust discovery: waffles can append suffixes and/or write into a directory
+            patterns = [
+                f"waffles_coastline_{chash}*.tif",
+                f"{base_prefix.name}*.tif",
+                f"{base_prefix.name}*coast*.tif",
+                "*coastline*.tif",
+            ]
+            candidates = []
+            seen = set()
+            for pat in patterns:
+                for p in cache_masks.glob(pat):
+                    if p.suffix.lower() != ".tif":
+                        continue
+                    if p in seen:
+                        continue
+                    seen.add(p)
+                    candidates.append(p)
+            # Some waffles versions write into a directory named after the output prefix
+            prefix_dir = base_prefix
+            if prefix_dir.is_dir():
+                for p in prefix_dir.rglob("*.tif"):
+                    if p not in seen:
+                        seen.add(p)
+                        candidates.append(p)
+            coasty = [p for p in candidates if "coast" in p.name.lower()]
+            if coasty:
+                candidates = coasty
+            if candidates:
+                candidates = sorted(candidates, key=lambda p: p.stat().st_size if p.exists() else 0, reverse=True)
+                base_tif = candidates[0]
             else:
-                raise RuntimeError("Waffles did not produce a coastline raster. Ensure 'waffles' is in your PATH.")
+                existing = sorted([p.name for p in cache_masks.glob("*.tif")])
+                raise RuntimeError(
+                    "Waffles did not produce a coastline raster. "
+                    f"Expected {base_tif} or a matching *coast*.tif in {cache_masks}. "
+                    f"Existing .tif files: {existing}. "
+                    "Ensure 'waffles' is in your PATH and that the coastline module ran successfully."
+                )
 
     # 4. Return Logic
     # If no target provided (e.g. pre-S2 download QC), return raw path

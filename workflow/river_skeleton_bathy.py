@@ -205,6 +205,7 @@ def _soundings_to_grids(
     dmax_max_m: float,
     mode: str,
     min_r: float,
+    cell_percentile: float | None = None,
     wse_map: np.ndarray | None = None,
 ):
     """Rasterize external soundings onto the template grid.
@@ -292,12 +293,14 @@ def _soundings_to_grids(
         if rr2.size == 0:
             return depth_grid, dmax_grid, bed_grid
 
-        # Minimum elevation per cell = deeper bed
-        for r0, c0, bv in zip(rr2, cc2, bed):
-            cur = bed_grid[r0, c0]
-            if (not np.isfinite(cur)) or (bv < cur):
-                bed_grid[r0, c0] = float(bv)
-
+        
+        # Aggregate bed elevation per cell with a percentile to reduce outliers.
+        # For NAVD88 bed elevations: lower percentile -> deeper (more conservative) but robust.
+        pct = 5.0 if cell_percentile is None else float(cell_percentile)
+        idx = (rr2.astype(np.int64) * W + cc2.astype(np.int64))
+        df = pd.DataFrame({"idx": idx, "v": bed.astype(np.float64)})
+        q = df.groupby("idx")["v"].quantile(pct / 100.0)
+        bed_grid.ravel()[q.index.to_numpy(dtype=np.int64)] = q.to_numpy(dtype=np.float64)
         # If we have a WSE proxy, infer depth + implied Dmax from bed elevations
         if wse_map is not None:
             wse = wse_map[rr2, cc2].astype("float64")
@@ -305,21 +308,26 @@ def _soundings_to_grids(
             ok2 = np.isfinite(d) & (d >= 0.0)
             rr3, cc3, d = rr2[ok2], cc2[ok2], d[ok2]
             if rr3.size > 0:
-                for r0, c0, dv in zip(rr3, cc3, d):
-                    cur = depth_grid[r0, c0]
-                    if (not np.isfinite(cur)) or (dv > cur):
-                        depth_grid[r0, c0] = float(dv)
-
+                
+                # Aggregate depths per cell using a high percentile (deeper) to reduce shallow outliers.
+                pct_d = 95.0 if cell_percentile is None else (100.0 - float(cell_percentile))
+                idx3 = (rr3.astype(np.int64) * W + cc3.astype(np.int64))
+                df3 = pd.DataFrame({"idx": idx3, "v": d.astype(np.float64)})
+                q3 = df3.groupby("idx")["v"].quantile(pct_d / 100.0)
+                depth_grid.ravel()[q3.index.to_numpy(dtype=np.int64)] = q3.to_numpy(dtype=np.float64)
                 rvals = r[rr3, cc3].astype("float64")
                 ruse = np.maximum(rvals, float(min_r))
                 denom = np.power(ruse, float(shape_exp)) + 1e-6
                 dmax_imp = (d / denom).astype("float64")
                 dmax_imp = np.clip(dmax_imp, float(dmax_min_m), float(dmax_max_m))
 
-                for r0, c0, dv in zip(rr3, cc3, dmax_imp):
-                    cur = dmax_grid[r0, c0]
-                    if (not np.isfinite(cur)) or (dv > cur):
-                        dmax_grid[r0, c0] = float(dv)
+                
+                # Aggregate implied dmax per cell using the same high-percentile rule as depths.
+                pct_dm = 95.0 if cell_percentile is None else (100.0 - float(cell_percentile))
+                idx4 = (rr3.astype(np.int64) * W + cc3.astype(np.int64))
+                df4 = pd.DataFrame({"idx": idx4, "v": dmax_imp.astype(np.float64)})
+                q4 = df4.groupby("idx")["v"].quantile(pct_dm / 100.0)
+                dmax_grid.ravel()[q4.index.to_numpy(dtype=np.int64)] = q4.to_numpy(dtype=np.float64)
         else:
             LOG.warning("soundings-mode=bed_elev but no wse_map provided; skipping depth/Dmax inference from soundings.")
 
@@ -345,22 +353,26 @@ def _soundings_to_grids(
     if rr3.size == 0:
         return depth_grid, dmax_grid, bed_grid
 
-    for r0, c0, dv in zip(rr3, cc3, d):
-        cur = depth_grid[r0, c0]
-        if (not np.isfinite(cur)) or (dv > cur):
-            depth_grid[r0, c0] = float(dv)
-
+    
+    # Aggregate depth per cell with percentile to reduce outliers.
+    pct_d = 95.0 if cell_percentile is None else float(cell_percentile)
+    idx3 = (rr3.astype(np.int64) * W + cc3.astype(np.int64))
+    df3 = pd.DataFrame({"idx": idx3, "v": d.astype(np.float64)})
+    q3 = df3.groupby("idx")["v"].quantile(pct_d / 100.0)
+    depth_grid.ravel()[q3.index.to_numpy(dtype=np.int64)] = q3.to_numpy(dtype=np.float64)
     rvals = r[rr3, cc3].astype("float64")
     ruse = np.maximum(rvals, float(min_r))
     denom = np.power(ruse, float(shape_exp)) + 1e-6
     dmax_imp = (d / denom).astype("float64")
     dmax_imp = np.clip(dmax_imp, float(dmax_min_m), float(dmax_max_m))
 
-    for r0, c0, dv in zip(rr3, cc3, dmax_imp):
-        cur = dmax_grid[r0, c0]
-        if (not np.isfinite(cur)) or (dv > cur):
-            dmax_grid[r0, c0] = float(dv)
-
+    
+    # Aggregate implied dmax per cell using a high percentile (deeper) to reduce shallow outliers.
+    pct_dm = 95.0 if cell_percentile is None else float(cell_percentile)
+    idx4 = (rr3.astype(np.int64) * W + cc3.astype(np.int64))
+    df4 = pd.DataFrame({"idx": idx4, "v": dmax_imp.astype(np.float64)})
+    q4 = df4.groupby("idx")["v"].quantile(pct_dm / 100.0)
+    dmax_grid.ravel()[q4.index.to_numpy(dtype=np.int64)] = q4.to_numpy(dtype=np.float64)
     return depth_grid, dmax_grid, bed_grid
 
 
@@ -495,6 +507,8 @@ def main(
                    help="CRS of soundings (e.g., EPSG:4326). If omitted, assumes soundings already match the template CRS.")
     p.add_argument("--soundings-mode", choices=["auto","depth_pos","depth_neg","bed_elev"], default="auto",
                    help="Interpret soundings Z as depth (auto/depth_pos/depth_neg) or as bed elevation (bed_elev, same vertical datum as DEM).")
+    p.add_argument("--soundings-cell-percentile", type=float, default=None,
+                   help="Per-cell percentile used when binning multiple XYZ points into the same grid cell. If not set: bed_elev uses 5th percentile (deeper, outlier-robust); depth uses 95th percentile (deeper, outlier-robust).")
     p.add_argument("--soundings-max-dist-m", type=float, default=10000.0,
                    help="Max distance (m) from a sounding to influence skeleton Dmax (nearest-sounding within this distance).")
     p.add_argument("--soundings-min-r", type=float, default=0.25,
@@ -653,7 +667,8 @@ def main(
                 dmax_max_m=float(args.dmax_max_m),
                 mode=str(args.soundings_mode),
                 min_r=float(args.soundings_min_r),
-                wse_map=wse_map,
+                cell_percentile=args.soundings_cell_percentile,
+            wse_map=wse_map,
             )
             snd_mask = np.isfinite(snd_dmax_grid)
             snd_dmax_field = None

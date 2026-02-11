@@ -1,0 +1,1 @@
+Fix: river_domain_mask.py computes width proxy even when no water-mask is supplied (prevents NameError in corridor-only fallback).

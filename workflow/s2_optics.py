@@ -43,7 +43,7 @@ import atexit
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Iterable
+from typing import Dict, List, Optional, Tuple, Iterable, Union
 
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1470,6 +1470,7 @@ def build_weighted_shared_date_composite(
     cache_strict: bool = False,
     cache_code_strict: bool = False,
     cache_ignore_code: bool = True,
+    **kwargs,
 ) -> Dict[str, str]:
     """
     Updated version with:
@@ -1509,6 +1510,33 @@ def build_weighted_shared_date_composite(
     # ---------------------------------------------------------------------
     meta = _read_composite_meta(out_dir) or {}
     outputs_exist = all(p.exists() and p.stat().st_size > 0 for p in expected.values())
+
+
+    # -----------------------------------------------------------
+    # Glint-correction parameters (optional; passed via **kwargs)
+    # -----------------------------------------------------------
+    # NOTE: These are used by the optional Hedley-style glint correction block.
+    # They are *also* included in the cache fingerprint so changing them invalidates cache.
+    glint_correct = bool(kwargs.get("glint_correct", False))
+    glint_clip_min = float(kwargs.get("glint_clip_min", 1e-6))
+    glint_deepwater_b02_max = float(kwargs.get("glint_deepwater_b02_max", 0.2))
+    glint_nir_band = str(kwargs.get("glint_nir_band", "B08")).strip()
+    glint_vis_bands = kwargs.get("glint_vis_bands", ["B02", "B03", "B04"])
+    if isinstance(glint_vis_bands, str):
+        glint_vis_bands = [
+            b.strip()
+            for b in glint_vis_bands.replace(";", ",").split(",")
+            if b.strip()
+        ]
+    else:
+        glint_vis_bands = (
+            list(glint_vis_bands)
+            if glint_vis_bands is not None
+            else ["B02", "B03", "B04"]
+        )
+    glint_nir_min_percentile = float(kwargs.get("glint_nir_min_percentile", 1.0))
+    glint_min_samples = int(kwargs.get("glint_min_samples", 5000))
+    glint_max_samples = int(kwargs.get("glint_max_samples", 2000000))
 
     # Build the full parameter dict (exclude only performance-only knobs unless you want them to invalidate cache)
     params_fp = _build_s2_params_fingerprint_dict(
