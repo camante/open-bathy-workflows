@@ -42,6 +42,9 @@ import shutil
 import subprocess
 import shlex
 import threading
+
+# Central constants (versioning, nodata)
+import constants
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -109,7 +112,19 @@ def _river_cache_key_and_manifest(cfg: "BathyConfig") -> tuple[str, Dict[str, An
         "river_method": getattr(cfg, "river_method", "xs"),
         "river_dem": _fingerprint_path(cfg.river_dem),
         "soundings": [_fingerprint_path(p) for p in soundings],
+        "river_soundings_mode": getattr(cfg, "river_soundings_mode", "auto"),
+        "river_soundings_max_dist_m": float(getattr(cfg, "river_soundings_max_dist_m", 1500.0)),
+        "river_soundings_min_r": float(getattr(cfg, "river_soundings_min_r", 0.25)),
+        "river_soundings_enforce": bool(getattr(cfg, "river_soundings_enforce", True)),
         "snap_m": cfg.snap_m,
+
+        "river_authoritative_bed": _fingerprint_path(getattr(cfg, "river_authoritative_bed", None)),
+        "river_authoritative_bed_max_dist_m": float(getattr(cfg, "river_authoritative_bed_max_dist_m", 2000.0)),
+        "river_residual_blend_sigma_m": float(getattr(cfg, "river_residual_blend_sigma_m", 120.0)),
+        "river_nodata": float(getattr(cfg, "river_nodata", -9999.0)),
+        "mask_river_to_waffles": bool(getattr(cfg, "mask_river_to_waffles", True)),
+        "river_use_nhdarea": bool(getattr(cfg, "river_use_nhdarea", True)),
+        "river_nhdarea_layer": getattr(cfg, "river_nhdarea_layer", "nhdarea_clip"),
 
         # Legacy XS parameters (only used when river_method == "xs")
         "xs_spacing_m": cfg.xs_spacing_m,
@@ -125,6 +140,16 @@ def _river_cache_key_and_manifest(cfg: "BathyConfig") -> tuple[str, Dict[str, An
         "river_thalweg_densify_factor": getattr(cfg, "river_thalweg_densify_factor", 0.5),
         "river_thalweg_densify_step_m": getattr(cfg, "river_thalweg_densify_step_m", None),
         "river_overlap_reducer": cfg.river_overlap_reducer,
+
+        # XS generation controls (geometry stability / artifact reduction)
+        "xs_smoothing_window_m": getattr(cfg, "xs_smoothing_window_m", 0.0),
+        "xs_trim_overlaps": bool(getattr(cfg, "xs_trim_overlaps", True)),
+        "xs_global_deconflict": bool(getattr(cfg, "xs_global_deconflict", True)),
+        "xs_deconflict_tol_m": float(getattr(cfg, "xs_deconflict_tol_m", 2.0)),
+        "xs_skip_junctions": bool(getattr(cfg, "xs_skip_junctions", True)),
+        "xs_junction_snap_m": float(getattr(cfg, "xs_junction_snap_m", 30.0)),
+        "xs_junction_buffer_m": float(getattr(cfg, "xs_junction_buffer_m", 120.0)),
+        "xs_densify_step_m": float(getattr(cfg, "xs_densify_step_m", 20.0)),
 
         # Skeleton parameters (only used when river_method == "skeleton")
         "river_channel_buffer_m": getattr(cfg, "river_channel_buffer_m", 400.0),
@@ -144,6 +169,60 @@ def _river_cache_key_and_manifest(cfg: "BathyConfig") -> tuple[str, Dict[str, An
         "river_mv_eps_a": cfg.river_mv_eps_a,
         "river_mv_eps_s": cfg.river_mv_eps_s,
 
+        # USGS anchors / gage-derived priors
+        "river_usgs_sites": getattr(cfg, "river_usgs_sites", None),
+        "river_usgs_start": getattr(cfg, "river_usgs_start", None),
+        "river_usgs_end": getattr(cfg, "river_usgs_end", None),
+        "river_usgs_cache_dir": _fingerprint_path(getattr(cfg, "river_usgs_cache_dir", None)),
+        "river_usgs_max_dist_m": float(getattr(cfg, "river_usgs_max_dist_m", 5000.0)),
+        "river_usgs_mean_to_dmax": getattr(cfg, "river_usgs_mean_to_dmax", "auto"),
+        "river_usgs_a_stat": getattr(cfg, "river_usgs_a_stat", "median"),
+        "river_usgs_q_quantile_lo": float(getattr(cfg, "river_usgs_q_quantile_lo", 0.20)),
+        "river_usgs_q_quantile_hi": float(getattr(cfg, "river_usgs_q_quantile_hi", 0.80)),
+        "river_usgs_a_cv_warn": float(getattr(cfg, "river_usgs_a_cv_warn", 0.50)),
+        "river_usgs_width_ratio_max": float(getattr(cfg, "river_usgs_width_ratio_max", 3.0)),
+        "river_usgs_width_ratio_blend": bool(getattr(cfg, "river_usgs_width_ratio_blend", True)),
+        "river_gage_snap_max_dist_m": float(getattr(cfg, "river_gage_snap_max_dist_m", 1000.0)),
+
+        # Width-stage CSV anchors
+        "river_width_stage_csv": getattr(cfg, "river_width_stage_csv", None),
+        "river_width_stage_max_dist_m": float(getattr(cfg, "river_width_stage_max_dist_m", 5000.0)),
+        "river_width_stage_min_n": int(getattr(cfg, "river_width_stage_min_n", 6)),
+        "river_width_stage_min_r2": float(getattr(cfg, "river_width_stage_min_r2", 0.25)),
+        "river_width_stage_max_weight": float(getattr(cfg, "river_width_stage_max_weight", 0.8)),
+
+        # Slope/WSE profile controls
+        "river_slope_proxy_window": int(getattr(cfg, "river_slope_proxy_window", 9)),
+        "river_slope_min": float(getattr(cfg, "river_slope_min", 1e-5)),
+        "river_slope_max": float(getattr(cfg, "river_slope_max", 0.05)),
+        "river_slope_proxy_min_n": int(getattr(cfg, "river_slope_proxy_min_n", 7)),
+        "river_wse_profile_enabled": bool(getattr(cfg, "river_wse_profile_enabled", True)),
+        "river_wse_profile_window": int(getattr(cfg, "river_wse_profile_window", 9)),
+        "river_wse_profile_min_n": int(getattr(cfg, "river_wse_profile_min_n", 7)),
+        "river_wse_profile_monotonic": bool(getattr(cfg, "river_wse_profile_monotonic", True)),
+
+        # Skeleton scientific controls
+        "river_skeleton_wse_mode": str(getattr(cfg, "river_skeleton_wse_mode", "bank")),
+        "river_skeleton_wse_smooth_sigma_m": float(getattr(cfg, "river_skeleton_wse_smooth_sigma_m", 0.0)),
+        "river_skeleton_wse_profile_step_m": float(getattr(cfg, "river_skeleton_wse_profile_step_m", 20.0)),
+        "river_skeleton_wse_profile_resample_m": float(getattr(cfg, "river_skeleton_wse_profile_resample_m", 20.0)),
+        "river_skeleton_wse_profile_smooth_sigma_m": float(getattr(cfg, "river_skeleton_wse_profile_smooth_sigma_m", 200.0)),
+        "river_skeleton_wse_profile_max_slope": float(getattr(cfg, "river_skeleton_wse_profile_max_slope", 0.005)),
+        "river_skeleton_wse_profile_min_samples": int(getattr(cfg, "river_skeleton_wse_profile_min_samples", 10)),
+        "river_skeleton_wse_profile_max_query_dist_m": float(getattr(cfg, "river_skeleton_wse_profile_max_query_dist_m", 250.0)),
+        "river_skeleton_junction_mode": str(getattr(cfg, "river_skeleton_junction_mode", "smooth")),
+        "river_skeleton_junction_buffer_m": float(getattr(cfg, "river_skeleton_junction_buffer_m", 120.0)),
+        "river_skeleton_junction_degree_min": int(getattr(cfg, "river_skeleton_junction_degree_min", 3)),
+        "river_skeleton_junction_smooth_sigma_m": float(getattr(cfg, "river_skeleton_junction_smooth_sigma_m", 80.0)),
+        "river_skeleton_junction_max_width_m": float(getattr(cfg, "river_skeleton_junction_max_width_m", 300.0)),
+        "river_skeleton_asymmetry_mode": str(getattr(cfg, "river_skeleton_asymmetry_mode", "none")),
+        "river_skeleton_asymmetry_strength": float(getattr(cfg, "river_skeleton_asymmetry_strength", 0.25)),
+        "river_skeleton_asymmetry_curv_ref": float(getattr(cfg, "river_skeleton_asymmetry_curv_ref", 0.002)),
+        "river_skeleton_asymmetry_max_shift": float(getattr(cfg, "river_skeleton_asymmetry_max_shift", 0.20)),
+        "river_skeleton_asymmetry_min_width_m": float(getattr(cfg, "river_skeleton_asymmetry_min_width_m", 10.0)),
+        "river_skeleton_asymmetry_min_curv": float(getattr(cfg, "river_skeleton_asymmetry_min_curv", 0.0005)),
+        "river_skeleton_asymmetry_densify_step_m": float(getattr(cfg, "river_skeleton_asymmetry_densify_step_m", 20.0)),
+
         "tnm_enable": bool(cfg.tnm_enable),
         "tnm_dataset": cfg.tnm_dataset,
         "scripts": {
@@ -153,7 +232,7 @@ def _river_cache_key_and_manifest(cfg: "BathyConfig") -> tuple[str, Dict[str, An
             "river_domain_mask.py": _fingerprint_script("river_domain_mask.py"),
             "river_skeleton_bathy.py": _fingerprint_script("river_skeleton_bathy.py"),
         },
-        "version": "river_cache_v2",
+	    	"version": "river_cache_v8",
     }
     s = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
     key = hashlib.sha1(s.encode("utf-8")).hexdigest()
@@ -235,6 +314,20 @@ class BathyConfig:
     river_dmax_min_m: float = 0.5                   # clamp Dmax prior (m)
     river_dmax_max_m: float = 30.0                  # clamp Dmax prior (m)
     river_save_skeleton_debug: bool = False         # write debug rasters (r, d_bank, d_center, dmax, wse)
+
+    # Skeleton WSE proxy controls (scientific correctness guardrails)
+    river_skeleton_wse_mode: str = "bank"          # 'bank' (recommended) or 'skeleton' (legacy)
+    river_skeleton_wse_smooth_sigma_m: float = 0.0 # optional smoothing of WSE field inside channel
+    # Confluence/junction handling (degree>=3 graph nodes). Helps suppress artifacts near confluences.
+    river_skeleton_junction_mode: str = "smooth"   # smooth | mask | none
+    river_skeleton_junction_buffer_m: float = 120.0
+    river_skeleton_junction_degree_min: int = 3
+    river_skeleton_junction_smooth_sigma_m: float = 80.0
+    river_skeleton_junction_max_width_m: float = 300.0
+    # Optional: constrain river bathymetry domain using polygonal channel features (NHDArea)
+    river_use_nhdarea: bool = True
+    river_nhdarea_layer: str = "nhdarea_clip"
+    river_ocean_keep_dist_m: float = 0.0  # allow ocean-connected water near flowlines (tidal mouths)
     # River depth inference priors / anchors (passed through to xs_infer_bathy_raster.py)
     river_prior_mode: str = "powerlaw"  # powerlaw | multivariate
     river_mv_a0: float = 0.18
@@ -283,6 +376,14 @@ class BathyConfig:
     # XS params
     xs_spacing_m: float = 200.0
     xs_length_m: float = 1000.0
+    xs_smoothing_window_m: float = 0.0   # 0 = auto (use xs_spacing_m)
+    xs_trim_overlaps: bool = True        # local/adjacent trimming
+    xs_global_deconflict: bool = True    # drop XS that intersect non-adjacent XS within a reach
+    xs_deconflict_tol_m: float = 2.0     # treat endpoint "touches" within this tolerance as non-harmful
+    xs_skip_junctions: bool = True       # avoid XS too close to confluences/junction nodes
+    xs_junction_snap_m: float = 30.0     # snapping scale for junction detection (m)
+    xs_junction_buffer_m: float = 120.0  # do not place XS within this distance of junctions (m)
+    xs_densify_step_m: float = 20.0      # densify centerlines to this vertex spacing before tangents (m)
 
     # River patch rasterization / interpolation options (passed to xs_infer_bathy_raster.py)
     # NOTE: xs_infer defaults can be expensive for large networks; expose here for control.
@@ -297,7 +398,7 @@ class BathyConfig:
     river_thalweg_only: bool = False
     river_thalweg_densify_factor: float = 0.5
     river_thalweg_densify_step_m: Optional[float] = None
-    river_overlap_reducer: str = "min"  # min | median
+    river_overlap_reducer: str = "median"  # min | median
     river_nodata: float = -9999.0
 
     # Fusion controls
@@ -458,7 +559,15 @@ def _mask_raster_to_waffles(raster_path: Path, waffles_mask_path: Path, nodata: 
         # Reproject waffles mask to ds grid
         with rasterio.open(waffles_mask_path) as ms:
             mask_src = ms.read(1)
-            mask_dst = np.empty((ds.height, ds.width), dtype=mask_src.dtype)
+            # IMPORTANT: initialize destination to LAND(1) so any pixels outside the reprojected
+            # mask footprint remain LAND instead of uninitialized garbage (np.empty()).
+            fill_val = 1  # waffles coastline mask convention: land=1, water=0
+            mask_dst = np.full((ds.height, ds.width), fill_val, dtype=mask_src.dtype)
+
+            # Only honor src_nodata if it is not a semantic (0/1) value.
+            src_nodata = ms.nodata
+            if src_nodata in (0, 1):
+                src_nodata = None
 
             reproject(
                 source=mask_src,
@@ -468,7 +577,8 @@ def _mask_raster_to_waffles(raster_path: Path, waffles_mask_path: Path, nodata: 
                 dst_transform=ds.transform,
                 dst_crs=ds.crs,
                 resampling=Resampling.nearest,
-                dst_nodata=None,
+                src_nodata=src_nodata,
+                dst_nodata=fill_val,
             )
         # STRICT keep rule: waffles coastline mask is binary with WATER=0, LAND=1.
         # We keep only WATER pixels (mask == 0) and set everything else to nodata.
@@ -497,6 +607,107 @@ def _mask_raster_to_waffles(raster_path: Path, waffles_mask_path: Path, nodata: 
         if tmp_out.exists():
             tmp_out.unlink()
 
+    return True
+
+
+def _mask_raster_to_nhdarea(
+    raster_path: Path,
+    nhd_gpkg: Path,
+    nhd_layer: str = "nhdarea_clip",
+    nodata: float = -9999.0,
+) -> bool:
+    """Mask *outside* NHDArea polygons (best-effort).
+
+    Intended use:
+      - Constrain river bathymetry outputs (especially XS interpolation) to polygonal river/channel
+        features when those exist (NHDArea).
+      - Avoids accidental bathy spill into adjacent water bodies or across banks.
+
+    Returns True if a non-empty NHDArea mask was applied, False otherwise.
+    """
+    try:
+        import geopandas as gpd
+        import numpy as np
+        import rasterio
+        from rasterio.features import rasterize
+    except Exception:
+        return False
+
+    raster_path = Path(raster_path)
+    nhd_gpkg = Path(nhd_gpkg)
+
+    if (not raster_path.exists()) or (not nhd_gpkg.exists()):
+        return False
+
+    try:
+        areas = gpd.read_file(nhd_gpkg, layer=nhd_layer)
+    except Exception:
+        return False
+
+    if areas is None or areas.empty:
+        return False
+
+    areas = areas[areas.geometry.notnull() & (~areas.geometry.is_empty)]
+    areas = areas[areas.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
+    if areas.empty:
+        return False
+
+    # Fix invalid polygons where possible
+    if (~areas.is_valid).any():
+        try:
+            fixed = areas.geometry.buffer(0)
+            ok = fixed.geom_type.isin(["Polygon", "MultiPolygon"])
+            areas.loc[ok, "geometry"] = fixed[ok].values
+        except Exception:
+            pass
+        areas = areas[areas.geometry.notnull() & (~areas.geometry.is_empty)]
+        areas = areas[areas.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
+
+    if areas.empty:
+        return False
+
+    with rasterio.open(raster_path) as src:
+        r_crs = src.crs
+        transform = src.transform
+        shape = (src.height, src.width)
+        profile = src.profile.copy()
+        arr = src.read(1)
+
+    # Reproject polygons to raster CRS if needed
+    try:
+        if areas.crs is not None and r_crs is not None and areas.crs != r_crs:
+            areas = areas.to_crs(r_crs)
+    except Exception:
+        # If CRS handling fails, try rasterizing in-place; worst case it yields empty mask and we no-op.
+        pass
+
+    try:
+        geom = areas.geometry.unary_union
+    except Exception:
+        return False
+
+    mask = rasterize(
+        [(geom, 1)],
+        out_shape=shape,
+        transform=transform,
+        fill=0,
+        all_touched=True,
+        dtype="uint8",
+    ).astype(bool)
+
+    if not bool(mask.any()):
+        return False
+
+    out = arr.copy()
+    out[~mask] = nodata
+
+    # Write via temp file then atomic replace
+    tmp = raster_path.with_suffix(raster_path.suffix + ".nhdmask.tmp")
+    profile.update(nodata=float(nodata))
+    with rasterio.open(tmp, "w", **profile) as dst:
+        dst.write(out, 1)
+
+    tmp.replace(raster_path)
     return True
 
 def _utm_epsg_from_lonlat(lon: float, lat: float) -> str:
@@ -853,6 +1064,8 @@ def compute_depth_from_bed_and_dem(
 
         bed_nodata = bed.nodata
         dem_nodata = dem.nodata
+        nodata_out = -9999.0
+        profile.update(nodata=float(nodata_out))
 
         with rasterio.open(out_depth_tif, "w", **profile) as dst:
             for ji, window in bed.block_windows(1):
@@ -867,15 +1080,9 @@ def compute_depth_from_bed_and_dem(
                 mask |= ~np.isfinite(b) | ~np.isfinite(d)
 
                 depth = b - d  # negative when b < d (bed below terrain)
-                depth[mask] = np.nan
+                depth[mask] = float(nodata_out)
 
                 dst.write(depth.astype("float32"), 1, window=window)
-
-            # Preserve nodata as NaN if rasterio supports it; else leave unset.
-            try:
-                dst.nodata = np.nan
-            except Exception:
-                pass
 
     # Tag semantics
     apply_depth_metadata(out_depth_tif, depth_sign=depth_sign, depth_reference="terrain_surface")
@@ -1745,8 +1952,18 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
             f"--mainstem-min-order={getattr(cfg, 'river_mainstem_min_order', 5)}",
             f"--max-mainstem-width-m={getattr(cfg, 'river_max_mainstem_width_m', 2500.0)}",
         ]
+
+        # Optional: NHDArea constraint (if river_network.py wrote polygons into the gpkg).
+        # This helps prevent bays/lakes within the corridor from being treated as "river".
+        if bool(getattr(cfg, "river_use_nhdarea", True)):
+            cmd.append(f"--nhdarea-gpkg={network_gpkg}")
+            cmd.append(f"--nhdarea-layer={getattr(cfg, 'river_nhdarea_layer', 'nhdarea_clip')}")
         if ocean_mask and Path(ocean_mask).exists():
             cmd.append(f"--ocean-mask={ocean_mask}")
+        oke = float(getattr(cfg, 'river_ocean_keep_dist_m', 0.0) or 0.0)
+        if (oke > 0.0):
+            cmd.append(f"--ocean-keep-dist-m={oke}")
+
         if with_nhd_mask and Path(with_nhd_mask).exists():
             cmd.append(f"--water-mask={with_nhd_mask}")
         if getattr(cfg, "river_save_skeleton_debug", False):
@@ -1801,6 +2018,40 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
             f"--residual-blend-sigma-m={float(getattr(cfg, 'river_residual_blend_sigma_m', 120.0))}",
             f"--authoritative-bed-max-dist-m={float(getattr(cfg, 'river_authoritative_bed_max_dist_m', 2000.0))}",
         ]
+
+        # WSE proxy controls (bank-derived WSE is usually more robust than in-channel DEM sampling)
+        cmd.append(f"--wse-mode={getattr(cfg, 'river_skeleton_wse_mode', 'bank')}")
+        wse_sig = float(getattr(cfg, 'river_skeleton_wse_smooth_sigma_m', 0.0) or 0.0)
+        if wse_sig > 0.0:
+            cmd.append(f"--wse-smooth-sigma-m={wse_sig}")
+        if str(getattr(cfg, "river_skeleton_wse_mode", "bank")).strip().lower() == "bank_profile":
+            cmd.append(f"--wse-profile-step-m={float(getattr(cfg, 'river_skeleton_wse_profile_step_m', 20.0) or 20.0)}")
+            cmd.append(f"--wse-profile-resample-m={float(getattr(cfg, 'river_skeleton_wse_profile_resample_m', 20.0) or 20.0)}")
+            cmd.append(f"--wse-profile-smooth-sigma-m={float(getattr(cfg, 'river_skeleton_wse_profile_smooth_sigma_m', 200.0) or 0.0)}")
+            cmd.append(f"--wse-profile-max-slope={float(getattr(cfg, 'river_skeleton_wse_profile_max_slope', 0.005) or 0.0)}")
+            cmd.append(f"--wse-profile-min-samples={int(getattr(cfg, 'river_skeleton_wse_profile_min_samples', 10) or 10)}")
+            cmd.append(f"--wse-profile-max-query-dist-m={float(getattr(cfg, 'river_skeleton_wse_profile_max_query_dist_m', 250.0) or 0.0)}")
+        # Junction / confluence handling
+        jmode = str(getattr(cfg, "river_skeleton_junction_mode", "smooth")).strip().lower()
+        if jmode and jmode != "none":
+            cmd.append(f"--junction-mode={jmode}")
+            cmd.append(f"--junction-buffer-m={float(getattr(cfg, 'river_skeleton_junction_buffer_m', 120.0))}")
+            cmd.append(f"--junction-degree-min={int(getattr(cfg, 'river_skeleton_junction_degree_min', 3))}")
+            jsig = float(getattr(cfg, "river_skeleton_junction_smooth_sigma_m", 80.0) or 0.0)
+            if jsig > 0.0:
+                cmd.append(f"--junction-smooth-sigma-m={jsig}")
+            cmd.append(f"--junction-max-width-m={float(getattr(cfg, 'river_skeleton_junction_max_width_m', 300.0))}")
+
+        # Curvature-driven asymmetry (outer-bank deeper in bends)
+        amode = str(getattr(cfg, "river_skeleton_asymmetry_mode", "none")).strip().lower()
+        if amode and amode != "none":
+            cmd.append(f"--asymmetry-mode={amode}")
+            cmd.append(f"--asymmetry-strength={float(getattr(cfg, 'river_skeleton_asymmetry_strength', 0.25))}")
+            cmd.append(f"--asymmetry-curv-ref={float(getattr(cfg, 'river_skeleton_asymmetry_curv_ref', 0.002))}")
+            cmd.append(f"--asymmetry-max-shift={float(getattr(cfg, 'river_skeleton_asymmetry_max_shift', 0.20))}")
+            cmd.append(f"--asymmetry-min-width-m={float(getattr(cfg, 'river_skeleton_asymmetry_min_width_m', 10.0))}")
+            cmd.append(f"--asymmetry-min-curv={float(getattr(cfg, 'river_skeleton_asymmetry_min_curv', 0.0005))}")
+            cmd.append(f"--asymmetry-densify-step-m={float(getattr(cfg, 'river_skeleton_asymmetry_densify_step_m', 20.0))}")
         if getattr(cfg, "river_save_skeleton_debug", False):
             cmd.append(f"--debug-dir={work_dir / 'skeleton_debug'}")
 
@@ -1833,6 +2084,20 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
 
         log.info(f"[RIVER] Skeleton bathymetry raster: {bed_tif}")
 
+        # Optional: constrain river outputs to NHDArea polygons (best-effort).
+        # NOTE: This must happen AFTER the bed raster exists.
+        if bool(getattr(cfg, "river_use_nhdarea", True)):
+            try:
+                applied = _mask_raster_to_nhdarea(
+                    bed_tif,
+                    network_gpkg,
+                    nhd_layer=getattr(cfg, "river_nhdarea_layer", "nhdarea_clip"),
+                    nodata=float(getattr(cfg, "river_nodata", -9999.0)),
+                )
+                report.setdefault("river", {}).setdefault("masking", {})["nhdarea_bed_masked"] = bool(applied)
+            except Exception:
+                pass
+
     else:
         # Step 2: Generating cross-sections...
         log.info("[RIVER] Step 2: Generating cross-sections...")
@@ -1846,7 +2111,19 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
             f"--out-gpkg={xs_gpkg}",
             f"--spacing-m={cfg.xs_spacing_m}",
             f"--half-width-m={cfg.xs_length_m / 2.0}",
+            f"--smoothing-window-m={getattr(cfg, 'xs_smoothing_window_m', 0.0)}",
+            f"--deconflict-tol-m={getattr(cfg, 'xs_deconflict_tol_m', 2.0)}",
+            f"--junction-snap-m={getattr(cfg, 'xs_junction_snap_m', 30.0)}",
+            f"--junction-buffer-m={getattr(cfg, 'xs_junction_buffer_m', 120.0)}",
+            f"--densify-step-m={getattr(cfg, 'xs_densify_step_m', 20.0)}",
         ]
+        if not bool(getattr(cfg, "xs_trim_overlaps", True)):
+            cmd.append("--no-trim-overlaps")
+        if not bool(getattr(cfg, "xs_global_deconflict", True)):
+            cmd.append("--no-global-deconflict")
+        if not bool(getattr(cfg, "xs_skip_junctions", True)):
+            cmd.append("--no-skip-junctions")
+
 
         rc, out, err = run_command(cmd, cwd=script_dir, prefix="[RIVER] ")
         cmd_str = " ".join(str(c) for c in cmd)
@@ -2404,7 +2681,7 @@ def fuse(cfg: BathyConfig, sdb_raster: Optional[Path], river_raster: Optional[Pa
             if out_prov and Path(out_prov).exists():
                 with rasterio.open(str(out_prov)) as dp:
                     p = dp.read(1)
-                    has_river = bool(np.any((p == 2) | (p == 5)))  # PROV_RIVER=2, PROV_BLENDED=5
+                    has_river = bool(np.any((p == 2) | (p == 6)))  # PROV_RIVER=2, PROV_BLENDED=6
             if not has_river:
                 try:
                     _simple_union_overlay(Path(sdb_fuse_path), Path(river_fuse_path), Path(out_depth), Path(template), pri)
@@ -2596,12 +2873,67 @@ def parse_args() -> argparse.Namespace:
                help="Stream order threshold for allowing larger widths (if stream order attribute exists).")
     p.add_argument("--river-max-mainstem-width-m", type=float, default=2500.0,
                help="Maximum channel width allowed for mainstem corridor pixels (meters).")
+
+    # Optional: constrain river predictions to NHDArea polygons when available
+    p.add_argument("--no-river-nhdarea", dest="river_use_nhdarea", action="store_false", default=True,
+               help="Disable NHDArea polygon constraint for river domain (if available).")
+    p.add_argument("--river-nhdarea-layer", default="nhdarea_clip",
+               help="Layer name in river_network.gpkg containing NHDArea polygons (default nhdarea_clip).")
+    p.add_argument("--river-ocean-keep-dist-m", dest="river_ocean_keep_dist_m", type=float, default=0.0,
+               help="Allow ocean-connected water within this distance (m) of flowlines when building the river channel mask. Useful for tidal river mouths/estuaries where the mainstem is classified as ocean water. 0 disables.")
     p.add_argument("--river-shape-exp", type=float, default=0.5,
                help="Depth profile exponent for skeleton method (0.5 ~ U-shape; 1.0 ~ V-shape).")
     p.add_argument("--river-dmax-min-m", type=float, default=0.5, help="Clamp minimum Dmax prior (meters).")
     p.add_argument("--river-dmax-max-m", type=float, default=30.0, help="Clamp maximum Dmax prior (meters).")
     p.add_argument("--river-save-skeleton-debug", action="store_true", default=False,
                help="Write skeleton debug rasters (r, d_bank, d_center, dmax, wse).")
+    p.add_argument("--river-skeleton-wse-mode", dest="river_skeleton_wse_mode", default="bank",
+               choices=["bank", "skeleton", "bank_profile"],
+               help="Skeleton WSE proxy mode: 'bank' uses bank-adjacent DEM samples (recommended); 'skeleton' uses in-channel centerline sampling (legacy).")
+    p.add_argument("--river-skeleton-wse-smooth-sigma-m", dest="river_skeleton_wse_smooth_sigma_m", type=float, default=0.0,
+               help="Optional Gaussian smoothing sigma (m) for the skeleton WSE proxy field inside the channel.")
+# Longitudinal WSE profile controls (river-skeleton-wse-mode=bank_profile)
+    p.add_argument("--river-skeleton-wse-profile-step-m", dest="river_skeleton_wse_profile_step_m", type=float, default=20.0,
+               help="Densification step (m) for sampling along flowlines when building a longitudinal WSE profile.")
+    p.add_argument("--river-skeleton-wse-profile-resample-m", dest="river_skeleton_wse_profile_resample_m", type=float, default=20.0,
+               help="Resample step (m) for 1D WSE profile smoothing along flow distance.")
+    p.add_argument("--river-skeleton-wse-profile-smooth-sigma-m", dest="river_skeleton_wse_profile_smooth_sigma_m", type=float, default=200.0,
+               help="Gaussian smoothing sigma (m) applied to the 1D WSE profile along flow distance.")
+    p.add_argument("--river-skeleton-wse-profile-max-slope", dest="river_skeleton_wse_profile_max_slope", type=float, default=0.005,
+               help="Optional maximum absolute slope (m/m) enforced along the 1D WSE profile (0 to disable).")
+    p.add_argument("--river-skeleton-wse-profile-min-samples", dest="river_skeleton_wse_profile_min_samples", type=int, default=10,
+               help="Minimum number of valid samples along flowlines to build a profile; otherwise falls back to wse-mode=bank.")
+    p.add_argument("--river-skeleton-wse-profile-max-query-dist-m", dest="river_skeleton_wse_profile_max_query_dist_m", type=float, default=250.0,
+               help="Maximum XY distance (m) for assigning profile samples to centerline pixels (0 to disable). Helps avoid cross-reach snapping.")
+
+    p.add_argument("--river-skeleton-junction-mode", dest="river_skeleton_junction_mode", default="smooth",
+               choices=["smooth","mask","none"],
+               help="How to handle confluence/junction zones (degree>=3 graph nodes): smooth (default), mask, or none.")
+    p.add_argument("--river-skeleton-junction-buffer-m", dest="river_skeleton_junction_buffer_m", type=float, default=120.0,
+               help="Buffer radius (m) around junction nodes used for smoothing/masking.")
+    p.add_argument("--river-skeleton-junction-degree-min", dest="river_skeleton_junction_degree_min", type=int, default=3,
+               help="Minimum graph node degree to be treated as a junction.")
+    p.add_argument("--river-skeleton-junction-smooth-sigma-m", dest="river_skeleton_junction_smooth_sigma_m", type=float, default=80.0,
+               help="Gaussian smoothing sigma (m) used in junction zones when mode=smooth.")
+    p.add_argument("--river-skeleton-junction-max-width-m", dest="river_skeleton_junction_max_width_m", type=float, default=300.0,
+               help="Limit junction smoothing/masking to pixels with estimated channel width <= this (m). Helps avoid over-smoothing wide confluences.")
+    # Curvature-driven asymmetry (outer-bank deeper in bends)
+    p.add_argument("--river-skeleton-asymmetry-mode", dest="river_skeleton_asymmetry_mode",
+               choices=["none","curvature"], default="none",
+               help="Optional curvature-driven asymmetry: biases depth toward the outer bank using signed centerline curvature.")
+    p.add_argument("--river-skeleton-asymmetry-strength", dest="river_skeleton_asymmetry_strength", type=float, default=0.25,
+               help="Strength of curvature-driven r-shift (dimensionless; typical 0.1–0.4).")
+    p.add_argument("--river-skeleton-asymmetry-curv-ref", dest="river_skeleton_asymmetry_curv_ref", type=float, default=0.002,
+               help="Reference curvature (1/m) for scaling (e.g., 0.002 ~ 500 m radius).")
+    p.add_argument("--river-skeleton-asymmetry-max-shift", dest="river_skeleton_asymmetry_max_shift", type=float, default=0.20,
+               help="Max absolute shift applied to r (clamped).")
+    p.add_argument("--river-skeleton-asymmetry-min-width-m", dest="river_skeleton_asymmetry_min_width_m", type=float, default=10.0,
+               help="Only apply asymmetry where estimated channel width >= this (m).")
+    p.add_argument("--river-skeleton-asymmetry-min-curv", dest="river_skeleton_asymmetry_min_curv", type=float, default=0.0005,
+               help="Only apply asymmetry where |curvature| >= this (1/m).")
+    p.add_argument("--river-skeleton-asymmetry-densify-step-m", dest="river_skeleton_asymmetry_densify_step_m", type=float, default=20.0,
+               help="Vertex spacing (m) used when estimating curvature/tangent from flowlines.")
+
     p.add_argument("--river-soundings-mode", choices=["auto","depth_pos","depth_neg","bed_elev"], default="auto",
                    help="How to interpret extra XYZ Z values for river skeleton: auto/depth_pos/depth_neg (depths) or bed_elev (bed elevations, same vertical datum as DEM).")
     p.add_argument("--river-soundings-max-dist-m", type=float, default=10000.0,
@@ -2618,6 +2950,29 @@ def parse_args() -> argparse.Namespace:
                    help="Gaussian sigma (m) for residual blending smoothing. 0 disables smoothing (nearest-only).")
     p.add_argument("--xs-spacing-m", type=float, default=200.0)
     p.add_argument("--xs-length-m", type=float, default=1000.0)
+
+    p.add_argument("--xs-smoothing-window-m", type=float, default=0.0,
+                   help="Smoothing window (m) for XS orientation tangents. 0=auto (uses xs-spacing-m).")
+    p.add_argument("--xs-deconflict-tol-m", type=float, default=2.0,
+                   help="Endpoint tolerance (m) when identifying intersecting cross-sections.")
+    p.add_argument("--xs-junction-snap-m", type=float, default=30.0,
+                   help="Snapping scale (m) for junction detection from reach endpoints.")
+    p.add_argument("--xs-junction-buffer-m", type=float, default=120.0,
+                   help="Skip XS within this distance (m) of junction nodes.")
+    p.add_argument("--xs-densify-step-m", type=float, default=20.0,
+                   help="Densify centerlines to this vertex spacing (m) before computing tangents.")
+
+    p.add_argument("--no-xs-trim-overlaps", dest="xs_trim_overlaps", action="store_false",
+                   help="Disable local overlap trimming between adjacent XS.")
+    p.set_defaults(xs_trim_overlaps=True)
+
+    p.add_argument("--no-xs-global-deconflict", dest="xs_global_deconflict", action="store_false",
+                   help="Disable dropping XS that intersect non-adjacent XS within a reach.")
+    p.set_defaults(xs_global_deconflict=True)
+
+    p.add_argument("--no-xs-skip-junctions", dest="xs_skip_junctions", action="store_false",
+                   help="Do not skip XS near confluences/junctions.")
+    p.set_defaults(xs_skip_junctions=True)
 
     p.add_argument("--river-thalweg-only", action="store_true",
                    help="Use a thalweg-only control spine (1 control point per cross-section) for river interpolation; also builds corridor from buffered thalweg spine to avoid cross-channel ribbing.")
@@ -2922,10 +3277,18 @@ def main() -> int:
         river_max_channel_width_m=args.river_max_channel_width_m,
         river_mainstem_min_order=args.river_mainstem_min_order,
         river_max_mainstem_width_m=args.river_max_mainstem_width_m,
+        river_use_nhdarea=bool(getattr(args, "river_use_nhdarea", True)),
+        river_nhdarea_layer=getattr(args, "river_nhdarea_layer", "nhdarea_clip"),
         river_shape_exp=args.river_shape_exp,
         river_dmax_min_m=args.river_dmax_min_m,
         river_dmax_max_m=args.river_dmax_max_m,
         river_save_skeleton_debug=bool(args.river_save_skeleton_debug),
+        river_skeleton_wse_mode=getattr(args, "river_skeleton_wse_mode", "bank"),
+        river_skeleton_wse_smooth_sigma_m=float(getattr(args, "river_skeleton_wse_smooth_sigma_m", 0.0)),
+        river_skeleton_junction_mode=str(getattr(args, "river_skeleton_junction_mode", "smooth")),
+        river_skeleton_junction_buffer_m=float(getattr(args, "river_skeleton_junction_buffer_m", 120.0)),
+        river_skeleton_junction_degree_min=int(getattr(args, "river_skeleton_junction_degree_min", 3)),
+        river_skeleton_junction_smooth_sigma_m=float(getattr(args, "river_skeleton_junction_smooth_sigma_m", 80.0)),
         river_soundings_mode=args.river_soundings_mode,
         river_soundings_max_dist_m=args.river_soundings_max_dist_m,
         river_soundings_min_r=args.river_soundings_min_r,
@@ -2933,6 +3296,14 @@ def main() -> int:
 
         xs_spacing_m=args.xs_spacing_m,
         xs_length_m=args.xs_length_m,
+        xs_smoothing_window_m=args.xs_smoothing_window_m,
+        xs_trim_overlaps=bool(getattr(args, 'xs_trim_overlaps', True)),
+        xs_global_deconflict=bool(getattr(args, 'xs_global_deconflict', True)),
+        xs_deconflict_tol_m=args.xs_deconflict_tol_m,
+        xs_skip_junctions=bool(getattr(args, 'xs_skip_junctions', True)),
+        xs_junction_snap_m=args.xs_junction_snap_m,
+        xs_junction_buffer_m=args.xs_junction_buffer_m,
+        xs_densify_step_m=args.xs_densify_step_m,
         river_continuous=args.river_continuous,
         river_continuous_buffer_m=args.river_continuous_buffer_m,
         river_continuous_k=args.river_continuous_k,
@@ -3089,6 +3460,7 @@ def main() -> int:
 
     report: Dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "pipeline_version": getattr(constants, "PIPELINE_VERSION", "unknown"),
         "config": {
             "aoi": cfg.aoi,
             "start": cfg.start_date,

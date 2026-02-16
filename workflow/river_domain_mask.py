@@ -54,6 +54,15 @@ def _warp_mask_to_template(mask_path: Path, template_profile: dict) -> np.ndarra
     dst = np.ones((template_profile["height"], template_profile["width"]), dtype=np.uint8)  # default to land
     with rasterio.open(mask_path) as src:
         src_arr = src.read(1)
+
+        # IMPORTANT:
+        # Some mask rasters use semantic values (0/1) for water/land and may also
+        # set nodata to 0 or 1. If we pass that through as src_nodata, rasterio
+        # will treat real water/land as nodata and destroy the mask.
+        src_nodata = src.nodata
+        if src_nodata in (0, 1):
+            src_nodata = None
+
         reproject(
             source=src_arr,
             destination=dst,
@@ -62,7 +71,7 @@ def _warp_mask_to_template(mask_path: Path, template_profile: dict) -> np.ndarra
             dst_transform=template_profile["transform"],
             dst_crs=template_profile["crs"],
             resampling=Resampling.nearest,
-            src_nodata=src.nodata,
+            src_nodata=src_nodata,
             dst_nodata=1,  # land by default
         )
     return dst
@@ -100,6 +109,12 @@ def main() -> int:
                    help="Optional water/land mask raster. For waffles mask: water=0 land=1.")
     p.add_argument("--ocean-mask", default=None,
                    help="Optional ocean-only waffles coastline mask (land=1, water=0). Used to prevent ocean bleed and to build fallback river domain when NHD water mask is unavailable.")
+    p.add_argument("--ocean-keep-dist-m", type=float, default=0.0,
+                   help="Allow ocean-connected water within this distance (meters) of a flowline centerline. Useful for tidal river mouths/estuaries where the mainstem is classified as ocean water. 0 disables.")
+    p.add_argument("--nhdarea-gpkg", default=None,
+                   help="Optional GeoPackage with NHDArea polygons (e.g., river_network.gpkg). If present, used to constrain the river channel mask.")
+    p.add_argument("--nhdarea-layer", default="nhdarea_clip",
+                   help="Layer name for NHDArea polygons inside --nhdarea-gpkg (default nhdarea_clip).")
     p.add_argument("--channel-buffer-m", type=float, default=400.0,
                    help="Buffer around flowlines to define candidate corridor (meters).")
     p.add_argument("--max-channel-width-m", type=float, default=600.0,
@@ -122,11 +137,51 @@ def main() -> int:
     pix = _pixel_size_m(transform)
     LOG.info("Template grid: %s x %s | pixel_size≈%.3fm", shape[1], shape[0], pix)
 
+    # This script assumes the template CRS is projected in meters. If it is geographic
+    # (degrees), buffers and distances will be wrong. We still run (best-effort) but
+    # warn loudly because the resulting mask will be unreliable.
+    try:
+        if crs is not None and (not crs.is_projected):
+            LOG.warning(
+                "Template CRS is not projected (crs=%s). Buffer widths are interpreted as degrees, not meters; "
+                "river_domain_mask outputs may be incorrect. Use a projected river_dem/template raster.",
+                str(crs),
+            )
+    except Exception:
+        pass
+
     # Load rivers layer
     rivers = gpd.read_file(args.river_gpkg, layer=args.rivers_layer)
     if rivers.empty:
         raise SystemExit(f"No features found in {args.river_gpkg}:{args.rivers_layer}")
     rivers = rivers.to_crs(crs)
+
+    # Optional: NHDArea polygons to constrain channel predictions
+    nhdarea_mask = None
+    if args.nhdarea_gpkg:
+        try:
+            areas = gpd.read_file(args.nhdarea_gpkg, layer=args.nhdarea_layer)
+            if areas is not None and not areas.empty:
+                areas = areas.to_crs(crs)
+                areas = areas[areas.geometry.notnull() & (~areas.geometry.is_empty)]
+                areas = areas[areas.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
+                if not areas.empty:
+                    area_geom = areas.geometry.unary_union
+                    nhdarea_mask = rasterize(
+                        [(area_geom, 1)],
+                        out_shape=shape,
+                        transform=transform,
+                        fill=0,
+                        all_touched=True,
+                        dtype="uint8",
+                    ).astype(bool)
+                    LOG.info("NHDArea mask enabled: %s:%s (pixels=%d)", args.nhdarea_gpkg, args.nhdarea_layer, int(nhdarea_mask.sum()))
+                else:
+                    LOG.info("NHDArea layer has no polygon geometries: %s:%s", args.nhdarea_gpkg, args.nhdarea_layer)
+            else:
+                LOG.info("NHDArea layer empty: %s:%s", args.nhdarea_gpkg, args.nhdarea_layer)
+        except Exception as e:
+            LOG.warning("Failed to load NHDArea polygons (%s:%s): %s", args.nhdarea_gpkg, args.nhdarea_layer, str(e))
 
     # Build corridor masks
     corridor_geom = rivers.geometry.buffer(float(args.channel_buffer_m)).unary_union
@@ -162,40 +217,11 @@ def main() -> int:
         else:
             LOG.info("No stream order column found; using only default corridor.")
 
-    # Water mask
-    # Water mask(s)
-    ocean = None
-    if args.ocean_mask:
-        om = _warp_mask_to_template(Path(args.ocean_mask), template_profile)
-        ocean = (om == 0)  # waffles convention: water=0 (ocean-only mask)
-        LOG.info("Ocean-only mask loaded: %s (waffles convention water=0 land=1)", args.ocean_mask)
 
-    if args.water_mask:
-        wm = _warp_mask_to_template(Path(args.water_mask), template_profile)
-        water_all = (wm == 0)  # waffles convention: water=0
-        if ocean is not None:
-            # Inland-water = (rivers+lakes+ocean) minus ocean-only water
-            water = water_all & (~ocean)
-            LOG.info("Derived inland-water mask: water_mask & ~ocean_mask")
-        else:
-            water = water_all
-            LOG.info("Water mask loaded: %s (waffles convention water=0 land=1)", args.water_mask)
-    else:
-        if ocean is not None:
-            # Fallback when NHD water mask is unavailable: restrict corridor to non-ocean areas
-            water = corridor & (~ocean)
-            LOG.warning("No --water-mask supplied; using corridor constrained to non-ocean areas from --ocean-mask.")
-        else:
-            # Last-resort fallback: treat corridor as water
-            water = corridor.copy()
-            LOG.warning("No --water-mask or --ocean-mask supplied; using buffered corridor as 'water' (ocean separation degraded).")
 
-    # Width proxy from distance to boundary (land)
-    d_bank = distance_transform_edt(water, sampling=pix).astype("float32")
-    width = (2.0 * d_bank).astype("float32")
-
-    # Optional: also compute distance-to-centerline to suppress stray water far from flowlines
-    # Rasterize flowlines as a thin skeleton
+    # Distance to nearest flowline (centerline proximity)
+    # This is used both to suppress stray water far from flowlines and (optionally)
+    # to keep ocean-connected pixels near flowlines for tidal mouths.
     skel = rasterize(
         [(geom, 1) for geom in rivers.geometry],
         out_shape=shape,
@@ -208,6 +234,59 @@ def main() -> int:
     inv[skel] = 0
     d_center = distance_transform_edt(inv, sampling=pix).astype("float32")
 
+    # Water mask
+    # Water mask(s)
+    ocean = None
+    if args.ocean_mask:
+        om = _warp_mask_to_template(Path(args.ocean_mask), template_profile)
+        ocean = (om == 0)  # waffles convention: water=0 (ocean-only mask)
+        LOG.info("Ocean-only mask loaded: %s (waffles convention water=0 land=1)", args.ocean_mask)
+
+        # Optionally keep ocean-connected pixels that lie close to river flowlines.
+        # This is critical for tidal river mouths/estuaries where the mainstem
+        # is classified as ocean water by the coastline mask.
+        keep_dist = float(args.ocean_keep_dist_m)
+        if keep_dist > 0:
+            ocean_exclude = ocean & (d_center > keep_dist)
+            LOG.info("Ocean keep enabled: keeping ocean-connected pixels within %.1fm of flowlines", keep_dist)
+        else:
+            ocean_exclude = ocean
+
+    if args.water_mask:
+        wm = _warp_mask_to_template(Path(args.water_mask), template_profile)
+        water_all = (wm == 0)  # waffles convention: water=0
+        if ocean is not None:
+            # Inland-water = (rivers+lakes+ocean) minus ocean-only water
+            water = water_all & (~ocean_exclude)
+            LOG.info("Derived inland-water mask: water_mask & ~ocean_mask")
+        else:
+            water = water_all
+            LOG.info("Water mask loaded: %s (waffles convention water=0 land=1)", args.water_mask)
+    else:
+        if ocean is not None:
+            # Fallback when NHD water mask is unavailable: restrict corridor to non-ocean areas
+            water = corridor & (~ocean_exclude)
+            LOG.warning("No --water-mask supplied; using corridor constrained to non-ocean areas from --ocean-mask.")
+        else:
+            # Last-resort fallback: treat corridor as water
+            water = corridor.copy()
+            LOG.warning("No --water-mask or --ocean-mask supplied; using buffered corridor as 'water' (ocean separation degraded).")
+
+
+    # If no raster water-mask is available, NHDArea polygons provide a much better water-domain than corridor-only fallback.
+    if (nhdarea_mask is not None) and bool(nhdarea_mask.any()) and (not args.water_mask):
+        if ocean is not None:
+            water = nhdarea_mask & (~ocean_exclude)
+            LOG.info("Using NHDArea polygons as water mask (NHDArea & ~ocean).")
+        else:
+            water = nhdarea_mask
+            LOG.info("Using NHDArea polygons as water mask.")
+    # Width proxy from distance to boundary (land)
+    d_bank = distance_transform_edt(water, sampling=pix).astype("float32")
+    width = (2.0 * d_bank).astype("float32")
+
+
+
     maxw = float(args.max_channel_width_m)
     maxw_main = float(args.max_mainstem_width_m)
     width_limit = np.where(corridor_main, maxw_main, maxw).astype("float32")
@@ -217,6 +296,10 @@ def main() -> int:
 
     # Also require "not too far from a flowline" (helps when water mask has large bays inside corridor buffer)
     channel &= (d_center <= (float(args.channel_buffer_m) + 0.5 * width_limit + 2.0 * pix))
+
+    # Constrain the river channel to NHDArea polygons when available (prevents random spill into adjacent water bodies).
+    if (nhdarea_mask is not None) and bool(nhdarea_mask.any()):
+        channel &= nhdarea_mask
 
     # Open water = water but not channel
     open_water = water & (~channel)

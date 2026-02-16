@@ -1,4 +1,4 @@
-# Open Bathy Workflows (v1.3)
+# Open Bathy Workflows (v2.0.2)
 
 A Python workflow that generates bathymetry by combining:
 - **Satellite‑Derived Bathymetry (SDB)** from Sentinel‑2 + ICESat‑2 / in‑situ training points

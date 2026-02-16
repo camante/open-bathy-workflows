@@ -1,6 +1,6 @@
-# Script reference (v1.3)
+# Script reference (v2.0.2)
 
-This document describes each Python script in the v1.3 zip (typically placed in `workflow/`).
+This document describes each Python script in the v2.0.2 zip (typically placed in `workflow/`).
 For each script:
 - **Pipeline** indicates whether it supports **SDB**, **River**, **Fusion**, or shared infrastructure.
 - **Invocation** notes whether it is called directly (CLI), called by `bathy_main.py`, or imported as a module.
@@ -49,6 +49,8 @@ For each script:
 ## xs_builder.py
 
 - **Pipeline**: River
+
+**New in v2.0.2 (artifact reduction):** by default, xs_builder now (1) densifies centerlines before tangent estimation, (2) skips cross-sections near confluences/junctions, and (3) drops cross-sections that still intersect non-adjacent cross-sections within a reach. You can disable these with `--no-skip-junctions` and/or `--no-global-deconflict`, and tune tolerances with `--junction-buffer-m` and `--deconflict-tol-m`.
 - **Size**: 755 lines
 - **Invocation**: Called by `bathy_main.py` via subprocess; Can be run as a CLI script
 - **What it does**: xs_builder.py – Build river cross-sections (XS) from a river network + DEM/topo rasters

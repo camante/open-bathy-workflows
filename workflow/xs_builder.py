@@ -32,6 +32,7 @@ import geopandas as gpd
 import rasterio
 from shapely.geometry import LineString, Point
 from shapely.ops import linemerge, split
+from shapely.strtree import STRtree
 from pyproj import CRS, Transformer
 
 # Use centralized logging
@@ -49,6 +50,18 @@ class XSConfig:
     # New options for overlap handling
     smoothing_window_m: float = 0.0  # 0.0 means "auto" (use spacing)
     trim_overlaps: bool = True
+
+    # Global intersection handling (within a reach)
+    global_deconflict: bool = True     # drop XS that intersect non-adjacent XS
+    deconflict_tol_m: float = 2.0      # endpoint tolerance for "touching" intersections
+
+    # Junction handling (avoid XS near confluences where geometry is ambiguous)
+    skip_junctions: bool = True
+    junction_snap_m: float = 30.0      # snapping scale for junction detection from reach endpoints (m)
+    junction_buffer_m: float = 120.0   # skip XS within this distance of junction nodes (m)
+
+    # Centerline preprocessing
+    densify_step_m: float = 20.0       # densify centerlines to this vertex spacing (m) before tangents
 
 
 # --------------------------------------------------------------------------------------
@@ -336,6 +349,124 @@ def _trim_overlapping_xs(xs_list: List[Dict]) -> List[Dict]:
     return xs_list
 
 
+
+def _densify_linestring(line: LineString, step_m: float) -> LineString:
+    """Densify a LineString so that no segment is longer than step_m.
+
+    Improves tangent estimation and XS orientation stability on coarse/segmented inputs.
+    """
+    if line is None or line.is_empty:
+        return line
+    if not step_m or step_m <= 0:
+        return line
+    L = float(line.length)
+    if L <= step_m:
+        return line
+    # Always include endpoints
+    dists = list(np.arange(0.0, L, float(step_m)))
+    if dists[-1] < L:
+        dists.append(L)
+    pts = [line.interpolate(d) for d in dists]
+    return LineString([(p.x, p.y) for p in pts])
+
+
+def _compute_junction_points(lines: List[LineString], snap_m: float, min_degree: int = 3) -> List[Point]:
+    """Approximate junction points by counting snapped reach endpoints.
+
+    This is a fast, topology-light proxy that works well when reach endpoints are already
+    snapped by upstream preprocessing (e.g., river_network snap_m).
+    """
+    if not lines:
+        return []
+    snap_m = float(snap_m) if snap_m and snap_m > 0 else 30.0
+
+    def _key(pt: Point) -> tuple[int, int]:
+        return (int(round(pt.x / snap_m)), int(round(pt.y / snap_m)))
+
+    counts: Dict[tuple[int, int], int] = {}
+    reps: Dict[tuple[int, int], Point] = {}
+    for ln in lines:
+        if ln is None or ln.is_empty:
+            continue
+        try:
+            c0 = Point(ln.coords[0])
+            c1 = Point(ln.coords[-1])
+        except Exception:
+            continue
+        for pt in (c0, c1):
+            k = _key(pt)
+            counts[k] = counts.get(k, 0) + 1
+            if k not in reps:
+                reps[k] = pt
+
+    out = [reps[k] for k, n in counts.items() if n >= int(min_degree)]
+    return out
+
+
+def _is_harmful_intersection(g1: LineString, g2: LineString, tol_m: float) -> bool:
+    """Return True if g1 and g2 intersect in a way likely to cause interpolation artifacts."""
+    if not g1.intersects(g2):
+        return False
+    inter = g1.intersection(g2)
+    if inter.is_empty:
+        return False
+
+    # For multi-intersections, treat as harmful (rare but typically messy).
+    pts: List[Point] = []
+    if inter.geom_type == "Point":
+        pts = [inter]
+    elif inter.geom_type == "MultiPoint":
+        pts = list(inter.geoms)
+    else:
+        return True
+
+    a0 = Point(g1.coords[0]); a1 = Point(g1.coords[-1])
+    b0 = Point(g2.coords[0]); b1 = Point(g2.coords[-1])
+    tol_m = float(tol_m) if tol_m is not None else 0.0
+
+    for p in pts:
+        # If the intersection is very close to an endpoint on either line, treat as benign.
+        if min(p.distance(a0), p.distance(a1)) <= tol_m:
+            continue
+        if min(p.distance(b0), p.distance(b1)) <= tol_m:
+            continue
+        return True
+
+    return False
+
+
+def _global_deconflict_xs(xs_list: List[Dict], tol_m: float) -> List[Dict]:
+    """Drop cross-sections that intersect other cross-sections within a reach.
+
+    Strategy (deterministic):
+      - Iterate in station order.
+      - Keep the first XS in any conflicting group; drop later ones.
+    """
+    if len(xs_list) < 2:
+        return xs_list
+
+    kept: List[Dict] = []
+    for rec in xs_list:
+        g = rec.get("geometry")
+        if g is None or g.is_empty:
+            continue
+        conflict = False
+        for prev in kept:
+            g2 = prev.get("geometry")
+            if g2 is None or g2.is_empty:
+                continue
+            if _is_harmful_intersection(g, g2, tol_m=tol_m):
+                conflict = True
+                break
+        if not conflict:
+            kept.append(rec)
+
+    dropped = len(xs_list) - len(kept)
+    if dropped > 0:
+        log.info(f"[XS] Global deconflict dropped {dropped} intersecting XS within reach.")
+    return kept
+
+
 # --------------------------------------------------------------------------------------
 # Raster sampling with CRS transforms + nodata handling
 # --------------------------------------------------------------------------------------
@@ -499,7 +630,26 @@ def build_xs_for_river(
         xs_lines_records = []
         xs_points_records = []
         xs_id_counter = 1
-        
+
+        # Pre-compute junction nodes from snapped reach endpoints (fast proxy for confluences).
+        junction_pts: List[Point] = []
+        junction_tree = None
+        if bool(getattr(cfg, "skip_junctions", True)) and float(getattr(cfg, "junction_buffer_m", 0.0)) > 0:
+            try:
+                lines: List[LineString] = []
+                for _, r in rivers_clip.iterrows():
+                    g = _ensure_single_linestring(r.geometry)
+                    if g is None or g.is_empty:
+                        continue
+                    g = _densify_linestring(g, float(getattr(cfg, "densify_step_m", 0.0)))
+                    lines.append(g)
+                junction_pts = _compute_junction_points(lines, snap_m=float(getattr(cfg, "junction_snap_m", 30.0)), min_degree=3)
+                if junction_pts:
+                    junction_tree = STRtree(junction_pts)
+                    log.info(f"[XS] Detected {len(junction_pts)} junction node(s) from reach endpoints.")
+            except Exception as e:
+                log.debug("[XS] Junction detection failed: %s", e)
+                junction_tree = None
         # Determine smoothing window (use spacing if not explicit)
         smoothing_eps = (cfg.smoothing_window_m / 2.0) if cfg.smoothing_window_m > 0 else (cfg.spacing_m / 2.0)
         smoothing_eps = max(smoothing_eps, 0.5)
@@ -508,6 +658,9 @@ def build_xs_for_river(
             geom = _ensure_single_linestring(row.geometry)
             if geom is None:
                 continue
+
+            # Densify to stabilize tangents and reduce spurious XS crossings on coarse centerlines
+            geom = _densify_linestring(geom, float(getattr(cfg, 'densify_step_m', 0.0)))
 
             L = float(geom.length)
             if L < cfg.min_centerline_len_m:
@@ -525,6 +678,22 @@ def build_xs_for_river(
             for k in range(n_xs):
                 s_center = min(L, k * cfg.spacing_m)
                 center_pt = geom.interpolate(s_center)
+
+                # Skip XS too close to a junction/confluence (reduces self-intersection artifacts)
+                if junction_tree is not None:
+                    try:
+                        buf = center_pt.buffer(float(getattr(cfg, 'junction_buffer_m', 0.0)))
+                        hits = junction_tree.query(buf)
+                        # Shapely 2 returns indices; Shapely 1 may return geometries
+                        if len(hits) > 0:
+                            if isinstance(hits[0], (int, np.integer)):
+                                geoms = [junction_pts[int(i)] for i in hits]
+                            else:
+                                geoms = list(hits)
+                            if any(center_pt.distance(pt) <= float(getattr(cfg, 'junction_buffer_m', 0.0)) for pt in geoms):
+                                continue
+                    except Exception:
+                        pass
 
                 # Use smoothed tangent for orientation
                 tan = _line_tangent(geom, s_center, eps=smoothing_eps)
@@ -545,9 +714,13 @@ def build_xs_for_river(
                     "center_pt": center_pt
                 })
             
-            # 2. Trim overlapping XS if requested
+            # 2. Trim overlapping XS if requested (adjacent pairs)
             if cfg.trim_overlaps and len(xs_batch) > 1:
                 xs_batch = _trim_overlapping_xs(xs_batch)
+
+            # 2b. Global deconflict within reach: drop XS that still intersect after trimming
+            if bool(getattr(cfg, 'global_deconflict', True)) and len(xs_batch) > 1:
+                xs_batch = _global_deconflict_xs(xs_batch, tol_m=float(getattr(cfg, 'deconflict_tol_m', 2.0)))
             
             # 3. Sample Rasters along final geometries
             for rec in xs_batch:
@@ -672,6 +845,22 @@ def _parse_args() -> argparse.Namespace:
                    help="Trim intersecting cross-sections (default True).")
     p.add_argument("--no-trim-overlaps", dest="trim_overlaps", action="store_false", help="Disable overlap trimming.")
 
+    p.add_argument("--deconflict-tol-m", type=float, default=2.0,
+                   help="Endpoint tolerance (m) when identifying intersecting cross-sections.")
+    p.add_argument("--no-global-deconflict", dest="global_deconflict", action="store_false",
+                   help="Disable dropping XS that intersect non-adjacent XS within a reach.")
+    p.set_defaults(global_deconflict=True)
+
+    p.add_argument("--no-skip-junctions", dest="skip_junctions", action="store_false",
+                   help="Do not skip XS near confluences/junctions.")
+    p.set_defaults(skip_junctions=True)
+    p.add_argument("--junction-snap-m", type=float, default=30.0,
+                   help="Snapping scale (m) for junction detection from reach endpoints.")
+    p.add_argument("--junction-buffer-m", type=float, default=120.0,
+                   help="Skip XS within this distance (m) of junction nodes.")
+    p.add_argument("--densify-step-m", type=float, default=20.0,
+                   help="Densify centerlines to this vertex spacing (m) before computing tangents.")
+
     # Component pruning (ON by default)
     p.add_argument("--disable-component-prune", action="store_true", help="Disable component-first pruning.")
     p.add_argument("--keep-top-components", type=int, default=1, help="Keep the N largest components by total length.")
@@ -703,7 +892,13 @@ def main() -> None:
         bank_search_m=float(args.bank_search_m),
         min_centerline_len_m=float(args.min_centerline_len_m),
         smoothing_window_m=float(args.smoothing_window_m),
-        trim_overlaps=bool(args.trim_overlaps)
+        trim_overlaps=bool(args.trim_overlaps),
+        global_deconflict=bool(getattr(args, "global_deconflict", True)),
+        deconflict_tol_m=float(getattr(args, "deconflict_tol_m", 2.0)),
+        skip_junctions=bool(getattr(args, "skip_junctions", True)),
+        junction_snap_m=float(getattr(args, "junction_snap_m", 30.0)),
+        junction_buffer_m=float(getattr(args, "junction_buffer_m", 120.0)),
+        densify_step_m=float(getattr(args, "densify_step_m", 20.0)),
     )
 
     river_gpkg = Path(args.river_gpkg)

@@ -15,7 +15,7 @@ from typing import Dict, FrozenSet, Final
 import numpy as np
 
 __version__ = "0.8.0"
-PIPELINE_VERSION = "sdb_river_unified_v0.8.0"
+PIPELINE_VERSION = "open-bathy-workflows_v2.0.10"
 
 # =============================================================================
 # NODATA VALUES - Standardized across all modules

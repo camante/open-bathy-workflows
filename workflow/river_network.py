@@ -211,6 +211,119 @@ def try_arcgis_nhd_flowlines(
     return gpd.GeoDataFrame(columns=["geometry"], crs="EPSG:4326")
 
 
+
+# --------------------------------------------------------------------------------------
+# Optional: ArcGIS REST NHDArea polygons (river channel polygons)
+# --------------------------------------------------------------------------------------
+
+_ARCGIS_LAYER_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+
+def arcgis_list_layers(service_url: str, timeout_s: int = 60) -> List[Dict[str, Any]]:
+    """Return ArcGIS MapServer layer metadata (id+name) for a service URL."""
+    if service_url in _ARCGIS_LAYER_CACHE:
+        return _ARCGIS_LAYER_CACHE[service_url]
+    try:
+        r = requests.get(service_url, params={"f": "pjson"}, timeout=timeout_s)
+        r.raise_for_status()
+        j = r.json()
+        layers = j.get("layers", []) or []
+        # keep minimal, stable fields
+        out = [{"id": int(L.get("id")), "name": str(L.get("name", ""))} for L in layers if "id" in L]
+        _ARCGIS_LAYER_CACHE[service_url] = out
+        return out
+    except Exception:
+        return []
+
+def arcgis_find_layer_id(service_url: str, name_patterns: List[str], timeout_s: int = 60) -> Optional[int]:
+    """Find a layer id whose name matches any of the provided substrings (case-insensitive)."""
+    layers = arcgis_list_layers(service_url, timeout_s=timeout_s)
+    if not layers:
+        return None
+    for pat in name_patterns:
+        pl = pat.lower()
+        for L in layers:
+            if pl in (L.get("name", "").lower()):
+                return int(L["id"])
+    return None
+
+def _clean_polys(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    gdf = gdf.copy()
+    gdf = gdf[gdf.geometry.notnull()]
+    gdf = gdf[~gdf.geometry.is_empty]
+    gdf = gdf[gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
+    if gdf.empty:
+        return gdf
+    if (~gdf.is_valid).any():
+        log.info("[CLEAN] Fixing invalid polygon geometries with buffer(0) where possible.")
+        fixed = gdf.geometry.buffer(0)
+        ok = fixed.geom_type.isin(["Polygon", "MultiPolygon"])
+        gdf.loc[ok, "geometry"] = fixed[ok].values
+        gdf = gdf[gdf.is_valid]
+        gdf = gdf[gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
+    return gdf
+
+def clip_polys_to_aoi(gdf_polys: gpd.GeoDataFrame, aoi_poly_proj: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    poly = aoi_poly_proj.iloc[0].geometry
+    gdf = gdf_polys.copy()
+    gdf["geometry"] = gdf.geometry.intersection(poly)
+    gdf = _clean_polys(gdf)
+    return gdf
+
+def try_arcgis_nhdarea_polygons(
+    aoi: Tuple[float, float, float, float],
+    out_crs: Optional[str],
+    timeout_s: int = 120,
+) -> gpd.GeoDataFrame:
+    """Fetch NHDArea polygons via ArcGIS REST (best-effort).
+
+    This is used downstream to constrain river bathymetry predictions to polygonal channel areas
+    when those features exist (e.g., wide rivers, braided channels, tidal channels).
+
+    Returns GeoDataFrame in projected CRS (out_crs or auto-UTM). Empty on failure.
+    """
+    lonc, latc = _aoi_center(aoi)
+    crs_out = CRS.from_user_input(out_crs) if out_crs else CRS.from_epsg(_auto_utm_epsg_from_lonlat(lonc, latc))
+
+    # Try NHD MapServer first (most common place for NHDArea)
+    layer_id = arcgis_find_layer_id(
+        NHD_MAPSERVER,
+        name_patterns=["NHDArea", "NHD Area"],
+        timeout_s=min(60, timeout_s),
+    )
+    if layer_id is not None:
+        try:
+            log.info("[ARCGIS] Querying NHDArea polygons (%s layer %s) ...", NHD_MAPSERVER, layer_id)
+            gdf_ll = arcgis_query_layer_geojson(NHD_MAPSERVER, layer_id, aoi, timeout_s=timeout_s)
+            if gdf_ll is not None and not gdf_ll.empty:
+                gdfp = gdf_ll.to_crs(crs_out)
+                gdfp = _clean_polys(gdfp)
+                if not gdfp.empty:
+                    gdfp["source"] = "arcgis_nhdarea"
+                    return gdfp
+        except Exception as e:
+            log.warning("[ARCGIS] NHDArea query failed: %s", str(e))
+
+    # Fallback: some services expose similar polygons under waterbody/area names.
+    layer_id = arcgis_find_layer_id(
+        NHD_MAPSERVER,
+        name_patterns=["NHD Waterbody", "NHDWaterbody", "Waterbody"],
+        timeout_s=min(60, timeout_s),
+    )
+    if layer_id is not None:
+        try:
+            log.info("[ARCGIS] Querying NHD waterbody polygons (%s layer %s) ...", NHD_MAPSERVER, layer_id)
+            gdf_ll = arcgis_query_layer_geojson(NHD_MAPSERVER, layer_id, aoi, timeout_s=timeout_s)
+            if gdf_ll is not None and not gdf_ll.empty:
+                gdfp = gdf_ll.to_crs(crs_out)
+                gdfp = _clean_polys(gdfp)
+                if not gdfp.empty:
+                    gdfp["source"] = "arcgis_waterbody"
+                    return gdfp
+        except Exception as e:
+            log.warning("[ARCGIS] Waterbody polygon query failed: %s", str(e))
+
+    return gpd.GeoDataFrame(columns=["geometry"], crs=crs_out)
+
 # --------------------------------------------------------------------------------------
 # AOI / CRS helpers
 # --------------------------------------------------------------------------------------
@@ -903,6 +1016,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--tnm-max-items", type=int, default=50, help="Max TNM products to download.")
     p.add_argument("--tnm-timeout", type=int, default=120, help="HTTP timeout seconds for TNM search/download.")
     p.add_argument("--arcgis-timeout", type=int, default=120, help="HTTP timeout seconds for ArcGIS REST flowline fallback.")
+
+    # Optional NHDArea polygons (constrains river bathymetry domain when available)
+    p.add_argument("--no-nhdarea-polygons", dest="nhdarea_enable", action="store_false", default=True,
+                   help="Disable ArcGIS REST fetch of NHDArea polygons.")
+    p.add_argument("--nhdarea-layer-name", default="nhdarea_clip",
+                   help="Output layer name for NHDArea polygons (default nhdarea_clip).")
+
     p.add_argument("--tnm-dry-run", action="store_true", help="Search but do not download.")
 
     # HydroRIVERS fallback (local and/or auto-download)
@@ -923,7 +1043,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--snap-m", type=float, default=5.0, help="Endpoint snap tolerance for node merging (m).")
     p.add_argument(
         "--write-layers",
-        default="rivers_aoi,rivers_clip,graph_nodes,graph_edges",
+        default="rivers_aoi,rivers_clip,graph_nodes,graph_edges,nhdarea_aoi,nhdarea_clip",
         help="Comma-separated output layers to write.",
     )
     return p.parse_args()
@@ -1056,6 +1176,21 @@ def main() -> None:
     rivers_aoi = gdf.copy()
     rivers_clip = clip_lines_to_aoi(rivers_aoi, aoi_poly_proj)
 
+    # Optional: NHDArea polygons (used downstream to constrain river bathymetry domain)
+    nhdarea_aoi = gpd.GeoDataFrame(columns=["geometry"], crs=crs_out)
+    nhdarea_clip = gpd.GeoDataFrame(columns=["geometry"], crs=crs_out)
+    src_name = str(rivers_aoi["source"].iloc[0]) if "source" in rivers_aoi.columns and len(rivers_aoi) else ""
+    if getattr(args, "nhdarea_enable", True) and (not src_name.startswith("hydrorivers")):
+        try:
+            nhdarea_aoi = try_arcgis_nhdarea_polygons(aoi=aoi, out_crs=str(crs_out), timeout_s=int(getattr(args, "arcgis_timeout", 120)))
+            if nhdarea_aoi is not None and not nhdarea_aoi.empty:
+                nhdarea_clip = clip_polys_to_aoi(nhdarea_aoi, aoi_poly_proj)
+                log.info("[OK] Loaded %d NHDArea polygon(s) via ArcGIS REST (%s).", len(nhdarea_clip), str(nhdarea_aoi.get("source", ["arcgis"]).iloc[0]) if "source" in nhdarea_aoi.columns else "arcgis")
+            else:
+                log.info("[ARCGIS] No NHDArea polygons found in AOI (continuing).")
+        except Exception as e:
+            log.warning("[ARCGIS] NHDArea polygon fetch failed (continuing): %s", str(e))
+
     nodes_gdf, edges_gdf = build_reach_graph(rivers_clip, snap_m=float(args.snap_m))
     edges_gdf = station_edges_from_root(nodes_gdf, edges_gdf)
 
@@ -1072,13 +1207,19 @@ def main() -> None:
         nodes_gdf.to_file(out_path, layer="graph_nodes", driver="GPKG")
     if "graph_edges" in layers:
         edges_gdf.to_file(out_path, layer="graph_edges", driver="GPKG")
+    if "nhdarea_aoi" in layers and nhdarea_aoi is not None and not nhdarea_aoi.empty:
+        nhdarea_aoi.to_file(out_path, layer="nhdarea_aoi", driver="GPKG")
+    if "nhdarea_clip" in layers and nhdarea_clip is not None and not nhdarea_clip.empty:
+        layer_name = getattr(args, "nhdarea_layer_name", "nhdarea_clip")
+        nhdarea_clip.to_file(out_path, layer=layer_name, driver="GPKG")
 
     log.info(
-        "[DONE] rivers_aoi=%d | rivers_clip=%d | nodes=%d | edges=%d | CRS=%s | source=%s",
+        "[DONE] rivers_aoi=%d | rivers_clip=%d | nodes=%d | edges=%d | nhdarea=%d | CRS=%s | source=%s",
         len(rivers_aoi),
         len(rivers_clip),
         len(nodes_gdf),
         len(edges_gdf),
+        len(nhdarea_clip) if 'nhdarea_clip' in locals() else 0,
         str(gdf.crs),
         str(rivers_aoi["source"].iloc[0]) if "source" in rivers_aoi.columns and len(rivers_aoi) else "unknown",
     )
