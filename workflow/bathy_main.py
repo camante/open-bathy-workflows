@@ -44,13 +44,14 @@ import re
 import shutil
 from vdatum_utils import convert_sdb_msl_to_navd88
 from process_utils import run_cmd
-import subprocess
-import shlex
-import threading
+
+# Phase-1 anti-soup refactor: shared helpers
+from core.paths import ensure_dir
+from core.exec import run_command, run_command_stdout_to_file
+from core.fingerprint import hash_key as _hash_key
 
 # Central constants (versioning, nodata)
 import constants
-from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1083,11 +1084,6 @@ class BathyConfig:
 # Helpers
 # -----------------------------------------------------------------------------
 
-def ensure_dir(p: Path) -> Path:
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-
 def _find_latest_waffles_mask(cache_root: Path) -> Optional[Path]:
     """Find the most recent waffles coastline mask in cache_root/masks/.
 
@@ -1716,11 +1712,6 @@ def _normalize_cudem_source_name(src: str) -> str:
         return s
     return _CUDEM_XYZ_SOURCE_ALIASES.get(s, s)
 
-def _hash_key(*parts: str, n: int = 12) -> str:
-    # Be defensive: callers sometimes pass floats/ints.
-    h = hashlib.md5("|".join(str(p) for p in parts).encode("utf-8")).hexdigest()
-    return h[:n]
-
 
 def _reproject_xyz_file(
     xyz_path: Path,
@@ -1914,20 +1905,9 @@ def fetch_cudem_soundings_via_dlim(
         stderr_tail = ""
         rc = 999
         try:
-            tmp_path = out_xyz.with_suffix(".xyz.tmp")
-            if tmp_path.exists():
-                tmp_path.unlink()
-
-            with open(tmp_path, "w", encoding="utf-8") as f_out:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=f_out,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
-                stderr = proc.stderr.read() if proc.stderr else ""
-                rc = proc.wait()
-                stderr_tail = (stderr or "")[-4000:]
+            # Write dlim stdout to an atomic temp file alongside the target.
+            rc, stderr_tail = run_command_stdout_to_file(cmd, out_xyz, prefix=prefix, tail_chars=4000)
+            tmp_path = out_xyz.with_suffix(out_xyz.suffix + ".tmp")
 
             # Basic sanity: non-empty file
             file_size = tmp_path.stat().st_size if tmp_path.exists() else 0
@@ -2004,176 +1984,6 @@ def write_json(path: Path, obj: Dict[str, Any]) -> None:
         emit_artifact_written(path, kind="json", role="report_or_metadata")
     except Exception as e:
         logging.getLogger(__name__).debug("Optional flight-recorder emit failed: %s", e)
-
-
-def run_command(
-    cmd: Any,
-    cwd: Optional[Path] = None,
-    env: Optional[Dict[str, str]] = None,
-    prefix: str = "",
-    stream_stdout: bool = True,
-    stream_stderr: bool = True,
-    stdout_log_path: Optional[Path] = None,
-    stderr_log_path: Optional[Path] = None,
-    max_lines: int = 8000,
-    tail_chars: int = 16000,
-) -> Tuple[int, str, str]:
-    """
-    Run a command as a list of arguments (NOT shell=True for security).
-    
-    SECURITY FIX: Using list-based arguments prevents shell injection attacks.
-    
-    Args:
-        cmd: List of command arguments (e.g., [sys.executable, "script.py", "--arg=value"])
-        cwd: Working directory
-        env: Environment variables
-        prefix: Prefix for log messages
-        stream_stdout: Whether to stream stdout to log
-        stream_stderr: Whether to stream stderr to log
-        max_lines: Maximum lines to keep in memory
-        tail_chars: Maximum chars to return
-        
-    Returns:
-        Tuple of (return_code, stdout_tail, stderr_tail)
-    """
-    env = env or os.environ.copy()
-
-    # Allow cmd to be either a list(argv) or a single command string.
-    if isinstance(cmd, str):
-        cmd = shlex.split(cmd)
-    cmd = [str(c) for c in cmd]
-
-    stdout_lines = deque(maxlen=max_lines)
-    stderr_lines = deque(maxlen=max_lines)
-    stdout_fh = None
-    stderr_fh = None
-    try:
-        if stdout_log_path is not None:
-            ensure_dir(Path(stdout_log_path).parent)
-            stdout_fh = open(stdout_log_path, 'w', buffering=1, encoding='utf-8')
-        if stderr_log_path is not None:
-            ensure_dir(Path(stderr_log_path).parent)
-            stderr_fh = open(stderr_log_path, 'w', buffering=1, encoding='utf-8')
-    except Exception:
-        stdout_fh = None
-        stderr_fh = None
-
-    
-    # Log the command being run (safely formatted)
-    cmd_str = " ".join(str(c) for c in cmd)
-    log.debug(f"Executing: {cmd_str}")
-
-    # Flight recorder: capture subprocess lifecycle
-    _fr = None
-    try:
-        from flight_recorder import FlightRecorder
-
-        _fr = FlightRecorder.global_instance()
-    except Exception:
-        _fr = None
-    if _fr is not None:
-        _fr.record_event(
-            "subprocess_start",
-            cmd=cmd,
-            cmd_str=cmd_str,
-            cwd=str(cwd) if cwd else None,
-            prefix=prefix,
-        )
-
-    proc = subprocess.Popen(
-        cmd,  # List of arguments - no shell injection possible
-        shell=False,  # SECURITY: Never use shell=True with user input
-        cwd=str(cwd) if cwd else None,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-        universal_newlines=True,
-    )
-
-    def _pump(stream, sink, log_fn, pfx: str, enabled: bool, fh=None):
-        try:
-            for line in iter(stream.readline, ""):
-                if not line:
-                    break
-                sink.append(line)
-                if fh is not None:
-                    try:
-                        fh.write(line)
-                    except Exception:
-                        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
-                if enabled:
-                    log_fn(f"{pfx}{line.rstrip()}" if pfx else line.rstrip())
-        finally:
-            try:
-                stream.close()
-            except Exception:
-                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
-
-    threads: List[threading.Thread] = []
-    if proc.stdout is not None:
-        threads.append(threading.Thread(
-            target=_pump,
-            args=(proc.stdout, stdout_lines, log.info, prefix, stream_stdout, stdout_fh),
-            daemon=True,
-        ))
-    if proc.stderr is not None:
-        err_pfx = f"{prefix}[stderr] " if prefix else "[stderr] "
-        threads.append(threading.Thread(
-            target=_pump,
-            args=(proc.stderr, stderr_lines, log.warning, err_pfx, stream_stderr, stderr_fh),
-            daemon=True,
-        ))
-
-    for t in threads:
-        t.start()
-
-    rc = proc.wait()
-
-    for t in threads:
-        t.join(timeout=2.0)
-
-    try:
-        if stdout_fh is not None:
-            stdout_fh.close()
-        if stderr_fh is not None:
-            stderr_fh.close()
-    except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
-
-    out = "".join(stdout_lines)
-    err = "".join(stderr_lines)
-
-    if _fr is not None:
-        _fr.record_event(
-            "subprocess_end",
-            cmd=cmd,
-            rc=int(rc),
-            stdout_tail=out[-tail_chars:] if isinstance(out, str) else None,
-            stderr_tail=err[-tail_chars:] if isinstance(err, str) else None,
-        )
-    if len(out) > tail_chars:
-        out = out[-tail_chars:]
-    if len(err) > tail_chars:
-        err = err[-tail_chars:]
-
-    # Flight recorder heuristic: many GDAL/tools write to the last argument.
-    # Emit artifact_written if the last token looks like a path and exists.
-    try:
-        from flight_recorder import emit_artifact_written
-        if isinstance(cmd, (list, tuple)) and len(cmd) >= 2:
-            cand = cmd[-1]
-            if isinstance(cand, (str, Path)):
-                p = Path(str(cand))
-                if p.exists() and p.is_file():
-                    ext = p.suffix.lower()
-                    kind = "raster" if ext in (".tif", ".tiff", ".vrt") else "file"
-                    emit_artifact_written(p, kind=kind, role="subprocess_output")
-    except Exception as e:
-        logging.getLogger(__name__).debug("Optional flight-recorder emit failed: %s", e)
-
-    return rc, out, err
 
 
 
