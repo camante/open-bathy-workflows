@@ -47,7 +47,7 @@ import logging
 import argparse
 import textwrap
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Optional
 import numpy as np
 import pandas as pd
 
@@ -73,9 +73,8 @@ except Exception:
     gpd = None
     Point = None
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+from plot_utils import lazy_pyplot
+plt = None  # lazy-loaded
 from pyproj import Transformer
 
 # Direct import for flat directory structure
@@ -124,7 +123,7 @@ def _resolve_max_depth_sdb(
     try:
         return float(s)
     except Exception:
-        pass
+        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
     if s not in ("auto", "automatic"):
         return default
@@ -213,6 +212,10 @@ def generate_atl03_debug_plots(training_df, atl03_files, aoi_bbox, plots_dir,
     """
     Generates diagnostic plots of ATL03 photons with overlaid training picks.
     """
+    global plt
+    if plt is None:
+        plt = lazy_pyplot()
+
     required_cols = {"longitude", "latitude", "depth_m", "ws_h", "granule", "beam"}
     if required_cols.difference(training_df.columns) or training_df.empty or not atl03_files:
         log.warning("[VIS] Skipping plots (missing cols/data).")
@@ -369,7 +372,7 @@ def generate_atl03_debug_plots(training_df, atl03_files, aoi_bbox, plots_dir,
                             label=f"Depth support ({max_depth_val:.1f} m)",
                         )
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
             ax.set_title(f"{granule} – {beam_name} – {int(start_m)}-{int(end_m)} m")
 

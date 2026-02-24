@@ -37,15 +37,14 @@ Author: SDB Pipeline Development Team
 Version: 0.8.0
 """
 
-from __future__ import annotations
 
 import logging
 import math
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union, Any, Iterator, Generator
+from typing import Dict, List, Optional, Tuple, Union, Any
 
 import numpy as np
 
@@ -252,7 +251,7 @@ def _is_geographic_crs(crs) -> bool:
             c = PyprojCRS.from_user_input(crs)
             return c.is_geographic
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
     
     # Fallback: check for common geographic CRS strings
     crs_str = str(crs).lower()
@@ -1190,12 +1189,12 @@ def main():
         xs_params_gpkg=Path(args.xs_gpkg) if args.xs_gpkg else None,
     )
     
-    print(f"\nGap-fill complete:")
-    print(f"  HQ points: {stats['n_hq_points']} (in water: {stats['n_hq_points_in_water']})")
-    print(f"  Components: {stats['n_components']}")
-    print(f"  Residual RMSE: {stats['residual_rmse']:.3f} m")
-    print(f"  Pixels corrected: {stats['pixels_corrected']}")
-    print(f"  Pixels prior-only: {stats['pixels_prior_only']}")
+    log.info(f"\nGap-fill complete:")
+    log.info(f"  HQ points: {stats['n_hq_points']} (in water: {stats['n_hq_points_in_water']})")
+    log.info(f"  Components: {stats['n_components']}")
+    log.info(f"  Residual RMSE: {stats['residual_rmse']:.3f} m")
+    log.info(f"  Pixels corrected: {stats['pixels_corrected']}")
+    log.info(f"  Pixels prior-only: {stats['pixels_prior_only']}")
 
 
 if __name__ == "__main__":

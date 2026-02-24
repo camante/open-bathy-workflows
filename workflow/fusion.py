@@ -9,14 +9,13 @@ This module handles the fusion of multiple bathymetric data sources with:
 - Weighted sample generation for RF training
 """
 
-from __future__ import annotations
 
 import os
 import sys
 import argparse
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -77,7 +76,7 @@ def _log_funnel(stage: str, df: Optional[pd.DataFrame], rr: Optional[Any] = None
             elif hasattr(rr, "data") and isinstance(rr.data, dict):
                 rr.data[f"funnel.{stage}"] = stats
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
 # -----------------------------------------------------------------------------
 # Helper: local metric projection
@@ -427,7 +426,7 @@ def _ensure_training_schema(
         stats = df.groupby("source")["sample_weight"].mean().to_dict()
         log.info(f"[Fusion] Weight distribution (mean by source): {stats}")
     except Exception:
-        pass
+        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
     # Enforce column order
     col_order = [
@@ -515,25 +514,68 @@ def build_fused_training_dataframe(
     xyz_df = xyz_df.copy() if (xyz_df is not None and not xyz_df.empty) else empty_schema.copy()
 
     _log_funnel('fusion.input.atl03', atl03_df, rr)
+    try:
+        if not atl03_df.empty and 'depth_m' in atl03_df.columns:
+            _d = pd.to_numeric(atl03_df['depth_m'], errors='coerce')
+            _d = _d[np.isfinite(_d)]
+            if len(_d) >= 50:
+                dmin = float(np.nanmin(_d.to_numpy()))
+                p95 = float(np.nanpercentile(_d.to_numpy(), 95))
+                spread95 = p95 - dmin
+                if spread95 < 0.25:
+                    log.warning(
+                        "[ATL03_QC] ATL03 depths are tightly clustered near their shallow limit (min=%.2f, p95=%.2f, spread95=%.2f m). This often indicates bottom-picking clipping / poor penetration. Consider checking ATL03 params (min-depth-atl03, conf/min-bottom-photons, water class) and rely more on ATL24/XYZ for this run.",
+                        dmin, p95, spread95,
+                    )
+        
+    except Exception:
+        logging.getLogger(__name__).debug("Optional ATL03 QC warning failed", exc_info=True)
     _log_funnel('fusion.input.atl24', atl24_df, rr)
     _log_funnel('fusion.input.xyz', xyz_df, rr)
+
+    # Defensive ATL03 QC: if ATL03 collapses near the shallow floor (failed bottom-pick signature),
+    # prevent it from poisoning training when stronger anchors exist.
+    try:
+        if not atl03_df.empty and 'depth_m' in atl03_df.columns and len(atl03_df) >= 50:
+            _d = pd.to_numeric(atl03_df['depth_m'], errors='coerce').to_numpy()
+            _d = _d[np.isfinite(_d)]
+            if _d.size >= 50:
+                _dmin = float(np.nanmin(_d))
+                _p50 = float(np.nanpercentile(_d, 50))
+                _p95 = float(np.nanpercentile(_d, 95))
+                _spread95 = _p95 - _dmin
+                _shallow_collapsed = (_spread95 < 0.25) and (_p95 > -1.25)
+                if _shallow_collapsed and ((not atl24_df.empty) or (not xyz_df.empty)):
+                    log.warning(
+                        "[ATL03_QC] Dropping ATL03 from fusion: shallow-floor collapse detected (min=%.2f, p50=%.2f, p95=%.2f, spread95=%.2f m) with ATL24/XYZ anchors available. Check ATL03 params (depth/confidence/refraction/water mask).",
+                        _dmin, _p50, _p95, _spread95,
+                    )
+                    atl03_df = atl03_df.iloc[0:0].copy()
+                    _log_funnel('fusion.input.atl03.quarantined', atl03_df, rr)
+    except Exception:
+        logging.getLogger(__name__).debug("Optional ATL03 quarantine QC failed", exc_info=True)
 
     log.info(
         f"[Fusion] Starting build_fused_training_dataframe with "
         f"ATL03={len(atl03_df)}, ATL24={len(atl24_df)}, XYZ={len(xyz_df)}."
     )
 
-    # CRITICAL FIX: Force source normalization for XYZ data
-    # This ensures xyz_df["source"] == "extra_xyz" unconditionally
+    # Normalize sensor sources. Keep XYZ provenance if provided (e.g., extra_xyz:<subset>).
+    # We only fill missing/empty XYZ source values; we do NOT clobber informative tags.
     if not atl03_df.empty:
         atl03_df["source"] = "atl03"
     if not atl24_df.empty:
         atl24_df["source"] = "atl24"
     if not xyz_df.empty:
-        # Force overwrite to ensure consistency (was conditional before)
-        xyz_df["source"] = "extra_xyz"
-        log.info(f"[Fusion] XYZ source normalized: {len(xyz_df)} points set to 'extra_xyz'")
-
+        if ("source" not in xyz_df.columns) or xyz_df["source"].isna().all():
+            xyz_df["source"] = "extra_xyz"
+            log.info(f"[Fusion] XYZ source normalized: {len(xyz_df)} points set to 'extra_xyz'")
+        else:
+            # Fill only missing entries; preserve existing tags
+            n_missing = int(xyz_df["source"].isna().sum())
+            if n_missing > 0:
+                xyz_df.loc[xyz_df["source"].isna(), "source"] = "extra_xyz"
+            log.info(f"[Fusion] XYZ source preserved: {len(xyz_df)} points (missing filled={n_missing})")
     # Step 1: Filter ATL against XYZ, if XYZ provided
     if not xyz_df.empty and (not atl03_df.empty or not atl24_df.empty):
         log.info("[Fusion] Stage 1: Filter ATL03/ATL24 against high-quality XYZ data.")
@@ -639,7 +681,7 @@ def build_fused_training_dataframe(
                         elif hasattr(rr, "data") and isinstance(rr.data, dict):
                             rr.data["fusion.adaptive_sampling"] = sampling_stats
                     except Exception:
-                        pass
+                        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
                 
                 _log_funnel('fusion.sampled.final', sampled_df, rr)
                 return sampled_df

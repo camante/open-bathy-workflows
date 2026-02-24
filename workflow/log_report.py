@@ -14,15 +14,18 @@ They rely on keys populated across atl.py, fusion.py, train.py, predict.py and s
 If keys are missing, the plots will still render but will show "missing" markers.
 """
 
-from __future__ import annotations
 
+import logging
+log = logging.getLogger(__name__)
 import datetime
 import json
 import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Iterable, Tuple, List
+from typing import Any, Dict, Optional, Tuple, List
+
+plt = None  # lazy-loaded matplotlib.pyplot (set via plot_utils.lazy_pyplot)
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -71,10 +74,12 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 def _maybe_import_matplotlib():
+    """Best-effort import of matplotlib via plot_utils.lazy_pyplot."""
+    global plt
     try:
-        import matplotlib
-        matplotlib.use("Agg", force=True)
-        import matplotlib.pyplot as plt  # noqa: F401
+        from plot_utils import lazy_pyplot
+        if plt is None:
+            plt = lazy_pyplot()
         return True
     except Exception:
         return False
@@ -209,6 +214,10 @@ def _render_funnel_panel(ax, title: str, stages: List[Tuple[str, Any]], *, hist:
             bar_width = (val / max_val) * bar_max_width
             # Color gradient: green for high retention, red for low
             retention = val / max_val
+            global plt
+            if plt is None:
+                plt = lazy_pyplot()
+
             color = plt.cm.RdYlGn(retention * 0.8 + 0.1)  # Avoid extremes
             
             rect = plt.Rectangle((0.52, y - bar_height/2), bar_width, bar_height,
@@ -252,7 +261,8 @@ def _emit_funnel_pngs_from_data(data: Dict[str, Any], out_dir: Path) -> Dict[str
     if not _maybe_import_matplotlib():
         return artifacts
 
-    import matplotlib.pyplot as plt
+    global plt  # set by _maybe_import_matplotlib()
+
 
     plots_dir = out_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
@@ -453,7 +463,7 @@ class RunReport:
             if artifacts:
                 out_path.write_text(json.dumps(self.data, indent=2))
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
         return out_path
 
@@ -477,9 +487,9 @@ def _cli():
         data.setdefault("artifacts", {})
         data["artifacts"].update(artifacts)
         rr_path.write_text(json.dumps(data, indent=2))
-        print("Wrote:", ", ".join(str(Path(v)) for v in artifacts.values()))
+        log.info("Wrote:", ", ".join(str(Path(v)) for v in artifacts.values()))
     else:
-        print("No funnels written (matplotlib missing or no output dir).")
+        log.info("No funnels written (matplotlib missing or no output dir).")
 
 if __name__ == "__main__":
     _cli()

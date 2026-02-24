@@ -614,7 +614,7 @@ def main():
         max_depth=args.max_depth,
     )
     
-    print(json.dumps(result, indent=2, default=str))
+    log.info(json.dumps(result, indent=2, default=str))
 
 
 if __name__ == "__main__":

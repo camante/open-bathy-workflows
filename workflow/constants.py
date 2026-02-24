@@ -11,11 +11,11 @@ This module provides:
 All magic numbers are documented with their sources.
 """
 
-from typing import Dict, FrozenSet, Final
+from typing import Dict, FrozenSet
 import numpy as np
 
 __version__ = "0.8.0"
-PIPELINE_VERSION = "open-bathy-workflows_v2.0.10"
+PIPELINE_VERSION = 'open-bathy-workflows_v2.0.17_river_domain_mask_v2'
 
 # =============================================================================
 # NODATA VALUES - Standardized across all modules

@@ -14,14 +14,13 @@ Design goals:
   * diagnostic plot (histogram + residual vs depth) for RunReport integration
 """
 
-from __future__ import annotations
 
 import os
 import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List, Sequence, Any
+from typing import Dict, Optional, Tuple, Sequence, Any
 
 import numpy as np
 
@@ -847,19 +846,27 @@ def align_to_atl24(
                 "n_tie_points": 0,
             }
         raise ValueError(msg + " Use allow_empty=True to skip instead.")
-    # prefer atl24 if available
-    if tp_all.source is not None:
-        tp_24 = tp_all.subset_by_source(["atl24"])
-        if tp_24.lon.size >= min_points:
-                tp_use = tp_sel
-                tie_used = str(tiepoint_mode)
-        else:
-            tp_use = tp_all
-            tie_used = "all_depths"
-    else:
-        tp_use = tp_all
-        tie_used = "all_depths"
+    # tiepoint selection (deterministic)
+    tp_use = tp_sel
+    tie_used = str(tiepoint_mode)
 
+    # Prefer ATL24-only tie points when using the default 'stacked' mode and there are
+    # enough ATL24 points to meet min_points. This improves alignment stability by
+    # avoiding mixed-source vertical behavior.
+    mode_l = str(tiepoint_mode or "").strip().lower()
+    if mode_l in ("stacked", "auto", "") and getattr(tp_all, "source", None) is not None:
+        tp_24 = tp_all.subset_by_source(["atl24"])
+        if tp_24 is not None and getattr(tp_24, "lon", None) is not None and tp_24.lon.size >= min_points:
+            tp_use = select_tiepoints(
+                tp_all,
+                mode="atl24",
+                source_col=tiepoint_source_col,
+                per_source_max=tiepoint_per_source_max,
+                seed=tiepoint_seed,
+            )
+            if tp_use is None or len(tp_use) < 1:
+                tp_use = tp_24
+            tie_used = "atl24"
     out = align_raster_to_tie_points(
         raster_path,
         tp_use,

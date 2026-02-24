@@ -20,8 +20,8 @@ Core ideas
 This module is dependency-light. rasterio is optional (only used for grid fingerprints).
 """
 
-from __future__ import annotations
 
+import logging
 import json
 import hashlib
 from dataclasses import dataclass
@@ -55,7 +55,7 @@ def _normalize_for_json(obj: Any) -> _JSONABLE:
         if isinstance(obj, np.ndarray):
             return _normalize_for_json(obj.tolist())
     except Exception:
-        pass
+        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
     return str(obj)
 
 def canonical_json(obj: Any) -> str:

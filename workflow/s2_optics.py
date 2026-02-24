@@ -10,7 +10,6 @@ Updates:
 4) Cleanup: Deletes bad/rejected dates immediately to save space.
 """
 
-from __future__ import annotations
 
 import argparse
 import logging
@@ -43,7 +42,7 @@ import atexit
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Iterable, Union
+from typing import Dict, List, Optional, Tuple, Iterable
 
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -146,7 +145,7 @@ def _write_composite_meta(out_dir: Path, meta: dict) -> None:
     try:
         meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True))
     except Exception:
-        pass
+        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
 
 def _build_s2_params_fingerprint_dict(
@@ -204,7 +203,7 @@ def _purge_expected_outputs(expected: Dict[str, Path]) -> None:
             if p.exists():
                 p.unlink()
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
 
 def acquire_run_lock(lock_path: Path, stale_hours: float = 6.0) -> None:
@@ -247,7 +246,7 @@ def acquire_run_lock(lock_path: Path, stale_hours: float = 6.0) -> None:
         try:
             lock_path.unlink()
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
     meta = {
         "pid": os.getpid(),
@@ -266,7 +265,7 @@ def acquire_run_lock(lock_path: Path, stale_hours: float = 6.0) -> None:
             if lock_path.exists():
                 lock_path.unlink()
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
     atexit.register(_cleanup)
 
@@ -339,7 +338,7 @@ def extract_orbit(item: dict) -> str:
         try:
             return f"{int(v):03d}"
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
     iid = item.get("id", "") or ""
     m = re.search(r"_R(\d{3})_", iid)
     if m:
@@ -1164,7 +1163,7 @@ def _hedley_glint_correct(
             vmask = scl_valid_mask(scl_int, dilate=0, scl_bad=set(scl_bad))
             mask0 &= vmask
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
     mask = mask0
     mask_mode = "strict"
@@ -1185,7 +1184,7 @@ def _hedley_glint_correct(
                 vmask = scl_valid_mask(scl_int, dilate=0, scl_bad=set(scl_bad))
                 mask1 &= vmask
             except Exception:
-                pass
+                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
         n1 = int(np.count_nonzero(mask1))
         if n1 > n0:
             mask = mask1
@@ -1596,7 +1595,7 @@ def build_weighted_shared_date_composite(
             if Path(coastline_mask_path).exists():
                 inputs_fp["coastline_mask"] = fingerprint_file(Path(coastline_mask_path), strict=bool(cache_strict))
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
     want_key = _s2_exact_cache_key(
         bbox_wesn=bbox_wesn,
@@ -1688,11 +1687,11 @@ def build_weighted_shared_date_composite(
                     od["signal_feasibility"] = "unknown"
                 rep["optical_diagnostics"] = od
             except Exception:
-                pass
+                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
             ret["_report"] = rep
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
         return ret
 
     # If outputs exist but key differs, purge and rebuild
@@ -2278,7 +2277,7 @@ def build_weighted_shared_date_composite(
             }
             (out_dir / "S2_DATE_QC.json").write_text(json.dumps(qc_report, indent=2))
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
         if used == 0:
             raise RuntimeError("[S2] Could not build any mosaics with publicly downloadable assets. Try a different --stac-url or relax filters.")
@@ -2548,11 +2547,11 @@ def build_weighted_shared_date_composite(
                     od["signal_feasibility"] = "unknown"
                 rep["optical_diagnostics"] = od
             except Exception:
-                pass
+                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
             ret["_report"] = rep
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
         return ret
 
     finally:
@@ -2562,7 +2561,7 @@ def build_weighted_shared_date_composite(
             if lock.exists():
                 lock.unlink()
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
 def main():
     p = argparse.ArgumentParser(description="Sentinel-2 composite via weighted shared-date selection + feather mosaic.")

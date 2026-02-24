@@ -13,7 +13,6 @@ Key Features:
 - Compatible with rasterio window-based I/O
 """
 
-from __future__ import annotations
 
 import logging
 from dataclasses import dataclass

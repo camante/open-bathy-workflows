@@ -1,4 +1,6 @@
-# Open Bathy Workflows (v2.0.2)
+########################################################################
+# Open Bathy Workflows (v2.0.42)
+########################################################################
 
 A Python workflow that generates bathymetry by combining:
 - **Satellite‑Derived Bathymetry (SDB)** from Sentinel‑2 + ICESat‑2 / in‑situ training points
@@ -32,7 +34,9 @@ The workflow assumes you have:
 ### 1) Orchestration (`bathy_main.py`)
 Parses arguments, validates configuration, sets up cache + output directories, and runs:
 - **SDB pipeline** via `sdb_main.py`
-- **River pipeline** via `river_network.py`, `xs_builder.py`, and `xs_infer_bathy_raster.py` (or `river_skeleton_bathy.py`)
+- **River pipeline** via `river_network.py`, plus either:
+  - **Cross‑sections**: `xs_builder.py` → `xs_infer_bathy_raster.py`
+  - **Skeleton**: `river_skeleton_bathy.py`
 - **Fusion** via `bathy_fusion.py` / `fusion.py`
 It also writes a JSON run report (e.g., `output/<name>/bathy_report.json`).
 
@@ -45,11 +49,19 @@ High‑level flow:
 5. Trains the model (Random Forest + uncertainty helpers)
 6. Predicts SDB depth tiles and writes outputs to `output/<name>/sdb/`
 
+**Cross‑tile consistency (default behavior):** SDB uses a bounded **model bank** (reservoir sample) stored under `cache/model_bank/sdb_global_v1` (or your `--cache-root`). Training points from each AOI update this bounded reservoir (max samples configurable), and the Random Forest is **only retrained periodically** once enough new samples accumulate. This improves seam consistency across adjacent tiles without storing unbounded training data.
+
 ### 3) River bathymetry
 There are two main river approaches in this codebase:
 - **Cross‑section approach**: build XS lines, infer depths/beds from DEM + optional WSE/Manning constraints.
 - **Skeleton approach**: a lighter‑weight, morphology‑driven estimator (`river_skeleton_bathy.py`).
-Outputs generally land in `output/<name>/river/`.
+Outputs land in `output/<name>/river/`.
+
+**Important safety guarantee:** the final river rasters are **hard‑clipped** to the computed river/channel domain mask, so river outputs contain values **only inside river/channel pixels**.
+
+**Confluence artifact fix:** at tributary junctions, the interpolation enforces **main‑stem priority** (by stream order when available) so small stems cannot imprint circular “bullseye” artifacts into the main channel.
+
+**Optional SWOT WSE constraint:** SWOT RiverSP WSE (when provided) is used only to stabilize/anchor the **water‑surface elevation profile** (stage/slope). SWOT is not used as a direct bathymetry predictor.
 
 ### 4) Fusion (`bathy_fusion.py` / `fusion.py`)
 Combines SDB and river rasters into a single product, optionally patching gaps and enforcing masks.
@@ -67,8 +79,22 @@ Final merged outputs are written to `output/<name>/combined/`.
 - **S2 acquisition keeps failing**: try widening the date range, lowering `--cloud`, or clearing the S2 cache.
 - **CRS / vertical datum errors**: make sure PROJ grid files are available; consider running without vertical transforms first.
 - **Mask surprises (land vs water)**: waffles coastline masks typically use **water=0, land=1**; the workflow expects that convention.
-- **Cross‑section artifacts**: intersecting cross‑sections can cause interpolation artifacts; fix XS generation parameters or post‑filter XS intersections.
+- **Cross‑section artifacts**: intersecting cross‑sections can cause interpolation artifacts. This repo includes:
+  - XS deconfliction controls in `xs_builder.py`
+  - a confluence guard (main‑stem priority) in `xs_infer_bathy_raster.py`
+  If you still see artifacts, focus first on XS generation spacing/overlap trimming.
 
 ## Where the scripts live
 
 All scripts in this zip are intended to live under `workflow/`. The detailed per‑script reference is in `README_SCRIPTS_DETAILED.md`.
+
+For a full “how it works” walkthrough (inputs → caches → outputs → failure modes), see `README_WORKFLOW_DETAILED.md`.
+
+
+## Verification (offline)
+
+Run the repo's offline verification (syntax/compile + smoke tests):
+
+```bash
+./verify_repo.sh
+```

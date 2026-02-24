@@ -31,12 +31,64 @@ Solution:
 3. Module-level logging is configured to propagate to root by default
 """
 
-from __future__ import annotations
 
 import logging
 import sys
 from pathlib import Path
 from typing import Optional, Union
+
+
+class _RunContextFilter(logging.Filter):
+    """Inject run_id/step into LogRecord (safe defaults if not configured)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Defaults
+        if not hasattr(record, "run_id"):
+            record.run_id = "-"
+        if not hasattr(record, "step"):
+            record.step = "-"
+        try:
+            # Import lazily to avoid import-order issues.
+            from flight_recorder import current_run_id, current_step
+
+            record.run_id = current_run_id()
+            record.step = current_step()
+        except Exception:
+            logging.getLogger(__name__).debug('Unexpected exception suppressed (was pass).', exc_info=True)
+        return True
+
+
+class _FlightRecorderHandler(logging.Handler):
+    """Logging handler that mirrors records into the FlightRecorder JSONL."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            from flight_recorder import FlightRecorder
+            from datetime import datetime, timezone
+
+            rec = FlightRecorder.global_instance()
+            if rec is None:
+                return
+            ts = datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(timespec="milliseconds")
+            rec._write(
+                {
+                    "ts": ts,
+                    "run_id": getattr(record, "run_id", "-"),
+                    "step": getattr(record, "step", "-"),
+                    "kind": "log",
+                    "level": record.levelname,
+                    "logger": record.name,
+                    "msg": record.getMessage(),
+                    "pathname": record.pathname,
+                    "lineno": record.lineno,
+                    "func": record.funcName,
+                    "process": record.process,
+                    "thread": record.thread,
+                }
+            )
+        except Exception:
+            # Never break the pipeline for recorder issues.
+            return
 
 
 # Global state to prevent double-initialization
@@ -45,6 +97,8 @@ _LOGGING_INITIALIZED: bool = False
 
 # Standard format matching original sdb_main.py
 DEFAULT_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+# A more detailed format suitable for file logs.
+DEFAULT_FILE_FORMAT = "%(asctime)s [%(levelname)s] %(name)s [run=%(run_id)s step=%(step)s]: %(message)s"
 DEFAULT_DATE_FORMAT = None  # Use logging default
 
 
@@ -92,6 +146,10 @@ def setup_logging(
     # Set level on root logger
     root.setLevel(level)
     
+    # Inject run context into all records
+    ctx_filter = _RunContextFilter()
+    root.addFilter(ctx_filter)
+
     # Create formatter
     formatter = logging.Formatter(log_format, datefmt=date_format)
     
@@ -99,17 +157,29 @@ def setup_logging(
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(level)
     console_handler.setFormatter(formatter)
+    console_handler.addFilter(ctx_filter)
     root.addHandler(console_handler)
     
     # Add file handler if requested
     if log_file is not None:
         log_path = Path(log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         file_handler = logging.FileHandler(str(log_path), mode='a')
         file_handler.setLevel(level)
-        file_handler.setFormatter(formatter)
+        # Use a richer format for file logs unless caller provided a custom one.
+        if log_format == DEFAULT_FORMAT:
+            file_handler.setFormatter(logging.Formatter(DEFAULT_FILE_FORMAT, datefmt=date_format))
+        else:
+            file_handler.setFormatter(formatter)
+        file_handler.addFilter(ctx_filter)
         root.addHandler(file_handler)
+
+    # Flight recorder handler (enabled when FlightRecorder.start_global() is called)
+    fr_handler = _FlightRecorderHandler()
+    fr_handler.setLevel(logging.DEBUG)  # record everything; filtering happens elsewhere
+    fr_handler.addFilter(ctx_filter)
+    root.addHandler(fr_handler)
     
     _LOGGING_INITIALIZED = True
 
@@ -163,11 +233,43 @@ def add_file_handler(
     handler = logging.FileHandler(str(log_path), mode='a')
     handler.setLevel(level)
     
-    fmt = log_format or DEFAULT_FORMAT
+    fmt = log_format or DEFAULT_FILE_FORMAT
     handler.setFormatter(logging.Formatter(fmt))
+
+    # Keep run context on added handlers as well
+    handler.addFilter(_RunContextFilter())
     
     logging.getLogger().addHandler(handler)
     return handler
+
+
+def start_flight_recorder(out_dir: Union[str, Path], run_id: str) -> Optional[Path]:
+    """Start a per-run flight recorder JSONL file in <out_dir>/run_logs/."""
+    try:
+        from flight_recorder import FlightRecorder
+
+        out_dir = Path(out_dir)
+        log_dir = out_dir / "run_logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        fr_path = log_dir / f"flight_recorder_{run_id}.jsonl"
+        FlightRecorder.start_global(fr_path, run_id=run_id)
+        # Best-effort: write summaries at process exit (works even on crashes)
+        try:
+            import atexit
+            from run_summary import write_run_summary_files
+
+            def _write_summaries():
+                try:
+                    write_run_summary_files(out_dir, run_id=run_id, stats=None, fr_path=fr_path)
+                except Exception:
+                    return
+
+            atexit.register(_write_summaries)
+        except Exception:
+            logging.getLogger(__name__).debug('Unexpected exception suppressed (was pass).', exc_info=True)
+        return fr_path
+    except Exception:
+        return None
 
 
 def is_initialized() -> bool:

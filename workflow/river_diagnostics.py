@@ -8,12 +8,11 @@ processing results, including cross-section analysis, calibration metrics,
 and spatial coverage assessments.
 """
 
-from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -281,7 +280,134 @@ def summarize_river_run(
         try:
             report.add("diagnostics", summary)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
     
     return summary
+
+
+def create_unified_bathy_report(
+    output_dir: Union[str, Path],
+    sdb_output: Optional[Union[str, Path]] = None,
+    river_output: Optional[Union[str, Path]] = None,
+    methods: Optional[List[str]] = None,
+    priority: Optional[str] = None,
+) -> Path:
+    """Create a unified, lightweight report that summarizes the *whole* bathy pipeline.
+
+    This is intentionally dependency-light: it should work even when geopandas is
+    not installed. It is safe to call at the end of bathy_main.
+
+    Outputs:
+      - <output_dir>/unified_bathy_report.json
+      - <output_dir>/unified_bathy_report.md
+    """
+    import json
+    from datetime import datetime
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    sdb_out = Path(sdb_output) if sdb_output is not None else None
+    river_out = Path(river_output) if river_output is not None else None
+
+    rep: Dict[str, Any] = {
+        "pipeline": "unified_bathy",
+        "version": "0.1",
+        "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+        "methods": list(methods) if methods is not None else [],
+        "priority": str(priority) if priority is not None else None,
+        "status": {},
+        "artifacts": {},
+        "notes": "Derived from bathy_report.json + filesystem discovery; safe when optional deps are missing.",
+    }
+
+    # Primary report produced by bathy_main
+    main_rep_path = out_dir / "bathy_report.json"
+    if main_rep_path.exists():
+        try:
+            main_rep = json.loads(main_rep_path.read_text(errors="ignore"))
+            rep["bathy_report_path"] = str(main_rep_path)
+            # Extract high-level statuses if present
+            try:
+                rep["status"]["sdb"] = main_rep.get("sdb", {}).get("status")
+                rep["status"]["river"] = main_rep.get("river", {}).get("status")
+                rep["status"]["fusion"] = main_rep.get("fusion", {}).get("status")
+            except Exception:
+                pass
+            # Keep the main report embedded for traceability (users can inspect one file)
+            rep["bathy_report"] = main_rep
+        except Exception as e:
+            rep["status"]["bathy_report_read_error"] = str(e)
+
+    def _discover_artifacts(base: Path, kinds: tuple[str, ...] = (".tif", ".tiff", ".gpkg", ".json", ".csv", ".pkl")) -> List[str]:
+        if base is None or (not base.exists()):
+            return []
+        out: List[str] = []
+        try:
+            for p in sorted(base.rglob("*")):
+                if p.is_file() and p.suffix.lower() in kinds:
+                    out.append(str(p))
+        except Exception:
+            return []
+        # Avoid huge reports: cap
+        return out[:200]
+
+    # SDB outputs: include model + key rasters if present
+    if sdb_out is not None and sdb_out.exists():
+        rep["artifacts"]["sdb_dir"] = str(sdb_out)
+        rep["artifacts"]["sdb_files"] = _discover_artifacts(sdb_out)
+        try:
+            mm = sdb_out / "model" / "model_meta.json"
+            if mm.exists():
+                rep["artifacts"]["sdb_model_meta"] = json.loads(mm.read_text(errors="ignore"))
+        except Exception:
+            pass
+
+    # River outputs
+    if river_out is not None and river_out.exists():
+        rep["artifacts"]["river_dir"] = str(river_out)
+        rep["artifacts"]["river_files"] = _discover_artifacts(river_out)
+
+    out_json = out_dir / "unified_bathy_report.json"
+    out_md = out_dir / "unified_bathy_report.md"
+
+    try:
+        out_json.write_text(json.dumps(rep, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.warning("[DIAG] Failed to write unified JSON report: %s", e)
+
+    # Simple markdown mirror for humans
+    try:
+        lines = []
+        lines.append(f"# Unified bathymetry report")
+        lines.append("")
+        lines.append(f"- Timestamp (UTC): {rep.get('timestamp_utc')}")
+        lines.append(f"- Methods: {', '.join(rep.get('methods') or []) or 'n/a'}")
+        lines.append(f"- Priority: {rep.get('priority') or 'n/a'}")
+        st = rep.get("status", {}) or {}
+        lines.append(f"- Status: SDB={st.get('sdb','n/a')} | River={st.get('river','n/a')} | Fusion={st.get('fusion','n/a')}")
+        lines.append("")
+        if rep.get("bathy_report_path"):
+            lines.append(f"- bathy_report.json: {rep.get('bathy_report_path')}")
+        if rep.get("artifacts", {}).get("sdb_dir"):
+            lines.append(f"- SDB dir: {rep['artifacts']['sdb_dir']}")
+        if rep.get("artifacts", {}).get("river_dir"):
+            lines.append(f"- River dir: {rep['artifacts']['river_dir']}")
+        lines.append("")
+        lines.append("## Discovered artifacts (capped)")
+        lines.append("")
+        for key in ("sdb_files", "river_files"):
+            files = rep.get("artifacts", {}).get(key, [])
+            if files:
+                lines.append(f"### {key}")
+                for fp in files[:50]:
+                    lines.append(f"- {fp}")
+                if len(files) > 50:
+                    lines.append(f"- ... ({len(files)-50} more)")
+                lines.append("")
+        out_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception as e:
+        log.warning("[DIAG] Failed to write unified markdown report: %s", e)
+
+    return out_json
 

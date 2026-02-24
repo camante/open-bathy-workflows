@@ -39,7 +39,7 @@ References:
 
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Any, Union
+from typing import Dict, Optional, Any, Union
 import numpy as np
 
 log = logging.getLogger(__name__)
@@ -573,7 +573,6 @@ def generate_kd_qc_layer(
         Path to generated QC raster
     """
     import rasterio
-    from rasterio.transform import from_bounds
     
     output_path = Path(output_path)
     
@@ -657,7 +656,7 @@ if __name__ == "__main__":
     
     result = compute_physics_based_max_depth(raster_paths, algorithm=args.algorithm)
     
-    print(json.dumps(result, indent=2))
+    log.info(json.dumps(result, indent=2))
     
     if args.output_json:
         with open(args.output_json, "w") as f:

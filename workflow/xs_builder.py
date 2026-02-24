@@ -18,7 +18,6 @@ Outputs:
 - Output GPKG with 'xs_lines' and 'xs_points' layers.
 """
 
-from __future__ import annotations
 
 import argparse
 import logging
@@ -28,6 +27,9 @@ from typing import Dict, Optional, Tuple, List, Set
 
 import numpy as np
 import pandas as pd
+
+# Ensure GeoPandas remains usable on pandas>=2.0 even if GeoPandas lags.
+import compat_pandas  # noqa: F401
 import geopandas as gpd
 import rasterio
 from shapely.geometry import LineString, Point
@@ -55,6 +57,11 @@ class XSConfig:
     global_deconflict: bool = True     # drop XS that intersect non-adjacent XS
     deconflict_tol_m: float = 2.0      # endpoint tolerance for "touching" intersections
 
+
+    # Conservative global intersection handling (across the entire AOI)
+    # If enabled, drop any XS that intersects a higher-score kept XS, regardless of reach id.
+    # This reduces interpolation artifacts at tight meanders / reach boundaries at the cost of fewer XS.
+    global_deconflict_all: bool = True
     # Junction handling (avoid XS near confluences where geometry is ambiguous)
     skip_junctions: bool = True
     junction_snap_m: float = 30.0      # snapping scale for junction detection from reach endpoints (m)
@@ -341,7 +348,7 @@ def _trim_overlapping_xs(xs_list: List[Dict]) -> List[Dict]:
             
             modified += 1
         except Exception:
-            pass # Geometry error, skip trimming this pair
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True) # Geometry error, skip trimming this pair
 
     if modified > 0:
         log.info(f"[XS] Trimmed {modified} intersecting cross-section pairs.")
@@ -435,6 +442,115 @@ def _is_harmful_intersection(g1: LineString, g2: LineString, tol_m: float) -> bo
     return False
 
 
+
+
+
+def _global_deconflict_xs_all(xs_lines_records: List[Dict], tol_m: float) -> List[Dict]:
+    """Conservatively drop cross-sections that intersect across the entire AOI.
+
+    Policy (deterministic):
+      - Score each XS by (xs_len_m, then xs_id) and keep higher-score first.
+      - If a candidate intersects any already-kept XS in a *harmful* way, drop it.
+
+    Notes:
+      - "Harmful" intersections exclude benign endpoint touches within tol_m.
+      - This is intentionally conservative to reduce interpolation artifacts where
+        XS from adjacent reaches or tight meanders intersect.
+    """
+    if len(xs_lines_records) < 2:
+        return xs_lines_records
+
+    geoms: List[LineString] = []
+    idx_map: List[int] = []
+    for i, rec in enumerate(xs_lines_records):
+        g = rec.get("geometry")
+        if g is None or getattr(g, "is_empty", True):
+            continue
+        if getattr(g, "geom_type", None) != "LineString":
+            continue
+        geoms.append(g)
+        idx_map.append(i)
+
+    if len(geoms) < 2:
+        return xs_lines_records
+
+    def _score(rec: Dict) -> tuple[float, str]:
+        L = float(rec.get("xs_len_m", 0.0) or 0.0)
+        xid = str(rec.get("xs_id", ""))
+        return (L, xid)
+
+    scores = {i: _score(xs_lines_records[i]) for i in idx_map}
+
+    tree = STRtree(geoms)
+
+    # record-index <-> geometry-index mapping
+    geom_to_rec = {g_i: rec_i for g_i, rec_i in enumerate(idx_map)}
+    rec_to_geom = {rec_i: g_i for g_i, rec_i in enumerate(idx_map)}
+
+    sorted_recs = sorted(idx_map, key=lambda i: scores[i], reverse=True)
+
+    kept: Set[int] = set()
+    dropped: Set[int] = set()
+
+    for rec_i in sorted_recs:
+        if rec_i in dropped:
+            continue
+        g_i = rec_to_geom.get(rec_i)
+        if g_i is None:
+            continue
+        g = geoms[g_i]
+
+        try:
+            hits = tree.query(g)
+        except Exception:
+            hits = []
+
+        hit_geom_indices: List[int] = []
+        if hits is None or len(hits) == 0:
+            hit_geom_indices = []
+        else:
+            # Shapely 2 returns indices; Shapely 1 may return geometries
+            if isinstance(hits[0], (int, np.integer)):
+                hit_geom_indices = [int(h) for h in hits]
+            else:
+                # Build id-based map for fallback
+                id_map = {id(gg): ii for ii, gg in enumerate(geoms)}
+                for hg in hits:
+                    ii = id_map.get(id(hg))
+                    if ii is not None:
+                        hit_geom_indices.append(ii)
+
+        conflict = False
+        for hg_i in hit_geom_indices:
+            if hg_i == g_i:
+                continue
+            other_rec_i = geom_to_rec.get(hg_i)
+            if other_rec_i is None or other_rec_i not in kept:
+                continue  # only compare to already-kept higher-score XS
+            try:
+                if _is_harmful_intersection(g, geoms[hg_i], tol_m=tol_m):
+                    conflict = True
+                    break
+            except Exception:
+                continue
+
+        if conflict:
+            dropped.add(rec_i)
+        else:
+            kept.add(rec_i)
+
+    if dropped:
+        log.info(f"[XS] Global deconflict (all) dropped {len(dropped)} intersecting XS across AOI.")
+
+    # Return records in original order for stability
+    out: List[Dict] = []
+    for i, rec in enumerate(xs_lines_records):
+        if i in idx_map:
+            if i in kept:
+                out.append(rec)
+        else:
+            out.append(rec)
+    return out
 def _global_deconflict_xs(xs_list: List[Dict], tol_m: float) -> List[Dict]:
     """Drop cross-sections that intersect other cross-sections within a reach.
 
@@ -693,7 +809,7 @@ def build_xs_for_river(
                             if any(center_pt.distance(pt) <= float(getattr(cfg, 'junction_buffer_m', 0.0)) for pt in geoms):
                                 continue
                     except Exception:
-                        pass
+                        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
                 # Use smoothed tangent for orientation
                 tan = _line_tangent(geom, s_center, eps=smoothing_eps)
@@ -796,6 +912,17 @@ def build_xs_for_river(
             log.warning("No cross-sections were generated. Check river filtering or DEM coverage.")
             return
 
+        # Conservative: drop intersecting XS across the entire AOI to reduce artifacts at tight meanders
+        # and reach boundaries (at the cost of fewer XS).
+        if getattr(cfg, 'global_deconflict_all', True) and len(xs_lines_records) > 1:
+            before = len(xs_lines_records)
+            xs_lines_records = _global_deconflict_xs_all(xs_lines_records, tol_m=float(cfg.deconflict_tol_m))
+            kept_ids = {r.get('xs_id') for r in xs_lines_records}
+            xs_points_records = [r for r in xs_points_records if r.get('xs_id') in kept_ids]
+            dropped = before - len(xs_lines_records)
+            if dropped > 0:
+                log.info(f"[XS] Global deconflict (all) dropped {dropped} intersecting XS across AOI.")
+
         xs_lines_gdf = gpd.GeoDataFrame(xs_lines_records, crs=rivers_clip.crs)
         xs_pts_gdf = gpd.GeoDataFrame(xs_points_records, crs=rivers_clip.crs)
 
@@ -851,6 +978,10 @@ def _parse_args() -> argparse.Namespace:
                    help="Disable dropping XS that intersect non-adjacent XS within a reach.")
     p.set_defaults(global_deconflict=True)
 
+    p.add_argument("--no-global-deconflict-all", dest="global_deconflict_all", action="store_false",
+                   help="Disable conservative AOI-wide dropping of intersecting cross-sections.")
+    p.set_defaults(global_deconflict_all=True)
+
     p.add_argument("--no-skip-junctions", dest="skip_junctions", action="store_false",
                    help="Do not skip XS near confluences/junctions.")
     p.set_defaults(skip_junctions=True)
@@ -894,6 +1025,7 @@ def main() -> None:
         smoothing_window_m=float(args.smoothing_window_m),
         trim_overlaps=bool(args.trim_overlaps),
         global_deconflict=bool(getattr(args, "global_deconflict", True)),
+        global_deconflict_all=bool(getattr(args, "global_deconflict_all", True)),
         deconflict_tol_m=float(getattr(args, "deconflict_tol_m", 2.0)),
         skip_junctions=bool(getattr(args, "skip_junctions", True)),
         junction_snap_m=float(getattr(args, "junction_snap_m", 30.0)),
@@ -919,7 +1051,7 @@ def main() -> None:
         try:
             ftype_allow.append(int(float(s)))
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
     if not ftype_allow:
         ftype_allow = [460, 558]
 

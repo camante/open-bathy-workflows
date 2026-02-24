@@ -22,17 +22,54 @@ Notes:
 
 import argparse
 import logging
+import re
 from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
 import geopandas as gpd
+import pandas as pd
 import rasterio
 from rasterio.features import rasterize
 from rasterio.warp import reproject, Resampling
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import distance_transform_edt, label, binary_closing, binary_fill_holes
+from shapely.ops import unary_union
 
 LOG = logging.getLogger("river_domain_mask")
+
+
+def _union_all_geoms(geos):
+    """Compatibility wrapper for GeoPandas/Shapely union.
+
+    GeoPandas 0.14+/Shapely 2 exposes GeoSeries.union_all(); older stacks used unary_union.
+    """
+    try:
+        if hasattr(geos, "union_all"):
+            return geos.union_all()
+    except Exception:
+        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+    # fallback
+    try:
+        return geos.unary_union
+    except Exception:
+        # list-like
+        return unary_union(list(geos))
+
+
+def _buffer_geoms_safe(geos, dist_m: float):
+    """Buffer geometries robustly across GeoPandas/Shapely version combinations.
+
+    Some GeoPandas versions attempt vectorized buffering that is incompatible with
+    Shapely>=2.0, raising NotImplementedError about the array interface.
+    To keep this script stable, buffer geometries one-by-one.
+    """
+    out = []
+    for g in list(geos):
+        if g is None or getattr(g, "is_empty", True):
+            continue
+        out.append(g.buffer(float(dist_m)))
+    return out
+
 
 
 def _pixel_size_m(transform: rasterio.Affine) -> float:
@@ -115,6 +152,27 @@ def main() -> int:
                    help="Optional GeoPackage with NHDArea polygons (e.g., river_network.gpkg). If present, used to constrain the river channel mask.")
     p.add_argument("--nhdarea-layer", default="nhdarea_clip",
                    help="Layer name for NHDArea polygons inside --nhdarea-gpkg (default nhdarea_clip).")
+    p.add_argument(
+        "--channel-source",
+        default="auto",
+        choices=["auto", "nhdarea", "corridor"],
+        help=(
+            "How to build the river channel domain. 'nhdarea' uses NHD water polygons filtered to Stream/River types; "
+            "'corridor' uses a buffered flowline corridor; 'auto' prefers nhdarea when usable, otherwise falls back to corridor."
+        ),
+    )
+    p.add_argument(
+        "--nhdarea-allow-ftype",
+        default="460",
+        help=(
+            "Comma-separated list of allowed NHDArea FType codes to treat as river/stream area (default: 460 Stream/River)."
+        ),
+    )
+    p.add_argument(
+        "--nhdarea-allow-fcode",
+        default=None,
+        help="Optional comma-separated list of allowed NHDArea FCode values. Used only if FType is not present.",
+    )
     p.add_argument("--channel-buffer-m", type=float, default=400.0,
                    help="Buffer around flowlines to define candidate corridor (meters).")
     p.add_argument("--max-channel-width-m", type=float, default=600.0,
@@ -127,6 +185,8 @@ def main() -> int:
                    help="Write debug rasters (width proxy, corridor masks).")
     p.add_argument("--out-channel-mask", required=True, help="Output TIFF for river channel mask (1=river,0=else).")
     p.add_argument("--out-open-water-mask", required=True, help="Output TIFF for open water mask (1=open water,0=else).")
+    p.add_argument("--out-mainstem-mask", default=None, help="Optional output TIFF for mainstem corridor mask (1=mainstem,0=else). Useful for hybrid XS+Skeleton.")
+
 
     args = p.parse_args()
 
@@ -148,7 +208,7 @@ def main() -> int:
                 str(crs),
             )
     except Exception:
-        pass
+        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
     # Load rivers layer
     rivers = gpd.read_file(args.river_gpkg, layer=args.rivers_layer)
@@ -156,9 +216,10 @@ def main() -> int:
         raise SystemExit(f"No features found in {args.river_gpkg}:{args.rivers_layer}")
     rivers = rivers.to_crs(crs)
 
-    # Optional: NHDArea polygons to constrain channel predictions
+    # Optional: NHDArea polygons to constrain channel predictions.
+    # IMPORTANT: We extract *river/stream polygons only* (exclude lakes/reservoirs).
     nhdarea_mask = None
-    if args.nhdarea_gpkg:
+    if args.nhdarea_gpkg and (args.channel_source in ("auto", "nhdarea")):
         try:
             areas = gpd.read_file(args.nhdarea_gpkg, layer=args.nhdarea_layer)
             if areas is not None and not areas.empty:
@@ -166,16 +227,94 @@ def main() -> int:
                 areas = areas[areas.geometry.notnull() & (~areas.geometry.is_empty)]
                 areas = areas[areas.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
                 if not areas.empty:
-                    area_geom = areas.geometry.unary_union
-                    nhdarea_mask = rasterize(
-                        [(area_geom, 1)],
-                        out_shape=shape,
-                        transform=transform,
-                        fill=0,
-                        all_touched=True,
-                        dtype="uint8",
-                    ).astype(bool)
-                    LOG.info("NHDArea mask enabled: %s:%s (pixels=%d)", args.nhdarea_gpkg, args.nhdarea_layer, int(nhdarea_mask.sum()))
+                    allow_ftype = set(int(x.strip()) for x in str(args.nhdarea_allow_ftype).split(",") if str(x).strip())
+                    allow_fcode = None
+                    if args.nhdarea_allow_fcode:
+                        allow_fcode = set(int(x.strip()) for x in str(args.nhdarea_allow_fcode).split(",") if str(x).strip())
+
+                    ftype_col = next((c for c in ("FType", "FTYPE", "ftype") if c in areas.columns), None)
+                    fcode_col = next((c for c in ("FCode", "FCODE", "fcode") if c in areas.columns), None)
+
+                    areas_f = areas
+                    if ftype_col is not None:
+                        # Some services export coded value domains as strings (e.g. 'SwampMarsh') which cannot be cast to int.
+                        # We treat non-numeric entries as NA (excluded) so we never accidentally include lakes.
+
+                            # Some services export coded value domains as strings (e.g. 'SwampMarsh', 'StreamRiver')
+                            # rather than integer codes. We normalize and map common labels back to numeric FType.
+                            raw = areas_f[ftype_col]
+                            ser_num = pd.to_numeric(raw, errors="coerce")
+
+                            if ser_num.isna().any():
+                                def _norm(v: str) -> str:
+                                    v = str(v).strip()
+                                    v = v.replace("/", " ").replace("-", " ")
+                                    v = re.sub(r"\s+", " ", v)
+                                    return v.lower().replace(" ", "")
+
+                                # Minimal mapping needed for safe filtering.
+                                # NOTE: We only *include* allow_ftype, so unrecognized labels are excluded.
+                                label_to_ftype = {
+                                    _norm("StreamRiver"): 460,
+                                    _norm("Stream/River"): 460,
+                                    _norm("Submerged Stream"): 461,
+                                    _norm("CanalDitch"): 336,
+                                    _norm("Canal/Ditch"): 336,
+                                    _norm("BayInlet"): 312,
+                                    _norm("SeaOcean"): 445,
+                                    _norm("SwampMarsh"): 466,
+                                    _norm("Swamp/Marsh"): 466,
+                                    _norm("LakePond"): 390,
+                                    _norm("Lake/Pond"): 390,
+                                    _norm("Reservoir"): 436,
+                                    _norm("Estuary"): 493,
+                                    _norm("IceMass"): 378,
+                                    _norm("Playa"): 361,
+                                }
+
+                                mapped = raw.astype(str).map(lambda x: label_to_ftype.get(_norm(x), None))
+                                ser_num = ser_num.fillna(mapped)
+
+                            n_bad = int(ser_num.isna().sum())
+                            if n_bad:
+                                LOG.info(
+                                    "NHDArea %s contains %d/%d unparseable FType values; excluding them from river-polygon filter.",
+                                    ftype_col,
+                                    n_bad,
+                                    len(areas_f),
+                                )
+
+                            areas_f = areas_f[ser_num.fillna(-1).astype(int).isin(allow_ftype)]
+                            LOG.info("NHDArea filter: %s in %s (kept %d/%d polygons)", allow_ftype, ftype_col, len(areas_f), len(areas))
+                    elif (allow_fcode is not None) and (fcode_col is not None):
+                        areas_f = areas_f[areas_f[fcode_col].fillna(-1).astype(int).isin(allow_fcode)]
+                        LOG.info("NHDArea filter: %s in %s (kept %d/%d polygons)", allow_fcode, fcode_col, len(areas_f), len(areas))
+                    else:
+                        msg = (
+                            f"NHDArea layer {args.nhdarea_gpkg}:{args.nhdarea_layer} has no FType/FCode field; "
+                            "cannot safely extract river polygons (would include lakes)."
+                        )
+                        if args.channel_source == "nhdarea":
+                            raise RuntimeError(msg)
+                        LOG.warning("%s Falling back to corridor.", msg)
+                        areas_f = areas.iloc[0:0]
+
+                    if not areas_f.empty:
+                        area_geom = _union_all_geoms(areas_f.geometry)
+                        nhdarea_mask = rasterize(
+                            [(area_geom, 1)],
+                            out_shape=shape,
+                            transform=transform,
+                            fill=0,
+                            all_touched=True,
+                            dtype="uint8",
+                        ).astype(bool)
+                        LOG.info(
+                            "NHDArea river-only mask enabled: %s:%s (pixels=%d)",
+                            args.nhdarea_gpkg,
+                            args.nhdarea_layer,
+                            int(nhdarea_mask.sum()),
+                        )
                 else:
                     LOG.info("NHDArea layer has no polygon geometries: %s:%s", args.nhdarea_gpkg, args.nhdarea_layer)
             else:
@@ -184,7 +323,7 @@ def main() -> int:
             LOG.warning("Failed to load NHDArea polygons (%s:%s): %s", args.nhdarea_gpkg, args.nhdarea_layer, str(e))
 
     # Build corridor masks
-    corridor_geom = rivers.geometry.buffer(float(args.channel_buffer_m)).unary_union
+    corridor_geom = _union_all_geoms(_buffer_geoms_safe(rivers.geometry, float(args.channel_buffer_m)))
     corridor = rasterize(
         [(corridor_geom, 1)],
         out_shape=shape,
@@ -194,30 +333,85 @@ def main() -> int:
         dtype="uint8",
     ).astype(bool)
 
+    
+
     stream_col = _get_stream_order_col(rivers)
+
+    # Mainstem corridor: ensure continuity across tile/AOI cuts and stream-order 'dips'
+    # by expanding a seed mainstem mask to the connected corridor component(s) it touches.
+    #
+    # Why: A pure stream-order threshold can fragment the mainstem (order dips along the same channel,
+    # or short clipped stubs near AOI boundaries). If the river domain mask has holes, river prediction
+    # becomes nodata there and fusion may fall back to SDB inside the true river corridor.
     if stream_col:
         main = rivers[rivers[stream_col].fillna(0).astype(float) >= float(args.mainstem_min_order)]
     else:
         main = rivers.iloc[0:0]
+
     if not main.empty:
-        main_geom = main.geometry.buffer(float(args.channel_buffer_m)).unary_union
-        corridor_main = rasterize(
+        main_geom = _union_all_geoms(_buffer_geoms_safe(main.geometry, float(args.channel_buffer_m)))
+        seed_main = rasterize(
             [(main_geom, 1)],
             out_shape=shape,
             transform=transform,
             fill=0,
             all_touched=True,
-            dtype="uint8",
+            dtype='uint8',
         ).astype(bool)
-        LOG.info("Mainstem corridor enabled using '%s' >= %s (n=%d)", stream_col, args.mainstem_min_order, len(main))
+        LOG.info(
+            "Mainstem seed enabled using '%s' >= %s (n=%d)",
+            stream_col,
+            args.mainstem_min_order,
+            len(main),
+        )
     else:
-        corridor_main = np.zeros(shape, dtype=bool)
+        seed_main = np.zeros(shape, dtype=bool)
         if stream_col:
-            LOG.info("No mainstem features found at '%s' >= %s; using only default corridor.", stream_col, args.mainstem_min_order)
+            LOG.info(
+                "No mainstem features found at '%s' >= %s; mainstem will be derived from corridor connectivity only.",
+                stream_col,
+                args.mainstem_min_order,
+            )
         else:
-            LOG.info("No stream order column found; using only default corridor.")
+            LOG.info(
+                "No stream order column found; mainstem seed unavailable; using only default corridor width limits."
+            )
 
+    # Expand seed_main to the corridor component(s) it intersects, so the 'mainstem corridor'
+    # is continuous even when order dips or flowlines are clipped.
+    if np.any(seed_main):
+        lbl, _nlbl = label(corridor.astype(np.uint8), structure=np.ones((3, 3), dtype=np.uint8))
+        hit = np.unique(lbl[seed_main & corridor])
+        hit = hit[hit != 0]
+        if hit.size > 0:
+            corridor_main = corridor & np.isin(lbl, hit)
+        else:
+            corridor_main = seed_main & corridor
+    else:
+        # No mainstem seed available (missing/empty stream order). For hybrid workflows,
+        # we still want a continuous 'mainstem' corridor so XS can be applied reliably.
+        # Fall back to the largest connected corridor component (by pixel area).
+        try:
+            lbl, _nlbl = label(corridor.astype(np.uint8), structure=np.ones((3, 3), dtype=np.uint8))
+            if _nlbl > 0:
+                # Count pixels per component label (exclude background 0)
+                counts = np.bincount(lbl.ravel())
+                counts[0] = 0
+                main_lbl = int(np.argmax(counts))
+                corridor_main = corridor & (lbl == main_lbl)
+                LOG.info("Mainstem seed unavailable; using largest corridor component (label=%d, pixels=%d).", main_lbl, int(counts[main_lbl]))
+            else:
+                corridor_main = np.zeros(shape, dtype=bool)
+        except Exception as e:
+            LOG.warning("Mainstem fallback (largest corridor component) failed: %s", str(e))
+            corridor_main = np.zeros(shape, dtype=bool)
 
+    # Morphological cleanup: close small gaps and fill interior holes within the mainstem corridor.
+    # Constrain to the corridor to avoid expanding into large estuaries/open water.
+    if np.any(corridor_main):
+        corridor_main = binary_closing(corridor_main, structure=np.ones((3, 3), dtype=bool))
+        corridor_main = binary_fill_holes(corridor_main)
+        corridor_main &= corridor
 
     # Distance to nearest flowline (centerline proximity)
     # This is used both to suppress stray water far from flowlines and (optionally)
@@ -237,6 +431,7 @@ def main() -> int:
     # Water mask
     # Water mask(s)
     ocean = None
+    keep_ocean = np.zeros(shape, dtype=bool)  # ocean water pixels we explicitly keep near flowlines
     if args.ocean_mask:
         om = _warp_mask_to_template(Path(args.ocean_mask), template_profile)
         ocean = (om == 0)  # waffles convention: water=0 (ocean-only mask)
@@ -247,10 +442,14 @@ def main() -> int:
         # is classified as ocean water by the coastline mask.
         keep_dist = float(args.ocean_keep_dist_m)
         if keep_dist > 0:
-            ocean_exclude = ocean & (d_center > keep_dist)
+            keep_ocean = ocean & (d_center <= keep_dist)
+            ocean_exclude = ocean & (~keep_ocean)
             LOG.info("Ocean keep enabled: keeping ocean-connected pixels within %.1fm of flowlines", keep_dist)
         else:
+            keep_ocean = np.zeros(shape, dtype=bool)
             ocean_exclude = ocean
+
+
 
     if args.water_mask:
         wm = _warp_mask_to_template(Path(args.water_mask), template_profile)
@@ -259,9 +458,35 @@ def main() -> int:
             # Inland-water = (rivers+lakes+ocean) minus ocean-only water
             water = water_all & (~ocean_exclude)
             LOG.info("Derived inland-water mask: water_mask & ~ocean_mask")
+
+            # Water-mask sanity check: some masks (e.g., coastline ocean-only) may classify
+            # inland rivers as land. If the provided water mask yields ~no water inside the
+            # buffered flowline corridor, fall back to using the corridor itself as 'water'
+            # (still respecting ocean exclusion/keep rules).
+            if corridor.sum() > 0:
+                frac = float((water & corridor).sum()) / float(corridor.sum())
+                if frac < 0.02:
+                    LOG.warning(
+                        "Water mask appears to exclude most corridor pixels (water∩corridor=%.2f%%). "
+                        "Falling back to corridor-based water mask; check --water-mask input.",
+                        100.0 * frac,
+                    )
+                    water = corridor & (~ocean_exclude)
         else:
             water = water_all
             LOG.info("Water mask loaded: %s (waffles convention water=0 land=1)", args.water_mask)
+
+            # Water-mask sanity check (no ocean mask): if the provided water mask yields
+            # ~no water inside the corridor, fall back to corridor-based water.
+            if corridor.sum() > 0:
+                frac = float((water & corridor).sum()) / float(corridor.sum())
+                if frac < 0.02:
+                    LOG.warning(
+                        "Water mask appears to exclude most corridor pixels (water∩corridor=%.2f%%). "
+                        "Falling back to corridor-based water mask; check --water-mask input.",
+                        100.0 * frac,
+                    )
+                    water = corridor.copy()
     else:
         if ocean is not None:
             # Fallback when NHD water mask is unavailable: restrict corridor to non-ocean areas
@@ -272,15 +497,9 @@ def main() -> int:
             water = corridor.copy()
             LOG.warning("No --water-mask or --ocean-mask supplied; using buffered corridor as 'water' (ocean separation degraded).")
 
-
-    # If no raster water-mask is available, NHDArea polygons provide a much better water-domain than corridor-only fallback.
-    if (nhdarea_mask is not None) and bool(nhdarea_mask.any()) and (not args.water_mask):
-        if ocean is not None:
-            water = nhdarea_mask & (~ocean_exclude)
-            LOG.info("Using NHDArea polygons as water mask (NHDArea & ~ocean).")
-        else:
-            water = nhdarea_mask
-            LOG.info("Using NHDArea polygons as water mask.")
+    # NOTE: We do NOT replace the water mask with NHDArea here because NHDArea is filtered
+    # to river/stream polygons only (excluding lakes). Using that as a general water mask
+    # would incorrectly remove valid non-river water needed for width estimation.
     # Width proxy from distance to boundary (land)
     d_bank = distance_transform_edt(water, sampling=pix).astype("float32")
     width = (2.0 * d_bank).astype("float32")
@@ -297,9 +516,37 @@ def main() -> int:
     # Also require "not too far from a flowline" (helps when water mask has large bays inside corridor buffer)
     channel &= (d_center <= (float(args.channel_buffer_m) + 0.5 * width_limit + 2.0 * pix))
 
-    # Constrain the river channel to NHDArea polygons when available (prevents random spill into adjacent water bodies).
-    if (nhdarea_mask is not None) and bool(nhdarea_mask.any()):
-        channel &= nhdarea_mask
+    # Apply channel-source policy
+    if args.channel_source == "corridor":
+        # corridor-only: do not constrain by NHDArea
+        pass
+    else:
+        # nhdarea/auto: constrain by NHDArea river polygons when available, but allow
+        # mainstem corridor continuity and (optionally) ocean-kept pixels near flowlines.
+        if (nhdarea_mask is not None) and bool(nhdarea_mask.any()):
+            # If NHDArea exists but barely overlaps the flowline corridor, it's almost certainly
+            # "wrong" polygons for our purpose (e.g., lakes/wetlands only). In that case, ignore
+            # NHDArea and fall back to corridor-based channel selection.
+            if corridor.sum() > 0:
+                ov = float((nhdarea_mask & corridor).sum()) / float(corridor.sum())
+                if ov < 0.01:
+                    LOG.warning(
+                        "NHDArea mask has very low overlap with corridor (%.2f%%). "
+                        "Ignoring NHDArea and falling back to corridor-only channel mask.",
+                        100.0 * ov,
+                    )
+                    nhdarea_mask = None
+
+        if (nhdarea_mask is not None) and bool(nhdarea_mask.any()):
+            channel &= (nhdarea_mask | corridor_main | keep_ocean)
+        else:
+            if args.channel_source == "nhdarea":
+                raise SystemExit(
+                    "--channel-source=nhdarea requested, but no usable river/stream polygons were extracted from NHDArea. "
+                    "Check FType/FCode filtering or use --channel-source=corridor."
+                )
+            LOG.warning("NHDArea river polygons missing/empty; auto mode falling back to corridor-only channel mask.")
+
 
     # Open water = water but not channel
     open_water = water & (~channel)
@@ -310,6 +557,12 @@ def main() -> int:
 
     _save_u8(out_channel, channel.astype("uint8"), template_profile, nodata=0)
     _save_u8(out_open, open_water.astype("uint8"), template_profile, nodata=0)
+    if args.out_mainstem_mask:
+        out_main = Path(args.out_mainstem_mask)
+        out_main.parent.mkdir(parents=True, exist_ok=True)
+        _save_u8(out_main, corridor_main.astype("uint8"), template_profile, nodata=0)
+        LOG.info("Wrote: %s", out_main)
+
 
     if args.write_debug:
         dbg = out_channel.parent

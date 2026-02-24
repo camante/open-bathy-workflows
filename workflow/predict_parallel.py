@@ -43,7 +43,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -419,7 +419,6 @@ def predict_scene_parallel(
         Dictionary with processing statistics
     """
     import rasterio
-    from rasterio.transform import from_bounds
     
     if config is None:
         config = ParallelConfig()
@@ -752,7 +751,7 @@ if __name__ == "__main__":
             )
         
         import json
-        print(json.dumps(estimate, indent=2))
+        log.info(json.dumps(estimate, indent=2))
         sys.exit(0)
     
     config = ParallelConfig(

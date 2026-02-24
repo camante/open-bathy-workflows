@@ -22,7 +22,6 @@ table (xs_param) and used as:
 * A physically plausible WSE curve for diagnostics and future SWOT/ICESat-2
   constraints
 """
-from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional, Tuple

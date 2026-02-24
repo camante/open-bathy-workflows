@@ -34,7 +34,7 @@ The second term represents bottom reflection (decreases with depth).
 
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Any, Union, List
+from typing import Dict, Optional, Tuple, Any, Union
 import numpy as np
 
 log = logging.getLogger(__name__)
@@ -824,7 +824,6 @@ def physics_only_predict(
         Dictionary with output paths and diagnostics
     """
     import rasterio
-    from rasterio.transform import from_bounds
     
     s2_dir = Path(s2_dir)
     output_dir = Path(output_dir)

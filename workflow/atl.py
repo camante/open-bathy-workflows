@@ -59,6 +59,7 @@ Notes
 
 import os
 import sys
+import shutil
 import zipfile
 import time
 import logging
@@ -70,10 +71,32 @@ from pathlib import Path
 from datetime import datetime, date, timezone
 from typing import List, Dict, Tuple, Optional, Any, Union
 
-import requests
-import h5py
+def _lazy_requests():
+    """Import requests only when needed.
+
+    Rationale: this module is imported by orchestration scripts; keeping heavy
+    imports lazy improves startup time and avoids import-time issues on mixed
+    HPC stacks.
+    """
+    try:
+        import requests  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("The 'requests' package is required for ATL downloads.") from e
+    return requests
+
+
+def _lazy_h5py():
+    """Import h5py only when needed (ATL HDF5 readers)."""
+    try:
+        import h5py  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("The 'h5py' package is required to read ATL HDF5 files.") from e
+    return h5py
 import numpy as np
 import pandas as pd
+
+# Ensure GeoPandas remains usable on pandas>=2.0 even if GeoPandas lags.
+import compat_pandas  # noqa: F401
 
 # -----------------------------------------------------------------------------
 # Optional exact-match caching utilities
@@ -84,6 +107,7 @@ try:
         fingerprint_file,
         fingerprint_code,
         artifact_cache_key,
+        meta_payload,
         read_meta,
         write_meta,
         cache_hit,
@@ -107,7 +131,7 @@ def _rr_add(rr, key, value):
         if rr is not None:
             rr.add(key, value)
     except Exception:
-        pass
+        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
 def _rr_artifact(rr, kind: str, path: str):
     """Record an artifact path in the run report."""
@@ -115,7 +139,7 @@ def _rr_artifact(rr, kind: str, path: str):
         if rr is not None and hasattr(rr, "record_artifact"):
             rr.record_artifact(kind, path)
     except Exception:
-        pass
+        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
 
 def _df_depth_summary(df: pd.DataFrame, depth_col: str = "depth_m") -> Dict[str, Any]:
@@ -167,12 +191,13 @@ def _log_depth_funnel(stage: str, df: pd.DataFrame, *, rr=None, depth_col: str =
         if "hist_0_40_1m" in s:
             _rr_add(rr, f"funnel.{stage}.depth.hist_0_40_1m", s["hist_0_40_1m"])
     except Exception:
-        pass
+        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
-import geopandas as gpd
-import rasterio
-from pyproj import Transformer
-from shapely.geometry import LineString
+# NOTE: Heavy geospatial imports are intentionally *lazy*.
+#
+# This module is imported by orchestration scripts and may be used in environments
+# where GDAL/GeoPandas stacks are optional. Import expensive geospatial libraries
+# inside the small set of functions that require them.
 
 try:
     from harmony import Client as HarmonyClient, BBox, Request, Collection
@@ -292,10 +317,38 @@ def _maybe_load_cached_training_points(
     data_path = cdir / f"{stage}_{key}.pkl"
     meta_path = cdir / f"{stage}_{key}.meta.json"
 
+    # Standard cache check (meta-driven)
     hit, reason = cache_hit(meta_path, expected_key=key, require_exact_params=True, expected_params=params)
     _rr_add(rr, f"{stage}.cache.enabled", True)
     _rr_add(rr, f"{stage}.cache.key", key)
     _rr_add(rr, f"{stage}.cache.check", reason)
+
+    # Legacy upgrade path: older runs may have written the pickle but not the meta.
+    # Treat that as a HIT (if readable) and write meta now so future runs are clean.
+    if (not hit) and reason == "no_meta" and data_path.exists() and data_path.stat().st_size > 0:
+        try:
+            df = pd.read_pickle(data_path)
+            try:
+                code_fp = fingerprint_code(Path(__file__), strict=bool(cache_code_strict))
+            except Exception:
+                code_fp = ""
+            payload = {
+                "cache_key": key,
+                "stage": stage,
+                "params": params,
+                "inputs": inputs,
+                "code_fingerprint": code_fp,
+                "extra": {"rows": int(len(df)), "upgraded_from": "legacy_no_meta"},
+            }
+            try:
+                write_meta(meta_path, payload)
+                reason = "legacy_no_meta_upgraded"
+            except Exception:
+                reason = "legacy_no_meta"
+            _rr_add(rr, f"{stage}.cache.legacy_upgrade", True)
+            return df, "hit_legacy_no_meta", key, data_path, meta_path
+        except Exception:
+            return None, "read_failed", key, data_path, meta_path
 
     if hit and data_path.exists() and data_path.stat().st_size > 0:
         try:
@@ -329,17 +382,18 @@ def _write_cached_training_points(
             code_fp = fingerprint_code(Path(__file__), strict=bool(cache_code_strict))
         except Exception:
             code_fp = ""
-        payload = {
-            "cache_key": key,
-            "stage": stage,
-            "params": params,
-            "inputs": inputs,
-            "code_fingerprint": code_fp,
-            "extra": extra or {},
-        }
+        payload = meta_payload(
+            cache_key=key,
+            stage=stage,
+            params=params,
+            inputs=inputs,
+            code_fp=code_fp,
+            extra=extra or {},
+        )
+        write_meta(meta_path, payload)
         write_meta(meta_path, payload)
     except Exception:
-        pass
+        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
 # Use centralized logging - get logger, don't configure root here
 log = logging.getLogger("sdb.atl")
@@ -416,6 +470,8 @@ def _filter_points_by_mask(
     )
 
     try:
+        import rasterio  # heavy import (GDAL) - keep local
+        from pyproj import Transformer
         with rasterio.open(mask_path) as src:
             transformer = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
             xs, ys = transformer.transform(df.longitude.values, df.latitude.values)
@@ -530,30 +586,84 @@ def _filter_points_by_mask(
 # ICESat-2 Data Acquisition
 # -----------------------------------------------------------------------------
 
+def _iter_h5_recursive(d: Path):
+    """Yield non-empty .h5 files under d (recursive)."""
+    if not d.exists():
+        return
+    for f in d.rglob("*.h5"):
+        try:
+            if f.is_file() and f.stat().st_size > 0:
+                yield f
+        except Exception:
+            continue
+
 def existing_atl_files(d: Path, product_key: str) -> List[str]:
-    if not d.exists(): return []
-    product_key = product_key.upper()
-    if product_key == "ATL03":
-        files = sorted(f for f in d.glob("*ATL03*subset*.h5") if f.is_file() and f.stat().st_size > 0)
-    elif product_key == "ATL24":
-        files = sorted(f for f in d.glob("*.h5") if f.is_file() and f.stat().st_size > 0)
+    """Return cached ICESat-2 product files under directory `d`.
+
+    Harmony outputs are not fully consistent across time:
+      - filenames may or may not include the substring 'subset'
+      - zip payloads may contain nested folders
+
+    We therefore search recursively and prefer product-matching filenames when possible.
+    """
+    if not d.exists():
+        return []
+    product_key = (product_key or "").upper().strip()
+
+    files = sorted(_iter_h5_recursive(d), key=lambda x: x.name)
+
+    if product_key in ("ATL03", "ATL24"):
+        key = product_key
+        matched = [f for f in files if key in f.name.upper()]
+        files = matched if matched else files
+
     return [str(f) for f in files]
 
 def _safe_unzip(z: Path, d: Path) -> List[str]:
-    out = []
+    """Extract zip file `z` into directory `d` safely, flattening any internal paths.
+
+    Returns absolute paths to extracted files.
+    """
+    out: List[str] = []
+    d.mkdir(parents=True, exist_ok=True)
+
     with zipfile.ZipFile(z, "r") as zf:
         for m in zf.infolist():
-            if m.is_dir(): continue
-            p = d / Path(m.filename).name
-            zf.extract(m, d)
-            out.append(str(p))
+            if m.is_dir():
+                continue
+
+            base = Path(m.filename).name
+            if not base:
+                continue
+
+            dest = d / base
+            if dest.exists():
+                stem = dest.stem
+                suf = dest.suffix
+                i = 1
+                while True:
+                    cand = d / f"{stem}_{i}{suf}"
+                    if not cand.exists():
+                        dest = cand
+                        break
+                    i += 1
+
+            try:
+                with zf.open(m, "r") as src, open(dest, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                if dest.exists() and dest.stat().st_size > 0:
+                    out.append(str(dest))
+            except Exception:
+                continue
+
     return out
 
 def _cmr_latest_concept_id(short_name: str) -> Optional[str]:
+
     try:
         url = "https://cmr.earthdata.nasa.gov/search/collections.json"
         params = {"short_name": short_name, "page_size": 2000, "sort_key": "-version"}
-        r = requests.get(url, params=params, timeout=30)
+        r = _lazy_requests().get(url, params=params, timeout=30)
         r.raise_for_status()
         items = r.json().get("feed", {}).get("entry", [])
         return items[0]["id"] if items else None
@@ -563,7 +673,7 @@ def cmr_search_atl24_full(bbox, start, end, page_size=200) -> List[dict]:
     url = "https://cmr.earthdata.nasa.gov/search/granules.json"
     params = {"short_name": "ATL24", "version": "001", "temporal": f"{_iso(start)},{_iso(end, True)}",
               "bounding_box": f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}", "page_size": str(page_size), "sort_key": "-start_date"}
-    r = requests.get(url, params=params, timeout=45)
+    r = _lazy_requests().get(url, params=params, timeout=45)
     entries = r.json().get("feed", {}).get("entry", []) or []
     return entries
 
@@ -645,7 +755,7 @@ def ensure_icesat_files_harmony_cachefirst(d, product_key, bbox, start, end, for
 # -----------------------------------------------------------------------------
 
 def read_atl03_basic(h5_file, laser_num="1"):
-    with h5py.File(h5_file, "r") as f:
+    with _lazy_h5py().File(h5_file, "r") as f:
         orientation = f["/orbit_info/sc_orient"][0]
         orientDict = {0: "l", 1: "r", 21: "l"}
         laser = f"gt{laser_num}{orientDict.get(orientation, 'l')}"
@@ -762,7 +872,7 @@ def _collect_points_from_atl24_file(h5_path, conf_min, segment_length_m=5.0):
     """
     all_segments = []
 
-    with h5py.File(h5_path, "r") as f:
+    with _lazy_h5py().File(h5_path, "r") as f:
         # Try to get granule-level time metadata
         granule_start_delta_time = None
         try:
@@ -771,7 +881,7 @@ def _collect_points_from_atl24_file(h5_path, conf_min, segment_length_m=5.0):
             if "orbit_info" in f and "sc_orient_time" in f["orbit_info"]:
                 granule_start_delta_time = f["orbit_info"]["sc_orient_time"][0]
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
         for beam_key in [k for k in f.keys() if k.startswith("gt")]:
             g = f.get(beam_key)
@@ -1049,6 +1159,22 @@ def collect_training_points_from_atl03(
                 bath_df["depth_m"] = -np.abs(bath_df["depth_m"])
 
                 bath_df = bath_df[(bath_df["depth_m"] <= -min_depth_m) & (bath_df["depth_m"] >= -max_depth_m)]
+                try:
+                    if len(bath_df) > 0 and "depth_m" in bath_df.columns:
+                        d = bath_df["depth_m"].astype(float).to_numpy()
+                        d = d[np.isfinite(d)]
+                        if d.size > 0:
+                            shallow_floor = -float(min_depth_m)  # negative-down convention
+                            frac_near_floor = float(np.mean(np.abs(d - shallow_floor) <= 0.20))
+                            p50 = float(np.nanpercentile(d, 50))
+                            p95 = float(np.nanpercentile(d, 95))
+                            if frac_near_floor >= 0.60 or (p95 - p50) <= 0.25:
+                                logging.getLogger(__name__).warning(
+                                    "[ATL03_QC] Depths cluster near shallow floor after ATL03 filtering (floor=%.2f m, p50=%.2f, p95=%.2f, near_floor<=0.20m=%.1f%%, n=%d). Check min-depth-atl03 / bottom-pick thresholds / water classification.",
+                                    shallow_floor, p50, p95, 100.0 * frac_near_floor, int(d.size)
+                                )
+                except Exception:
+                    logging.getLogger(__name__).debug("ATL03 shallow-floor QC warning failed", exc_info=True)
                 bath_df = bath_df[(bath_df["n_bottom"] >= min_bottom_photons) & (bath_df["frac_bottom"] >= min_bottom_frac)]
 
                 bath_df["granule"] = Path(atl03_path).stem; bath_df["beam"] = f"gt{laser_num}"; bath_df["source"] = "atl03"
@@ -1058,7 +1184,24 @@ def collect_training_points_from_atl03(
         except Exception as exc:
             log.warning(f"[TRAIN-ATL03] failed to parse {Path(atl03_path).name}: {exc}")
 
-    if not all_rows: return pd.DataFrame()
+    # If we have no valid rows, still write an empty cache entry.
+    # This avoids repeated expensive parsing work across identical runs.
+    if not all_rows:
+        out_empty = pd.DataFrame()
+        if cache_dir is not None and _CACHE_UTILS_AVAILABLE and cache_key and cache_data_path and cache_meta_path:
+            log.info(f"[ATL03_TRAINING_POINTS-CACHE] WRITE: {Path(cache_data_path).name} (empty)")
+            _write_cached_training_points(
+                stage="atl03_training_points",
+                key=cache_key,
+                data_path=Path(cache_data_path),
+                meta_path=Path(cache_meta_path),
+                params=params_fp,
+                inputs=inputs_fp,
+                cache_code_strict=bool(cache_code_strict),
+                df=out_empty,
+                extra={"rows": 0, "empty": True},
+            )
+        return out_empty
     out = pd.concat(all_rows, ignore_index=True)
     _log_depth_funnel("atl03.points.concat", out, rr=rr)
 
@@ -1079,7 +1222,7 @@ def collect_training_points_from_atl03(
             inputs=inputs_fp,
             cache_code_strict=bool(cache_code_strict),
             df=out.reset_index(drop=True),
-            extra={"rows": int(len(out))},
+            extra={"rows": int(len(out)), "empty": bool(len(out) == 0)},
         )
 
     return out.reset_index(drop=True)
@@ -1223,6 +1366,13 @@ def build_gl_atl24_like_product(
         log.warning("No ATL03 picks found to export.")
 
 def build_atl03_track_lines(atl03_files: List[str], aoi_str: str, out_shp: str):
+    # Heavy geospatial deps are local to keep module import light.
+    try:
+        import geopandas as gpd
+        from shapely.geometry import LineString
+    except Exception as e:
+        raise RuntimeError("build_atl03_track_lines requires geopandas + shapely") from e
+
     # This visualizes where the tracks are
     W, E, S, N = [float(x) for x in aoi_str.split("/")]
     lines, names, beams = [], [], []
@@ -1230,7 +1380,7 @@ def build_atl03_track_lines(atl03_files: List[str], aoi_str: str, out_shp: str):
         try:
             for laser in ("1", "2", "3"):
                 # Just read enough to get a line
-                with h5py.File(f, "r") as h5:
+                with _lazy_h5py().File(f, "r") as h5:
                     # Quick orientation check
                     orientation = h5["/orbit_info/sc_orient"][0]
                     orientDict = {0: "l", 1: "r", 21: "l"}
@@ -1275,6 +1425,7 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
     """
     from pyproj import Transformer, CRS
     import geopandas as gpd
+    import re
 
     dfs = []
     W, E, S, N = [float(x) for x in aoi_str.split("/")]
@@ -1376,6 +1527,18 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
                 log.warning(f"[load_extra_xyz]   Available columns: {list(tmp.columns)}")
                 continue
 
+
+            # Coerce depth_m to numeric early (protect against object/string depths)
+            # This prevents downstream np.isfinite / sign logic failures.
+            tmp['depth_m'] = pd.to_numeric(tmp['depth_m'], errors='coerce')
+            n_bad = int(tmp['depth_m'].isna().sum())
+            if n_bad:
+                log.warning(f"[load_extra_xyz]   Dropping {n_bad} rows with non-numeric depth_m in {filepath.name}")
+                tmp = tmp.loc[tmp['depth_m'].notna()].copy()
+            if len(tmp) == 0:
+                log.warning(f"[load_extra_xyz]   No valid depth rows remain after coercion in {filepath.name}")
+                continue
+
             # Apply CRS transformation if needed
             if transformer is not None:
                 log.info(f"[load_extra_xyz]   Transforming coordinates...")
@@ -1472,7 +1635,7 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
                         pct_outliers = 100.0 * n_outliers / len(tmp)
                         log.warning(
                             f"[load_extra_xyz] QC: Removing {n_outliers} outliers "
-                            f"({pct_outliers:.1f}%) beyond 5×MAD "
+                            f"({pct_outliers:.1f}%) beyond 12×MAD "
                             f"(median={median_depth:.2f}, MAD={mad:.2f})"
                         )
                         tmp = tmp[~outlier_mask].copy()
@@ -1499,8 +1662,15 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
             log.info(f"[load_extra_xyz]   AOI clipping: {n_before} → {n_after} points ({n_after/max(n_before,1)*100:.1f}%)")
 
             if not tmp.empty:
-                # CRITICAL: Set source to "extra_xyz" directly
-                tmp["source"] = "extra_xyz"
+                # Preserve per-file provenance so authoritative subsets can be tiered differently.
+                # If the input already has a meaningful 'source' column, keep it. Otherwise tag by filename.
+                if "source" in tmp.columns and tmp["source"].notna().any():
+                    tmp["source"] = tmp["source"].astype(str)
+                else:
+                    tag = filepath.stem.lower().strip()
+                    # normalize common prefixes
+                    tag = re.sub(r"[^a-z0-9_\-]+", "_", tag)
+                    tmp["source"] = f"extra_xyz:{tag}"
 
                 # Keep only required columns
                 tmp = tmp[['longitude', 'latitude', 'depth_m', 'source']].copy()

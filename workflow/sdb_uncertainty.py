@@ -56,7 +56,7 @@ The uncertainty value at each pixel means:
 """
 
 import logging
-from typing import Dict, List, Optional, Tuple, Any, Union
+from typing import Dict, Tuple, Any, Union
 from pathlib import Path
 from dataclasses import dataclass
 import numpy as np
@@ -789,7 +789,6 @@ def _predict_calibrated_with_tree_variance(
     """
     Predict using calibrated RF model, returning depth and tree variance.
     """
-    from sklearn.ensemble import RandomForestRegressor
     
     shape = s2_bands["B02"].shape
     
@@ -934,7 +933,8 @@ def predict_physics_only(
     s2_dir: Union[str, Path],
     output_dir: Union[str, Path],
     *,
-    region: str = "auto",
+    region: str = "default",
+    allow_heuristic_region: bool = False,
     kd_algorithm: str = "lee2005",
 ) -> SDBPrediction:
     """
@@ -949,7 +949,7 @@ def predict_physics_only(
     output_dir : Path
         Output directory
     region : str
-        Regional parameter set, or "auto" to guess from coordinates
+        Regional parameter set. Use "auto" only if allow_heuristic_region=True.
     kd_algorithm : str
         Kd estimation algorithm
         
@@ -979,6 +979,9 @@ def predict_physics_only(
         raise ValueError("B02 and B03 bands are required")
     
     # Auto-detect region
+    if region == "auto" and not allow_heuristic_region:
+        raise ValueError(            "region='auto' relies on very rough geographic heuristics. "            "To use it, pass allow_heuristic_region=True (and record this in your provenance). "            "Otherwise choose an explicit region (e.g., region='default')."        )
+
     if region == "auto":
         center_lon = (bounds.left + bounds.right) / 2
         center_lat = (bounds.bottom + bounds.top) / 2
@@ -1032,8 +1035,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Physics-based SDB with uncertainty")
     parser.add_argument("--s2-dir", required=True, help="Sentinel-2 band directory")
     parser.add_argument("--output-dir", required=True, help="Output directory")
-    parser.add_argument("--region", default="auto", 
-                       choices=list(REGIONAL_PARAMS.keys()) + ["auto"])
+    parser.add_argument(
+        "--region",
+        default="default",
+        choices=list(REGIONAL_PARAMS.keys()) + ["auto"],
+        help="Regional parameter set. Use region='auto' only with --allow-heuristic-region.",
+    )
+    parser.add_argument(
+        "--allow-heuristic-region",
+        action="store_true",
+        help="Allow region='auto' (uses very rough geographic heuristics; not scientifically defensible without disclosure).",
+    )
     parser.add_argument("--mode", default="physics",
                        choices=["physics", "uncalibrated"])
     
@@ -1045,10 +1057,11 @@ if __name__ == "__main__":
         args.s2_dir,
         args.output_dir,
         region=args.region,
+        allow_heuristic_region=bool(args.allow_heuristic_region),
     )
     
-    print(f"\nResults saved to {args.output_dir}")
-    print(f"Mode: {prediction.mode}")
-    print(f"Depth range: {prediction.metadata['depth_stats']['min']:.1f} - {prediction.metadata['depth_stats']['max']:.1f} m")
-    print(f"Mean uncertainty: {prediction.metadata['uncertainty_stats']['mean']:.2f} m")
-    print(f"High confidence fraction: {prediction.metadata['confidence_stats']['high_confidence_fraction']*100:.1f}%")
+    log.info(f"\nResults saved to {args.output_dir}")
+    log.info(f"Mode: {prediction.mode}")
+    log.info(f"Depth range: {prediction.metadata['depth_stats']['min']:.1f} - {prediction.metadata['depth_stats']['max']:.1f} m")
+    log.info(f"Mean uncertainty: {prediction.metadata['uncertainty_stats']['mean']:.2f} m")
+    log.info(f"High confidence fraction: {prediction.metadata['confidence_stats']['high_confidence_fraction']*100:.1f}%")

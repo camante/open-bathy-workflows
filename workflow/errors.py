@@ -18,7 +18,7 @@ Usage:
             raise ProcessingError(f"Failed to read {path}") from e
 """
 
-from typing import Optional, Any
+from typing import Optional
 
 
 class SDBError(Exception):

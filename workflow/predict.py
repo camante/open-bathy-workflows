@@ -17,7 +17,10 @@ FIXES (this patch):
 - Make tqdm optional.
 """
 
-from __future__ import annotations
+
+import os as _os
+# Force a headless-safe Matplotlib backend early (prevents TkAgg/Tkinter crashes under multiprocessing)
+_os.environ.setdefault('MPLBACKEND', 'Agg')
 
 import os
 import sys
@@ -25,10 +28,11 @@ import json
 import logging
 import argparse
 import subprocess
+from process_utils import run_cmd
 import shlex
 from pathlib import Path
 from contextlib import ExitStack
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import rasterio
@@ -51,6 +55,26 @@ except Exception:
     _TQDM = None
 
 log = logging.getLogger("sdb.predict")
+
+
+def _fmt_phys_scalar(value) -> str:
+    """Format physics metadata values that may be scalar or nested dicts."""
+    try:
+        if value is None:
+            return "N/A"
+        if isinstance(value, (int, float, np.floating)):
+            v = float(value)
+            return f"{v:.4f}" if np.isfinite(v) else "nan"
+        if isinstance(value, dict):
+            for k in ("value", "mean", "kd", "ku"):
+                if k in value:
+                    return _fmt_phys_scalar(value.get(k))
+            # compact fallback for unexpected dict schema
+            return json.dumps(value, sort_keys=True)
+        return str(value)
+    except Exception:
+        return str(value)
+
 
 # -----------------------------------------------------------------------------
 # Optional modules
@@ -145,7 +169,7 @@ def compute_hybrid_prediction(
     if physics_params:
         kd_corrected = physics_params.get("kd_corrected")
         if kd_corrected:
-            log.debug(f"[HYBRID] Using geometry-corrected Kd={kd_corrected:.4f}")
+            log.debug("[HYBRID] Using geometry-corrected Kd=%s", _fmt_phys_scalar(kd_corrected))
 
     if stumpf_lr_coef is not None and stumpf_lr_intercept is not None:
         stumpf_physics = stumpf_lr_intercept + stumpf_lr_coef * stumpf_idx
@@ -352,7 +376,7 @@ def _normalize_linf_constants(d):
             try:
                 out[ku] = float(v)
             except Exception:
-                pass
+                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
     for k, v in defaults.items():
         out.setdefault(k, v)
@@ -481,7 +505,7 @@ def predict_scene(
     if physics_params:
         log.info(f"[PREDICT][PHYSICS] Loaded physics params: SZA={physics_params.get('sun_zenith_deg', 'N/A')}°")
         if physics_params.get("kd_corrected"):
-            log.info(f"[PREDICT][PHYSICS] Geometry-corrected Kd={physics_params['kd_corrected']:.4f}")
+            log.info("[PREDICT][PHYSICS] Geometry-corrected Kd=%s", _fmt_phys_scalar(physics_params.get('kd_corrected')))
         if physics_params.get("seagrass_detected"):
             log.warning("[PREDICT][PHYSICS] ⚠️ Seagrass signature was detected in training scene")
 
@@ -545,7 +569,7 @@ def predict_scene(
                 if any(float(v) != 0 for v in linf_raw.values()):
                     log.warning("[PREDICT] linf_enabled=False but NON-ZERO L∞ constants are present in metadata; ignoring.")
             except Exception:
-                pass
+                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
         log.info("[PREDICT] L_inf disabled; using zeros.")
 
     training_bounds = meta.get("training_bounds", {})
@@ -606,6 +630,25 @@ def predict_scene(
 
         _cwm_src = rasterio.open(s2_paths["CLEAR_WATER"])
         _brt_src = rasterio.open(s2_paths["BRIGHTNESS"])
+
+        # Robustness: the land mask is an external artifact (often produced by waffles).
+        # If it is missing, create a conservative all-water mask aligned to the S2 grid
+        # so prediction can proceed (and log loudly so users notice).
+        land_mask_path = str(land_mask_path)
+        if not os.path.exists(land_mask_path):
+            log.warning(
+                f"[PREDICT][MASK] land mask missing: {land_mask_path}. "
+                "Creating aligned all-water fallback mask (water=0)."
+            )
+            _dst_dir = os.path.dirname(land_mask_path)
+            if _dst_dir:
+                os.makedirs(_dst_dir, exist_ok=True)
+            prof = ref.profile.copy()
+            prof.update(driver="GTiff", dtype="uint8", count=1, nodata=None, compress="DEFLATE", tiled=True)
+            fallback = np.zeros((ref.height, ref.width), dtype=np.uint8)
+            with rasterio.open(land_mask_path, "w", **prof) as _dst:
+                _dst.write(fallback, 1)
+
         _lnd_src = rasterio.open(land_mask_path)
 
         srcs["_CWM_SRC"] = _cwm_src
@@ -752,6 +795,18 @@ def predict_scene(
 
                         funnel["doa_pass"] += int(domain_mask_local.sum())
 
+                        # Guard sklearn prediction against NaN/Inf feature rows that can survive
+                        # earlier masks (e.g., NaNs fail comparisons and slip through DOA logic).
+                        if np.any(domain_mask_local):
+                            finite_domain_mask = np.all(np.isfinite(X_block[domain_mask_local]), axis=1)
+                            if not np.all(finite_domain_mask):
+                                bad_n = int((~finite_domain_mask).sum())
+                                funnel.setdefault("doa_nonfinite_reject", 0)
+                                funnel["doa_nonfinite_reject"] += bad_n
+                                idx_local = np.flatnonzero(domain_mask_local)
+                                domain_mask_local[idx_local[~finite_domain_mask]] = False
+                                funnel["doa_pass"] -= bad_n
+
                         if doa_score_block is not None:
                             doa_score_block[valid_mask] = doa_score_local.astype(np.float32)
 
@@ -893,14 +948,14 @@ def predict_scene(
             with open(report_dir / "predict_report.json", "w") as f:
                 json.dump(rep, f, indent=2)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
     finally:
         for s in srcs.values():
             try:
                 s.close()
             except Exception:
-                pass
+                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
     log.info("[PREDICT] Finished. Depth: %s", out_path)
     return {"status": "ok"}
@@ -910,7 +965,7 @@ def reproject_to_nad83(src_path: str, dst_path: str):
     cmd = f"gdalwarp -overwrite -t_srs EPSG:4269 -r bilinear -of GTiff {shlex.quote(src_path)} {shlex.quote(dst_path)}"
     log.info("[NAD83] Reprojecting with: %s", cmd)
     try:
-        subprocess.run(shlex.split(cmd), check=True)
+        run_cmd(shlex.split(cmd), check=True)
     except Exception:
         log.warning("[NAD83] gdalwarp failed.")
 

@@ -162,11 +162,11 @@ def create_spatial_clusters(
         # Assign invalid points to cluster 0
         clusters = np.zeros(len(df), dtype=int)
         if np.sum(valid_mask) >= n_clusters:
-            km = KMeans(n_clusters=n_clusters, random_state=seed, n_init="auto")
+            km = KMeans(n_clusters=n_clusters, random_state=seed, n_init=10)
             clusters[valid_mask] = km.fit_predict(coords[valid_mask])
         return clusters
     
-    km = KMeans(n_clusters=n_clusters, random_state=seed, n_init="auto")
+    km = KMeans(n_clusters=n_clusters, random_state=seed, n_init=10)
     return km.fit_predict(coords)
 
 
@@ -887,7 +887,8 @@ def plot_spatial_cv_results(
     title: str = "Spatial Cross-Validation Results",
 ):
     """Generate visualization of spatial CV results."""
-    import matplotlib.pyplot as plt
+    from plot_utils import lazy_pyplot
+    plt = lazy_pyplot()
     
     fig, axes = plt.subplots(1, 3, figsize=(14, 4))
     

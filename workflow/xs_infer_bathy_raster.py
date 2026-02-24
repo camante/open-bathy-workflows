@@ -60,7 +60,6 @@ Use --no-swot-use-for-slope if you want observed stage to shift bed elevations b
 longitudinal WSE-profile slope fit.
 """
 
-from __future__ import annotations
 
 import argparse
 import logging
@@ -81,9 +80,12 @@ import math
 import numpy as np
 import pandas as pd
 
+# Ensure GeoPandas remains usable on pandas>=2.0 even if GeoPandas lags.
+import compat_pandas  # noqa: F401
+
 # Longitudinal WSE profile fitting (stabilizes slope for Manning / multivariate priors)
 try:
-    from river_wse import WSEFitConfig, fit_wse_profile  # optional dependency
+    from river_wse import WSEFitConfig
 except Exception:  # pragma: no cover
     WSEFitConfig = None
     fit_wse_profile = None
@@ -235,6 +237,16 @@ class InferConfig:
     calib_max_dist_m: float = 200.0
     calib_stat: str = "p90"
 
+    # Soundings loading guardrails (prevents OOM when extra_xyz is huge)
+    soundings_max_points: int = 2_000_000
+    soundings_sample_seed: int = 0
+
+    # Optional: write the (possibly downsampled) soundings set to a single file so downstream
+    # river steps can reuse the exact same subset (reproducibility + seam consistency).
+    # Intended to be passed from bathy_main.py.
+    write_soundings_subset: Optional[str] = None
+    only_write_soundings_subset: bool = False
+
     # Tier-1 calibration anchors (no bed data required)
     usgs_max_dist_m: float = 5000.0          # meters (distance from gage to XS center)
     usgs_mean_to_dmax: float = 1.30          # convert mean depth -> approximate Dmax
@@ -273,7 +285,10 @@ class InferConfig:
     # DA units controlled by regional_curve_da_units ('km2' or 'mi2').
     # If depth represents mean depth, convert to Dmax using trapezoid factor unless overridden.
     regional_curve_enabled: bool = False
-    regional_curve_region: str = "default"      # selects built-in placeholder coefficients
+    regional_curve_region: Optional[str] = None  # must be explicitly set to use regional curves
+    # Safety valve: allow using built-in regional curve tables (if present) even when
+    # regional_curve_region is not explicitly provided. Default is False for reproducibility.
+    allow_builtin_regional_curves: bool = False
     regional_curve_c: Optional[float] = None    # override c
     regional_curve_f: Optional[float] = None    # override f
     regional_curve_unc_pct: float = 40.0        # 1-sigma-ish percent uncertainty (used for weighting)
@@ -905,12 +920,25 @@ def _compute_dmax_regional_curve(row: pd.Series, cfg: InferConfig) -> Tuple[floa
         return (float("nan"), 0.0, "")
 
     # Coefficients
-    reg = str(getattr(cfg, "regional_curve_region", "default") or "default").lower().replace(" ", "_").replace("-", "_")
     c = getattr(cfg, "regional_curve_c", None)
     f = getattr(cfg, "regional_curve_f", None)
+    reg_raw = getattr(cfg, "regional_curve_region", None)
 
+    # Anti-slop guard: built-in coefficients are illustrative placeholders and must be explicitly opted into.
+    # If the user did not provide explicit (c,f), require that they *explicitly* provided a region key.
+    if (c is None or f is None) and (reg_raw is None):
+        return (float("nan"), 0.0, "rc:no_coeffs_no_region")
+
+    reg = str(reg_raw).lower().replace(" ", "_").replace("-", "_") if reg_raw is not None else ""
+    if (c is None or f is None) and (reg in ("", "default", "none")):
+        return (float("nan"), 0.0, "rc:default_placeholder_blocked")
+
+    used_builtin = False
     if c is None or f is None:
         c0, f0, da_u0, depth_u0, depth_t0, unc0 = REGIONAL_CURVE_DEFAULTS.get(reg, REGIONAL_CURVE_DEFAULTS["default"])
+        used_builtin = True
+        if not bool(getattr(cfg, "allow_builtin_regional_curves", False)):
+            return (float("nan"), 0.0, "rc:builtin_not_allowed")
         if c is None:
             c = c0
         if f is None:
@@ -924,7 +952,6 @@ def _compute_dmax_regional_curve(row: pd.Series, cfg: InferConfig) -> Tuple[floa
         depth_units = getattr(cfg, "regional_curve_depth_units", "m")
         depth_type = getattr(cfg, "regional_curve_depth_type", "mean")
         unc_pct = float(getattr(cfg, "regional_curve_unc_pct", 40.0))
-
     da_use = _convert_da_units(float(da), str(da_units)) if str(da_units).lower().strip() != "km2" else float(da)
     # (If da_units is km2, da_use is km2; if mi2, converted.)
     # Bankfull depth
@@ -958,7 +985,7 @@ def _compute_dmax_regional_curve(row: pd.Series, cfg: InferConfig) -> Tuple[floa
     w = max(0.0, min(1.0, 1.0 - float(unc_pct) / 100.0))
     w = float(np.clip(max_w * w, 0.0, 1.0))
 
-    detail = f"{reg}:{conv}:unc{unc_pct:.0f}%"
+    detail = f"{('builtin:' if used_builtin else '')}{reg}:{conv}:unc{unc_pct:.0f}%"
     return (dmax, w, detail)
 def _uncertainty_for_row(row: pd.Series, cfg: InferConfig) -> float:
     """Heuristic uncertainty (1-sigma, meters) by depth source with basic quality modifiers."""
@@ -1189,12 +1216,34 @@ def _load_soundings(
     elev_col: Optional[str],
     x_col: Optional[str],
     y_col: Optional[str],
+    soundings_crs: Optional[str] = None,
 ) -> Optional[gpd.GeoDataFrame]:
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(str(path))
 
-    if path.suffix.lower() == ".csv":
+    suf = path.suffix.lower()
+
+    if suf == ".parquet":
+        df = pd.read_parquet(path)
+        # Expect x/y/z columns; allow lon/lat as fallback.
+        if x_col is None or y_col is None:
+            for xc, yc in [("x", "y"), ("lon", "lat"), ("longitude", "latitude"), ("easting", "northing")]:
+                if xc in df.columns and yc in df.columns:
+                    x_col, y_col = xc, yc
+                    break
+        if x_col is None or y_col is None:
+            raise RuntimeError("Soundings Parquet requires x/y columns (or specify --soundings-x-col/--soundings-y-col).")
+        # CRS is stored as a string column when produced by our subset writer.
+        if soundings_crs:
+            src_crs = CRS.from_user_input(soundings_crs)
+        elif "crs" in df.columns and str(df["crs"].iloc[0]).strip():
+            src_crs = CRS.from_user_input(str(df["crs"].iloc[0]))
+        else:
+            src_crs = _guess_xy_crs(df[x_col].to_numpy(), df[y_col].to_numpy(), target_crs, x_col, y_col)
+        gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df[x_col], df[y_col]), crs=src_crs)
+
+    elif suf == ".csv":
         df = pd.read_csv(path)
         if x_col is None or y_col is None:
             for xc, yc in [("lon", "lat"), ("longitude", "latitude"), ("x", "y"), ("easting", "northing")]:
@@ -1204,9 +1253,12 @@ def _load_soundings(
         if x_col is None or y_col is None:
             raise RuntimeError("Soundings CSV requires --soundings-x-col/--soundings-y-col (or lon/lat columns).")
 
-        src_crs = _guess_xy_crs(df[x_col].to_numpy(), df[y_col].to_numpy(), target_crs, x_col, y_col)
+        if soundings_crs:
+            src_crs = CRS.from_user_input(soundings_crs)
+        else:
+            src_crs = _guess_xy_crs(df[x_col].to_numpy(), df[y_col].to_numpy(), target_crs, x_col, y_col)
         gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df[x_col], df[y_col]), crs=src_crs)
-    elif path.suffix.lower() in (".xyz", ".txt", ".dat"):
+    elif suf in (".xyz", ".txt", ".dat"):
         # USACE eHydro and similar XYZ soundings are commonly whitespace or comma-delimited
         # with 3 columns: x y z (or lon lat depth). Support optional header.
         # We assume EPSG:4326 for XYZ/CSV unless the user provides a vector file with CRS.
@@ -1238,7 +1290,10 @@ def _load_soundings(
             # Fall back to first two columns
             x_col, y_col = df.columns[0], df.columns[1]
 
-        src_crs = _guess_xy_crs(df[x_col].to_numpy(), df[y_col].to_numpy(), target_crs, x_col, y_col)
+        if soundings_crs:
+            src_crs = CRS.from_user_input(soundings_crs)
+        else:
+            src_crs = _guess_xy_crs(df[x_col].to_numpy(), df[y_col].to_numpy(), target_crs, x_col, y_col)
         gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df[x_col], df[y_col]), crs=src_crs)
     else:
         gdf = gpd.read_file(path)
@@ -1284,7 +1339,7 @@ def _expand_soundings_inputs(items) -> list[Path]:
         for part in parts:
             pth = Path(part)
             if pth.is_dir():
-                for ext in ("*.xyz", "*.csv", "*.txt", "*.dat", "*.gpkg", "*.shp", "*.geojson", "*.json"):
+                for ext in ("*.xyz", "*.csv", "*.txt", "*.dat", "*.gpkg", "*.shp", "*.geojson", "*.json", "*.parquet"):
                     out.extend(sorted(pth.glob(ext)))
             else:
                 out.append(pth)
@@ -1306,6 +1361,7 @@ def _load_soundings_many(
     elev_col: Optional[str],
     x_col: Optional[str],
     y_col: Optional[str],
+    soundings_crs: Optional[str] = None,
 ) -> Optional[gpd.GeoDataFrame]:
     """Load and merge multiple soundings inputs into a single GeoDataFrame."""
     paths = _expand_soundings_inputs(items)
@@ -1321,6 +1377,7 @@ def _load_soundings_many(
                 elev_col=elev_col,
                 x_col=x_col,
                 y_col=y_col,
+                soundings_crs=soundings_crs,
             )
             if g is not None and not g.empty:
                 g = g.copy()
@@ -1332,6 +1389,83 @@ def _load_soundings_many(
         return None
     df = pd.concat(gdfs, ignore_index=True)
     return gpd.GeoDataFrame(df, geometry="geometry", crs=target_crs)
+
+
+def _write_soundings_subset(path: Path, soundings: gpd.GeoDataFrame) -> None:
+    """Write a unified soundings subset for reuse by downstream river steps.
+
+    Preferred output is **Parquet** (fast + small). If the target path ends with
+    .parquet (or has no suffix), a flat table is written with explicit x/y.
+
+    Fallback output is GPKG (geometry-preserving) if parquet isn't available.
+    """
+    if soundings is None or soundings.empty:
+        return
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Default to parquet if no suffix.
+    if path.suffix == "":
+        path = path.with_suffix(".parquet")
+
+    # Prefer a depth column if available; keep elevation too when present.
+    out = soundings.copy()
+    if "_depth_m" in out.columns:
+        out["depth"] = pd.to_numeric(out["_depth_m"], errors="coerce")
+        out["depth_m"] = out["depth"]
+    if "_z_m" in out.columns:
+        out["z"] = pd.to_numeric(out["_z_m"], errors="coerce")
+        out["z_m"] = out["z"]
+
+    keep = ["geometry"]
+    for c in ["depth", "depth_m", "z", "z_m", "_src_file"]:
+        if c in out.columns:
+            keep.append(c)
+    out = out[keep].copy()
+    out = out[out.geometry.notnull() & (~out.geometry.is_empty)].copy()
+    if out.empty:
+        return
+
+    ext = path.suffix.lower()
+
+    # Remove any pre-existing file to avoid stale layers.
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception:
+        log.debug("Could not remove existing subset file %s; will overwrite.", str(path), exc_info=True)
+
+    if ext == ".parquet":
+        # Parquet: store explicit x/y + z + src + crs.
+        try:
+            import pyarrow  # noqa: F401
+            tbl = pd.DataFrame({
+                "x": out.geometry.x.astype("float64"),
+                "y": out.geometry.y.astype("float64"),
+                # Prefer depth (positive-down) when present, else z.
+                "z": pd.to_numeric(out["depth"], errors="coerce") if ("depth" in out.columns) else pd.to_numeric(out.get("z"), errors="coerce"),
+                "_src_file": out.get("_src_file", "unknown"),
+                "crs": str(out.crs) if out.crs is not None else "",
+            })
+            tbl = tbl[np.isfinite(tbl["x"]) & np.isfinite(tbl["y"]) & np.isfinite(tbl["z"])].copy()
+            tbl.to_parquet(path, index=False)
+            return
+        except Exception as e:
+            log.warning("[SOUNDINGS] Parquet write failed (%s); falling back to GPKG.", e)
+            path = path.with_suffix(".gpkg")
+
+    # GPKG fallback
+    out.to_file(path, driver="GPKG")
+
+
+def _soundings_one_line(path: Path, n_out: int, n_in: int, by_src: dict[str, int] | None = None) -> str:
+    """One-line summary: <file>: n=<out> from <in> (src=...)."""
+    parts = []
+    if by_src:
+        for k, v in sorted(by_src.items(), key=lambda kv: (-kv[1], str(kv[0]))):
+            parts.append(f"{k}={int(v):,}")
+    src = f" ({', '.join(parts)})" if parts else ""
+    return f"{Path(path).name}: n={int(n_out):,} from {int(n_in):,}{src}"
 
 
 
@@ -1446,20 +1580,100 @@ def _attach_swot_wse_to_xs(
     # Project to meters for distance constraints
     xsc_m, swot_m, _ = _project_for_distance(xsc, swot)
 
-    try:
-        joined = gpd.sjoin_nearest(
-            xsc_m,
-            swot_m[["_wse_m", "geometry"]],
-            how="left",
-            distance_col="_dist_m",
-        )
-    except Exception as e:
-        raise RuntimeError(
-            "Spatial join nearest failed (SWOT WSE). Install a spatial index backend (rtree) or use shapely>=2. "
-            f"Original error: {e}"
-        )
+    # Attach observations using a metric-space KDTree (more robust than sjoin_nearest,
+    # avoids spatial-index backend requirements, and supports robust aggregation when
+    # multiple observations fall near the same cross-section).
+    sw = pd.DataFrame({"xs_id": xsc_m["xs_id"].astype(str).values})
+    sw["swot_wse_m"] = np.nan
+    sw["swot_dist_m"] = np.nan
 
-    # Respect distance threshold
+    try:
+        from scipy.spatial import cKDTree
+    except Exception:
+        cKDTree = None
+
+    max_d = float(cfg.swot_max_dist_m)
+    if cKDTree is None:
+        # Fallback to geopandas nearest join (requires spatial index backend)
+        try:
+            joined = gpd.sjoin_nearest(
+                xsc_m,
+                swot_m[["_wse_m", "geometry"]],
+                how="left",
+                distance_col="_dist_m",
+            )
+            joined.loc[joined["_dist_m"] > max_d, "_wse_m"] = np.nan
+            joined.loc[joined["_dist_m"] > max_d, "_dist_m"] = np.nan
+            sw = joined[["xs_id", "_wse_m", "_dist_m"]].copy()
+            sw = sw.rename(columns={"_wse_m": "swot_wse_m", "_dist_m": "swot_dist_m"})
+            sw["swot_wse_m"] = pd.to_numeric(sw["swot_wse_m"], errors="coerce")
+        except Exception as e:
+            raise RuntimeError(
+                "SWOT WSE attachment failed. Install SciPy for KDTree support, or install a GeoPandas spatial index backend (rtree/pygeos). "
+                f"Original error: {e}"
+            )
+    else:
+        # KDTree-based neighbor aggregation
+        sw_xy = np.column_stack([swot_m.geometry.x.values.astype(float), swot_m.geometry.y.values.astype(float)])
+        xs_xy = np.column_stack([xsc_m.geometry.x.values.astype(float), xsc_m.geometry.y.values.astype(float)])
+        sw_wse = pd.to_numeric(swot_m["_wse_m"], errors="coerce").values.astype(float)
+
+        # Filter finite observations before building the tree
+        ok_obs = np.isfinite(sw_xy[:, 0]) & np.isfinite(sw_xy[:, 1]) & np.isfinite(sw_wse)
+        sw_xy = sw_xy[ok_obs]
+        sw_wse = sw_wse[ok_obs]
+        if sw_xy.shape[0] > 0:
+            tree = cKDTree(sw_xy)
+
+            def _robust_median_mad(v: np.ndarray, zmax: float) -> float:
+                v = np.asarray(v, dtype=float)
+                v = v[np.isfinite(v)]
+                if v.size == 0:
+                    return float("nan")
+                if v.size < 3:
+                    return float(np.nanmedian(v))
+                med = float(np.nanmedian(v))
+                mad = float(np.nanmedian(np.abs(v - med)))
+                if mad <= 0.0 or (not np.isfinite(mad)):
+                    return float(med)
+                z = np.abs(v - med) / (1.4826 * mad)
+                v2 = v[z <= float(zmax)]
+                if v2.size == 0:
+                    return float(med)
+                return float(np.nanmedian(v2))
+
+            # Query up to k nearest to stabilize aggregation and distance reporting.
+            # Use a small k cap for speed; aggregation uses only those within max_d anyway.
+            k = int(min(16, max(4, sw_xy.shape[0])))
+            dists, idxs = tree.query(xs_xy, k=k, distance_upper_bound=max_d)
+            # Ensure 2D arrays
+            dists = np.atleast_2d(dists)
+            idxs = np.atleast_2d(idxs)
+
+            wse_out = np.full((xs_xy.shape[0],), np.nan, dtype=float)
+            dist_out = np.full((xs_xy.shape[0],), np.nan, dtype=float)
+
+            for i in range(xs_xy.shape[0]):
+                di = np.asarray(dists[i], dtype=float).ravel()
+                ii = np.asarray(idxs[i], dtype=int).ravel()
+                good = np.isfinite(di) & (di <= max_d) & (ii >= 0) & (ii < sw_wse.shape[0])
+                if not np.any(good):
+                    continue
+                di = di[good]
+                ii = ii[good]
+                vals = sw_wse[ii]
+                # Robust aggregate (median after MAD rejection) to reduce sensitivity to
+                # local outliers or mixed-quality observations near confluences.
+                wse_out[i] = _robust_median_mad(vals, float(cfg.swot_outlier_mad_z))
+                dist_out[i] = float(np.nanmin(di)) if di.size else np.nan
+
+            sw["swot_wse_m"] = wse_out
+            sw["swot_dist_m"] = dist_out
+        else:
+            # no usable observations
+            pass
+
+# Respect distance threshold
     joined.loc[joined["_dist_m"] > float(cfg.swot_max_dist_m), "_wse_m"] = np.nan
     joined.loc[joined["_dist_m"] > float(cfg.swot_max_dist_m), "_dist_m"] = np.nan
 
@@ -1484,7 +1698,7 @@ def _attach_swot_wse_to_xs(
         tmp.loc[z > float(cfg.swot_outlier_mad_z), "swot_wse_m"] = np.nan
         sw = tmp[["xs_id", "swot_wse_m", "swot_dist_m"]]
     except Exception:
-        pass
+        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
     xs_param = xs_param.merge(sw, on="xs_id", how="left")
     xs_param["swot_wse_m"] = xs_param["swot_wse_m"] + float(cfg.swot_vertical_offset_m)
@@ -1775,11 +1989,9 @@ def _kd_tree():
     Return a (TreeClass, name) using available libs.
     """
     try:
-        from scipy.spatial import cKDTree  # type: ignore
         return cKDTree, "scipy"
     except Exception:
         try:
-            from sklearn.neighbors import KDTree  # type: ignore
             return KDTree, "sklearn"
         except Exception:
             return None, "none"
@@ -1793,24 +2005,41 @@ def _idw_interpolate_on_mask(
     power: float = 2.0,
     adaptive: bool = False,
     eps: float = 1e-6,
+    pts_weight: Optional[np.ndarray] = None,
+    pts_group: Optional[np.ndarray] = None,
+    pts_priority: Optional[np.ndarray] = None,
+    priority_delta: float = 0.0,
+    priority_min_spread: float = 1.0,
 ) -> np.ndarray:
+    """IDW / adaptive IDW interpolation for query coordinates.
+
+    pts_weight (optional): per-control-point multiplicative weights (>=0) applied
+    to the kernel. This is useful for emphasizing thalweg points (WALID-style)
+    without duplicating points.
     """
-    IDW / adaptive IDW for query coordinates.
-    pts_xy: (n,2), pts_val: (n,), q_xy: (m,2)
-    Returns: (m,) float64
-    """
+    pts_xy = np.asarray(pts_xy, dtype="float64")
+    pts_val = np.asarray(pts_val, dtype="float64").reshape(-1)
+    q_xy = np.asarray(q_xy, dtype="float64")
+
+    if pts_weight is not None:
+        pts_weight = np.asarray(pts_weight, dtype="float64").reshape(-1)
+        if pts_weight.shape[0] != pts_val.shape[0]:
+            raise ValueError("pts_weight must have same length as pts_val")
+        pts_weight = np.maximum(pts_weight, 0.0)
+
     Tree, which = _kd_tree()
     if Tree is None:
-        # Fallback: brute-force kNN in chunks (slow, but avoids hard dependency)
         which = "numpy"
 
-    pts_xy = np.asarray(pts_xy, dtype="float64")
-    pts_val = np.asarray(pts_val, dtype="float64")
-    q_xy = np.asarray(q_xy, dtype="float64")
+    if len(pts_xy) == 0 or len(q_xy) == 0:
+        return np.full((len(q_xy),), np.nan, dtype="float64")
 
     if which == "scipy":
         tree = Tree(pts_xy)
-        d, idx = tree.query(q_xy, k=min(k, len(pts_xy)))
+        try:
+            d, idx = tree.query(q_xy, k=min(k, len(pts_xy)), workers=-1)
+        except TypeError:
+            d, idx = tree.query(q_xy, k=min(k, len(pts_xy)))
     elif which == "sklearn":
         tree = Tree(pts_xy)
         d, idx = tree.query(q_xy, k=min(k, len(pts_xy)), return_distance=True)
@@ -1836,20 +2065,16 @@ def _idw_interpolate_on_mask(
             d_list.append(d_sorted)
             idx_list.append(idx_sorted)
 
-        d = np.vstack(d_list)
-        idx = np.vstack(idx_list)
+        d = np.vstack(d_list) if d_list else np.zeros((0, k_eff), dtype="float64")
+        idx = np.vstack(idx_list) if idx_list else np.zeros((0, k_eff), dtype="int64")
 
     d = np.asarray(d, dtype="float64")
     idx = np.asarray(idx, dtype="int64")
-
-    # Ensure 2D
     if d.ndim == 1:
         d = d[:, None]
         idx = idx[:, None]
 
-    # Adaptive power: increase in sparse areas, reduce in dense
     if adaptive:
-        # crude AIDW: p in [1.5, 4.0] based on nearest-neighbor spread
         d1 = d[:, 0]
         dK = d[:, -1]
         ratio = np.clip(dK / np.maximum(d1, eps), 1.0, 10.0)
@@ -1859,17 +2084,51 @@ def _idw_interpolate_on_mask(
     else:
         w = 1.0 / (np.power(d + eps, power))
 
+    if pts_weight is not None:
+        w = w * pts_weight[idx]
+
+    # Confluence guard: when multiple river branches contribute nearby control points,
+    # prefer the highest-priority branch (typically main stem) to avoid circular "bullseye" artifacts.
+    if pts_group is not None and pts_priority is not None:
+        pg = np.asarray(pts_group)
+        pp = np.asarray(pts_priority, dtype='float64').reshape(-1)
+        if pg.shape[0] == pts_val.shape[0] and pp.shape[0] == pts_val.shape[0]:
+            try:
+                g = pg[idx]
+                # Ignore missing/unknown groups (factorize may encode NaN as -1).
+                gv = g.astype('float64', copy=False)
+                gv[gv < 0] = np.nan
+                gmin = np.nanmin(gv, axis=1)
+                gmax = np.nanmax(gv, axis=1)
+                multi = np.isfinite(gmin) & np.isfinite(gmax) & (gmin != gmax)
+                p = pp[idx]
+                pmax = np.nanmax(p, axis=1)
+                pmin = np.nanmin(p, axis=1)
+                spread = pmax - pmin
+                apply = multi & np.isfinite(pmax) & np.isfinite(spread) & (spread >= float(priority_min_spread))
+                if np.any(apply):
+                    keep = p >= (pmax[:, None] - float(priority_delta))
+                    mask_keep = np.ones_like(w, dtype=bool)
+                    mask_keep[apply, :] = keep[apply, :]
+                    w_f = w * mask_keep
+                    den_f = np.sum(w_f, axis=1)
+                    bad = den_f <= eps
+                    if np.any(bad):
+                        # Fallback to unfiltered weights where filtering would remove all neighbors.
+                        w_f[bad, :] = w[bad, :]
+                    w = w_f
+            except Exception:
+                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+
     v = pts_val[idx]
     num = np.sum(w * v, axis=1)
     den = np.sum(w, axis=1)
     out = num / np.maximum(den, eps)
 
-    # exact hits
     hit = d[:, 0] <= eps
     if np.any(hit):
         out[hit] = pts_val[idx[hit, 0]]
     return out
-
 
 
 
@@ -1995,7 +2254,7 @@ def _build_thalweg_lines_from_points(
     try:
         log.info("[THALWEG] Identified %d connected component(s) from %d thalweg points (max_jump_m=%.1f).", len(comps), n, max_jump_m)
     except Exception:
-        pass
+        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
     out_rows = []
     for component_id, comp in enumerate(comps):
@@ -2072,7 +2331,7 @@ def _build_thalweg_lines_from_points(
                 int(len(final_line.coords)),
             )
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
     if not out_rows:
         return None
@@ -2091,30 +2350,29 @@ def _aniso_idw_interpolate_on_mask(
     along_scale_m: float = 500.0,
     cross_scale_m: float = 30.0,
     eps: float = 1e-6,
+    pts_weight: Optional[np.ndarray] = None,
+    pts_group: Optional[np.ndarray] = None,
+    pts_priority: Optional[np.ndarray] = None,
+    priority_delta: float = 0.0,
+    priority_min_spread: float = 1.0,
 ) -> np.ndarray:
-    """Barrier-aware-ish anisotropic IDW using a centerline as the along-channel axis.
+    """Anisotropic IDW using a centerline as the along-channel axis.
 
-    We compute an effective distance:
-
+    Effective distance:
         d_eff = sqrt( (d_along/along_scale)^2 + (d_cross/cross_scale)^2 )
 
-    where d_along is the absolute difference of projected chainage on `centerline`,
-    and d_cross is derived from Euclidean distance by:
-
-        d_cross = sqrt(max(0, d_euclid^2 - d_along^2))
-
-    This strongly discourages cross-channel influence while still allowing smooth
-    along-channel interpolation.
-
-    Notes:
-    - This is not a full geodesic-in-mask solver (too expensive for large rasters),
-      but it removes the most common cross-channel artifacts.
-    - Requires a projected CRS in meters for meaningful scales.
+    pts_weight (optional): per-control-point multiplicative weights (>=0) applied
+    to the kernel (useful for emphasizing thalweg points).
     """
     if pts_xy.size == 0 or q_xy.size == 0:
         return np.full((q_xy.shape[0],), np.nan, dtype="float64")
 
-    # Guard scales
+    if pts_weight is not None:
+        pts_weight = np.asarray(pts_weight, dtype="float64").reshape(-1)
+        if pts_weight.shape[0] != len(pts_val):
+            raise ValueError("pts_weight must have same length as pts_val")
+        pts_weight = np.maximum(pts_weight, 0.0)
+
     along_scale_m = float(max(1e-3, along_scale_m))
     cross_scale_m = float(max(1e-3, cross_scale_m))
 
@@ -2122,22 +2380,33 @@ def _aniso_idw_interpolate_on_mask(
     try:
         s_pts = np.array([centerline.project(Point(float(x), float(y))) for x, y in pts_xy], dtype="float64")
     except Exception:
-        # If projection fails for any reason, fall back to isotropic IDW
-        return _idw_interpolate_on_mask(pts_xy, pts_val, q_xy, k=int(k), power=float(power), adaptive=False, eps=eps)
+        return _idw_interpolate_on_mask(
+            pts_xy, pts_val, q_xy, k=int(k), power=float(power), adaptive=False, eps=eps, pts_weight=pts_weight,
+            pts_group=pts_group,
+            pts_priority=pts_priority,
+            priority_delta=0.0,
+            priority_min_spread=1.0,
+        )
 
     Tree, which = _kd_tree()
     if Tree is None:
-        # SciPy missing; fall back
-        return _idw_interpolate_on_mask(pts_xy, pts_val, q_xy, k=int(k), power=float(power), adaptive=False, eps=eps)
+        return _idw_interpolate_on_mask(
+            pts_xy, pts_val, q_xy, k=int(k), power=float(power), adaptive=False, eps=eps, pts_weight=pts_weight,
+            pts_group=pts_group,
+            pts_priority=pts_priority,
+            priority_delta=0.0,
+            priority_min_spread=1.0,
+        )
 
     tree = Tree(pts_xy)
     n = pts_xy.shape[0]
     k = int(min(max(1, int(k)), n))
-    # Candidate pool to re-rank by anisotropic distance
     cand = int(min(n, max(k, k * 5)))
 
-    # Query Euclidean candidates
-    d_eu, idx = tree.query(q_xy, k=cand)
+    try:
+        d_eu, idx = tree.query(q_xy, k=cand, workers=-1)
+    except TypeError:
+        d_eu, idx = tree.query(q_xy, k=cand)
     if cand == 1:
         d_eu = d_eu.reshape(-1, 1)
         idx = idx.reshape(-1, 1)
@@ -2147,38 +2416,56 @@ def _aniso_idw_interpolate_on_mask(
     for i in range(q_xy.shape[0]):
         ids = idx[i]
         de = d_eu[i].astype("float64")
-        # Chainage for query
         try:
             s_q = centerline.project(Point(float(q_xy[i, 0]), float(q_xy[i, 1])))
         except Exception:
-            # Fallback for this point
-            ids = ids[:k]
-            de = de[:k]
-            w = 1.0 / (np.maximum(de, eps) ** float(power))
-            vv = pts_val[ids]
-            out[i] = float(np.sum(w * vv) / np.sum(w)) if np.isfinite(np.sum(w)) and np.sum(w) > 0 else float(np.nan)
+            ids2 = ids[:k]
+            de2 = de[:k]
+            w = 1.0 / (np.maximum(de2, eps) ** float(power))
+            if pts_weight is not None:
+                w = w * pts_weight[ids2]
+            vv = pts_val[ids2]
+            sw = np.sum(w)
+            out[i] = float(np.sum(w * vv) / sw) if np.isfinite(sw) and sw > 0 else float(np.nan)
             continue
 
         s_p = s_pts[ids]
         d_along = np.abs(s_q - s_p)
 
-        # FIX: Meander Shortcut Guard
-        # If Euclidean distance (de) is smaller than river distance (d_along),
-        # we are cutting across a meander or land. Treat cross distance as full Euclidean.
-        radicand = de * de - d_along * d_along
-        valid = radicand >= 0
+        rad = de * de - d_along * d_along
+        valid = rad >= 0
         d_cross = np.zeros_like(de)
-        d_cross[valid] = np.sqrt(radicand[valid])
+        d_cross[valid] = np.sqrt(rad[valid])
         d_cross[~valid] = de[~valid]  # Penalize shortcuts
 
         d_eff = np.sqrt((d_along / along_scale_m) ** 2 + (d_cross / cross_scale_m) ** 2) + eps
 
-        # choose top-k smallest effective distances
         order = np.argsort(d_eff)[:k]
         ids2 = ids[order]
         d2 = d_eff[order]
 
         w = 1.0 / (d2 ** float(power))
+        if pts_weight is not None:
+            w = w * pts_weight[ids2]
+        # Confluence guard: prefer highest-priority branch when multiple groups contribute.
+        if pts_group is not None and pts_priority is not None:
+            try:
+                g = np.asarray(pts_group)[ids2]
+                gv = g.astype('float64', copy=False)
+                gv[gv < 0] = np.nan
+                gmin = np.nanmin(gv)
+                gmax = np.nanmax(gv)
+                if np.isfinite(gmin) and np.isfinite(gmax) and (gmin != gmax):
+                    p = np.asarray(pts_priority, dtype='float64').reshape(-1)[ids2]
+                    pmax = np.nanmax(p)
+                    pmin = np.nanmin(p)
+                    if np.isfinite(pmax) and np.isfinite(pmin) and (pmax - pmin) >= float(priority_min_spread):
+                        keep = p >= (pmax - float(priority_delta))
+                        w_f = w * keep
+                        if np.sum(w_f) > 0:
+                            w = w_f
+            except Exception:
+                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
         vv = pts_val[ids2]
         sw = np.sum(w)
         out[i] = float(np.sum(w * vv) / sw) if np.isfinite(sw) and sw > 0 else float(np.nan)
@@ -2280,6 +2567,7 @@ def _continuous_surface(
     channel_mask_raster: Path | None = None,
     channel_mask_inside_value: int = 1,
     channel_mask_invert: bool = False,
+    max_query_dist_m: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Build a continuous surface raster (float32) and a mask raster (uint8) on the template grid.
@@ -2302,55 +2590,101 @@ def _continuous_surface(
         arr = np.full((h, w), nodata, dtype="float32")
         m = np.zeros((h, w), dtype="uint8")
         return arr, m
-
-    # 1. Optimized Overlap Reduction (Numpy > Pandas)
+    # 1. Optimized Overlap Reduction (avoid allocating full H*W temporaries)
     rr_pts, cc_pts = rasterio.transform.rowcol(
         template_ds.transform,
         pts_t.geometry.x.to_numpy(dtype="float64"),
         pts_t.geometry.y.to_numpy(dtype="float64"),
     )
-    rr_pts = np.array(rr_pts, dtype=np.int64)
-    cc_pts = np.array(cc_pts, dtype=np.int64)
-    
+    rr_pts = np.asarray(rr_pts, dtype=np.int64)
+    cc_pts = np.asarray(cc_pts, dtype=np.int64)
+
     # Filter points outside raster bounds
     in_bounds = (rr_pts >= 0) & (rr_pts < h) & (cc_pts >= 0) & (cc_pts < w)
-    
-    if np.any(in_bounds):
-        rr_pts = rr_pts[in_bounds]
-        cc_pts = cc_pts[in_bounds]
-        vals = vals[in_bounds]
-        # Keep geometry for later if needed, though strictly we only need coords now
-        # pts_t = pts_t.iloc[in_bounds] # Not strictly needed if we reconstruct coords
+    if not np.any(in_bounds):
+        log.warning("[continuous] No control points fall inside template extent.")
+        arr = np.full((h, w), nodata, dtype="float32")
+        m = np.zeros((h, w), dtype="uint8")
+        return arr, m
 
-        # 1D index for fast reduction
-        flat_idx = rr_pts * w + cc_pts
-        
-        if str(overlap_reducer).lower() == "median":
-            # Group by sorting
-            sort_order = np.argsort(flat_idx)
-            flat_idx_sorted = flat_idx[sort_order]
-            vals_sorted = vals[sort_order]
-            unique_idx, split_indices = np.unique(flat_idx_sorted, return_index=True)
-            grouped_vals = np.split(vals_sorted, split_indices[1:])
-            agg_vals = np.array([np.median(g) for g in grouped_vals])
+    keep_idx = np.where(in_bounds)[0]
+    pts_t = pts_t.iloc[keep_idx].copy()
+    rr_pts = rr_pts[in_bounds]
+    cc_pts = cc_pts[in_bounds]
+    vals = vals[in_bounds]
+
+    # WALID expects thalweg emphasis; median reducers destroy that signal.
+    if str(method).lower().startswith("walid") and str(overlap_reducer).lower() == "median":
+        log.warning("[continuous] overlap_reducer=median is incompatible with WALID thalweg weighting; using 'min'.")
+        overlap_reducer = "min"
+
+    reducer = str(overlap_reducer).lower().strip()
+    if reducer != "none":
+        flat = rr_pts * w + cc_pts
+        order = np.argsort(flat)
+        flat_s = flat[order]
+        vals_s = vals[order]
+
+        uniq, start = np.unique(flat_s, return_index=True)
+        ends = np.r_[start[1:], len(flat_s)]
+
+        def _group_stat(fn):
+            outv = np.empty((len(start),), dtype="float64")
+            for i, (s, e) in enumerate(zip(start, ends)):
+                outv[i] = fn(vals_s[s:e])
+            return outv
+
+        if reducer == "min":
+            agg_vals = np.minimum.reduceat(vals_s, start)
+            sel = []
+            for s, e in zip(start, ends):
+                j = s + int(np.argmin(vals_s[s:e]))
+                sel.append(int(order[j]))
+            pts_t = pts_t.iloc[sel].copy()
+
+        elif reducer == "max":
+            agg_vals = np.maximum.reduceat(vals_s, start)
+            sel = []
+            for s, e in zip(start, ends):
+                j = s + int(np.argmax(vals_s[s:e]))
+                sel.append(int(order[j]))
+            pts_t = pts_t.iloc[sel].copy()
+
+        elif reducer in ("mean", "avg"):
+            agg_vals = _group_stat(np.mean)
+            sel = [int(order[s]) for s in start]
+            pts_t = pts_t.iloc[sel].copy()
+
+        elif reducer == "median":
+            agg_vals = _group_stat(np.median)
+            # Median has no meaningful representative row; rebuild a minimal point set.
+            agg_r = (uniq // w).astype("int64")
+            agg_c = (uniq % w).astype("int64")
+            xs, ys = rasterio.transform.xy(template_ds.transform, agg_r, agg_c, offset="center")
+            pts_t = gpd.GeoDataFrame({value_col: agg_vals}, geometry=gpd.points_from_xy(xs, ys), crs=template_ds.crs)
+
         else:
-            # Min reduction is fully vectorizable using ufunc.at
-            temp_grid = np.full(h * w, np.inf, dtype=np.float64)
-            np.minimum.at(temp_grid, flat_idx, vals)
-            unique_idx = np.unique(flat_idx)
-            agg_vals = temp_grid[unique_idx]
+            log.warning(f"[continuous] Unknown overlap_reducer='{overlap_reducer}', using 'min'.")
+            agg_vals = np.minimum.reduceat(vals_s, start)
+            sel = []
+            for s, e in zip(start, ends):
+                j = s + int(np.argmin(vals_s[s:e]))
+                sel.append(int(order[j]))
+            pts_t = pts_t.iloc[sel].copy()
 
-        # Reconstruct coordinates for the aggregated points
-        agg_r = unique_idx // w
-        agg_c = unique_idx % w
+        # Stabilize geometry to pixel centers for deterministic results
+        agg_r = (uniq // w).astype("int64")
+        agg_c = (uniq % w).astype("int64")
         xs, ys = rasterio.transform.xy(template_ds.transform, agg_r, agg_c, offset="center")
-        
-        pts_t = gpd.GeoDataFrame(
-            {value_col: agg_vals},
-            geometry=gpd.points_from_xy(xs, ys),
-            crs=template_ds.crs
-        )
-        vals = agg_vals
+        try:
+            pts_t = pts_t.copy()
+            pts_t.geometry = gpd.points_from_xy(xs, ys)
+            pts_t.set_crs(template_ds.crs, inplace=True)
+            pts_t[value_col] = agg_vals
+        except Exception:
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+
+        vals = np.asarray(agg_vals, dtype="float64")
 
     # Corridor mask (where we are allowed to interpolate)
     if channel_mask_raster is not None:
@@ -2414,18 +2748,53 @@ def _continuous_surface(
 
     pts_val = vals
 
-    # WALID-style thalweg guidance: deepest point per xs_id
-    if method == "walid" and "xs_id" in pts_t.columns and thalweg_weight > 1.0:
-        # Note: If we just aggregated points in step 1, xs_id might be lost unless we kept it.
-        # But walid works on original points usually. Since we aggregated to pixel centers,
-        # we effectively lost individual XS IDs at the pixel level if overlaps occurred.
-        # However, for general walid use, the aggregated points act as sufficient control.
-        # If thalweg enforcement is critical, it should ideally happen before pixel aggregation.
-        pass
+
+    # Optional confluence guard inputs
+    # - pts_group: integer codes for river branches (river_id)
+    # - pts_priority: branch priority (stream order) so main stems dominate at junctions
+    pts_group = None
+    pts_priority = None
+
+    # Group code for confluence guard. Prefer stable IDs if present.
+    try:
+        if "river_id" in pts_t.columns:
+            s = pts_t["river_id"]
+            if pd.notna(s).any():
+                pts_group = pd.factorize(s.astype(str), sort=False)[0].astype("int32")
+        if pts_group is None or (np.asarray(pts_group) < 0).all():
+            if "component_id" in pts_t.columns:
+                s = pts_t["component_id"]
+                if pd.notna(s).any():
+                    pts_group = pd.factorize(s.astype(str), sort=False)[0].astype("int32")
+    except Exception:
+        pts_group = None
+
+    if "stream_order" in pts_t.columns:
+        try:
+            pts_priority = pd.to_numeric(pts_t["stream_order"], errors="coerce").to_numpy(dtype="float64")
+        except Exception:
+            pts_priority = None
 
 
     # Interpolate (continuous modes)
     method_l = str(method).lower()
+
+    # Optional WALID thalweg emphasis (per-control-point weights)
+    pts_weight = None
+    if method_l.startswith("walid") and thalweg_weight is not None and float(thalweg_weight) > 1.0:
+        if "xs_id" in pts_t.columns:
+            try:
+                idx_thalweg = pts_t.groupby("xs_id")[value_col].idxmin()
+                pts_weight = np.ones((len(pts_t),), dtype="float64")
+                pos = pts_t.index.get_indexer(idx_thalweg.to_numpy())
+                pos = pos[pos >= 0]
+                pts_weight[pos] = float(thalweg_weight)
+            except Exception as e:
+                log.warning(f"[continuous] Thalweg weighting failed; continuing unweighted. ({e})")
+                pts_weight = None
+        else:
+            log.debug("[continuous] WALID requested but xs_id not present; skipping thalweg weighting.")
+
     if method_l in ("aniso", "walid_aniso"):
         centerline = None
         if corridor_lines_gdf is not None and len(corridor_lines_gdf) > 0:
@@ -2455,6 +2824,11 @@ def _continuous_surface(
                 along_scale_m=float(aniso_along_scale_m),
                 cross_scale_m=float(aniso_cross_scale_m),
                 eps=1e-6,
+                pts_weight=pts_weight,
+                pts_group=pts_group,
+                pts_priority=pts_priority,
+                priority_delta=0.0,
+                priority_min_spread=1.0,
             )
         else:
             vals_q = _idw_interpolate_on_mask(
@@ -2465,6 +2839,11 @@ def _continuous_surface(
                 power=float(idw_power),
                 adaptive=False,
                 eps=1e-6,
+                pts_weight=pts_weight,
+                pts_group=pts_group,
+                pts_priority=pts_priority,
+                priority_delta=0.0,
+                priority_min_spread=1.0,
             )
     else:
         adaptive = (method_l == "aidw")
@@ -2476,11 +2855,549 @@ def _continuous_surface(
             power=float(idw_power),
             adaptive=adaptive,
             eps=1e-6,
+            pts_weight=pts_weight,
+            pts_group=pts_group,
+            pts_priority=pts_priority,
+            priority_delta=0.0,
+            priority_min_spread=1.0,
         )
 
+    # Optionally prune predictions that are too far from any control point
+    vals_q = np.asarray(vals_q, dtype="float64").reshape(-1)
+    mask_out = mask.astype("uint8").copy()
+
+    if max_query_dist_m is not None:
+        try:
+            maxd = float(max_query_dist_m)
+        except Exception:
+            maxd = float('nan')
+        if np.isfinite(maxd) and maxd > 0:
+            Tree, which = _kd_tree()
+            dmin = np.empty((q_xy_utm.shape[0],), dtype="float64")
+            if Tree is not None and which == "scipy":
+                tree = Tree(pts_xy_utm)
+                try:
+                    dmin[:] = tree.query(q_xy_utm, k=1, workers=-1)[0]
+                except TypeError:
+                    dmin[:] = tree.query(q_xy_utm, k=1)[0]
+            elif Tree is not None and which == "sklearn":
+                tree = Tree(pts_xy_utm)
+                d, _ = tree.query(q_xy_utm, k=1, return_distance=True)
+                dmin[:] = np.asarray(d).reshape(-1)
+            else:
+                # Numpy brute-force nearest distance (chunked)
+                chunk = 50000
+                for s in range(0, q_xy_utm.shape[0], chunk):
+                    e = min(q_xy_utm.shape[0], s + chunk)
+                    q = q_xy_utm[s:e]
+                    # (m,1,2) - (1,n,2) -> (m,n,2)
+                    diff = q[:, None, :] - pts_xy_utm[None, :, :]
+                    d2 = np.sum(diff * diff, axis=2)
+                    dmin[s:e] = np.sqrt(np.min(d2, axis=1))
+
+            far = dmin > maxd
+            if np.any(far):
+                mask_out[rr[far], cc[far]] = 0
+                vals_q[far] = np.nan
+
+    good_q = np.isfinite(vals_q)
     out = np.full((h, w), nodata, dtype="float32")
-    out[rr, cc] = vals_q.astype("float32")
-    return out, mask.astype("uint8")
+    if np.any(good_q):
+        out[rr[good_q], cc[good_q]] = vals_q[good_q].astype("float32")
+
+    # ---------------------------------------------------------------------
+    # Junction/confluence artifact suppression (best-effort)
+    #
+    # Near tributary mouths, mixing control points from different branches can
+    # create circular "bullseye" artifacts on the main stem. When a river
+    # network graph is available (graph_nodes with degree >= 3) and per-point
+    # stream order is present, overwrite predictions in a small junction zone
+    # using an interpolation driven by main-stem-only control points.
+    #
+    # This is a conservative selection rule in a limited neighborhood; it does
+    # not introduce new modeling assumptions.
+    # ---------------------------------------------------------------------
+    try:
+        river_gpkg = getattr(_continuous_surface, "_river_gpkg", None)
+    except Exception:
+        river_gpkg = None
+
+    do_junction_fix = False
+    try:
+        do_junction_fix = (
+            river_gpkg is not None
+            and pts_priority is not None
+            and np.isfinite(np.nanmax(np.asarray(pts_priority, dtype="float64")))
+            and Path(str(river_gpkg)).exists()
+        )
+    except Exception:
+        do_junction_fix = False
+
+    if do_junction_fix:
+        try:
+            import geopandas as gpd
+            from rasterio.features import rasterize
+
+            rg = Path(str(river_gpkg))
+            nodes = None
+            for lyr in ("graph_nodes", "nodes", "river_nodes"):
+                try:
+                    g = gpd.read_file(rg, layer=lyr)
+                    if g is not None and len(g) > 0:
+                        nodes = g
+                        break
+                except Exception:
+                    continue
+            if nodes is None or len(nodes) == 0:
+                raise RuntimeError("no nodes")
+
+            keep = None
+            for c in ("degree", "deg", "node_degree"):
+                if c in nodes.columns:
+                    deg = pd.to_numeric(nodes[c], errors="coerce").fillna(0.0)
+                    keep = deg >= 3.0
+                    break
+            if keep is None:
+                if "node_type" in nodes.columns:
+                    t = nodes["node_type"].astype(str).str.lower()
+                    keep = t.str.contains("conflu") | t.str.contains("junction")
+                else:
+                    keep = pd.Series(False, index=nodes.index)
+            nodes = nodes.loc[keep]
+            if len(nodes) == 0:
+                raise RuntimeError("no junction nodes")
+
+            nodes_utm = nodes.to_crs(utm_crs_obj)
+
+            try:
+                px = float(abs(template_ds.transform.a))
+            except Exception:
+                px = 10.0
+            r_m = max(40.0, 4.0 * px)
+
+            geoms = [geom.buffer(r_m) for geom in nodes_utm.geometry if geom is not None and not geom.is_empty]
+            if not geoms:
+                raise RuntimeError("no buffered geometries")
+
+            jmask = rasterize(
+                [(g, 1) for g in geoms],
+                out_shape=(h, w),
+                transform=template_ds.transform,
+                fill=0,
+                dtype="uint8",
+                all_touched=True,
+            )
+            jmask = (jmask == 1) & (mask_out == 1)
+            if not np.any(jmask):
+                raise RuntimeError("junction mask empty")
+
+            if "component_id" in pts_t.columns:
+                comp = pd.to_numeric(pts_t["component_id"], errors="coerce")
+                comp_code = pd.factorize(comp.astype("Int64").astype(str), sort=False)[0].astype("int32")
+            elif pts_group is not None:
+                comp_code = np.asarray(pts_group, dtype="int32")
+            else:
+                comp_code = np.zeros((len(pts_t),), dtype="int32")
+
+            pr = np.asarray(pts_priority, dtype="float64")
+            keep_main = np.zeros((len(pr),), dtype=bool)
+            for cid in np.unique(comp_code):
+                if cid < 0:
+                    continue
+                m = comp_code == cid
+                if not np.any(m):
+                    continue
+                mx = np.nanmax(pr[m])
+                if not np.isfinite(mx):
+                    continue
+                keep_main |= (m & (pr >= (mx - 0.5)))
+
+            if int(np.sum(keep_main)) < 6:
+                raise RuntimeError("mainstem controls too sparse")
+
+            pts_xy_m = pts_xy_utm[keep_main]
+            pts_val_m = pts_val[keep_main]
+            pts_w_m = pts_weight[keep_main] if pts_weight is not None else None
+
+            vals_q_m = _idw_interpolate_on_mask(
+                pts_xy=pts_xy_m,
+                pts_val=pts_val_m,
+                q_xy=q_xy_utm,
+                k=int(min(int(k), 24)),
+                power=float(idw_power),
+                adaptive=False,
+                eps=1e-6,
+                pts_weight=pts_w_m,
+                pts_group=None,
+                pts_priority=None,
+            )
+            vals_q_m = np.asarray(vals_q_m, dtype="float64").reshape(-1)
+            good_m = np.isfinite(vals_q_m)
+            if not np.any(good_m):
+                raise RuntimeError("no mainstem predictions")
+
+            out_m = np.full((h, w), nodata, dtype="float32")
+            out_m[rr[good_m], cc[good_m]] = vals_q_m[good_m].astype("float32")
+
+            overwrite = jmask & np.isfinite(out_m)
+            if np.any(overwrite):
+                out[overwrite] = out_m[overwrite]
+        except Exception:
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+
+
+    # ---------------------------------------------------------------------
+    # Main-stem corridor overwrite (tributary-first, then mainstem override)
+    #
+    # The most reliable way to eliminate circular artifacts at tributary mouths
+    # is to prevent mixed-branch control points from influencing the *mainstem*
+    # surface along its corridor. We therefore:
+    #   1) interpolate using all control points (tributaries included) -> out
+    #   2) interpolate using mainstem-only control points -> out_m
+    #   3) overwrite out with out_m inside a buffered mainstem corridor mask
+    #
+    # This keeps small-stream structure where it belongs, while ensuring the
+    # main stem remains continuous and dominant through confluences.
+    # ---------------------------------------------------------------------
+    if do_junction_fix:
+        try:
+            import geopandas as gpd
+            from rasterio.features import rasterize
+
+            rg = Path(str(river_gpkg))
+
+            # Try to load linework representing the river network.
+            lines = None
+            for lyr in ("graph_edges", "rivers_clip", "rivers", "flowlines", "river_network"):
+                try:
+                    g = gpd.read_file(rg, layer=lyr)
+                    if g is not None and len(g) > 0:
+                        lines = g
+                        break
+                except Exception:
+                    continue
+            if lines is None or len(lines) == 0:
+                raise RuntimeError("no river linework")
+
+            lines_utm = lines.to_crs(utm_crs_obj)
+
+            # Estimate pixel size in meters for buffer defaults.
+            try:
+                px = float(abs(template_ds.transform.a))
+            except Exception:
+                px = 10.0
+            buf_m = max(30.0, 3.0 * px)
+
+            # Choose a stream order / priority field on the linework if present.
+            so_field = None
+            for c in ("streamorde", "stream_order", "streamorder", "order", "StrmOrdr", "StreamOrde"):
+                if c in lines_utm.columns:
+                    so_field = c
+                    break
+
+            if so_field is not None:
+                so = pd.to_numeric(lines_utm[so_field], errors="coerce")
+            else:
+                so = pd.Series(np.nan, index=lines_utm.index, dtype="float64")
+
+            # Component grouping (optional).
+            comp_field = None
+            for c in ("component_id", "component", "comp_id"):
+                if c in lines_utm.columns:
+                    comp_field = c
+                    break
+            if comp_field is not None:
+                comp = pd.to_numeric(lines_utm[comp_field], errors="coerce").fillna(-1).astype("int32")
+            else:
+                comp = pd.Series(0, index=lines_utm.index, dtype="int32")
+
+            # Select mainstem linework inside each component:
+            # - if stream order exists: edges with order >= max(order)-0.5
+            # - else: fall back to the longest 20% of segments by length
+            seg_len = lines_utm.geometry.length
+            keep_edge = np.zeros((len(lines_utm),), dtype=bool)
+            comp_arr = np.asarray(comp, dtype="int32")
+            so_arr = np.asarray(so, dtype="float64")
+            len_arr = np.asarray(seg_len, dtype="float64")
+            for cid in np.unique(comp_arr):
+                m = comp_arr == cid
+                if not np.any(m):
+                    continue
+
+                mx = np.nanmax(so_arr[m])
+                if np.isfinite(mx):
+                    # Prefer the highest stream-order edges within this component.
+                    keep_edge |= (m & (so_arr >= (mx - 0.5)))
+                    continue
+
+                # No usable stream-order: choose a defensible "mainstem" by graph diameter
+                # (longest path) in an undirected graph built from segment endpoints.
+                # This is more stable at confluences than "longest segments" heuristics.
+                try:
+                    idxs = np.where(m)[0].tolist()
+                    node_id = {}
+                    nodes = []
+                    adj = {}  # nid -> list of (nbr, weight, edge_index)
+
+                    def _get_nid(xy):
+                        key = (round(float(xy[0]), 3), round(float(xy[1]), 3))
+                        if key in node_id:
+                            return node_id[key]
+                        nid = len(nodes)
+                        node_id[key] = nid
+                        nodes.append(key)
+                        adj[nid] = []
+                        return nid
+
+                    for ei in idxs:
+                        g = lines_utm.geometry.iloc[ei]
+                        if g is None or g.is_empty:
+                            continue
+                        try:
+                            coords = list(g.coords)
+                        except Exception:
+                            try:
+                                coords = list(list(g.geoms[0].coords)) + list(list(g.geoms[-1].coords))
+                            except Exception:
+                                continue
+                        if len(coords) < 2:
+                            continue
+                        a = coords[0]
+                        b = coords[-1]
+                        na = _get_nid(a)
+                        nb = _get_nid(b)
+                        wgt = float(len_arr[ei]) if np.isfinite(len_arr[ei]) else float(g.length)
+                        if wgt <= 0:
+                            continue
+                        adj[na].append((nb, wgt, ei))
+                        adj[nb].append((na, wgt, ei))
+
+                    if len(nodes) < 2:
+                        raise RuntimeError("graph too small")
+
+                    import heapq
+
+                    def _dijkstra(src):
+                        dist = {src: 0.0}
+                        prev = {}  # node -> (prev_node, edge_index)
+                        pq = [(0.0, src)]
+                        while pq:
+                            d, u = heapq.heappop(pq)
+                            if d != dist.get(u, None):
+                                continue
+                            for v, w, ei in adj.get(u, []):
+                                nd = d + w
+                                if nd < dist.get(v, 1e300):
+                                    dist[v] = nd
+                                    prev[v] = (u, ei)
+                                    heapq.heappush(pq, (nd, v))
+                        far = max(dist.items(), key=lambda kv: kv[1])
+                        return far[0], far[1], prev
+
+                    src0 = next((nid for nid, neis in adj.items() if neis), 0)
+                    a_node, _, _ = _dijkstra(src0)
+                    b_node, _, prev = _dijkstra(a_node)
+
+                    # reconstruct diameter path edges from b back to a
+                    path_edges = []
+                    cur = b_node
+                    seen = set()
+                    while cur != a_node and cur in prev and cur not in seen:
+                        seen.add(cur)
+                        pu, ei = prev[cur]
+                        path_edges.append(ei)
+                        cur = pu
+
+                    if path_edges:
+                        keep_edge |= np.isin(np.arange(len(lines_utm)), np.array(path_edges, dtype=int))
+                    else:
+                        q = np.nanquantile(len_arr[m], 0.80)
+                        keep_edge |= (m & (len_arr >= q))
+                except Exception:
+                    q = np.nanquantile(len_arr[m], 0.80)
+                    keep_edge |= (m & (len_arr >= q))
+
+            if int(np.sum(keep_edge)) == 0:
+                raise RuntimeError("no mainstem edges selected")
+
+                        # Build a mainstem corridor mask.
+            #
+            # Preferred (robust) approach: rasterize the mainstem *centerline* and
+            # construct a corridor using distance transforms, bounded by the local
+            # channel half-width estimated from the channel mask. This avoids
+            # narrow/overly-wide fixed buffers and reduces confluence "bullseye"
+            # artifacts by ensuring the overwrite covers the full mainstem width.
+            #
+            # Fallback: fixed-width geometric buffer if SciPy distance transforms
+            # are unavailable.
+            line_geoms = []
+            for geom in lines_utm.loc[keep_edge].geometry:
+                if geom is None or geom.is_empty:
+                    continue
+                line_geoms.append(geom)
+
+            if not line_geoms:
+                raise RuntimeError("no mainstem line geometries")
+
+            # Rasterize mainstem linework to the template grid
+            mline = rasterize(
+                [(g, 1) for g in line_geoms],
+                out_shape=(h, w),
+                transform=template_ds.transform,
+                fill=0,
+                dtype="uint8",
+                all_touched=True,
+            )
+
+            mmask = None
+            try:
+                from scipy.ndimage import distance_transform_edt
+
+                # Pixel sizes (x,y) in meters for sampling
+                try:
+                    px = float(abs(template_ds.transform.a))
+                except Exception:
+                    px = 10.0
+                try:
+                    py = float(abs(template_ds.transform.e))
+                except Exception:
+                    py = px
+
+                # Distance to mainstem line (meters)
+                dist_to_line = distance_transform_edt(mline == 0, sampling=(py, px))
+
+                # Local channel half-width proxy (meters): distance to channel edge
+                # for pixels inside the channel mask.
+                halfw = distance_transform_edt((mask_out == 1), sampling=(py, px))
+
+                # Corridor radius: at least a few pixels, but bounded by local half-width.
+                min_r = max(30.0, 3.0 * px)
+                rad = np.maximum(min_r, 0.90 * halfw)
+
+                mmask = (mask_out == 1) & (dist_to_line <= rad)
+            except Exception:
+                # Fallback: fixed-width geometric buffer
+                geoms = []
+                for geom in line_geoms:
+                    try:
+                        geoms.append(geom.buffer(buf_m))
+                    except Exception:
+                        continue
+                if not geoms:
+                    raise RuntimeError("no buffered mainstem geometries")
+                mm = rasterize(
+                    [(g, 1) for g in geoms],
+                    out_shape=(h, w),
+                    transform=template_ds.transform,
+                    fill=0,
+                    dtype="uint8",
+                    all_touched=True,
+                )
+                mmask = (mm == 1) & (mask_out == 1)
+
+            if not np.any(mmask):
+                raise RuntimeError("mainstem corridor mask empty")
+
+            # Recompute mainstem-only control point selection (same rule as junction fix).
+            if "component_id" in pts_t.columns:
+                comp_p = pd.to_numeric(pts_t["component_id"], errors="coerce")
+                comp_code = pd.factorize(comp_p.astype("Int64").astype(str), sort=False)[0].astype("int32")
+            elif pts_group is not None:
+                comp_code = np.asarray(pts_group, dtype="int32")
+            else:
+                comp_code = np.zeros((len(pts_t),), dtype="int32")
+
+            pr = np.asarray(pts_priority, dtype="float64")
+            keep_main = np.zeros((len(pr),), dtype=bool)
+            for cid in np.unique(comp_code):
+                if cid < 0:
+                    continue
+                m = comp_code == cid
+                if not np.any(m):
+                    continue
+                mx = np.nanmax(pr[m])
+                if not np.isfinite(mx):
+                    continue
+                keep_main |= (m & (pr >= (mx - 0.5)))
+
+            if int(np.sum(keep_main)) < 6:
+                raise RuntimeError("mainstem controls too sparse")
+
+            pts_xy_m = pts_xy_utm[keep_main]
+            pts_val_m = pts_val[keep_main]
+            pts_w_m = pts_weight[keep_main] if pts_weight is not None else None
+
+            vals_q_m = _idw_interpolate_on_mask(
+                pts_xy=pts_xy_m,
+                pts_val=pts_val_m,
+                q_xy=q_xy_utm,
+                k=int(min(int(k), 24)),
+                power=float(idw_power),
+                adaptive=False,
+                eps=1e-6,
+                pts_weight=pts_w_m,
+                pts_group=None,
+                pts_priority=None,
+            )
+            vals_q_m = np.asarray(vals_q_m, dtype="float64").reshape(-1)
+            good_m = np.isfinite(vals_q_m)
+            if not np.any(good_m):
+                raise RuntimeError("no mainstem predictions")
+
+            out_m = np.full((h, w), nodata, dtype="float32")
+            out_m[rr[good_m], cc[good_m]] = vals_q_m[good_m].astype("float32")
+
+            overwrite = mmask & np.isfinite(out_m)
+            if np.any(overwrite):
+                # Feather the overwrite to avoid seams at the corridor boundary.
+                # If SciPy is unavailable, fall back to a hard overwrite.
+                try:
+                    from scipy.ndimage import distance_transform_edt  # type: ignore
+
+                    # Pixel sizes (x,y) in meters
+                    try:
+                        px = float(abs(template_ds.transform.a))
+                    except Exception:
+                        px = 10.0
+                    try:
+                        py = float(abs(template_ds.transform.e))
+                    except Exception:
+                        py = px
+
+                    feather_m = max(20.0, 2.0 * px)
+
+                    # Distance-to-boundary inside overwrite zone (meters)
+                    d_in = distance_transform_edt(overwrite.astype(np.uint8), sampling=(py, px)).astype("float64")
+
+                    wgt = np.clip(d_in / feather_m, 0.0, 1.0).astype("float32")
+
+                    base = out.astype("float64", copy=True)
+                    base[base == nodata] = np.nan
+                    mainv = out_m.astype("float64", copy=False)
+                    mainv[mainv == nodata] = np.nan
+
+                    m = overwrite & np.isfinite(mainv)
+                    if np.any(m):
+                        out_blend = base
+                        # Where base is missing, take mainstem directly
+                        miss = m & (~np.isfinite(base))
+                        out_blend[miss] = mainv[miss]
+
+                        # Blend where both are present
+                        both = m & np.isfinite(base)
+                        if np.any(both):
+                            ww = wgt[both].astype("float64")
+                            out_blend[both] = out_blend[both] * (1.0 - ww) + mainv[both] * ww
+
+                        out = out_blend.astype("float32", copy=False)
+                        out[~np.isfinite(out)] = nodata
+                except Exception:
+                    out[overwrite] = out_m[overwrite]
+        except Exception:
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+
+    return out, mask_out
+
 
 
 def _exists_with_retry(path: Path, tries: int = 10, sleep_s: float = 0.2, min_size_bytes: int = 1) -> bool:
@@ -2496,7 +3413,7 @@ def _exists_with_retry(path: Path, tries: int = 10, sleep_s: float = 0.2, min_si
                 except FileNotFoundError:
                     pass
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
         time.sleep(sleep_s * (1.0 + 0.15 * i))
     return False
 
@@ -2563,13 +3480,13 @@ def _write_geotiff_gdal(path: Path, arr: np.ndarray, tmpl: rasterio.io.DatasetRe
         try:
             ds.SetProjection(tmpl.crs.to_wkt())
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
     band = ds.GetRasterBand(1)
     try:
         band.SetNoDataValue(float(nodata))
     except Exception:
-        pass
+        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
     band.WriteArray(arr.astype(dtype, copy=False))
     band.FlushCache()
@@ -2613,7 +3530,9 @@ def _write_geotiff(path: Path, arr: np.ndarray, tmpl: rasterio.io.DatasetReader,
         )
         with rasterio.open(tmp, "w", **profile) as dst:
             dst.write(arr, 1)
-        wrote = _exists_with_retry(tmp, tries=8, sleep_s=0.15, min_size_bytes=1024)
+        # Some small or highly-compressible rasters (e.g., uint8 masks) can be <1KB.
+        # Existence is the reliable signal here; size thresholds cause false negatives.
+        wrote = _exists_with_retry(tmp, tries=8, sleep_s=0.15, min_size_bytes=1)
     except Exception as e:
         last_err = e
         wrote = False
@@ -2625,7 +3544,7 @@ def _write_geotiff(path: Path, arr: np.ndarray, tmpl: rasterio.io.DatasetReader,
                 tmp.unlink()
         try:
             _write_geotiff_gdal(tmp, arr, tmpl, nodata=nodata, dtype=dtype)
-            wrote = _exists_with_retry(tmp, tries=8, sleep_s=0.15, min_size_bytes=1024)
+            wrote = _exists_with_retry(tmp, tries=8, sleep_s=0.15, min_size_bytes=1)
         except Exception as e:
             if last_err is not None:
                 log.error(f"[WRITE] rasterio write failed: {last_err}")
@@ -2644,7 +3563,7 @@ def _write_geotiff(path: Path, arr: np.ndarray, tmpl: rasterio.io.DatasetReader,
     _fsync_dir(path.parent)
 
     # Verify final output (network FS can delay metadata visibility)
-    if not _exists_with_retry(path, tries=12, sleep_s=0.15, min_size_bytes=1024):
+    if not _exists_with_retry(path, tries=12, sleep_s=0.15, min_size_bytes=1):
         try:
             parent_files = ", ".join(sorted([f.name for f in path.parent.iterdir() if f.is_file()])[:50])
         except Exception:
@@ -2671,6 +3590,7 @@ def infer_bathy(
     soundings_elev_col: Optional[str],
     soundings_x_col: Optional[str],
     soundings_y_col: Optional[str],
+    soundings_crs: Optional[str],
     cfg: InferConfig,
     xs_lines_layer: str = "xs_lines",
     xs_points_layer: str = "xs_points",
@@ -2707,6 +3627,7 @@ def infer_bathy(
     channel_mask_raster: Optional[Path] = None,
     channel_mask_inside_value: int = 1,
     channel_mask_invert: bool = False,
+    max_query_dist_m: Optional[float] = None,
     thalweg_only: bool = False,
     thalweg_densify_step_m: Optional[float] = None,
 ) -> None:
@@ -3073,9 +3994,57 @@ def infer_bathy(
             elev_col=soundings_elev_col,
             x_col=soundings_x_col,
             y_col=soundings_y_col,
+            soundings_crs=soundings_crs,
         )
         if soundings is not None and not soundings.empty:
-            log.info("[CALIB] Loaded soundings: n=%d", len(soundings))
+            n_in_all = int(len(soundings))
+            log.info("[CALIB] Loaded soundings: n=%d", n_in_all)
+            # Guard against massive point clouds (e.g., Hydronos/eHydro exports).
+            max_n = int(getattr(cfg, "soundings_max_points", 0) or 0)
+            if max_n > 0 and len(soundings) > max_n:
+                seed = int(getattr(cfg, "soundings_sample_seed", 0) or 0)
+                rng = np.random.default_rng(seed)
+                total = int(len(soundings))
+                # Preserve relative source-file composition when possible.
+                if "_src_file" in soundings.columns:
+                    parts = []
+                    for src, gsrc in soundings.groupby("_src_file", sort=False):
+                        frac = len(gsrc) / max(total, 1)
+                        take = max(1, int(round(frac * max_n)))
+                        if len(gsrc) <= take:
+                            parts.append(gsrc)
+                        else:
+                            idx = rng.choice(gsrc.index.values, size=take, replace=False)
+                            parts.append(gsrc.loc[idx])
+                    soundings = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), geometry="geometry", crs=soundings.crs)
+                else:
+                    idx = rng.choice(soundings.index.values, size=max_n, replace=False)
+                    soundings = soundings.loc[idx].copy()
+                log.warning("[CALIB] Downsampled soundings to n=%d (from %d) to avoid OOM (soundings_max_points=%d).",
+                            int(len(soundings)), total, int(max_n))
+
+            # Optional: write the unified (possibly downsampled) set for reuse by downstream steps.
+            if getattr(cfg, "write_soundings_subset", None):
+                try:
+                    out_path = Path(str(cfg.write_soundings_subset))
+                    _write_soundings_subset(out_path, soundings)
+                    by_src = None
+                    if "_src_file" in soundings.columns:
+                        by_src = {}
+                        vc = soundings["_src_file"].astype(str).value_counts()
+                        for k, v in vc.items():
+                            kk = Path(str(k)).stem if str(k) not in ["", "nan", "None"] else "unknown"
+                            by_src[kk] = int(v)
+                    log.info("[CALIB] %s", _soundings_one_line(out_path, int(len(soundings)), n_in_all, by_src))
+
+                    if bool(getattr(cfg, "only_write_soundings_subset", False)):
+                        log.info("[CALIB] --only-write-soundings-subset requested; exiting after subset write.")
+                        raise SystemExit(0)
+                except SystemExit:
+                    raise
+                except Exception as e:
+                    log.warning("[CALIB] Failed to write soundings subset '%s': %s", str(cfg.write_soundings_subset), e)
+
             calib_df = _calibrate_dmax_from_soundings(xs_lines[["xs_id", "geometry"]].copy(), soundings, wse_by_xs, cfg)
             log.info("[CALIB] Matched XS: %d", len(calib_df))
         else:
@@ -3622,6 +4591,10 @@ def infer_bathy(
                         nodata=float(nodata),
                         overlap_reducer=str(overlap_reducer),
                         corridor_lines_gdf=corridor_lines,
+                        channel_mask_raster=channel_mask_raster,
+                        channel_mask_inside_value=int(channel_mask_inside_value),
+                        channel_mask_invert=bool(channel_mask_invert),
+                        max_query_dist_m=(float(max_query_dist_m) if max_query_dist_m is not None else None),
                     )
                 except Exception as e:
                     log.warning("[CONTINUOUS] %s failed (%s); falling back to reducer='%s'", str(continuous), e, str(overlap_reducer))
@@ -3718,6 +4691,17 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--soundings-elev-col", default=None, help="Elevation column name (meters).")
     p.add_argument("--soundings-x-col", default=None, help="CSV X column (lon/easting).")
     p.add_argument("--soundings-y-col", default=None, help="CSV Y column (lat/northing).")
+    p.add_argument("--soundings-crs", default=None, help="CRS of soundings XY for CSV/XYZ inputs (e.g., EPSG:26919). If omitted, CRS is guessed (lon/lat→EPSG:4326; otherwise falls back to target CRS when projected).")
+    p.add_argument(
+        "--write-soundings-subset",
+        default=None,
+        help="Optional output path to write the (possibly downsampled) unified soundings set for reuse by downstream river steps. Preferred: .parquet; fallback: .gpkg.",
+    )
+    p.add_argument(
+        "--only-write-soundings-subset",
+        action="store_true",
+        help="If set, load + downsample soundings, write --write-soundings-subset, print a one-line summary, then exit 0 (no XS inference).",
+    )
     p.add_argument("--calib-max-dist-m", type=float, default=200.0, help="Max distance from sounding to XS line to use")
     p.add_argument("--calib-stat", choices=["p90", "max", "median"], default="p90", help="Per-XS depth stat from soundings")
 
@@ -3764,7 +4748,8 @@ def _parse_args() -> argparse.Namespace:
 
     # Regional hydraulic geometry curves (Drainage Area -> bankfull depth)
     p.add_argument("--regional-curve-enabled", action="store_true", help="Enable regional hydraulic geometry curve prior (DA -> bankfull depth) as a soft prior.")
-    p.add_argument("--regional-curve-region", default="default", help="Region key for built-in coefficients (illustrative). Prefer providing --regional-curve-c and --regional-curve-f from published curves.")
+    p.add_argument("--regional-curve-region", default=None, help="Region key for built-in coefficients (illustrative placeholders). To use built-ins you must pass this explicitly. Prefer providing --regional-curve-c/--regional-curve-f from published curves.")
+    p.add_argument("--allow-builtin-regional-curves", action="store_true", help="Allow using built-in regional curve coefficients (illustrative placeholders). Prefer published coefficients via --regional-curve-c/--regional-curve-f.")
     p.add_argument("--regional-curve-c", type=float, default=None, help="Coefficient c in D_bkf = c * DA^f (units depend on --regional-curve-da-units and --regional-curve-depth-units).")
     p.add_argument("--regional-curve-f", type=float, default=None, help="Exponent f in D_bkf = c * DA^f.")
     p.add_argument("--regional-curve-da-units", choices=["km2","mi2"], default="km2", help="Drainage area units expected by the curve coefficients.")
@@ -3873,6 +4858,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--channel-mask-raster", default=None, help="Optional DEM-aligned channel mask raster to constrain interpolation (1=inside by default).")
     p.add_argument("--channel-mask-inside-value", type=int, default=1, help="Raster value treated as inside-channel (default 1). For masks where water=0, set this to 0 or use --channel-mask-invert.")
     p.add_argument("--channel-mask-invert", action="store_true", help="Invert channel mask logic (inside becomes outside). Useful if mask uses 1=land and 0=water.")
+    p.add_argument("--max-query-dist-m", type=float, default=None,
+                   help="Optional max distance (meters) from any control point to allow interpolation. Pixels farther than this are dropped from the river surface/mask.")
     p.add_argument("--out-bathy-raster", default=None, help="Optional output GeoTIFF of predicted bed elevation (z_bed_pred_m) on template grid")
     p.add_argument("--out-mask-raster", default=None, help="Optional output GeoTIFF mask (1 where bathy raster has data)")
     p.add_argument("--out-uncert-raster", default=None, help="Optional output GeoTIFF uncertainty (meters) on template grid")
@@ -3910,6 +4897,13 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+
+    # Provide river network path to the continuous interpolator (best-effort)
+    # for junction/confluence artifact suppression.
+    try:
+        _continuous_surface._river_gpkg = args.river_gpkg
+    except Exception:
+        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
     # Backwards-compatible alias
     if getattr(args, "manning_enabled", False) and str(getattr(args, "manning_mode", "off")) == "off":
@@ -3951,11 +4945,10 @@ def main() -> None:
                     thalweg_weight=float(args.thalweg_weight),
                     nodata=float(args.nodata),
                     overlap_reducer=str(args.overlap_reducer),
-        thalweg_only=bool(args.thalweg_only),
-        thalweg_densify_step_m=getattr(args, 'thalweg_densify_step_m', None),
                     channel_mask_raster=Path(args.channel_mask_raster) if args.channel_mask_raster else None,
                     channel_mask_inside_value=int(args.channel_mask_inside_value),
                     channel_mask_invert=bool(args.channel_mask_invert),
+                    max_query_dist_m=(float(args.max_query_dist_m) if args.max_query_dist_m is not None else None),
                     aniso_along_scale_m=float(args.aniso_along_scale_m),
                     aniso_cross_scale_m=float(args.aniso_cross_scale_m)
                 )
@@ -4057,6 +5050,7 @@ def main() -> None:
         manning_dist_to_mouth_km_max=float(args.manning_dist_to_mouth_km_max),
         regional_curve_enabled=bool(args.regional_curve_enabled),
         regional_curve_region=str(args.regional_curve_region),
+        allow_builtin_regional_curves=bool(args.allow_builtin_regional_curves),
         regional_curve_c=(float(args.regional_curve_c) if args.regional_curve_c is not None else None),
         regional_curve_f=(float(args.regional_curve_f) if args.regional_curve_f is not None else None),
         regional_curve_da_units=str(args.regional_curve_da_units),
@@ -4068,6 +5062,8 @@ def main() -> None:
         regional_curve_max_weight=float(args.regional_curve_max_weight),
         regional_curve_min_da_km2=float(args.regional_curve_min_da_km2),
         only_with_banks=not bool(args.allow_missing_banks),
+        write_soundings_subset=(str(args.write_soundings_subset) if args.write_soundings_subset else None),
+        only_write_soundings_subset=bool(getattr(args, "only_write_soundings_subset", False)),
     )
 
     def _split_multi(vals):
@@ -4098,6 +5094,7 @@ def main() -> None:
         soundings_elev_col=args.soundings_elev_col,
         soundings_x_col=args.soundings_x_col,
         soundings_y_col=args.soundings_y_col,
+        soundings_crs=args.soundings_crs,
         cfg=cfg,
         xs_lines_layer=args.xs_lines_layer,
         xs_points_layer=args.xs_points_layer,
@@ -4130,6 +5127,7 @@ def main() -> None:
         channel_mask_raster=Path(args.channel_mask_raster) if args.channel_mask_raster else None,
         channel_mask_inside_value=int(args.channel_mask_inside_value),
         channel_mask_invert=bool(args.channel_mask_invert),
+        max_query_dist_m=(float(args.max_query_dist_m) if args.max_query_dist_m is not None else None),
     )
 
 

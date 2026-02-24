@@ -51,7 +51,6 @@ References
   of discharge equations for natural channels. J. Hydrology, 199, 13-35.
 """
 
-from __future__ import annotations
 
 import logging
 import math
@@ -582,7 +581,7 @@ def estimate_q2_from_drainage_area(
                 equation_id=str(ent.get('source','registry'))
             )
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
     # 2) Fallback: coarse built-in regressions (intended only as a last resort).
     
@@ -712,18 +711,18 @@ def main():
     )
     
     if args.json:
-        print(json.dumps(result.to_dict(), indent=2))
+        log.info(json.dumps(result.to_dict(), indent=2))
     else:
-        print(f"\n{'='*50}")
-        print("MANNING INVERSION DEPTH ESTIMATE")
-        print(f"{'='*50}")
-        print(f"Depth:        {result.depth_m:.2f} m")
-        print(f"Uncertainty:  ±{result.uncertainty_m:.2f} m")
-        print(f"Confidence:   {result.confidence:.0%}")
-        print(f"Backwater:    {'YES' if result.backwater_flag else 'No'}")
-        print(f"Tidal:        {'YES' if result.tidal_flag else 'No'}")
-        print(f"Guard Factor: {result.guard_factor:.2f}")
-        print(f"{'='*50}\n")
+        log.info(f"\n{'='*50}")
+        log.info("MANNING INVERSION DEPTH ESTIMATE")
+        log.info(f"{'='*50}")
+        log.info(f"Depth:        {result.depth_m:.2f} m")
+        log.info(f"Uncertainty:  ±{result.uncertainty_m:.2f} m")
+        log.info(f"Confidence:   {result.confidence:.0%}")
+        log.info(f"Backwater:    {'YES' if result.backwater_flag else 'No'}")
+        log.info(f"Tidal:        {'YES' if result.tidal_flag else 'No'}")
+        log.info(f"Guard Factor: {result.guard_factor:.2f}")
+        log.info(f"{'='*50}\n")
 
 
 if __name__ == "__main__":

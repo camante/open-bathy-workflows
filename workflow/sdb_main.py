@@ -17,10 +17,15 @@ UPDATES:
 - **FIXED: Config Override**: Regional config applies correctly without forcing spatial validation.
 """
 
+import os as _os
+# Force a headless-safe Matplotlib backend early (prevents TkAgg/Tkinter crashes under multiprocessing)
+_os.environ.setdefault('MPLBACKEND', 'Agg')
+
+import logging
+log = logging.getLogger(__name__)
 import sys
 import re
 import os
-import logging
 
 # IMPORTANT: Configure logging FIRST, before importing other pipeline modules
 try:
@@ -40,11 +45,14 @@ import traceback
 import importlib.util
 import inspect
 import shutil
+from vdatum_utils import convert_sdb_msl_to_navd88
+from process_utils import run_cmd
 import hashlib
-import subprocess
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, Tuple
+
+from deps import try_import, require
 
 # Optional run reporting (flight recorder)
 try:
@@ -57,30 +65,37 @@ except Exception:  # pragma: no cover
 
 import numpy as np
 import pandas as pd
+
+# Ensure GeoPandas remains usable on pandas>=2.0 even if GeoPandas lags.
+import compat_pandas  # noqa: F401
 import joblib
-import rasterio
-import geopandas as gpd
+rasterio = try_import('rasterio')  # optional for --help; required for SDB runtime
+gpd = try_import('geopandas')  # optional for --help; required for SDB runtime
 from pyproj import Transformer
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+from plot_utils import lazy_pyplot
+plt = None  # lazy-loaded when plots are enabled
+
+def _require_sdb_runtime_deps() -> None:
+    """Raise a clear error if heavy deps are missing when actually running SDB."""
+    require(rasterio, "rasterio", "Needed for raster I/O (GeoTIFF) in SDB pipeline.")
+    require(gpd, "geopandas", "Needed for vector I/O/masking in SDB pipeline.")
+
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 # Import new improvement modules
 try:
-    from validation import validate_pipeline_config, ValidationResult
+    from validation import validate_pipeline_config
     VALIDATION_AVAILABLE = True
 except ImportError:
     VALIDATION_AVAILABLE = False
     
 try:
-    from checkpoints import PipelineCheckpoint, CheckpointStage, CheckpointContext
+    from checkpoints import PipelineCheckpoint
     CHECKPOINTS_AVAILABLE = True
 except ImportError:
     CHECKPOINTS_AVAILABLE = False
 
 try:
-    from predict_parallel import predict_scene_parallel, ParallelConfig, estimate_parallel_benefit
     PARALLEL_PREDICT_AVAILABLE = True
 except ImportError:
     PARALLEL_PREDICT_AVAILABLE = False
@@ -110,104 +125,6 @@ def detect_active_config_profile(aoi_bbox: list, config_path: str = "sdb_config.
 # -----------------------------------------------------------------------------
 # Vertical Datum Transformation (MSL → NAVD88)
 # -----------------------------------------------------------------------------
-
-def convert_sdb_msl_to_navd88(
-    input_tif: Path,
-    output_tif: Path,
-    source_vdatum: str = "epsg:4269+5714",  # NAD83 + MSL
-    target_vdatum: str = "epsg:4269+5703",  # NAD83 + NAVD88
-    logger: Optional[logging.Logger] = None,
-) -> Tuple[bool, str]:
-    """
-    Convert SDB raster from MSL to NAVD88 vertical datum using CUDEM dlim.
-    
-    SCIENTIFIC NOTE:
-    SDB outputs are ELEVATION values relative to MSL (Mean Sea Level = 0).
-    - A pixel value of -5.0m means the seabed is at elevation -5.0m MSL
-    - This is NOT "depth below instantaneous water surface"
-    - MSL is the zero reference due to:
-      * Multi-temporal S2 compositing (averages tidal variations)
-      * ICESat-2 training data uses EGM2008 orthometric heights ≈ MSL
-    
-    Since SDB values are already elevations (relative to MSL), we can directly
-    apply a vertical datum transformation to convert to NAVD88:
-    
-        elev_NAVD88 = elev_MSL + (NAVD88 - MSL separation)
-    
-    Example:
-        - Input: -5.0m MSL (seabed 5m below MSL)
-        - MSL-NAVD88 separation: +0.3m (MSL is 0.3m above NAVD88 locally)
-        - Output: -5.0 + 0.3 = -4.7m NAVD88
-    
-    Args:
-        input_tif: Path to input SDB raster (elevations relative to MSL)
-        output_tif: Path to output raster (elevations in NAVD88)
-        source_vdatum: Source compound EPSG (default: NAD83+MSL)
-        target_vdatum: Target compound EPSG (default: NAD83+NAVD88)
-        logger: Optional logger instance
-    
-    Returns:
-        Tuple of (success: bool, message: str)
-    """
-    _log = logger or logging.getLogger("sdb_main")
-    
-    dlim_exe = shutil.which("dlim")
-    if dlim_exe is None:
-        msg = "dlim not found on PATH; cannot perform vertical datum transformation"
-        _log.warning(f"[VDATUM] {msg}")
-        return False, msg
-    
-    input_tif = Path(input_tif)
-    output_tif = Path(output_tif)
-    
-    if not input_tif.exists():
-        msg = f"Input raster not found: {input_tif}"
-        _log.error(f"[VDATUM] {msg}")
-        return False, msg
-    
-    output_tif.parent.mkdir(parents=True, exist_ok=True)
-    
-    cmd = [
-        dlim_exe,
-        str(input_tif),
-        "-J", source_vdatum,
-        "-P", target_vdatum,
-        "-O", str(output_tif),
-    ]
-    
-    _log.info(f"[VDATUM] Converting SDB from MSL to NAVD88")
-    _log.debug(f"[VDATUM] Command: {' '.join(cmd)}")
-    
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
-        
-        if result.returncode != 0:
-            msg = f"dlim failed with code {result.returncode}: {result.stderr[:500]}"
-            _log.error(f"[VDATUM] {msg}")
-            return False, msg
-        
-        if not output_tif.exists():
-            msg = f"dlim completed but output not found: {output_tif}"
-            _log.error(f"[VDATUM] {msg}")
-            return False, msg
-        
-        _log.info(f"[VDATUM] Successfully converted to NAVD88: {output_tif}")
-        return True, f"Converted to {target_vdatum}"
-        
-    except subprocess.TimeoutExpired:
-        msg = "dlim timed out after 600 seconds"
-        _log.error(f"[VDATUM] {msg}")
-        return False, msg
-    except Exception as e:
-        msg = f"dlim exception: {e}"
-        _log.error(f"[VDATUM] {msg}")
-        return False, msg
-
 
 def apply_sdb_metadata(
     raster_path: Path,
@@ -247,15 +164,15 @@ try:
     import vis
 except (ImportError, IndentationError, SyntaxError) as exc:
     import traceback
-    print("CRITICAL ERROR: Could not import one or more SDB modules.")
-    print(f"  {type(exc).__name__}: {exc}")
+    log.info("CRITICAL ERROR: Could not import one or more SDB modules.")
+    log.info(f"  {type(exc).__name__}: {exc}")
     traceback.print_exc()
-    print("\nTip: If this is an IndentationError/SyntaxError in predict.py, replace predict.py with the fixed version from sdb_river_fixed (v0.5.0+).")
+    log.info("\nTip: If this is an IndentationError/SyntaxError in predict.py, replace predict.py with the fixed version from sdb_river_fixed (v0.5.0+).")
     sys.exit(1)
 except Exception as exc:
     import traceback
-    print("CRITICAL ERROR: Unexpected exception while importing SDB modules.")
-    print(f"  {type(exc).__name__}: {exc}")
+    log.info("CRITICAL ERROR: Unexpected exception while importing SDB modules.")
+    log.info(f"  {type(exc).__name__}: {exc}")
     traceback.print_exc()
     sys.exit(1)
 
@@ -318,37 +235,9 @@ def _run(cmd: str):
     return _run_safe(cmd_list)
 
 
-def _run_safe(cmd_list: list):
-    """
-    Run a command safely without shell=True (SECURITY FIX).
-    
-    Args:
-        cmd_list: Command as list, e.g., ['python', 'script.py', '--flag=value']
-    
-    Returns:
-        stdout string
-    
-    Raises:
-        RuntimeError: If command fails
-    """
-    import subprocess
-    
-    res = subprocess.run(
-        cmd_list,
-        shell=False,  # SECURITY: Never use shell=True
-        capture_output=True,
-        text=True,
-        check=False
-    )
-    
-    if res.returncode != 0:
-        cmd_str = ' '.join(cmd_list)
-        raise RuntimeError(
-            f"Command failed ({res.returncode}): {cmd_str}\n"
-            f"STDOUT:\n{res.stdout}\n"
-            f"STDERR:\n{res.stderr}"
-        )
-    
+def _run_safe(cmd_list):
+    """Run command list safely and return stdout. Raises RuntimeError on failure."""
+    res = run_cmd(cmd_list, check=True)
     return res.stdout
 
 def _buffer_aoi(aoi, pct: float = 0.05) -> str:
@@ -424,7 +313,7 @@ def generate_coastline_mask(target_raster_path, aoi, cache_masks, out_mask_tif, 
                     else:
                         return str(out_mask_tif)
             except Exception:
-                pass # Re-generate if check fails
+                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True) # Re-generate if check fails
 
     # 2. Setup Cache and Params
     aoi_buf = _buffer_aoi(aoi, pct=0.05)
@@ -435,18 +324,18 @@ def generate_coastline_mask(target_raster_path, aoi, cache_masks, out_mask_tif, 
     cache_masks.mkdir(parents=True, exist_ok=True)
 
     if sdb_mode == "lakes":
-        want_nhd = "False"
-        want_lakes = "True"
+        want_nhd = False
+        want_lakes = True
     elif sdb_mode == "ocean":
-        want_nhd = "True"
-        want_lakes = "False"
+        want_nhd = True
+        want_lakes = False
     else:
-        want_nhd = "True"
-        want_lakes = "True"
+        want_nhd = True
+        want_lakes = True
 
-    waffles_params = f"want_nhd={want_nhd}:want_lakes={want_lakes}"
+    params = f"want_nhd={str(want_nhd).lower()}:want_lakes={str(want_lakes).lower()}"
     chash = hashlib.sha1(
-        f"{aoi_buf}|{WAFFLES_INC_ARCSEC:.9f}|{waffles_params}".encode()
+        f"{aoi_buf}|{WAFFLES_INC_ARCSEC:.9f}|{params}".encode()
     ).hexdigest()[:12]
 
     base_prefix = cache_masks / f"waffles_coastline_{chash}"
@@ -457,7 +346,7 @@ def generate_coastline_mask(target_raster_path, aoi, cache_masks, out_mask_tif, 
         cmd_list = [
             "waffles",
             "-M",
-            f"coastline:{waffles_params}",
+            f"coastline:{params}",
             f"-R={aoi_buf}",
             "-E",
             inc_str,
@@ -469,7 +358,7 @@ def generate_coastline_mask(target_raster_path, aoi, cache_masks, out_mask_tif, 
             _run_safe(cmd_list)
         except Exception:
             # Fallback check for glob if name varied slightly
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
         if not base_tif.exists():
             # Robust discovery: waffles can append suffixes and/or write into a directory
@@ -544,9 +433,14 @@ def _write_report(out_dir: Path, status: str, **kwargs):
             rr.add("run.status", status)
             rr.merge(kwargs or {})
             rr.write(status=status)
+            try:
+                # best-effort: emit artifacts from the assembled kwargs
+                _emit_artifacts_from_report(kwargs or {})
+            except Exception as e:
+                logging.getLogger(__name__).debug("Optional emit failed: %s", e)
             return
     except Exception:
-        pass
+        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
     report = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -554,23 +448,54 @@ def _write_report(out_dir: Path, status: str, **kwargs):
         "status": status,
         **kwargs
     }
-    with open(out_dir / "run_report.json", "w") as f:
+    report_path = out_dir / "run_report.json"
+    with open(report_path, "w") as f:
         json.dump(report, f, indent=2)
+    try:
+        from flight_recorder import emit_artifact_written
+        emit_artifact_written(report_path, kind="json", role="sdb_run_report")
+        _emit_artifacts_from_report(report)
+    except Exception as e:
+        logging.getLogger(__name__).debug("Optional flight-recorder emit failed: %s", e)
 
+
+
+
+def _emit_artifacts_from_report(report: dict) -> None:
+    """Emit artifact_written events for any path-like values in the report."""
+    try:
+        from flight_recorder import emit_artifact_written
+    except Exception:
+        return
+
+    def _walk(x):
+        if isinstance(x, dict):
+            for v in x.values():
+                _walk(v)
+        elif isinstance(x, (list, tuple)):
+            for v in x:
+                _walk(v)
+        elif isinstance(x, (str, Path)):
+            s = str(x)
+            if any(s.lower().endswith(ext) for ext in (".tif", ".tiff", ".vrt", ".nc", ".h5", ".csv", ".json", ".md", ".txt", ".png", ".jpg", ".jpeg")):
+                kind = "raster" if s.lower().endswith((".tif", ".tiff", ".vrt")) else "file"
+                emit_artifact_written(s, kind=kind, role="from_report")
+
+    _walk(report)
 
 def _rr_add(rr, key: str, value):
     try:
         if rr is not None:
             rr.add(key, value)
     except Exception:
-        pass
+        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
 def _rr_artifact(rr, name: str, path: str):
     try:
         if rr is not None and hasattr(rr, "record_artifact"):
             rr.record_artifact(name, str(path))
     except Exception:
-        pass
+        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
 def _rr_merge_json(rr, key: str, path: Path):
     try:
@@ -583,7 +508,7 @@ def _rr_merge_json(rr, key: str, path: Path):
             rr.add_dict(key, d if isinstance(d, dict) else {"value": d})
             _rr_artifact(rr, key.replace(".", "_") + "_json", str(p))
     except Exception:
-        pass
+        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
 def shift_start_back_one_month(start_str: str) -> str:
     """Backoff utility for retry loop."""
@@ -983,6 +908,26 @@ def main():
     import rasterio
     args = parse_args()
 
+    # ---------------------------------------------------------------------
+    # Run-scoped logging + flight recorder
+    # ---------------------------------------------------------------------
+    run_id = None
+    try:
+        from datetime import datetime, timezone
+        from logging_config import add_file_handler, start_flight_recorder
+
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        run_id = f"sdb_{ts}_{os.getpid()}"
+        out_dir = Path(getattr(args, "out_dir", "output"))
+        (out_dir / "run_logs").mkdir(parents=True, exist_ok=True)
+        add_file_handler(out_dir / "run_logs" / f"run_{run_id}.log", level=logging.INFO)
+        fr_path = start_flight_recorder(out_dir, run_id=run_id)
+        if fr_path is not None:
+            log.info(f"[RUN] Flight recorder: {fr_path}")
+        log.info(f"[RUN] run_id={run_id}")
+    except Exception as e:
+        log.debug(f"[RUN] Unable to initialize run logs/flight recorder: {e}")
+
     try:
         w, e, s, n = [float(x) for x in args.aoi.split("/")]
         bbox_list = [w, s, e, n]
@@ -1234,8 +1179,33 @@ def main():
         try:
             Path(_d).mkdir(parents=True, exist_ok=True)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Model bank (bounded reservoir): accumulate training across AOIs
+    # ------------------------------------------------------------------
+    model_bank_dir = None
+    if bool(getattr(args, 'model_bank_enabled', True)):
+        mb = str(getattr(args, 'model_bank', 'auto'))
+        if mb.strip().lower() == 'auto':
+            model_bank_dir = cache_root / 'model_bank' / 'sdb_global_v1'
+        else:
+            model_bank_dir = Path(mb).expanduser().resolve()
+        model_bank_dir.mkdir(parents=True, exist_ok=True)
+        log.info(f"[MODEL_BANK] enabled dir={model_bank_dir} max_samples={int(getattr(args,'bank_max_samples',100000))}")
+        if rr is not None:
+            rr.add('model_bank.enabled', True)
+            rr.add('model_bank.dir', str(model_bank_dir))
+            rr.add('model_bank.max_samples', int(getattr(args,'bank_max_samples',100000)))
+    else:
+        log.info('[MODEL_BANK] disabled')
+        if rr is not None:
+            rr.add('model_bank.enabled', False)
+
+    # Deprecated model cache is disabled by default in this workflow.
+    model_bank_dir_run = model_bank_dir  # may be partitioned later by source mix/depth regime
+    model_cache_dir = None
     log.info(f"--- Starting SDB Run [{args.sdb_mode}] ---")
     log.info(f"Output Directory: {out_root}")
 
@@ -1323,7 +1293,7 @@ def main():
                     allowed = set(sig.parameters.keys())
                     s2_kwargs = {k: v for k, v in s2_kwargs.items() if k in allowed}
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
                 s2_paths = s2_optics.build_weighted_shared_date_composite(**s2_kwargs)
 
@@ -1338,7 +1308,7 @@ def main():
                                 _rr_artifact(rr, f"s2_{k}".lower(), v)
                         _rr_merge_json(rr, "s2.date_qc", s2_out / "S2_DATE_QC.json")
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
                 log.info("[S2] Composite acquired.")
 
                 if getattr(args, 'cloud_report_only', False):
@@ -1413,6 +1383,22 @@ def main():
         except Exception as exc:
             log.warning(f"Mask generation failed ({exc}).")
 
+
+    # Ensure land mask exists even if waffles generation failed
+    if not land_mask_out.exists():
+        try:
+            import rasterio
+            with rasterio.open(s2_paths["B02"]) as src:
+                prof = src.profile.copy()
+                prof.update(count=1, dtype="uint8", nodata=None, compress="LZW")
+                data = np.zeros((src.height, src.width), dtype="uint8")  # 0 = water everywhere (no land gate)
+            with rasterio.open(land_mask_out, "w", **prof) as dst:
+                dst.write(data, 1)
+            log.warning(f"[MASK] LAND mask missing; created fallback all-water mask: {land_mask_out}")
+        except Exception as _e:
+            log.error(f"[MASK] Failed to create fallback LAND mask ({_e}); cannot proceed.")
+            raise
+
     log.info(f"[MASK] Using LAND mask as hard gate: keep pixels where LAND <= {args.land_max} (0.0 = waffles water-only).")
 
     # 5. ATL Processing
@@ -1432,7 +1418,7 @@ def main():
             rr.add("mask.land_mask_type", land_mask_type)
             rr.add("mask.land_mask_threshold", land_mask_threshold)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
 
     if atl_files_map["ATL03"]:
@@ -1481,6 +1467,116 @@ def main():
 
     # 6. Fusion
     log.info("\n--- Fusion & QC ---")
+    def _filter_extra_xyz_for_sdb(df_xyz_local):
+        """Conservative guardrails for extra_xyz in SDB training.
+        River/XS anchoring is handled separately in bathy_main; here we avoid poisoning SDB
+        with likely bed-elevation soundings mislabeled as depth.
+
+        Safe defaults (auto mode):
+          - fail-closed on guard exceptions (do not silently continue)
+          - require finite numeric depth_m
+          - cap to |depth_m| <= 10 m for SDB training support (nearshore-focused guard)
+          - apply mixed-sign / provenance checks for likely bed-elevation sources
+        """
+        if df_xyz_local is None or len(df_xyz_local) == 0:
+            return df_xyz_local
+        mode = str(getattr(args, "extra_xyz_sdb_mode", "auto") or "auto").lower()
+        if mode == "exclude":
+            log.warning("[XYZ][SDB] extra_xyz_sdb_mode=exclude -> excluding extra_xyz from SDB training.")
+            return None
+        if mode == "allow":
+            return df_xyz_local
+
+        guard_max_abs_depth_m = 10.0  # safe default for SDB training support from external XYZ
+
+        def _src_counts(_df):
+            if _df is None or len(_df) == 0 or "source" not in _df.columns:
+                return {}
+            try:
+                vc = _df["source"].astype(str).str.lower().value_counts(dropna=False)
+                return {str(k): int(v) for k, v in vc.to_dict().items()}
+            except Exception:
+                return {}
+
+        try:
+            if "depth_m" not in df_xyz_local.columns:
+                log.warning("[XYZ][SDB] extra_xyz missing depth_m; excluding from SDB training in auto mode.")
+                return None
+
+            n_before = int(len(df_xyz_local))
+            d_ser = pd.to_numeric(df_xyz_local["depth_m"], errors="coerce")
+            d_arr = d_ser.to_numpy(dtype=float)
+            finite_mask = np.isfinite(d_arr)
+            n_finite = int(finite_mask.sum())
+            if n_finite == 0:
+                log.warning("[XYZ][SDB] extra_xyz has no finite depth_m after coercion; excluding from SDB training.")
+                return None
+
+            df_guard = df_xyz_local.loc[finite_mask].copy()
+            df_guard["depth_m"] = d_arr[finite_mask]
+
+            src_before = _src_counts(df_xyz_local)
+
+            # Default depth-support guard for SDB (keeps nearshore training; avoids deep/offshore domination)
+            keep_depth = np.abs(df_guard["depth_m"].to_numpy(dtype=float)) <= float(guard_max_abs_depth_m)
+            df_guard = df_guard.loc[keep_depth].copy()
+            if df_guard.empty:
+                log.warning(
+                    f"[XYZ][SDB] Auto guard removed all extra_xyz rows for SDB training (|depth_m| <= {guard_max_abs_depth_m:g} m)."
+                )
+                return None
+
+            # Mixed-sign / provenance guard on the already depth-limited set
+            d = df_guard["depth_m"].to_numpy(dtype=float)
+            pct_pos = float((d > 0).mean()) if d.size else 0.0
+            med = float(np.nanmedian(d)) if d.size else float("nan")
+            src_text = ""
+            if "source" in df_guard.columns:
+                src_text = " ".join(sorted({str(v).lower() for v in df_guard["source"].dropna().unique()}))
+            suspect_prov = any(k in src_text for k in ("hydronos", "ehydro"))
+            if suspect_prov and pct_pos > 0.02:
+                n_mid = len(df_guard)
+                d_ser2 = pd.to_numeric(df_guard["depth_m"], errors="coerce")
+                neg_mask = (d_ser2 <= 0)
+                neg_mask = neg_mask.fillna(False) if hasattr(neg_mask, "fillna") else pd.Series(False, index=df_guard.index)
+                df_neg = df_guard.loc[np.asarray(neg_mask, dtype=bool)].copy()
+                if len(df_neg) >= 100:
+                    log.warning(
+                        f"[XYZ][SDB] Auto guard: suspected bed-elev/mixed-sign source ({pct_pos*100:.1f}% positive; median={med:.2f} m). "
+                        f"Keeping only non-positive rows for SDB training: {n_mid} -> {len(df_neg)}."
+                    )
+                    df_guard = df_neg
+                else:
+                    log.warning(
+                        f"[XYZ][SDB] Auto guard: suspected bed-elev/mixed-sign source ({pct_pos*100:.1f}% positive; median={med:.2f} m). "
+                        "Too few non-positive rows remain; excluding extra_xyz from SDB training."
+                    )
+                    return None
+            elif pct_pos > 0.20:
+                log.warning(
+                    f"[XYZ][SDB] Auto guard warning: extra_xyz has {pct_pos*100:.1f}% positive depth_m (median={med:.2f} m) after depth cap. "
+                    "Verify depth semantics/sign convention before trusting SDB metrics."
+                )
+
+            src_after = _src_counts(df_guard)
+            log.info(
+                f"[XYZ][SDB] Guard kept {len(df_guard)}/{n_before} extra_xyz rows for SDB training "
+                f"(finite depth + |depth_m|<={guard_max_abs_depth_m:g} m)."
+            )
+            if src_before or src_after:
+                log.info(f"[XYZ][SDB] Guard source breakdown before={src_before} after={src_after}")
+                hydro_before = sum(v for k, v in src_before.items() if ("hydronos" in k or "ehydro" in k))
+                hydro_after = sum(v for k, v in src_after.items() if ("hydronos" in k or "ehydro" in k))
+                if hydro_before > 0 and hydro_after < hydro_before:
+                    log.info(f"[XYZ][SDB] Hydronos/eHydro-like rows reduced by guard: {hydro_before} -> {hydro_after}")
+            return df_guard
+
+        except Exception as ex:
+            # Fail closed: do not silently keep unguarded extra_xyz in SDB training.
+            log.error(f"[XYZ][SDB] Auto guard failed; excluding extra_xyz from SDB training. Reason: {ex}")
+            log.debug("[XYZ][SDB] Guard exception details", exc_info=True)
+            return None
+
     df_xyz = None
     if args.extra_xyz:
         df_xyz = atl.load_extra_xyz_points(args.extra_xyz, args.extra_xyz_crs, args.aoi)
@@ -1495,6 +1591,9 @@ def main():
                 log.warning("[XYZ] Extra XYZ inputs were provided but produced 0 usable points after parsing/filtering.")
         except Exception:
             log.warning("[XYZ] Loaded extra XYZ points (stats unavailable).", exc_info=True)
+        df_xyz = _filter_extra_xyz_for_sdb(df_xyz)
+        if df_xyz is None or len(df_xyz) == 0:
+            log.warning("[XYZ][SDB] No extra_xyz points will be used for SDB training after guardrails.")
 
     fused_df = fusion.build_fused_training_dataframe(
         atl03_df=df_atl03, atl24_df=df_atl24, xyz_df=df_xyz,
@@ -1520,6 +1619,42 @@ def main():
             log.warning("[FUSION] Fusion produced 0 points. Check water/land masks, AOI, and input data.")
     except Exception:
         log.warning("[FUSION] Unable to summarize point provenance.", exc_info=True)
+    # Cap per-source rows before S2 sampling to prevent one source (e.g., Hydronos/eHydro)
+    # from dominating sampling cost and training provenance.
+    def _cap_per_source_presampling(df_in, cap_per_source=250000, seed=1337):
+        if df_in is None or len(df_in) == 0 or "source" not in df_in.columns:
+            return df_in
+        try:
+            src_ser = df_in["source"].astype(str)
+            vc_before = src_ser.value_counts(dropna=False)
+            needs_cap = bool((vc_before > int(cap_per_source)).any())
+            if not needs_cap:
+                return df_in
+            rng = np.random.default_rng(int(seed))
+            keep_idx_parts = []
+            for src, grp in df_in.groupby(src_ser, sort=False):
+                n_src = int(len(grp))
+                if n_src <= int(cap_per_source):
+                    keep_idx_parts.append(grp.index.to_numpy())
+                else:
+                    sel = rng.choice(grp.index.to_numpy(), size=int(cap_per_source), replace=False)
+                    keep_idx_parts.append(np.sort(sel))
+            keep_idx = np.concatenate(keep_idx_parts) if keep_idx_parts else np.array([], dtype=int)
+            df_out = df_in.loc[keep_idx].copy()
+            vc_after = df_out["source"].astype(str).value_counts(dropna=False)
+            log.warning(
+                f"[TRAIN][PRESAMPLE] Capped per-source rows before S2 sampling at {int(cap_per_source):,}. "
+                f"Total rows {len(df_in):,} -> {len(df_out):,}."
+            )
+            log.info(f"[TRAIN][PRESAMPLE] Source counts before: {vc_before.to_dict()}")
+            log.info(f"[TRAIN][PRESAMPLE] Source counts after: {vc_after.to_dict()}")
+            return df_out
+        except Exception as ex:
+            log.warning(f"[TRAIN][PRESAMPLE] Per-source cap failed; continuing without cap: {ex}")
+            return df_in
+
+    fused_df = _cap_per_source_presampling(fused_df, cap_per_source=250000, seed=int(getattr(args, 'seed', 42)))
+
     fused_df.to_csv(dir_data / "training_data_fused.csv", index=False)
 
     # Helpful provenance logging: how many fused points came from each source.
@@ -1532,104 +1667,186 @@ def main():
     except Exception:
         log.warning("[FUSION] Could not compute fused source counts.", exc_info=True)
 
+    # ------------------------------------------------------------------
+    # Model reuse (regional cache): if a cached model exists, prefer it over retraining.
+    # This improves cross-tile consistency in sparse-data regions and avoids per-tile drift.
+    # ------------------------------------------------------------------
+    cached_model = False
+    stumpf_lr = None
+    model_meta = None
+    df_train_final = None
+    df_test_final = None
+    try:
+        if False and model_cache_dir is not None:
+            rf_p = model_cache_dir / "rf_model.pkl"
+            meta_p = model_cache_dir / "model_meta.json"
+            stumpf_p = model_cache_dir / "stumpf_lr.pkl"
+            if rf_p.exists() and meta_p.exists():
+                shutil.copy2(rf_p, dir_model / "rf_model.pkl")
+                shutil.copy2(meta_p, dir_model / "model_meta.json")
+                if stumpf_p.exists():
+                    shutil.copy2(stumpf_p, dir_model / "stumpf_lr.pkl")
+                    stumpf_lr = True  # truthy sentinel for downstream arg
+                cached_model = True
+                try:
+                    with open(meta_p, "r") as f:
+                        model_meta = json.load(f)
+                except Exception:
+                    model_meta = None
+                try:
+                    df_train_final = pd.DataFrame()
+                    df_test_final = pd.DataFrame()
+                except Exception:
+                    df_train_final = None
+                    df_test_final = None
+                log.info(f"[MODEL_CACHE] HIT: using cached model from {model_cache_dir}")
+                if rr is not None:
+                    rr.add("model_cache.hit", True)
+            else:
+                if rr is not None:
+                    rr.add("model_cache.hit", False)
+    except Exception as e:
+        log.warning(f"[MODEL_CACHE] Could not use cached model: {e}")
+        if rr is not None:
+            rr.add("model_cache.hit", False)
+            rr.add("model_cache.error", str(e))
+
     if fused_df.empty:
-        log.error("No valid training points found after Fusion.")
-        return
+        # No new AOI training points. Attempt to proceed using the persisted model bank if available.
+        if model_bank_dir is not None:
+            try:
+                rf_p = model_bank_dir / 'rf_model.pkl'
+                meta_p = model_bank_dir / 'model_meta.json'
+                stumpf_p = model_bank_dir / 'stumpf_lr.pkl'
+                if rf_p.exists() and meta_p.exists():
+                    dir_model.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(rf_p, dir_model / 'rf_model.pkl')
+                    shutil.copy2(meta_p, dir_model / 'model_meta.json')
+                    if stumpf_p.exists():
+                        shutil.copy2(stumpf_p, dir_model / 'stumpf_lr.pkl')
+                        stumpf_lr = True  # sentinel (file exists)
+                    cached_model = True
+                    try:
+                        with open(meta_p, 'r') as f:
+                            model_meta = json.load(f)
+                    except Exception:
+                        model_meta = None
+                    log.warning('[FUSION] 0 training points; using existing model bank for prediction-only.')
+                    if rr is not None:
+                        rr.add('model_bank.prediction_only', True)
+                        _rr_artifact(rr, 'rf_model_pkl', str(dir_model / 'rf_model.pkl'))
+                        _rr_artifact(rr, 'model_meta_json', str(dir_model / 'model_meta.json'))
+                        if (dir_model / 'stumpf_lr.pkl').exists():
+                            _rr_artifact(rr, 'stumpf_lr_pkl', str(dir_model / 'stumpf_lr.pkl'))
+                else:
+                    log.error('[FUSION] 0 training points and model bank has no trained model yet.')
+            except Exception as ex:
+                log.error(f"[FUSION] 0 training points and failed to load model bank model: {ex}")
+        if not cached_model:
+            log.error('No valid training points found after Fusion, and no model is available to predict.')
+            return
 
     # 7. Training & Validation
-    log.info("\n--- Model Training & Validation ---")
-    df_with_s2 = train.sample_s2_bands_at_points(fused_df, s2_paths, str(land_mask_out))
 
-    # After S2 sampling/masking, re-log provenance to confirm XYZ is still present.
-    try:
-        if "source" in df_with_s2.columns:
-            src_counts2 = df_with_s2["source"].value_counts(dropna=False).to_dict()
-            log.info(f"[TRAIN][PROVENANCE] After S2 sampling/masking: {src_counts2}")
-    except Exception:
-        log.warning("[TRAIN][PROVENANCE] Could not compute source counts after S2 sampling.", exc_info=True)
-
-    log.info("[TRAIN] Running Standard Training (Random Split)...")
-
-    linf_est_mode = "deepwater" if args.linf_estimate_deepwater else "none"
-
+    # Training config needed downstream (even if using cached model)
+    linf_est_mode = "deepwater" if getattr(args, "linf_estimate_deepwater", False) else "none"
     land_mask_type_for_train = str(getattr(args, "land_mask_type", "auto"))
     land_mask_water_val_for_train = getattr(args, "land_mask_water_val", None)
     if land_mask_water_val_for_train is not None:
         land_mask_water_val_for_train = int(land_mask_water_val_for_train)
 
+    if not cached_model:
+        log.info("\n--- Model Training & Validation ---")
+        df_with_s2 = train.sample_s2_bands_at_points(fused_df, s2_paths, str(land_mask_out))
 
-    # UPDATED: We directly respect 'validate_spatial' flag now.
-    # If auto_max_depth is True, train.py handles the calculation regardless of split type.
-    rf, stumpf_lr, df_train_final, df_test_final, model_meta = train.train_sdb_model(
-        train_df=df_with_s2,
-        max_depth_sdb=max_depth_sdb_product,
-        seed=args.seed,
-        plots_dir=dir_plot, water_class=args.water_class,
-        use_stumpf_depth=args.use_stumpf_depth,
-        min_training_points_for_sdb=args.min_training_points_for_sdb,
-        spatial_split=False,  # Production model uses stratified random split
-        cw_min=args.cw_min,
-        land_max=args.land_max,
-        land_mask_type=land_mask_type_for_train,
-        land_mask_water_val=land_mask_water_val_for_train,
-        land_mask_invert=land_mask_invert,
-        linf_enabled=args.linf_enabled,
-        linf_estimate=linf_est_mode,
-        linf_deepwater_nir_max=args.linf_deepwater_nir_max,
-        linf_deepwater_bright_max=args.linf_deepwater_bright_max,
-        linf_percentile=args.linf_percentile,
-        rmse_target_sdb=getattr(args,'rmse_target_sdb',1.0),
-        raster_paths=s2_paths,
-        depth_bin_m=float(getattr(args, 'depth_bin_m', 1.0)),
-        depth_binning=str(getattr(args, 'depth_binning', 'quantile')),
-        min_samples_per_bin=int(getattr(args, 'min_samples_per_bin', 10)),
-    )
+        # After S2 sampling/masking, re-log provenance to confirm XYZ is still present.
+        try:
+            if "source" in df_with_s2.columns:
+                src_counts2 = df_with_s2["source"].value_counts(dropna=False).to_dict()
+                log.info(f"[TRAIN][PROVENANCE] After S2 sampling/masking: {src_counts2}")
+        except Exception:
+            log.warning("[TRAIN][PROVENANCE] Could not compute source counts after S2 sampling.", exc_info=True)
 
-    if df_train_final.empty:
-        log.error("Training failed (0 samples).")
-        return
+        # Partition model bank by source mix and depth regime to avoid cross-regime contamination.
+        if model_bank_dir is not None:
+            try:
+                def _partition_model_bank_dir(base_dir, df_pts):
+                    if base_dir is None or df_pts is None or len(df_pts) == 0:
+                        return base_dir, None
+                    n_all = int(len(df_pts))
+                    src_ser = df_pts["source"].astype(str).str.lower() if "source" in df_pts.columns else pd.Series(["unknown"] * n_all)
+                    n_xyz = int(src_ser.str.startswith("extra_xyz").sum()) if len(src_ser) else 0
+                    n_atl = int(src_ser.str.contains("atl", regex=False).sum()) if len(src_ser) else 0
+                    xyz_frac = (n_xyz / float(n_all)) if n_all else 0.0
+                    atl_frac = (n_atl / float(n_all)) if n_all else 0.0
+                    if xyz_frac >= 0.75:
+                        mix_bucket = "xyz_dominant"
+                    elif xyz_frac >= 0.25:
+                        mix_bucket = "xyz_mixed"
+                    elif atl_frac >= 0.75:
+                        mix_bucket = "atl_dominant"
+                    else:
+                        mix_bucket = "mixed_other"
+                    depth_bucket = "unknown"
+                    if "depth_m" in df_pts.columns:
+                        d = pd.to_numeric(df_pts["depth_m"], errors="coerce").to_numpy(dtype=float)
+                        d = np.abs(d[np.isfinite(d)])
+                        if d.size:
+                            p95 = float(np.nanpercentile(d, 95))
+                            if p95 <= 12.0:
+                                depth_bucket = "shallow"
+                            elif p95 <= 25.0:
+                                depth_bucket = "mid"
+                            else:
+                                depth_bucket = "deep"
+                        else:
+                            p95 = None
+                    else:
+                        p95 = None
+                    part_key = f"mix_{mix_bucket}__depth_{depth_bucket}"
+                    part_dir = Path(base_dir) / "partitions" / part_key
+                    part_meta = {
+                        "partition_key": part_key,
+                        "mix_bucket": mix_bucket,
+                        "depth_bucket": depth_bucket,
+                        "xyz_frac": float(xyz_frac),
+                        "atl_frac": float(atl_frac),
+                        "depth_p95_abs_m": (None if p95 is None else float(p95)),
+                        "n": n_all,
+                    }
+                    return part_dir, part_meta
 
-    src_rand_base = dir_plot / "SDB_Accuracy_Assessment_RandomSplit.png"
-    if src_rand_base.exists():
-        src_rand_base.rename(dir_plot / "Validation_RandomSplit.png")
+                model_bank_dir_run, mb_part = _partition_model_bank_dir(model_bank_dir, df_with_s2)
+                if model_bank_dir_run is not None and mb_part is not None:
+                    model_bank_dir_run.mkdir(parents=True, exist_ok=True)
+                    log.info(f"[MODEL_BANK] partitioned dir={model_bank_dir_run} meta={mb_part}")
+                    if rr is not None:
+                        rr.add('model_bank.partition_dir', str(model_bank_dir_run))
+                        rr.add('model_bank.partition', mb_part)
+            except Exception as ex:
+                model_bank_dir_run = model_bank_dir
+                log.warning(f"[MODEL_BANK] Partitioning failed; falling back to base bank dir. Reason: {ex}")
 
-    src_rand_v1 = dir_plot / "SDB_Accuracy_Assessment_RandomSplit_V1_AllData.png"
-    if src_rand_v1.exists():
-        src_rand_v1.rename(dir_plot / "Validation_RandomSplit_V1_AllData.png")
+        log.info("[TRAIN] Running Standard Training (Random Split)...")
+
+        linf_est_mode = "deepwater" if args.linf_estimate_deepwater else "none"
+
+        land_mask_type_for_train = str(getattr(args, "land_mask_type", "auto"))
+        land_mask_water_val_for_train = getattr(args, "land_mask_water_val", None)
+        if land_mask_water_val_for_train is not None:
+            land_mask_water_val_for_train = int(land_mask_water_val_for_train)
 
 
-    joblib.dump(rf, dir_model / "rf_model.pkl")
-    if stumpf_lr:
-        joblib.dump(stumpf_lr, str(dir_model / "stumpf_lr.pkl"))
-
-    _rr_artifact(rr, "rf_model_pkl", str(dir_model / "rf_model.pkl"))
-    if stumpf_lr:
-        _rr_artifact(rr, "stumpf_lr_pkl", str(dir_model / "stumpf_lr.pkl"))
-
-    if args.no_doa:
-        log.info("[Config] Domain of Applicability (DoA) enforcement DISABLED by user.")
-        if "training_bounds" in model_meta:
-            del model_meta["training_bounds"]
-
-    model_meta["max_depth_sdb"] = max_depth_sdb_product
-    model_meta["water_class"] = args.water_class
-    with open(dir_model / "model_meta.json", "w") as f:
-        json.dump(model_meta, f, indent=2)
-
-    chosen_max_depth = max_depth_sdb_product
-
-    # B. Optional Spatial Validation
-    if args.validate_spatial:
-        log.info("\n[TRAIN] Running Secondary Spatial Validation (Spatial Split)...")
-
-        _, _, _, df_test_spatial, model_meta_spatial = train.train_sdb_model(
+        # UPDATED: We directly respect 'validate_spatial' flag now.
+        # If auto_max_depth is True, train.py handles the calculation regardless of split type.
+        rf, stumpf_lr, df_train_final, df_test_final, model_meta = train.train_sdb_model(
             train_df=df_with_s2,
             max_depth_sdb=max_depth_sdb_product,
             seed=args.seed,
             plots_dir=dir_plot, water_class=args.water_class,
             use_stumpf_depth=args.use_stumpf_depth,
             min_training_points_for_sdb=args.min_training_points_for_sdb,
-            spatial_split=True,
+            spatial_split=False,  # Production model uses stratified random split
             cw_min=args.cw_min,
             land_max=args.land_max,
             land_mask_type=land_mask_type_for_train,
@@ -1643,120 +1860,319 @@ def main():
             rmse_target_sdb=getattr(args,'rmse_target_sdb',1.0),
             raster_paths=s2_paths,
             depth_bin_m=float(getattr(args, 'depth_bin_m', 1.0)),
-        depth_binning=str(getattr(args, 'depth_binning', 'quantile')),
+            depth_binning=str(getattr(args, 'depth_binning', 'quantile')),
             min_samples_per_bin=int(getattr(args, 'min_samples_per_bin', 10)),
+            model_bank_dir=model_bank_dir_run,
+            model_bank_enabled=bool(getattr(args,'model_bank_enabled', True)),
+            model_bank_max_samples=int(getattr(args,'bank_max_samples', 100000)),
+            model_bank_seed=int(getattr(args,'bank_seed', 1337)),
+            model_bank_retrain_min_new=int(getattr(args,'bank_retrain_min_new', 2000)),
         )
 
-        src_spat_base = dir_plot / "SDB_Accuracy_Assessment_SpatialSplit.png"
-        if src_spat_base.exists():
-            src_spat_base.rename(dir_plot / "Validation_SpatialSplit.png")
-
-        src_spat_v1 = dir_plot / "SDB_Accuracy_Assessment_SpatialSplit_V1_AllData.png"
-        if src_spat_v1.exists():
-            src_spat_v1.rename(dir_plot / "Validation_SpatialSplit_V1_AllData.png")
-
-        m_rand = _calc_metrics(df_test_final)
-        m_spat = _calc_metrics(df_test_spatial)
-
-
-        # ------------------------------------------------------------------
-        # Auto max-depth selection (depth-of-support)
-        # ------------------------------------------------------------------
-        chosen_max_depth = max_depth_sdb_product
-        src_key = None
-
-        def _load_train_report_auto_depth() -> tuple:
-            cand_paths = [
-                dir_logs / "train_report.json",
-                out_root / "train_report.json",
-                dir_model / "train_report.json",
-            ]
-            for tp in cand_paths:
-                try:
-                    if tp.exists() and tp.stat().st_size > 0:
-                        with open(tp, "r") as f:
-                            trj = json.load(f)
-                        tr = trj.get("train", {}) if isinstance(trj, dict) else {}
-                        v = tr.get("max_depth_sdb_auto_m", None)
-                        if v is None:
-                            diag = tr.get("max_depth_sdb_auto_diagnostics", None)
-                            if isinstance(diag, dict):
-                                dm = diag.get("depths_m", {}) or diag.get("depths", {})
-                                if isinstance(dm, dict):
-                                    v = dm.get("strict", dm.get("relaxed", None))
-                        if v is None:
-                            return None, None
-                        fv = float(v)
-                        if fv <= 0:
-                            return None, None
-                        return fv, f"{tp.name}:train.max_depth_sdb_auto_m"
-                except Exception:
-                    continue
-            return None, None
-
-        if auto_max_depth:
-            fv, src = _load_train_report_auto_depth()
-            if fv is None:
-                # If auto-depth requested but not found (e.g. training failed or strict mode yielded nothing), 
-                # fall back to safe default rather than hard crash, but warn loudly.
-                log.warning("[AUTO-DEPTH] Estimation failed or returned None. Falling back to default max depth.")
-                chosen_max_depth = max_depth_sdb_product
-                src_key = "fallback_default"
-            else:
-                src_key = src
-                chosen_max_depth = min(float(fv), float(max_depth_sdb_product))
-                log.info(
-                    f"[AUTO-DEPTH] Final product cap max_depth_sdb={chosen_max_depth:.2f} m "
-                    f"(from {src_key}; rmse_target={float(getattr(args,'rmse_target_sdb',0.5)):.2f} m; hard_cap={float(max_depth_sdb_product):.2f} m)."
-                )
-        else:
-            src_key = "cli"
-
-        _rr_add(rr, "sdb.max_depth.final_m", float(chosen_max_depth))
-        _rr_add(rr, "sdb.max_depth.source", str(src_key))
-
-        model_meta["max_depth_sdb"] = chosen_max_depth
-        model_meta["max_depth_sdb_final"] = chosen_max_depth
-        if auto_max_depth:
-            model_meta["max_depth_sdb_source"] = src_key
-            model_meta["rmse_target_sdb"] = float(getattr(args,'rmse_target_sdb',0.5))
-        else:
-            model_meta["max_depth_sdb_source"] = "cli"
-
-
+        # Model bank periodic retrain policy may intentionally reuse the last trained model,
+        # in which case train/test dataframes are empty by design.
+        reused_from_bank = False
         try:
-            with open(dir_model / "model_meta.json", "w") as f:
-                json.dump(model_meta, f, indent=2)
+            if isinstance(model_meta, dict):
+                reused_from_bank = bool(model_meta.get('model_bank', {}).get('reused_model', False))
         except Exception:
-            pass
+            reused_from_bank = False
+
+        if df_train_final is not None and df_train_final.empty and (not reused_from_bank):
+            log.error("Training failed (0 samples).")
+            return
+
+        src_rand_base = dir_plot / "SDB_Accuracy_Assessment_RandomSplit.png"
+        if src_rand_base.exists():
+            src_rand_base.rename(dir_plot / "Validation_RandomSplit.png")
+
+        src_rand_v1 = dir_plot / "SDB_Accuracy_Assessment_RandomSplit_V1_AllData.png"
+        if src_rand_v1.exists():
+            src_rand_v1.rename(dir_plot / "Validation_RandomSplit_V1_AllData.png")
 
 
-        report_lines = [
-            "="*60,
-            f"VALIDATION COMPARISON: {dir_name}",
-            "="*60,
-            f"{'Metric':<15} | {'Random (Prod)':<18} | {'Spatial (Val)':<18}",
-            "-" * 60,
-            f"{'RMSE (m)':<15} | {m_rand['rmse']:<18.3f} | {m_spat['rmse']:<18.3f}",
-            f"{'R²':<15} | {m_rand['r2']:<18.3f} | {m_spat['r2']:<18.3f}",
-            f"{'MAE (m)':<15} | {m_rand['mae']:<18.3f} | {m_spat['mae']:<18.3f}",
-            f"{'Test Size':<15} | {m_rand['n']:<18} | {m_spat['n']:<18}",
-            "="*60
-        ]
+        joblib.dump(rf, dir_model / "rf_model.pkl")
+        if stumpf_lr and (stumpf_lr is not True):
+            joblib.dump(stumpf_lr, str(dir_model / "stumpf_lr.pkl"))
 
-        if m_spat['rmse'] > m_rand['rmse'] * 1.5:
-            report_lines.append("[INSIGHT] Significant drop in Spatial Accuracy detected.")
-        else:
-            report_lines.append("[INSIGHT] Spatial Accuracy is comparable. Model generalizes well.")
+        _rr_artifact(rr, "rf_model_pkl", str(dir_model / "rf_model.pkl"))
+        if (dir_model / "stumpf_lr.pkl").exists():
+            _rr_artifact(rr, "stumpf_lr_pkl", str(dir_model / "stumpf_lr.pkl"))
 
-        report_text = "\n".join(report_lines)
-        print(report_text)
+        if args.no_doa:
+            log.info("[Config] Domain of Applicability (DoA) enforcement DISABLED by user.")
+            if "training_bounds" in model_meta:
+                del model_meta["training_bounds"]
 
-        with open(dir_logs / "validation_comparison.txt", "w") as f:
-            f.write(report_text)
+        model_meta["max_depth_sdb"] = max_depth_sdb_product
+        model_meta["water_class"] = args.water_class
+        with open(dir_model / "model_meta.json", "w") as f:
+            json.dump(model_meta, f, indent=2)
 
-    # --- SAVE GPKG ---
-    _save_training_gpkg(dir_data / "icesat_depths.gpkg", df_with_s2, df_train_final, df_test_final)
+        # Compute production (random split) validation metrics once for logging and model-bank gating.
+        m_rand = _calc_metrics(df_test_final)
+
+        chosen_max_depth = max_depth_sdb_product
+
+        # B. Optional Spatial Validation
+        if args.validate_spatial:
+            log.info("\n[TRAIN] Running Secondary Spatial Validation (Spatial Split)...")
+
+            _, _, _, df_test_spatial, model_meta_spatial = train.train_sdb_model(
+                train_df=df_with_s2,
+                max_depth_sdb=max_depth_sdb_product,
+                seed=args.seed,
+                plots_dir=dir_plot, water_class=args.water_class,
+                use_stumpf_depth=args.use_stumpf_depth,
+                min_training_points_for_sdb=args.min_training_points_for_sdb,
+                spatial_split=True,
+                cw_min=args.cw_min,
+                land_max=args.land_max,
+                land_mask_type=land_mask_type_for_train,
+                land_mask_water_val=land_mask_water_val_for_train,
+                land_mask_invert=land_mask_invert,
+                linf_enabled=args.linf_enabled,
+                linf_estimate=linf_est_mode,
+                linf_deepwater_nir_max=args.linf_deepwater_nir_max,
+                linf_deepwater_bright_max=args.linf_deepwater_bright_max,
+                linf_percentile=args.linf_percentile,
+                rmse_target_sdb=getattr(args,'rmse_target_sdb',1.0),
+                raster_paths=s2_paths,
+                depth_bin_m=float(getattr(args, 'depth_bin_m', 1.0)),
+                depth_binning=str(getattr(args, 'depth_binning', 'quantile')),
+                min_samples_per_bin=int(getattr(args, 'min_samples_per_bin', 10)),
+                model_bank_enabled=False,
+                model_bank_dir=model_bank_dir_run,
+                model_bank_max_samples=int(getattr(args,'bank_max_samples', 100000)),
+                model_bank_seed=int(getattr(args,'bank_seed', 1337)),
+                model_bank_retrain_min_new=int(getattr(args,'bank_retrain_min_new', 2000)),
+            )
+
+            src_spat_base = dir_plot / "SDB_Accuracy_Assessment_SpatialSplit.png"
+            if src_spat_base.exists():
+                src_spat_base.rename(dir_plot / "Validation_SpatialSplit.png")
+
+            src_spat_v1 = dir_plot / "SDB_Accuracy_Assessment_SpatialSplit_V1_AllData.png"
+            if src_spat_v1.exists():
+                src_spat_v1.rename(dir_plot / "Validation_SpatialSplit_V1_AllData.png")
+
+            m_rand = _calc_metrics(df_test_final)
+            m_spat = _calc_metrics(df_test_spatial)
+
+            def _fmt_metric_cell(v):
+                """Format metric cell for console tables.
+                Returns 'n/a' when the value is missing or non-finite to avoid misleading 'nan' output.
+                """
+                try:
+                    fv = float(v)
+                    return f"{fv:.3f}" if np.isfinite(fv) else "n/a"
+                except Exception:
+                    return "n/a"
+
+            def _fmt_count_cell(v):
+                try:
+                    return str(int(v))
+                except Exception:
+                    return str(v)
+
+
+            # ------------------------------------------------------------------
+            # Auto max-depth selection (depth-of-support)
+            # ------------------------------------------------------------------
+            chosen_max_depth = max_depth_sdb_product
+            src_key = None
+
+            def _load_train_report_auto_depth() -> tuple:
+                cand_paths = [
+                    dir_logs / "train_report.json",
+                    out_root / "train_report.json",
+                    dir_model / "train_report.json",
+                ]
+                for tp in cand_paths:
+                    try:
+                        if tp.exists() and tp.stat().st_size > 0:
+                            with open(tp, "r") as f:
+                                trj = json.load(f)
+                            tr = trj.get("train", {}) if isinstance(trj, dict) else {}
+                            v = tr.get("max_depth_sdb_auto_m", None)
+                            if v is None:
+                                diag = tr.get("max_depth_sdb_auto_diagnostics", None)
+                                if isinstance(diag, dict):
+                                    dm = diag.get("depths_m", {}) or diag.get("depths", {})
+                                    if isinstance(dm, dict):
+                                        v = dm.get("strict", dm.get("relaxed", None))
+                            if v is None:
+                                return None, None
+                            fv = float(v)
+                            if fv <= 0:
+                                return None, None
+                            return fv, f"{tp.name}:train.max_depth_sdb_auto_m"
+                    except Exception:
+                        continue
+                return None, None
+
+            if auto_max_depth:
+                fv, src = _load_train_report_auto_depth()
+                if fv is None:
+                    # If auto-depth requested but not found (e.g. training failed or strict mode yielded nothing), 
+                    # fall back to safe default rather than hard crash, but warn loudly.
+                    log.warning("[AUTO-DEPTH] Estimation failed or returned None. Falling back to default max depth.")
+                    chosen_max_depth = max_depth_sdb_product
+                    src_key = "fallback_default"
+                else:
+                    src_key = src
+                    chosen_max_depth = min(float(fv), float(max_depth_sdb_product))
+                    log.info(
+                        f"[AUTO-DEPTH] Final product cap max_depth_sdb={chosen_max_depth:.2f} m "
+                        f"(from {src_key}; rmse_target={float(getattr(args,'rmse_target_sdb',0.5)):.2f} m; hard_cap={float(max_depth_sdb_product):.2f} m)."
+                    )
+            else:
+                src_key = "cli"
+
+            _rr_add(rr, "sdb.max_depth.final_m", float(chosen_max_depth))
+            _rr_add(rr, "sdb.max_depth.source", str(src_key))
+
+            model_meta["max_depth_sdb"] = chosen_max_depth
+            model_meta["max_depth_sdb_final"] = chosen_max_depth
+            if auto_max_depth:
+                model_meta["max_depth_sdb_source"] = src_key
+                model_meta["rmse_target_sdb"] = float(getattr(args,'rmse_target_sdb',0.5))
+            else:
+                model_meta["max_depth_sdb_source"] = "cli"
+
+
+            try:
+                with open(dir_model / "model_meta.json", "w") as f:
+                    json.dump(model_meta, f, indent=2)
+            except Exception:
+                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+
+
+            report_lines = [
+                "="*60,
+                f"VALIDATION COMPARISON: {dir_name}",
+                "="*60,
+                f"{'Metric':<15} | {'Random (Prod)':<18} | {'Spatial (Val)':<18}",
+                "-" * 60,
+                f"{'RMSE (m)':<15} | {_fmt_metric_cell(m_rand.get('rmse')):<18} | {_fmt_metric_cell(m_spat.get('rmse')):<18}",
+                f"{'R²':<15} | {_fmt_metric_cell(m_rand.get('r2')):<18} | {_fmt_metric_cell(m_spat.get('r2')):<18}",
+                f"{'MAE (m)':<15} | {_fmt_metric_cell(m_rand.get('mae')):<18} | {_fmt_metric_cell(m_spat.get('mae')):<18}",
+                f"{'Test Size':<15} | {_fmt_count_cell(m_rand.get('n')):<18} | {_fmt_count_cell(m_spat.get('n')):<18}",
+                "="*60
+            ]
+
+            try:
+                r2_rand = float(m_rand.get('r2', float('nan')))
+                r2_spat = float(m_spat.get('r2', float('nan')))
+                rmse_rand = float(m_rand.get('rmse', float('nan')))
+                rmse_spat = float(m_spat.get('rmse', float('nan')))
+            except Exception:
+                r2_rand = r2_spat = rmse_rand = rmse_spat = float('nan')
+
+            n_rand = int(m_rand.get('n', 0) or 0) if str(m_rand.get('n', 0)).strip() != '' else 0
+            n_spat = int(m_spat.get('n', 0) or 0) if str(m_spat.get('n', 0)).strip() != '' else 0
+            if n_rand <= 0:
+                report_lines.append("[INSIGHT] Random production split metrics are unavailable (test set size is zero). This commonly happens when the production model was *reused from the model bank* (no new train/test split was generated) or when aggressive filtering removed all held-out points. Rely on spatial validation for this run.")
+            if (np.isfinite(r2_rand) and r2_rand < 0) or (np.isfinite(r2_spat) and r2_spat < 0):
+                report_lines.append("[INSIGHT] At least one validation R² is negative: do not treat this model as generalizing well (held-out performance is worse than a mean baseline on that split).")
+            elif np.isfinite(rmse_rand) and np.isfinite(rmse_spat) and rmse_spat > rmse_rand * 1.5:
+                report_lines.append("[INSIGHT] Significant drop in Spatial Accuracy detected.")
+            elif np.isfinite(r2_rand) and np.isfinite(r2_spat) and (r2_spat < 0.2):
+                report_lines.append("[INSIGHT] Validation metrics remain weak; do not interpret similar random/spatial RMSE as strong generalization.")
+            else:
+                report_lines.append("[INSIGHT] Spatial Accuracy is comparable and validation metrics are not obviously pathological.")
+
+            report_text = "\n".join(report_lines)
+            log.info(report_text)
+
+            with open(dir_logs / "validation_comparison.txt", "w") as f:
+                f.write(report_text)
+
+        # Persist model to the model bank for cross-tile consistency, but gate saves on validation quality.
+        try:
+            model_bank_save_ok = True
+            model_bank_gate_reason = "ok"
+            model_bank_gate_basis = "random"
+            model_bank_gate_r2 = None
+            m_spat_gate = locals().get("m_spat", None)
+
+            # Fail save if ANY available validation split reports negative R².
+            cand_metrics = [("random", m_rand)]
+            if isinstance(m_spat_gate, dict):
+                cand_metrics.append(("spatial", m_spat_gate))
+            for _basis, _m in cand_metrics:
+                if not isinstance(_m, dict):
+                    continue
+                try:
+                    _n = int(_m.get("n", 0) or 0)
+                except Exception:
+                    _n = 0
+                try:
+                    _r2 = float(_m.get("r2", float("nan")))
+                except Exception:
+                    _r2 = float("nan")
+                if _n > 0 and np.isfinite(_r2) and (_r2 < 0):
+                    model_bank_save_ok = False
+                    model_bank_gate_reason = f"negative_r2_{_basis}"
+                    model_bank_gate_basis = _basis
+                    model_bank_gate_r2 = float(_r2)
+                    break
+
+            if (model_bank_dir_run is not None) and (not reused_from_bank):
+                if model_bank_save_ok:
+                    model_bank_dir_run.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(dir_model / 'rf_model.pkl', model_bank_dir_run / 'rf_model.pkl')
+                    shutil.copy2(dir_model / 'model_meta.json', model_bank_dir_run / 'model_meta.json')
+                    if (dir_model / 'stumpf_lr.pkl').exists():
+                        shutil.copy2(dir_model / 'stumpf_lr.pkl', model_bank_dir_run / 'stumpf_lr.pkl')
+                    log.info(f"[MODEL_BANK] SAVED model artifacts to {model_bank_dir_run}")
+                    try:
+                        meta_p = model_bank_dir_run / 'bank_meta.json'
+                        if meta_p.exists():
+                            with open(meta_p, 'r') as _f:
+                                _bm = json.load(_f)
+                            _bm['last_trained_n_seen'] = int(_bm.get('n_seen', 0))
+                            _bm['last_trained_utc'] = datetime.utcnow().isoformat() + 'Z'
+                            with open(meta_p, 'w') as _f:
+                                json.dump(_bm, _f, indent=2)
+                    except Exception:
+                        log.debug('[MODEL_BANK] Failed to update last_trained checkpoint.', exc_info=True)
+                    if rr is not None:
+                        rr.add('model_bank.model_saved', True)
+                        rr.add('model_bank.model_dir', str(model_bank_dir_run))
+                        rr.add('model_bank.save_gate', {'ok': True, 'reason': model_bank_gate_reason})
+                else:
+                    log.warning(
+                        f"[MODEL_BANK] Skip save: validation gate failed ({model_bank_gate_reason}, "
+                        f"basis={model_bank_gate_basis}, R²={model_bank_gate_r2:.3f})."
+                    )
+                    if rr is not None:
+                        rr.add('model_bank.model_saved', False)
+                        rr.add('model_bank.save_gate', {
+                            'ok': False,
+                            'reason': model_bank_gate_reason,
+                            'basis': model_bank_gate_basis,
+                            'r2': model_bank_gate_r2,
+                        })
+        except Exception as e:
+            log.warning(f"[MODEL_BANK] Failed to save model artifacts: {e}")
+            if rr is not None:
+                rr.add('model_bank.model_saved', False)
+                rr.add('model_bank.model_save_error', str(e))
+
+        # --- SAVE GPKG ---
+        _save_training_gpkg(dir_data / "icesat_depths.gpkg", df_with_s2, df_train_final, df_test_final)
+
+    else:
+        log.info("[MODEL_CACHE] Skipping training/validation; using cached model artifacts in model/")
+        # Ensure downstream references exist
+        try:
+            if df_test_final is None:
+                df_test_final = pd.DataFrame()
+            if df_train_final is None:
+                df_train_final = pd.DataFrame()
+        except Exception:
+            log.debug('[SDB] Optional pandas DataFrame normalization failed; continuing.', exc_info=True)
 
     # 8. Visual Debugging
     if not df_train_final.empty:
@@ -1850,7 +2266,7 @@ def main():
     
     if not use_chunked:
         # Standard prediction
-        predict.predict_scene(
+        predict_result_meta = predict.predict_scene(
             s2_paths=s2_paths,
             land_mask_path=str(land_mask_out),
             rf_model_path=str(dir_model / "rf_model.pkl"),
@@ -2091,7 +2507,7 @@ def main():
             rr.write(status="ok")
             log.info("\n=== SDB Pipeline Completed Successfully ===")
     except Exception:
-        pass
+        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
 
 def parse_args():
@@ -2119,6 +2535,26 @@ def parse_args():
                    help="Exclude code fingerprint from cache keys (default: True for dev workflow).")
     p.add_argument("--no-cache-ignore-code", dest="cache_ignore_code", action="store_false",
                    help="Include code fingerprint in cache keys (invalidates cache when code changes).")
+    # Model Bank (bounded reservoir) – accumulates training across AOIs for seam-consistent tiling
+    p.add_argument("--model-bank", default="auto",
+                   help="Model bank directory for incremental training. 'auto' => <cache-root>/model_bank/sdb_global_v1")
+    p.add_argument("--no-model-bank", dest="model_bank_enabled", action="store_false",
+                   help="Disable model bank; train only on this AOI (not recommended for seamless tiling).")
+    p.set_defaults(model_bank_enabled=True)
+    p.add_argument("--bank-max-samples", type=int, default=100000,
+                   help="Max samples to keep in the model bank reservoir (bounded disk).")
+    p.add_argument("--bank-seed", type=int, default=1337,
+                   help="Seed for deterministic reservoir sampling in the model bank.")
+    p.add_argument("--bank-retrain-min-new", type=int, default=2000,
+                   help="Only retrain the RF when at least this many new samples have been added to the bank since last training (stability + speed).")
+
+    # Deprecated: regional model cache (skip-training). Use model bank instead.
+    p.add_argument("--model-cache-key", default="auto",
+                   help="[DEPRECATED] Key for regional SDB model reuse. Prefer --model-bank.")
+    p.add_argument("--no-model-cache", dest="model_cache_enabled", action="store_false",
+                   help="[DEPRECATED] Disable regional model reuse.")
+    p.set_defaults(model_cache_enabled=False)
+
     p.add_argument("--s2-module", default="s2_optics.py",
                    help="Path to s2_optics module .py file to use for composites")
 
@@ -2165,7 +2601,7 @@ def parse_args():
 
     # Sentinel-2 selection / STAC pagination (metadata-first)
     p.add_argument("--s2-scene-limit", type=int, default=10,
-                   help="Number of Sentinel-2 scenes to download per tile (selected by lowest cloud %).")
+                   help="Number of Sentinel-2 scenes to download per tile (selected by lowest cloud percentage).")
     p.add_argument("--min-scene-valid_frac", type=float, default=0.90,
                    help="Drop any candidate scene whose valid-pixel fraction is below this (artifact rejection).")
     p.add_argument("--edge-weight-power", type=float, default=2.0,
@@ -2218,6 +2654,8 @@ def parse_args():
                         "providing to this pipeline. Example: dlim -R=W/E/S/N hydronos -P epsg:4269+5714 > soundings_msl.xyz")
     p.add_argument("--extra-xyz-crs", default="EPSG:4326", 
                    help="Horizontal CRS for extra XYZ data. Vertical datum should be MSL (see --extra-xyz help).")
+    p.add_argument("--extra-xyz-sdb-mode", choices=["auto","allow","exclude"], default="auto",
+                   help="How extra XYZ is used for SDB training. auto = apply conservative guardrails for likely bed-elevation/mixed-sign sources; allow = always include; exclude = never use in SDB training (still available to river workflow in bathy_main).")
 
     # Working / datum harmonization
     p.add_argument("--working-srs", default="auto",

@@ -16,7 +16,7 @@ model learns generalizable relationships rather than location-specific patterns.
 """
 
 import logging
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Tuple, Any
 from dataclasses import dataclass
 import numpy as np
 import pandas as pd
@@ -112,7 +112,7 @@ def analyze_depth_coverage(
     
     Returns coverage score, gap ranges, and histogram.
     """
-    depths = df[depth_col].to_numpy()
+    depths = pd.to_numeric(df[depth_col], errors="coerce").to_numpy(dtype=float)
     depths = depths[np.isfinite(depths) & (depths > 0)]
     
     if len(depths) == 0:
@@ -173,7 +173,8 @@ def analyze_spectral_diversity(
     coverage_scores = []
     
     for col in feature_cols:
-        vals = df[col].to_numpy()
+        # Coerce to numeric to avoid object/dict columns breaking np.isfinite
+        vals = pd.to_numeric(df[col], errors='coerce').to_numpy(dtype=float)
         vals = vals[np.isfinite(vals)]
         
         if len(vals) < 10:
@@ -368,11 +369,11 @@ def analyze_training_diversity(
     
     # Cluster analysis for spatial distribution
     from sklearn.cluster import KMeans
-    coords = df[["longitude", "latitude"]].to_numpy()
+    coords = df[["longitude", "latitude"]].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
     valid = np.all(np.isfinite(coords), axis=1)
     n_clusters = min(10, len(df) // 100)
     if n_clusters >= 2 and np.sum(valid) >= n_clusters:
-        km = KMeans(n_clusters=n_clusters, random_state=42, n_init="auto")
+        km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
         labels = np.full(len(df), -1)
         labels[valid] = km.fit_predict(coords[valid])
         cluster_sizes = [int(np.sum(labels == k)) for k in range(n_clusters)]
@@ -441,7 +442,8 @@ def plot_diversity_analysis(
     """
     Generate visualization of training data diversity.
     """
-    import matplotlib.pyplot as plt
+    from plot_utils import lazy_pyplot
+    plt = lazy_pyplot()
     from matplotlib.patches import Rectangle
     
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
@@ -644,6 +646,6 @@ if __name__ == "__main__":
     with open(output_dir / "diversity_report.json", "w") as f:
         json.dump(report_dict, f, indent=2)
     
-    print("\nRecommendations:")
+    log.info("\nRecommendations:")
     for rec in report.recommendations:
-        print(f"  • {rec}")
+        log.info(f"  • {rec}")

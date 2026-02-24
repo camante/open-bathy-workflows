@@ -17,7 +17,6 @@ Notes
   * Falling back to local registry coefficients when endpoints/fields change
 """
 
-from __future__ import annotations
 
 import json
 import os
@@ -71,7 +70,7 @@ def cached_get_json(cfg: NSSConfig, url: str) -> Any:
         try:
             return json.load(open(path, "r", encoding="utf-8"))
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
     obj = _http_get_json(url, cfg.timeout_s, cfg.user_agent)
 

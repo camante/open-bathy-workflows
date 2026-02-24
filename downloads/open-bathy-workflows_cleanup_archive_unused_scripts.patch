@@ -1,0 +1,254 @@
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..b20f817
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,75 @@
++# Open Bathy Workflows (script-based)
++
++This repository is a **script-first** workflow for generating bathymetry products from:
++
++- **SDB (Satellite‑Derived Bathymetry)** from Sentinel‑2 + optional ICESat‑2 + optional external XYZ soundings
++- **River bathymetry** inferred from a river network + a bank DEM via cross‑section sampling/interpolation
++- **Fusion** of SDB + river products into a single depth raster
++
++## Main entrypoint
++
++Run the full workflow via **`bathy_main.py`**:
++
++```bash
++python bathy_main.py \
++  --aoi="-74.52/-74.23/40.23/40.52" \
++  --start 2024-01-01 \
++  --end 2026-01-01 \
++  --out-dir output/nyc \
++  --extra-xyz-cudem=hydronos,ehydro
++```
++
++`bathy_main.py` orchestrates three sub-pipelines:
++
++1. **SDB** (subprocess call to `sdb_main.py`)
++2. **River** (subprocess calls to `xs_builder.py` then `xs_infer_bathy_raster.py`)
++3. **Fusion** (Python import/call of `fusion.py`)
++
++## Script map
++
++These are the scripts that are *in the execution path* when you run `bathy_main.py` (directly, or via imports):
++
++### Orchestration / shared utilities
++
++- **`bathy_main.py`** — top-level driver; validates config, runs SDB + river, then fuses outputs.
++- **`validation.py`** — pipeline configuration validation.
++- **`checkpoints.py`** — checkpoint bookkeeping so long runs can resume.
++- **`logging_config.py`** — consistent logging setup.
++- **`utils.py`** — common helpers (I/O, CRS helpers, etc.).
++
++### SDB pipeline
++
++- **`sdb_main.py`** — SDB driver; acquires Sentinel‑2 scenes, builds optical features, samples training points from ATL/XYZ, trains a model, predicts rasters.
++- **`s2_optics.py`** — Sentinel‑2 processing (scene search/filter, composites, masks, feature stacks).
++- **`atl.py`** — ICESat‑2 utilities (reading/filters, refraction correction support, track sampling).
++- **`train.py` / `sdb_train.py`** — training dataset construction and model training.
++- **`predict.py` / `sdb_predict.py`** — applying the trained model to create SDB depth rasters.
++- **`align.py`** — alignment/offset handling between sources.
++- **`masks.py`** — land/water/clear-water and related masking logic.
++- **`glint.py`** — (optional) sunglint utilities when enabled.
++
++### River pipeline
++
++- **`river_network.py`** — fetches/builds the river network layers used for cross-sections.
++- **`xs_builder.py`** — builds cross-sections from the river network + DEM.
++- **`xs_infer_bathy_raster.py`** — infers river depths/bed elevations from cross-sections + DEM + optional soundings.
++- **`river_cache.py`** — caching for river intermediates/outputs.
++
++### Fusion
++
++- **`fusion.py`** — combines SDB + river products into the final raster(s) in `out-dir/combined/`.
++
++> Notes
++> - The exact set of modules imported at runtime may vary by options (e.g., enabling/disabling glint correction or choosing different ICESat-2 sources).
++> - The scripts above are the *core path* used by the `bathy_main.py` workflow.
++
++## Archive
++
++Scripts that are not referenced by the current `bathy_main.py` workflow (and were cluttering the root) were moved to:
++
++- **`archive/likely_unused/`**
++
++These are preserved for reference, experimentation, or future reintegration. If you rely on any of them directly, you can either:
++
++- run them from their archived location, or
++- move them back to the repo root and update imports accordingly.
+diff --git a/archive/README.md b/archive/README.md
+new file mode 100644
+index 0000000..94e4d45
+--- /dev/null
++++ b/archive/README.md
+@@ -0,0 +1,7 @@
++# Archive
++
++This directory holds scripts and experiments that are not part of the current default `bathy_main.py` execution path.
++
++- `likely_unused/` – scripts that are not referenced by the current pipeline entrypoints (`bathy_main.py`, `sdb_main.py`, `xs_builder.py`, `xs_infer_bathy_raster.py`, `fusion.py`).
++
++If you discover one of these is still needed for your workflow, you can move it back to the repo root (or update imports/calls accordingly).
+diff --git a/CHANGELOG_v0.7.2.py b/archive/likely_unused/CHANGELOG_v0.7.2.py
+similarity index 100%
+rename from CHANGELOG_v0.7.2.py
+rename to archive/likely_unused/CHANGELOG_v0.7.2.py
+diff --git a/archive/likely_unused/README.md b/archive/likely_unused/README.md
+new file mode 100644
+index 0000000..15be2d3
+--- /dev/null
++++ b/archive/likely_unused/README.md
+@@ -0,0 +1,58 @@
++# Archived scripts (likely unused by `bathy_main.py`)
++
++This folder holds scripts that are **not in the current execution path** when running the end-to-end workflow via:
++
++```bash
++python bathy_main.py ...
++```
++
++They were moved out of the repo root to reduce clutter and make it clearer which scripts are part of the supported pipeline.
++
++## What’s here
++
++The archived scripts are mostly:
++
++- **Old/legacy entrypoints** from earlier workflow iterations
++- **One-off utilities** for QA/QC, plotting, or packaging
++- **Experimental prototypes** (e.g., alternative interpolation or adjustment approaches)
++
++These scripts may still be useful, but they are **not imported or called** by the default pipeline (as of v1.2).
++
++## How to use an archived script
++
++If you want to run an archived script directly:
++
++```bash
++python archive/likely_unused/<script_name>.py --help
++```
++
++If you want to reintegrate one into the pipeline, move it back to the repo root (or a proper module directory) and update any imports/CLI calls accordingly.
++
++## Contents
++
++Currently archived:
++
++- `CHANGELOG_v0.7.2.py`
++- `adaptive_spatial_cv.py`
++- `apply_patches.py`
++- `bank_mask_from_xs.py`
++- `bathy_interp_cli.py`
++- `cudem_river_burn_taper.py`
++- `cudem_river_fill_monotonic.py`
++- `diagnose_bands.py`
++- `generate_script_reference.py`
++- `hyperparameter_tuning.py`
++- `idw_gpu.py`
++- `make_channel_mask.py`
++- `measured_mask_from_points.py`
++- `optical_utils.py`
++- `prediction_validation.py`
++- `river_bathy.py`
++- `river_skeleton.py`
++- `setup.py`
++- `swot_adjust.py`
++- `tidal.py`
++- `tile_blending.py`
++- `unified_bathy_report.py`
++- `waffles_bathy_interp.py`
++- `xs_adjust_monotonic.py`
+diff --git a/adaptive_spatial_cv.py b/archive/likely_unused/adaptive_spatial_cv.py
+similarity index 100%
+rename from adaptive_spatial_cv.py
+rename to archive/likely_unused/adaptive_spatial_cv.py
+diff --git a/apply_patches.py b/archive/likely_unused/apply_patches.py
+similarity index 100%
+rename from apply_patches.py
+rename to archive/likely_unused/apply_patches.py
+diff --git a/bank_mask_from_xs.py b/archive/likely_unused/bank_mask_from_xs.py
+similarity index 100%
+rename from bank_mask_from_xs.py
+rename to archive/likely_unused/bank_mask_from_xs.py
+diff --git a/bathy_interp_cli.py b/archive/likely_unused/bathy_interp_cli.py
+similarity index 100%
+rename from bathy_interp_cli.py
+rename to archive/likely_unused/bathy_interp_cli.py
+diff --git a/cudem_river_burn_taper.py b/archive/likely_unused/cudem_river_burn_taper.py
+similarity index 100%
+rename from cudem_river_burn_taper.py
+rename to archive/likely_unused/cudem_river_burn_taper.py
+diff --git a/cudem_river_fill_monotonic.py b/archive/likely_unused/cudem_river_fill_monotonic.py
+similarity index 100%
+rename from cudem_river_fill_monotonic.py
+rename to archive/likely_unused/cudem_river_fill_monotonic.py
+diff --git a/diagnose_bands.py b/archive/likely_unused/diagnose_bands.py
+similarity index 100%
+rename from diagnose_bands.py
+rename to archive/likely_unused/diagnose_bands.py
+diff --git a/generate_script_reference.py b/archive/likely_unused/generate_script_reference.py
+similarity index 100%
+rename from generate_script_reference.py
+rename to archive/likely_unused/generate_script_reference.py
+diff --git a/hyperparameter_tuning.py b/archive/likely_unused/hyperparameter_tuning.py
+similarity index 100%
+rename from hyperparameter_tuning.py
+rename to archive/likely_unused/hyperparameter_tuning.py
+diff --git a/idw_gpu.py b/archive/likely_unused/idw_gpu.py
+similarity index 100%
+rename from idw_gpu.py
+rename to archive/likely_unused/idw_gpu.py
+diff --git a/make_channel_mask.py b/archive/likely_unused/make_channel_mask.py
+similarity index 100%
+rename from make_channel_mask.py
+rename to archive/likely_unused/make_channel_mask.py
+diff --git a/measured_mask_from_points.py b/archive/likely_unused/measured_mask_from_points.py
+similarity index 100%
+rename from measured_mask_from_points.py
+rename to archive/likely_unused/measured_mask_from_points.py
+diff --git a/optical_utils.py b/archive/likely_unused/optical_utils.py
+similarity index 100%
+rename from optical_utils.py
+rename to archive/likely_unused/optical_utils.py
+diff --git a/prediction_validation.py b/archive/likely_unused/prediction_validation.py
+similarity index 100%
+rename from prediction_validation.py
+rename to archive/likely_unused/prediction_validation.py
+diff --git a/river_bathy.py b/archive/likely_unused/river_bathy.py
+similarity index 100%
+rename from river_bathy.py
+rename to archive/likely_unused/river_bathy.py
+diff --git a/river_skeleton.py b/archive/likely_unused/river_skeleton.py
+similarity index 100%
+rename from river_skeleton.py
+rename to archive/likely_unused/river_skeleton.py
+diff --git a/setup.py b/archive/likely_unused/setup.py
+similarity index 100%
+rename from setup.py
+rename to archive/likely_unused/setup.py
+diff --git a/swot_adjust.py b/archive/likely_unused/swot_adjust.py
+similarity index 100%
+rename from swot_adjust.py
+rename to archive/likely_unused/swot_adjust.py
+diff --git a/tidal.py b/archive/likely_unused/tidal.py
+similarity index 100%
+rename from tidal.py
+rename to archive/likely_unused/tidal.py
+diff --git a/tile_blending.py b/archive/likely_unused/tile_blending.py
+similarity index 100%
+rename from tile_blending.py
+rename to archive/likely_unused/tile_blending.py
+diff --git a/unified_bathy_report.py b/archive/likely_unused/unified_bathy_report.py
+similarity index 100%
+rename from unified_bathy_report.py
+rename to archive/likely_unused/unified_bathy_report.py
+diff --git a/waffles_bathy_interp.py b/archive/likely_unused/waffles_bathy_interp.py
+similarity index 100%
+rename from waffles_bathy_interp.py
+rename to archive/likely_unused/waffles_bathy_interp.py
+diff --git a/xs_adjust_monotonic.py b/archive/likely_unused/xs_adjust_monotonic.py
+similarity index 100%
+rename from xs_adjust_monotonic.py
+rename to archive/likely_unused/xs_adjust_monotonic.py

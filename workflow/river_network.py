@@ -35,10 +35,13 @@ Dependencies
 - pyproj
 - numpy"""
 
-from __future__ import annotations
 
 import argparse
 import hashlib
+import warnings
+
+# Silence GeoPandas GeoSeries.notna() behavior-change warning (we explicitly handle empties).
+warnings.filterwarnings('ignore', message='GeoSeries.notna\(\) previously returned False.*', category=UserWarning)
 import json
 import logging
 
@@ -53,6 +56,9 @@ from typing import Optional, Tuple, Dict, List, Any
 
 import numpy as np
 import pandas as pd
+
+# Ensure GeoPandas remains usable on pandas>=2.0 even if GeoPandas lags.
+import compat_pandas  # noqa: F401
 import geopandas as gpd
 import requests
 from shapely.geometry import box, Point
@@ -129,7 +135,11 @@ def arcgis_query_layer_geojson(
             raise RuntimeError(f"ArcGIS query error: {js.get('error')}")
 
         # Read GeoJSON into GeoDataFrame
-        gdf = gpd.read_file(json.dumps(js), driver="GeoJSON")
+        # Avoid pyogrio runtime warning on in-memory GeoJSON strings (driver/open option mismatch)
+        try:
+            gdf = gpd.GeoDataFrame.from_features(js.get("features", []), crs="EPSG:4326")
+        except Exception:
+            gdf = gpd.read_file(json.dumps(js))
         if gdf is None or gdf.empty:
             break
 
@@ -274,59 +284,71 @@ def try_arcgis_nhdarea_polygons(
     out_crs: Optional[str],
     timeout_s: int = 120,
 ) -> gpd.GeoDataFrame:
-    """Fetch NHDArea polygons via ArcGIS REST (best-effort).
+    """Fetch polygonal river areas via ArcGIS REST (best-effort).
 
-    This is used downstream to constrain river bathymetry predictions to polygonal channel areas
-    when those features exist (e.g., wide rivers, braided channels, tidal channels).
+    Important: we want *river/stream* polygons (NHD "Area" features), NOT lakes/waterbodies.
+    In the TNM NHD MapServer, these typically live in the generic Area layers (e.g. 9/7),
+    and the river class is commonly encoded as StreamRiver (often FType=460).
 
     Returns GeoDataFrame in projected CRS (out_crs or auto-UTM). Empty on failure.
     """
     lonc, latc = _aoi_center(aoi)
     crs_out = CRS.from_user_input(out_crs) if out_crs else CRS.from_epsg(_auto_utm_epsg_from_lonlat(lonc, latc))
 
-    # Try NHD MapServer first (most common place for NHDArea)
-    layer_id = arcgis_find_layer_id(
-        NHD_MAPSERVER,
-        name_patterns=["NHDArea", "NHD Area"],
-        timeout_s=min(60, timeout_s),
-    )
-    if layer_id is not None:
-        try:
-            log.info("[ARCGIS] Querying NHDArea polygons (%s layer %s) ...", NHD_MAPSERVER, layer_id)
-            gdf_ll = arcgis_query_layer_geojson(NHD_MAPSERVER, layer_id, aoi, timeout_s=timeout_s)
-            if gdf_ll is not None and not gdf_ll.empty:
-                gdfp = gdf_ll.to_crs(crs_out)
-                gdfp = _clean_polys(gdfp)
-                if not gdfp.empty:
-                    gdfp["source"] = "arcgis_nhdarea"
-                    return gdfp
-        except Exception as e:
-            log.warning("[ARCGIS] NHDArea query failed: %s", str(e))
+    def _filter_streamriver_polys(gdf_in: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+        if gdf_in is None or gdf_in.empty:
+            return gpd.GeoDataFrame(columns=["geometry"], crs=gdf_in.crs if gdf_in is not None else crs_out)
 
-    # Fallback: some services expose similar polygons under waterbody/area names.
-    layer_id = arcgis_find_layer_id(
-        NHD_MAPSERVER,
-        name_patterns=["NHD Waterbody", "NHDWaterbody", "Waterbody"],
-        timeout_s=min(60, timeout_s),
-    )
-    if layer_id is not None:
-        try:
-            log.info("[ARCGIS] Querying NHD waterbody polygons (%s layer %s) ...", NHD_MAPSERVER, layer_id)
-            gdf_ll = arcgis_query_layer_geojson(NHD_MAPSERVER, layer_id, aoi, timeout_s=timeout_s)
-            if gdf_ll is not None and not gdf_ll.empty:
-                gdfp = gdf_ll.to_crs(crs_out)
-                gdfp = _clean_polys(gdfp)
-                if not gdfp.empty:
-                    gdfp["source"] = "arcgis_waterbody"
-                    return gdfp
-        except Exception as e:
-            log.warning("[ARCGIS] Waterbody polygon query failed: %s", str(e))
+        gdf_in = gdf_in.copy()
 
+        # Find a plausible feature-type field
+        ftype_field = None
+        for c in ["FType", "FTYPE", "ftype", "FTypeName", "FTYPENAME", "ftypename", "FeatureType", "FEATURETYPE"]:
+            if c in gdf_in.columns:
+                ftype_field = c
+                break
+
+        if ftype_field is None:
+            # No reliable classification field; treat as unusable (forces corridor fallback)
+            return gpd.GeoDataFrame(columns=["geometry"], crs=gdf_in.crs)
+
+        vals = gdf_in[ftype_field]
+
+        # Numeric coding (common: StreamRiver=460)
+        keep = None
+        try:
+            vnum = vals.astype("float64")
+            keep = (vnum == 460)
+        except Exception:
+            # String coding (common: "StreamRiver")
+            vstr = vals.astype(str).str.lower()
+            keep = vstr.str.contains("streamriver") | vstr.str.contains("stream river")
+
+        gdf_out = gdf_in.loc[keep].copy()
+        gdf_out = _clean_polys(gdf_out)
+        return gdf_out
+
+    # Prefer the NHD MapServer "Area" layers (these are polygonal channel areas).
+    # Layer IDs observed in the TNM NHD service:
+    #   9 = Area - Large Scale
+    #   7 = Area - Small Scale
+    for layer_id, label in [(9, "area_large"), (7, "area_small")]:
+        try:
+            log.info("[ARCGIS] Querying NHD Area polygons (%s layer %d) ...", NHD_MAPSERVER, layer_id)
+            gdf_ll = arcgis_query_layer_geojson(NHD_MAPSERVER, layer_id, aoi, timeout_s=timeout_s)
+            if gdf_ll is None or gdf_ll.empty:
+                continue
+            gdfp = gdf_ll.to_crs(crs_out)
+            gdfp = _filter_streamriver_polys(gdfp)
+            if gdfp is not None and not gdfp.empty:
+                gdfp["source"] = f"arcgis_{label}"
+                return gdfp
+        except Exception as e:
+            log.warning("[ARCGIS] Area polygon query failed (layer=%d): %s", layer_id, str(e))
+
+    # If we couldn't get StreamRiver polygons, return empty to trigger downstream corridor fallback.
     return gpd.GeoDataFrame(columns=["geometry"], crs=crs_out)
 
-# --------------------------------------------------------------------------------------
-# AOI / CRS helpers
-# --------------------------------------------------------------------------------------
 
 def _parse_aoi(aoi_str: str) -> Tuple[float, float, float, float]:
     parts = aoi_str.strip().split("/")
@@ -566,7 +588,7 @@ def tnm_download_products(items: List[Dict[str, Any]], out_dir: Path, timeout_s:
                 if part.exists():
                     part.unlink()
             except Exception:
-                pass
+                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
     return downloaded
 
@@ -722,7 +744,7 @@ def download_hydrorivers_zip(region: str, out_dir: Path, timeout_s: int = 600) -
             if part.exists():
                 part.unlink()
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
         raise
 
     return dst
@@ -1017,6 +1039,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--tnm-timeout", type=int, default=120, help="HTTP timeout seconds for TNM search/download.")
     p.add_argument("--arcgis-timeout", type=int, default=120, help="HTTP timeout seconds for ArcGIS REST flowline fallback.")
 
+    p.add_argument("--hydrography-source", default="arcgis", choices=["arcgis","arcgis_tnm","tnm"],
+                   help="Hydrography acquisition strategy: arcgis (default) queries ArcGIS REST first; arcgis_tnm uses TNM as a fallback; tnm prefers TNM.")
+
     # Optional NHDArea polygons (constrains river bathymetry domain when available)
     p.add_argument("--no-nhdarea-polygons", dest="nhdarea_enable", action="store_false", default=True,
                    help="Disable ArcGIS REST fetch of NHDArea polygons.")
@@ -1074,8 +1099,26 @@ def main() -> None:
             gdf["source"] = "nhd_local"
             log.info("[OK] Loaded %d reaches from --nhd-flowlines.", len(gdf))
 
-    # 2) TNM auto-download for NHD (US)
-    if (gdf is None or gdf.empty) and args.tnm_enable and (not args.nhd_flowlines):
+    # 2) Hydrography acquisition (ArcGIS primary by default)
+    hydro_src = getattr(args, "hydrography_source", "arcgis").lower().strip()
+
+    # 2a) ArcGIS REST (primary/fast path)
+    if (gdf is None or gdf.empty) and (not args.nhd_flowlines) and (hydro_src in ("arcgis", "arcgis_tnm")):
+        gdf_arc = try_arcgis_nhd_flowlines(
+            aoi=aoi,
+            out_crs=args.out_crs,
+            timeout_s=int(getattr(args, "arcgis_timeout", 120)),
+        )
+        if gdf_arc is not None and not gdf_arc.empty:
+            gdf = gdf_arc
+            log.info(
+                "[OK] Loaded %d reaches via ArcGIS REST (%s).",
+                len(gdf),
+                str(gdf.get("source", ["arcgis"]).iloc[0]) if "source" in gdf.columns else "arcgis",
+            )
+
+    # 2b) TNM explicit fallback (ONLY when requested via --hydrography-source=arcgis_tnm or tnm)
+    if (gdf is None or gdf.empty) and (not args.nhd_flowlines) and (hydro_src in ("arcgis_tnm", "tnm")) and args.tnm_enable:
         cache_root = Path(args.cache_dir) / f"tnm_nhd_{_aoi_hash(aoi)}"
         dl_dir = cache_root / "downloads"
         wk_dir = cache_root / "work"
@@ -1120,14 +1163,17 @@ def main() -> None:
         else:
             log.warning("[TNM] No products found for AOI.")
 
-    # 3) ArcGIS REST fallback (still NHD-derived): if TNM download yields nothing usable,
-    # try querying NHDPlus_HR / NHD MapServers directly for flowlines.
-    if (gdf is None or gdf.empty) and (not args.nhd_flowlines):
-        gdf_arc = try_arcgis_nhd_flowlines(aoi=aoi, out_crs=args.out_crs, timeout_s=int(getattr(args, "arcgis_timeout", 120)))
+    # 2c) Guardrail: if user forced TNM but it failed, try ArcGIS so the run can proceed.
+    if (gdf is None or gdf.empty) and (not args.nhd_flowlines) and hydro_src == "tnm":
+        gdf_arc = try_arcgis_nhd_flowlines(
+            aoi=aoi,
+            out_crs=args.out_crs,
+            timeout_s=int(getattr(args, "arcgis_timeout", 120)),
+        )
         if gdf_arc is not None and not gdf_arc.empty:
             gdf = gdf_arc
-            log.info("[OK] Loaded %d reaches via ArcGIS REST fallback (%s).", len(gdf), str(gdf["source"].iloc[0]) if "source" in gdf.columns else "arcgis")
-
+            log.warning("[TNM] No usable TNM flowlines; falling back to ArcGIS REST (%s).",
+                        str(gdf.get("source", ["arcgis"]).iloc[0]) if "source" in gdf.columns else "arcgis")
 # 3) HydroRIVERS fallback — local path OR auto-download
     if gdf is None or gdf.empty:
         hydrorivers_path = None

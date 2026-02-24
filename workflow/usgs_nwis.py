@@ -15,6 +15,7 @@ Design goals:
 Refs:
 - NWIS Water Services: https://waterservices.usgs.gov/
 """
+
 from __future__ import annotations
 
 import io
@@ -24,7 +25,7 @@ import logging
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Dict, Optional, List, Tuple
+from typing import Optional, List
 
 import pandas as pd
 
@@ -42,7 +43,7 @@ def _read_text_cached(url: str, cache_path: Optional[Path], timeout_s: int = 45)
         try:
             return cache_path.read_text(encoding="utf-8", errors="replace")
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
     req = urllib.request.Request(
         url,
@@ -60,7 +61,7 @@ def _read_text_cached(url: str, cache_path: Optional[Path], timeout_s: int = 45)
             _ensure_dir(cache_path.parent)
             cache_path.write_text(text, encoding="utf-8")
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
     # be a polite client
     time.sleep(0.1)

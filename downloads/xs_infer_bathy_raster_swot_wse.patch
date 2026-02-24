@@ -1,0 +1,302 @@
+--- a/xs_infer_bathy_raster.py
++++ b/xs_infer_bathy_raster.py
+@@ -41,6 +41,23 @@
+ - If template CRS is geographic (degrees), interpolation distances are computed in a local UTM
+   CRS (auto-estimated from data), while outputs remain in the template CRS.
+ - Nodata is propagated and treated consistently; default nodata=-9999.0 for float rasters.
++
++Optional: SWOT water-surface elevation (WSE) stage anchoring
++-----------------------------------------------------------
++If you provide SWOT (or other) WSE point observations, the script can blend or replace the per-XS
++DEM/topo-derived WSE proxy. This helps constrain bed elevations in backwater/tidal reaches where the
++proxy stage can be biased.
++
++Example:
++  python xs_infer_bathy_raster.py \
++    --xs-gpkg river_xs.gpkg \
++    --out-gpkg river_xs_bathy.gpkg \
++    --swot-wse swot_wse_points.gpkg \
++    --swot-wse-col wse_m \
++    --swot-stage-blend 1.0
++
++Use --no-swot-use-for-slope if you want observed stage to shift bed elevations but NOT drive the
++longitudinal WSE-profile slope fit.
+ """
+ 
+ from __future__ import annotations
+@@ -130,6 +147,19 @@
+     wse_center_frac: float = 0.10
+     wse_quantile: float = 0.10
+     wse_fallback_drop_m: float = 0.50
++
++# Optional SWOT (or other) water-surface elevation (stage) observations
++# If provided, these can be used to anchor/blend the per-XS WSE proxy.
++swot_wse: Optional[Path] = None
++swot_wse_col: str = "wse_m"
++swot_x_col: Optional[str] = None  # for CSV inputs
++swot_y_col: Optional[str] = None  # for CSV inputs
++swot_csv_crs: str = "EPSG:4326"  # CRS for CSV lon/lat or x/y columns
++swot_max_dist_m: float = 1000.0
++swot_stage_blend: float = 1.0  # 0 => ignore obs; 1 => replace proxy when available
++swot_vertical_offset_m: float = 0.0
++swot_outlier_mad_z: float = 4.0
++swot_use_for_slope: bool = True  # if True, blended WSE drives WSE-profile slope fit
+ 
+     # Prior (base width->depth power law; Leopold & Maddock 1953 as default)
+     a: float = HYDRAULIC_GEOMETRY_A
+@@ -944,6 +974,169 @@
+     return gpd.GeoDataFrame(df, geometry="geometry", crs=target_crs)
+ 
+ 
++
++
++def _load_wse_obs(
++    path: Path,
++    target_crs,
++    wse_col: str = "wse_m",
++    x_col: Optional[str] = None,
++    y_col: Optional[str] = None,
++    csv_crs: str = "EPSG:4326",
++) -> Optional[gpd.GeoDataFrame]:
++    """Load water-surface elevation (WSE) observations as points.
++
++    Supported:
++      - Vector (gpkg/shp/geojson): point geometries + a WSE column
++      - CSV: requires x_col/y_col + a WSE column
++
++    Returns a GeoDataFrame in target_crs with a float column `_wse_m`.
++    """
++    if path is None:
++        return None
++    path = Path(path)
++    if not path.exists():
++        raise FileNotFoundError(str(path))
++
++    suf = path.suffix.lower()
++    if suf == ".csv":
++        if not (x_col and y_col):
++            raise ValueError("CSV WSE requires --swot-x-col and --swot-y-col.")
++        df = pd.read_csv(path)
++        if wse_col not in df.columns:
++            raise ValueError(f"WSE column '{wse_col}' not found in CSV: {path}")
++        g = gpd.GeoDataFrame(
++            df,
++            geometry=gpd.points_from_xy(df[x_col].astype(float), df[y_col].astype(float)),
++            crs=CRS.from_user_input(csv_crs),
++        )
++    else:
++        g = gpd.read_file(path)
++        if g.empty:
++            return None
++        if g.crs is None:
++            raise RuntimeError(f"WSE observation file has no CRS: {path}")
++        if wse_col not in g.columns:
++            raise ValueError(f"WSE column '{wse_col}' not found in {path}. Available: {list(g.columns)}")
++
++    g = g.copy()
++    g["_wse_m"] = pd.to_numeric(g[wse_col], errors="coerce")
++    g = g[np.isfinite(g["_wse_m"])].copy()
++    if g.empty:
++        return None
++
++    # Reproject to target CRS for spatial matching
++    if target_crs is not None:
++        g = g.to_crs(target_crs)
++
++    return gpd.GeoDataFrame(g, geometry="geometry", crs=g.crs)
++
++
++def _project_for_distance(
++    a: gpd.GeoDataFrame,
++    b: gpd.GeoDataFrame,
++) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, CRS]:
++    """Ensure both GeoDataFrames are in a projected CRS suitable for meter distances."""
++    crs_a = CRS.from_user_input(a.crs)
++    if crs_a.is_projected:
++        return a, b.to_crs(a.crs), crs_a
++
++    # Choose UTM from centroid of a
++    try:
++        union_geom = a.geometry.union_all()
++    except Exception:
++        union_geom = unary_union(list(a.geometry))
++    c = union_geom.centroid
++    utm = _utm_crs_from_lonlat(float(c.x), float(c.y))
++    return a.to_crs(utm), b.to_crs(utm), CRS.from_user_input(utm)
++
++
++def _attach_swot_wse_to_xs(
++    xs_lines: gpd.GeoDataFrame,
++    xs_param: pd.DataFrame,
++    swot: gpd.GeoDataFrame,
++    cfg: InferConfig,
++) -> Tuple[pd.DataFrame, Dict[str, float]]:
++    """Attach WSE observations to cross-sections and blend with the DEM/topo proxy.
++
++    Returns:
++      - updated xs_param (adds swot_wse_m, swot_dist_m, wse_proxy_m, wse_src, updates wse_m)
++      - updated wse_by_xs mapping (consistent with xs_param['wse_m'])
++    """
++    xs_param = xs_param.copy()
++    xs_param["wse_proxy_m"] = xs_param.get("wse_m", np.nan)
++    xs_param["swot_wse_m"] = np.nan
++    xs_param["swot_dist_m"] = np.nan
++    xs_param["wse_src"] = "dem_proxy"
++
++    if swot is None or swot.empty:
++        wse_by_xs = dict(zip(xs_param["xs_id"].astype(str), xs_param["wse_m"].astype("float64")))
++        return xs_param, wse_by_xs
++
++    # Build XS center points for matching
++    xsc = xs_lines[["xs_id", "geometry"]].copy()
++    xsc["xs_id"] = xsc["xs_id"].astype(str)
++    try:
++        xsc["geometry"] = xsc.geometry.interpolate(0.5, normalized=True)
++    except Exception:
++        xsc["geometry"] = xsc.geometry.centroid
++
++    xsc = gpd.GeoDataFrame(xsc, geometry="geometry", crs=xs_lines.crs)
++
++    # Project to meters for distance constraints
++    xsc_m, swot_m, _ = _project_for_distance(xsc, swot)
++
++    try:
++        joined = gpd.sjoin_nearest(
++            xsc_m,
++            swot_m[["_wse_m", "geometry"]],
++            how="left",
++            distance_col="_dist_m",
++        )
++    except Exception as e:
++        raise RuntimeError(
++            "Spatial join nearest failed (SWOT WSE). Install a spatial index backend (rtree) or use shapely>=2. "
++            f"Original error: {e}"
++        )
++
++    # Respect distance threshold
++    joined.loc[joined["_dist_m"] > float(cfg.swot_max_dist_m), "_wse_m"] = np.nan
++    joined.loc[joined["_dist_m"] > float(cfg.swot_max_dist_m), "_dist_m"] = np.nan
++
++    sw = joined[["xs_id", "_wse_m", "_dist_m"]].copy()
++    sw = sw.rename(columns={"_wse_m": "swot_wse_m", "_dist_m": "swot_dist_m"})
++    sw["swot_wse_m"] = pd.to_numeric(sw["swot_wse_m"], errors="coerce")
++
++    # Optional along-channel outlier filtering (MAD)
++    try:
++        tmp = xs_param[["xs_id", "component_id", "s_center_m"]].copy()
++        tmp["xs_id"] = tmp["xs_id"].astype(str)
++        tmp = tmp.merge(sw, on="xs_id", how="left")
++        tmp = tmp.sort_values(["component_id", "s_center_m", "xs_id"]).reset_index(drop=True)
++        tmp["_wse_smooth"] = tmp.groupby("component_id", dropna=False)["swot_wse_m"].apply(
++            lambda s: _rolling_smooth(s, int(max(3, getattr(cfg, "wse_profile_window", 9))))
++        ).reset_index(level=0, drop=True)
++        resid = tmp["swot_wse_m"] - tmp["_wse_smooth"]
++        med = resid.groupby(tmp["component_id"]).transform("median")
++        mad = (resid - med).abs().groupby(tmp["component_id"]).transform("median")
++        scale = 1.4826 * mad
++        z = (resid - med).abs() / scale.replace(0, np.nan)
++        tmp.loc[z > float(cfg.swot_outlier_mad_z), "swot_wse_m"] = np.nan
++        sw = tmp[["xs_id", "swot_wse_m", "swot_dist_m"]]
++    except Exception:
++        pass
++
++    xs_param = xs_param.merge(sw, on="xs_id", how="left")
++    xs_param["swot_wse_m"] = xs_param["swot_wse_m"] + float(cfg.swot_vertical_offset_m)
++
++    # Blend where SWOT WSE is finite
++    blend = float(np.clip(cfg.swot_stage_blend, 0.0, 1.0))
++    has = np.isfinite(xs_param["swot_wse_m"])
++    xs_param.loc[has, "wse_src"] = "swot"
++    xs_param.loc[has, "wse_m"] = (1.0 - blend) * xs_param.loc[has, "wse_proxy_m"].astype("float64") + blend * xs_param.loc[has, "swot_wse_m"].astype("float64")
++
++    wse_by_xs = dict(zip(xs_param["xs_id"].astype(str), xs_param["wse_m"].astype("float64")))
++    return xs_param, wse_by_xs
+ def _calibrate_dmax_from_soundings(
+     xs_lines: gpd.GeoDataFrame,
+     soundings: gpd.GeoDataFrame,
+@@ -1947,6 +2140,35 @@
+         except Exception as e:
+             log.warning("[RIVER][ATTR] failed to attach river attributes from %s:%s (%s)", river_gpkg, rivers_layer, e)
+ 
++
++# ------------------------
++# Optional SWOT (or other) WSE anchoring (stage)
++# ------------------------
++# If provided, blend/replace the DEM/topo-derived WSE proxy with observed WSE (e.g., SWOT)
++# BEFORE we fit a longitudinal WSE profile and BEFORE any anchor that uses WSE.
++if getattr(cfg, "swot_wse", None) is not None:
++    try:
++        swot = _load_wse_obs(
++            path=Path(cfg.swot_wse),
++            target_crs=xs_lines.crs,
++            wse_col=str(getattr(cfg, "swot_wse_col", "wse_m")),
++            x_col=getattr(cfg, "swot_x_col", None),
++            y_col=getattr(cfg, "swot_y_col", None),
++            csv_crs=str(getattr(cfg, "swot_csv_crs", "EPSG:4326")),
++        )
++        if swot is not None and not swot.empty:
++            xs_param, wse_by_xs = _attach_swot_wse_to_xs(xs_lines, xs_param, swot, cfg)
++            log.info("[SWOT][WSE] Attached/blended WSE observations: n_xs=%d", int(np.isfinite(xs_param["swot_wse_m"]).sum()))
++        else:
++            log.info("[SWOT][WSE] WSE observations empty; using DEM/topo proxy.")
++    except Exception as e:
++        log.warning("[SWOT][WSE] Failed to load/attach WSE observations (%s). Using DEM/topo proxy.", e)
++
++# If requested, keep observed stage for bed elevations but do NOT let it drive slope fitting.
++if (getattr(cfg, "swot_wse", None) is not None) and (not bool(getattr(cfg, "swot_use_for_slope", True))):
++    xs_param["_wse_blended_m"] = xs_param["wse_m"]
++    if "wse_proxy_m" in xs_param.columns:
++        xs_param["wse_m"] = xs_param["wse_proxy_m"]
+     # If slope was not provided, estimate a stabilized water-surface slope from a fitted
+     # longitudinal WSE profile (preferred) and fall back to the legacy slope proxy.
+     xs_param["wse_fit_m"] = np.nan
+@@ -1981,6 +2203,11 @@
+         else:
+             xs_param["slope_mpm"] = xs_param["slope_proxy_mpm"]
+ 
++
++# Restore blended WSE after slope estimation if we suppressed SWOT stage during slope fitting.
++if "_wse_blended_m" in xs_param.columns:
++    xs_param["wse_m"] = xs_param["_wse_blended_m"]
++    xs_param = xs_param.drop(columns=["_wse_blended_m"])
+     # Upgrade prior if requested
+     if str(cfg.prior_mode).lower().strip() == "multivariate":
+         xs_param["dmax_prior_m"] = xs_param.apply(lambda r: _compute_dmax_prior_multivariate(r, cfg), axis=1)
+@@ -2722,6 +2949,20 @@
+     p.add_argument("--wse-quantile", type=float, default=0.10, help="Quantile of center window elevations for WSE proxy")
+     p.add_argument("--wse-fallback-drop-m", type=float, default=0.50, help="Fallback WSE= min(bank_z)-drop (m)")
+ 
++# Optional SWOT (or other) WSE observations (stage anchoring)
++p.add_argument("--swot-wse", default=None, help="Optional point observations of water-surface elevation (WSE). GPKG/SHP/GeoJSON points or CSV.")
++p.add_argument("--swot-wse-col", default="wse_m", help="Column name holding WSE in meters in --swot-wse.")
++p.add_argument("--swot-x-col", default=None, help="For CSV --swot-wse: X column (lon or easting).")
++p.add_argument("--swot-y-col", default=None, help="For CSV --swot-wse: Y column (lat or northing).")
++p.add_argument("--swot-csv-crs", default="EPSG:4326", help="CRS for CSV lon/lat or x/y columns (default EPSG:4326).")
++p.add_argument("--swot-max-dist-m", type=float, default=1000.0, help="Maximum distance (m) from XS center to accept a WSE observation.")
++p.add_argument("--swot-stage-blend", type=float, default=1.0, help="Blend factor for WSE when observations exist: 0 uses DEM proxy; 1 replaces proxy.")
++p.add_argument("--swot-vertical-offset-m", type=float, default=0.0, help="Additive offset (m) applied to observed WSE before blending (for datum tweaks).")
++p.add_argument("--swot-outlier-mad-z", type=float, default=4.0, help="Outlier threshold (robust MAD z-score) for WSE observations along-channel.")
++p.add_argument("--swot-use-for-slope", dest="swot_use_for_slope", action="store_true", help="Use blended WSE to drive WSE-profile slope fitting (default).")
++p.add_argument("--no-swot-use-for-slope", dest="swot_use_for_slope", action="store_false", help="Do NOT use WSE observations for slope fitting; only shift bed elevations.")
++p.set_defaults(swot_use_for_slope=True)
++
+     # Smoothing
+     p.add_argument("--smooth-window", type=int, default=7, help="Rolling window (XS count) for Dmax smoothing")
+     p.add_argument("--allow-missing-banks", action="store_true", help="Process XS even if banks aren't detected")
+@@ -2848,6 +3089,16 @@
+         wse_center_frac=float(args.wse_center_frac),
+         wse_quantile=float(args.wse_quantile),
+         wse_fallback_drop_m=float(args.wse_fallback_drop_m),
++swot_wse=Path(args.swot_wse) if args.swot_wse else None,
++swot_wse_col=str(args.swot_wse_col),
++swot_x_col=args.swot_x_col,
++swot_y_col=args.swot_y_col,
++swot_csv_crs=str(args.swot_csv_crs),
++swot_max_dist_m=float(args.swot_max_dist_m),
++swot_stage_blend=float(args.swot_stage_blend),
++swot_vertical_offset_m=float(args.swot_vertical_offset_m),
++swot_outlier_mad_z=float(args.swot_outlier_mad_z),
++swot_use_for_slope=bool(getattr(args, "swot_use_for_slope", True)),
+         a=float(args.a),
+         b=float(args.b),
+         dmin_m=float(args.dmin_m),

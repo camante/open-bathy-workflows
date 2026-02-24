@@ -1,0 +1,219 @@
+--- a/workflow/bathy_main.py
++++ b/workflow/bathy_main.py
+@@ -1820,6 +1820,56 @@
+             report.setdefault("fusion", {}).setdefault("inputs_sanitized", {})["sdb_landmask_applied"] = str(lm)
+     except Exception:
+         pass
++    # Heuristic: if the SDB raster is overwhelmingly literal 0.0 (common failure mode),
++    # treat 0.0 as nodata for fusion so river can gap-fill.
++    try:
++        from osgeo import gdal
++        import numpy as np
++        ds0 = gdal.Open(str(sdb_fuse_path))
++        if ds0 is not None:
++            b0 = ds0.GetRasterBand(1)
++            a0 = b0.ReadAsArray()
++            nd0 = b0.GetNoDataValue()
++            m = np.isfinite(a0)
++            if nd0 is not None:
++                m &= (a0 != nd0)
++            if np.any(m):
++                frac0 = float(np.mean(a0[m] == 0.0))
++                # Only trigger when nearly all valid pixels are exactly 0
++                if frac0 >= 0.95:
++                    sanitized0 = combined_dir / "sdb_for_fusion_zeros_sanitized.tif"
++                    a1 = a0.astype(np.float32)
++                    nodata = -9999.0
++                    a1[~np.isfinite(a1)] = nodata
++                    if nd0 is not None:
++                        a1[a1 == nd0] = nodata
++                    a1[a1 == 0.0] = nodata
++                    drv = gdal.GetDriverByName("GTiff")
++                    out_ds = drv.Create(
++                        str(sanitized0),
++                        ds0.RasterXSize,
++                        ds0.RasterYSize,
++                        1,
++                        gdal.GDT_Float32,
++                        options=["COMPRESS=DEFLATE", "TILED=YES", "BIGTIFF=IF_SAFER"],
++                    )
++                    out_ds.SetGeoTransform(ds0.GetGeoTransform())
++                    out_ds.SetProjection(ds0.GetProjection())
++                    ob = out_ds.GetRasterBand(1)
++                    ob.SetNoDataValue(nodata)
++                    ob.WriteArray(a1)
++                    ob.FlushCache()
++                    out_ds.FlushCache()
++                    out_ds = None
++                    sdb_fuse_path = sanitized0
++                    report.setdefault("fusion", {}).setdefault("inputs_sanitized", {})["sdb_zero_sanitized"] = {
++                        "path": str(sanitized0),
++                        "frac0": frac0,
++                        "threshold": 0.95,
++                    }
++    except Exception:
++        pass
++
+ 
+     def _simple_union_overlay(sdb_path: Path, river_path: Path, out_path: Path, template_path: Path, pri: str) -> None:
+         """Guaranteed combine: fill gaps from the secondary raster into the primary on the template grid.
+@@ -1832,8 +1882,9 @@
+         def _read_align(src_path: Path):
+             with rasterio.open(template_path) as tmpl:
+                 prof = tmpl.profile.copy()
+-                prof.update(dtype="float32", nodata=np.nan, count=1, compress="deflate")
+-                arr = np.full((tmpl.height, tmpl.width), np.nan, dtype=np.float32)
++                nodata = -9999.0
++                prof.update(dtype="float32", nodata=nodata, count=1, compress="deflate")
++                arr = np.full((tmpl.height, tmpl.width), nodata, dtype=np.float32)
+                 with rasterio.open(src_path) as src:
+                     reproject(
+                         source=rasterio.band(src, 1),
+@@ -1844,7 +1895,7 @@
+                         dst_crs=tmpl.crs,
+                         resampling=Resampling.nearest,
+                         src_nodata=src.nodata,
+-                        dst_nodata=np.nan,
++                        dst_nodata=nodata,
+                     )
+             return arr, prof
+ 
+@@ -1857,12 +1908,98 @@
+             primary, secondary = sdb_a, riv_a
+ 
+         out = primary.copy()
+-        take = np.isnan(out) & np.isfinite(secondary)
++        take = (out == nodata) & (secondary != nodata)
+         out[take] = secondary[take]
+ 
+         with rasterio.open(out_path, "w", **prof) as dst:
+             dst.write(out.astype(np.float32), 1)
+ 
++
++    def _gdal_union_overlay(sdb_path: Path, river_path: Path, out_path: Path, template_path: Path, pri: str) -> None:
++        """GDAL-based union overlay fallback (no rasterio dependency).
++        Aligns both rasters onto the template grid, then fills primary nodata with secondary values.
++        """
++        try:
++            from osgeo import gdal
++            import numpy as np
++        except Exception as ee:
++            raise RuntimeError(f"GDAL/NumPy not available for fallback fusion: {ee}")
++
++        nodata = -9999.0
++
++        tmpl = gdal.Open(str(template_path))
++        if tmpl is None:
++            raise RuntimeError(f"Failed to open template raster: {template_path}")
++
++        gt = tmpl.GetGeoTransform()
++        proj = tmpl.GetProjection()
++        w = tmpl.RasterXSize
++        h = tmpl.RasterYSize
++        xres = gt[1]
++        yres = abs(gt[5])
++        xmin = gt[0]
++        ymax = gt[3]
++        xmax = xmin + xres * w
++        ymin = ymax - yres * h
++
++        warp_opts = gdal.WarpOptions(
++            format="MEM",
++            outputBounds=(xmin, ymin, xmax, ymax),
++            xRes=xres,
++            yRes=yres,
++            dstSRS=proj if proj else None,
++            resampleAlg="near",
++            dstNodata=nodata,
++            targetAlignedPixels=True,
++            multithread=True,
++        )
++
++        def _warp_to_mem(p: Path):
++            ds = gdal.Warp("", str(p), options=warp_opts)
++            if ds is None:
++                raise RuntimeError(f"gdal.Warp failed for {p}")
++            return ds
++
++        sdb_ds = _warp_to_mem(Path(sdb_path))
++        riv_ds = _warp_to_mem(Path(river_path))
++
++        sdb_a = sdb_ds.ReadAsArray().astype(np.float32)
++        riv_a = riv_ds.ReadAsArray().astype(np.float32)
++
++        # ensure finite
++        sdb_a[~np.isfinite(sdb_a)] = nodata
++        riv_a[~np.isfinite(riv_a)] = nodata
++
++        if pri == "river":
++            primary, secondary = riv_a, sdb_a
++        else:
++            primary, secondary = sdb_a, riv_a
++
++        out = primary.copy()
++        take = (out == nodata) & (secondary != nodata)
++        out[take] = secondary[take]
++
++        drv = gdal.GetDriverByName("GTiff")
++        ds_out = drv.Create(
++            str(out_path),
++            w,
++            h,
++            1,
++            gdal.GDT_Float32,
++            options=["COMPRESS=DEFLATE", "TILED=YES", "BIGTIFF=IF_SAFER"],
++        )
++        if ds_out is None:
++            raise RuntimeError(f"Failed to create output raster: {out_path}")
++
++        ds_out.SetGeoTransform(gt)
++        if proj:
++            ds_out.SetProjection(proj)
++        band = ds_out.GetRasterBand(1)
++        band.SetNoDataValue(nodata)
++        band.WriteArray(out)
++        band.FlushCache()
++        ds_out.FlushCache()
++        ds_out = None
+     try:
+         from bathy_fusion import fuse_bathymetry, FusionConfig
+ 
+@@ -1903,7 +2040,7 @@
+             "status": "success",
+             "mode": "weighted_overlap",
+             "priority": pri,
+-            "weights": {"primary": 0.70, "secondary": 0.30},
++            "weights": {"primary": float(cfg.fusion_primary_weight), "secondary": float(cfg.fusion_secondary_weight)},
+             "outputs": {"depth": str(out_depth), "provenance": str(out_prov) if out_prov else None},
+             "bathy_fusion_outputs": {
+                 "combined": str(getattr(res, "combined_raster", "")),
+@@ -1927,7 +2064,10 @@
+                     p = dp.read(1)
+                     has_river = bool(np.any((p == 2) | (p == 5)))  # PROV_RIVER=2, PROV_BLENDED=5
+             if not has_river:
+-                _simple_union_overlay(Path(sdb_fuse_path), Path(river_fuse_path), Path(out_depth), Path(template), pri)
++                try:
++                    _simple_union_overlay(Path(sdb_fuse_path), Path(river_fuse_path), Path(out_depth), Path(template), pri)
++                except Exception:
++                    _gdal_union_overlay(Path(sdb_fuse_path), Path(river_fuse_path), Path(out_depth), Path(template), pri)
+                 report["fusion"]["note"] = "River contribution missing after fusion; applied union overlay fallback."
+         except Exception:
+             pass
+@@ -1946,7 +2086,16 @@
+         }
+         log.warning(err)
+ 
+-        # Priority fallback: copy the chosen raster
++        # Robust fallback: union-overlay combine (fill priority nodata with secondary). If that fails, do priority copy.
++        try:
++            _gdal_union_overlay(Path(sdb_fuse_path), Path(river_fuse_path), Path(out_depth), Path(template), pri)
++            report["fusion"]["mode"] = "union_overlay_fallback"
++            report["fusion"]["note"] = "Fusion failed; used GDAL union overlay fallback."
++            return out_depth
++        except Exception as ee2:
++            report["fusion"]["note"] = f"Union overlay fallback also failed; priority copy used. union_error={ee2}"
++
++        # Priority copy as last resort
+         if pri == "river":
+             shutil.copy2(str(river_raster), str(out_depth))
+         else:

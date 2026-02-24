@@ -43,7 +43,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional
 
 log = logging.getLogger(__name__)
 
@@ -678,7 +678,7 @@ if __name__ == "__main__":
     )
     
     if len(sys.argv) < 2:
-        print("Usage: python checkpoints.py <output_dir> [--status|--clean|--invalidate <stage>]")
+        log.info("Usage: python checkpoints.py <output_dir> [--status|--clean|--invalidate <stage>]")
         sys.exit(1)
     
     output_dir = Path(sys.argv[1])
@@ -695,25 +695,25 @@ if __name__ == "__main__":
         
         if cmd == "--status":
             summary = checkpoint.get_progress_summary()
-            print(json.dumps(summary, indent=2))
+            log.info(json.dumps(summary, indent=2))
             
         elif cmd == "--clean":
             checkpoint.clean()
-            print("Checkpoints cleaned")
+            log.info("Checkpoints cleaned")
             
         elif cmd == "--invalidate" and len(sys.argv) > 3:
             stage_name = sys.argv[3]
             try:
                 stage = CheckpointStage.from_string(stage_name)
                 checkpoint.invalidate([stage])
-                print(f"Invalidated: {stage_name}")
+                log.info(f"Invalidated: {stage_name}")
             except ValueError as e:
-                print(f"Error: {e}")
+                log.info(f"Error: {e}")
                 sys.exit(1)
         else:
-            print(f"Unknown command: {cmd}")
+            log.info(f"Unknown command: {cmd}")
             sys.exit(1)
     else:
         # Default: show status
         summary = checkpoint.get_progress_summary()
-        print(json.dumps(summary, indent=2))
+        log.info(json.dumps(summary, indent=2))

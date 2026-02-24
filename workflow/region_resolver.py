@@ -13,7 +13,6 @@ Scientific intent: avoid hard-coded "example" coefficients and make the pipeline
 able to use *published* state/regional regressions when available.
 """
 
-from __future__ import annotations
 
 import json
 import os

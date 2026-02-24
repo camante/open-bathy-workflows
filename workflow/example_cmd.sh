@@ -1,0 +1,82 @@
+./bathy_main.py \
+  --aoi=-71.25/-71/42.75/43 \
+  --start=2025-01-01 --end=2026-01-01 \
+  --methods=river \
+  --out-dir=output/merrimack_coast \
+  --cache-root=cache/merrimack_coast \
+  --extra-xyz-cudem=hydronos,ehydro \
+  --river-soundings-mode=bed_elev \
+  --river-method=skeleton \
+  --river-channel-buffer-m=400 \
+  --river-max-channel-width-m=600 \
+  --river-mainstem-min-order=5 \
+  --river-max-mainstem-width-m=2500 \
+  --river-ocean-keep-dist-m=300 \
+  --river-skeleton-wse-mode=bank_profile \
+  --river-skeleton-wse-profile-step-m=20 \
+  --river-skeleton-wse-profile-resample-m=20 \
+  --river-skeleton-wse-profile-smooth-sigma-m=250 \
+  --river-skeleton-wse-profile-max-slope=0.004 \
+  --river-skeleton-wse-profile-min-samples=10 \
+  --river-skeleton-wse-profile-max-query-dist-m=200 \
+  --river-skeleton-asymmetry-mode=curvature \
+  --river-skeleton-asymmetry-strength=0.25 \
+  --river-skeleton-junction-mode=smooth \
+  --river-skeleton-junction-buffer-m=120 \
+  --river-skeleton-junction-degree-min=3 \
+  --river-skeleton-junction-smooth-sigma-m=80 \
+  --river-skeleton-junction-max-width-m=300 \
+  --river-swot-auto \
+  --river-swot-wse-field=wse \
+  --river-swot-max-dist-m=300 \
+  --river-swot-correct-sigma-m=1000 \
+  --river-swot-weight=1.0 \
+  --river-swot-max-correction-m=2.0 \
+  --river-swot-offset-mode=median_mad \
+  --fusion-strategy=spatial_taper \
+  --fusion-primary-weight=0.85 \
+  --fusion-secondary-weight=0.15 \
+  --fusion-taper-m=100 \
+  --river-save-skeleton-debug
+
+
+./bathy_main.py \
+  --aoi=-71.25/-71/42.75/43 \
+  --start=2025-01-01 --end=2026-01-01 \
+  --methods=river \
+  --out-dir=output/merrimack_inland \
+  --cache-root=cache/merrimack_inland \
+  --extra-xyz-cudem=hydronos,ehydro \
+  --river-soundings-mode=bed_elev \
+  --river-method=skeleton \
+  --river-channel-buffer-m=400 \
+  --river-max-channel-width-m=600 \
+  --river-mainstem-min-order=5 \
+  --river-max-mainstem-width-m=2500 \
+  --river-ocean-keep-dist-m=300 \
+  --river-skeleton-wse-mode=bank_profile \
+  --river-skeleton-wse-profile-step-m=20 \
+  --river-skeleton-wse-profile-resample-m=20 \
+  --river-skeleton-wse-profile-smooth-sigma-m=250 \
+  --river-skeleton-wse-profile-max-slope=0.004 \
+  --river-skeleton-wse-profile-min-samples=10 \
+  --river-skeleton-wse-profile-max-query-dist-m=200 \
+  --river-skeleton-asymmetry-mode=curvature \
+  --river-skeleton-asymmetry-strength=0.25 \
+  --river-skeleton-junction-mode=smooth \
+  --river-skeleton-junction-buffer-m=120 \
+  --river-skeleton-junction-degree-min=3 \
+  --river-skeleton-junction-smooth-sigma-m=80 \
+  --river-skeleton-junction-max-width-m=300 \
+  --river-swot-auto \
+  --river-swot-wse-field=wse \
+  --river-swot-max-dist-m=300 \
+  --river-swot-correct-sigma-m=1000 \
+  --river-swot-weight=1.0 \
+  --river-swot-max-correction-m=2.0 \
+  --river-swot-offset-mode=median_mad \
+  --fusion-strategy=spatial_taper \
+  --fusion-primary-weight=0.85 \
+  --fusion-secondary-weight=0.15 \
+  --fusion-taper-m=100 \
+  --river-save-skeleton-debug

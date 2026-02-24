@@ -104,6 +104,7 @@ def _warp_to_template(src_path: Path, template_profile: dict, dtype: str = "floa
 def _junction_zone_mask(
     river_gpkg: Path,
     nodes_layer: str,
+    river_layer: str,
     template_profile: dict,
     transform: rasterio.Affine,
     crs: rasterio.crs.CRS,
@@ -138,11 +139,15 @@ def _junction_zone_mask(
                     gdf = gdf.to_crs(c2)
         except Exception:
             # Best effort; if CRS is missing or parsing fails, rasterize as-is.
-            pass
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
         # Buffer and dissolve into a single geometry for efficiency
         geom = gdf.geometry.buffer(float(buffer_m))
-        union = geom.unary_union
+        try:
+            union = geom.union_all()
+        except Exception:
+            # GeoPandas < 0.14
+            union = geom.unary_union
         if union is None:
             return None
 
@@ -155,9 +160,136 @@ def _junction_zone_mask(
             all_touched=True,
         )
         return (mask_u8 == 1)
+
     except Exception as e:
+        # Common failure: nodes layer missing (e.g., "Null layer"). Fall back to a simple
+        # endpoint-degree approximation from the flowlines layer.
         LOG.warning("junction mask: failed building junction zone mask: %s", str(e))
+        try:
+            fb = _junction_zone_mask_from_flowlines(
+                river_gpkg=river_gpkg,
+                river_layer=river_layer,
+                transform=transform,
+                crs=crs,
+                shape=shape,
+                degree_min=degree_min,
+                buffer_m=buffer_m,
+            )
+            if fb is not None:
+                LOG.info("junction mask: using flowline-endpoint fallback (layer=%s).", river_layer)
+                return fb
+        except Exception as e2:
+            LOG.warning("junction mask fallback failed: %s", str(e2))
         return None
+
+
+
+
+def _junction_zone_mask_from_flowlines(
+    river_gpkg: Path,
+    river_layer: str,
+    transform: rasterio.Affine,
+    crs: rasterio.crs.CRS,
+    shape: Tuple[int, int],
+    degree_min: int = 3,
+    buffer_m: float = 120.0,
+    snap_m: float = 5.0,
+) -> Optional[np.ndarray]:
+    """Fallback junction-zone mask derived from flowline endpoints.
+
+    If a graph node layer is unavailable, approximate junctions by counting how many
+    flowline endpoints fall on the same snapped coordinate (in projected meters).
+
+    This is intentionally conservative and meant only to identify confluence neighborhoods
+    for smoothing/masking, not to replace a true graph.
+    """
+    gdf = None
+    tried = []
+    for lyr in [river_layer, 'rivers_clip', 'rivers', 'flowlines', 'river_network']:
+        if lyr in tried or lyr is None:
+            continue
+        tried.append(lyr)
+        try:
+            gdf = gpd.read_file(river_gpkg, layer=lyr)
+            if gdf is not None and not gdf.empty:
+                river_layer = lyr  # record the layer that worked
+                break
+        except Exception:
+            continue
+
+    if gdf is None or gdf.empty:
+        LOG.warning("junction mask fallback: could not read any flowlines layer (tried=%s)", tried)
+        return None
+    gdf = gdf[gdf.geometry.notnull() & (~gdf.geometry.is_empty)].copy()
+    if gdf.empty:
+        return None
+    # Reproject to template CRS if needed
+    try:
+        if gdf.crs is not None and crs is not None:
+            c1 = CRS.from_user_input(gdf.crs)
+            c2 = CRS.from_user_input(crs)
+            if not c1.equals(c2):
+                gdf = gdf.to_crs(c2)
+    except Exception:
+        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+
+    # Collect coordinates (not just endpoints), tracking which feature each coordinate came from.
+    # Confluences are often represented as shared vertices between a mainstem and tributary.
+    pts = []  # (x, y, fid)
+    for fid, geom in enumerate(gdf.geometry.values):
+        if geom is None:
+            continue
+        gt = geom.geom_type
+        if gt == "LineString":
+            coords = list(geom.coords)
+            if len(coords) >= 2:
+                pts.extend([(c[0], c[1], fid) for c in coords])
+        elif gt == "MultiLineString":
+            for ls in geom.geoms:
+                coords = list(ls.coords)
+                if len(coords) >= 2:
+                    pts.extend([(c[0], c[1], fid) for c in coords])
+
+    if not pts:
+        return None
+
+    snap = float(snap_m) if snap_m is not None else 5.0
+    if snap <= 0:
+        snap = 1.0
+
+    keys = {}  # (x,y) -> set(feature_ids)
+    for (x, y, fid) in pts:
+        kx = round(float(x) / snap) * snap
+        ky = round(float(y) / snap) * snap
+        s = keys.get((kx, ky))
+        if s is None:
+            keys[(kx, ky)] = {fid}
+        else:
+            s.add(fid)
+
+    # With unsplit flowlines, a confluence is commonly a shared vertex between exactly two features
+    # (mainstem + tributary). Treat >=2 as a junction by default, while still respecting a higher
+    # requested degree_min if the user supplied one.
+    deg_min_eff = max(2, int(degree_min) - 1)
+    jpts = [(x, y) for (x, y), fids in keys.items() if len(fids) >= deg_min_eff]
+    if not jpts:
+        return None
+
+    from shapely.geometry import Point
+    geoms = [Point(x, y).buffer(float(buffer_m)) for (x, y) in jpts]
+    union = gpd.GeoSeries(geoms).unary_union
+    if union is None:
+        return None
+
+    mask_u8 = rasterize(
+        [(union, 1)],
+        out_shape=shape,
+        transform=transform,
+        fill=0,
+        dtype="uint8",
+        all_touched=True,
+    )
+    return (mask_u8 == 1)
 
 
 def _build_wse_from_bank_dem(
@@ -225,6 +357,13 @@ def _build_wse_longitudinal_profile(
     max_slope: float = 0.0,
     min_samples: int = 10,
     max_query_dist_m: float = 250.0,
+    swot_pts: Optional[np.ndarray] = None,
+    swot_wse: Optional[np.ndarray] = None,
+    swot_max_dist_m: float = 300.0,
+    swot_min_samples: int = 5,
+    swot_correct_sigma_m: float = 2000.0,
+    swot_weight: float = 1.0,
+    swot_max_correction_m: float = 5.0,
 ) -> Optional[np.ndarray]:
     """Build a longitudinally-consistent WSE surface from bank-derived WSE samples.
 
@@ -243,6 +382,31 @@ def _build_wse_longitudinal_profile(
         from rasterio import features
         from scipy.ndimage import distance_transform_edt, gaussian_filter1d
         from scipy.spatial import cKDTree
+        swot_tree = None
+        if swot_pts is not None and swot_wse is not None and len(swot_pts) > 0 and len(swot_pts) == len(swot_wse):
+            try:
+                swot_tree = cKDTree(np.asarray(swot_pts, dtype=float))
+            except Exception as e:
+                LOG.warning("WSE longitudinal profile: could not build SWOT KDTree: %s", e)
+                swot_tree = None
+        # Robust aggregation helper for multiple SWOT observations near a sample.
+        def _robust_median_mad(v: np.ndarray, zmax: float = 4.0) -> float:
+            v = np.asarray(v, dtype=float)
+            v = v[np.isfinite(v)]
+            if v.size == 0:
+                return float("nan")
+            if v.size < 3:
+                return float(np.nanmedian(v))
+            med = float(np.nanmedian(v))
+            mad = float(np.nanmedian(np.abs(v - med)))
+            if mad <= 0.0 or (not np.isfinite(mad)):
+                return float(med)
+            z = np.abs(v - med) / (1.4826 * mad)
+            v2 = v[z <= float(zmax)]
+            if v2.size == 0:
+                return float(med)
+            return float(np.nanmedian(v2))
+
     except Exception as e:
         LOG.warning("WSE longitudinal profile: missing deps: %s", e)
         return None
@@ -317,6 +481,9 @@ def _build_wse_longitudinal_profile(
             xs: list[float] = []
             ys: list[float] = []
             ws: list[float] = []
+            swot_ws: list[float] = []
+            swot_d: list[float] = []
+            swot_used_idx: set[int] = set()
             d_kept: list[float] = []
             for d in dists:
                 pt = line.interpolate(d)
@@ -327,6 +494,38 @@ def _build_wse_longitudinal_profile(
                     ys.append(y)
                     ws.append(v)
                     d_kept.append(float(d))
+                    if swot_tree is not None:
+                        try:
+                            # Collect all SWOT points within radius and robustly aggregate.
+                            # This is more stable than a single nearest neighbor and reduces
+                            # sensitivity to mixed-quality samples near confluences.
+                            idxs = swot_tree.query_ball_point([float(x), float(y)], r=float(swot_max_dist_m))
+                            if idxs:
+                                # Prefer unused points to avoid over-weighting a single observation.
+                                idxs2 = [ii for ii in idxs if int(ii) not in swot_used_idx]
+                                if idxs2:
+                                    idxs = idxs2
+                                wsvs = np.asarray([float(swot_wse[int(ii)]) for ii in idxs], dtype=float)
+                                wsvs = wsvs[np.isfinite(wsvs)]
+                                if wsvs.size > 0:
+                                    wsv = _robust_median_mad(wsvs, zmax=4.0)
+                                    if np.isfinite(wsv):
+                                        # Mark the closest index as used (not all indices), so we don't
+                                        # repeatedly use the same local observation but also don't
+                                        # discard nearby distinct observations.
+                                        try:
+                                            # approximate closest as min Euclidean in tree space
+                                            pts_loc = np.asarray([swot_pts[int(ii)] for ii in idxs], dtype=float)
+                                            di = np.sqrt(np.sum((pts_loc - np.asarray([float(x), float(y)]))**2, axis=1))
+                                            ii0 = int(idxs[int(np.argmin(di))])
+                                            swot_used_idx.add(ii0)
+                                        except Exception:
+                                            swot_used_idx.add(int(idxs[0]))
+                                        swot_ws.append(float(wsv))
+                                        swot_d.append(float(d))
+                        except Exception:
+                            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+
             if len(ws) < int(min_samples):
                 continue
 
@@ -377,6 +576,45 @@ def _build_wse_longitudinal_profile(
                         wgrid[i] = wgrid[i + 1] + lim
                     elif dv < -lim:
                         wgrid[i] = wgrid[i + 1] - lim
+
+            # SWOT RiverSP anchoring (optional):
+            # If SWOT WSE samples exist near this flowline, compute a residual
+            # (SWOT - bank_profile) along distance, smooth it longitudinally,
+            # clamp it for safety, and apply it as a correction to the 1D WSE.
+            if swot_tree is not None and len(swot_ws) >= int(swot_min_samples or 0):
+                try:
+                    swd = np.asarray(swot_d, dtype=float)
+                    sww = np.asarray(swot_ws, dtype=float)
+                    ok = np.isfinite(swd) & np.isfinite(sww)
+                    swd = swd[ok]
+                    sww = sww[ok]
+                    if swd.size >= int(swot_min_samples or 0):
+                        # sort by distance along line
+                        order = np.argsort(swd)
+                        swd = swd[order]
+                        sww = sww[order]
+
+                        # expected WSE from current profile at SWOT distances
+                        w_at = np.interp(swd, dgrid, wgrid)
+                        resid = (sww - w_at).astype(float)
+
+                        # interpolate residual onto profile grid
+                        resid_grid = np.interp(dgrid, swd, resid)
+
+                        # smooth residual along distance
+                        if swot_correct_sigma_m and float(swot_correct_sigma_m) > 0.0:
+                            sigma_px_sw = float(swot_correct_sigma_m) / resample_m
+                            if sigma_px_sw > 0.25:
+                                resid_grid = gaussian_filter1d(resid_grid, sigma_px_sw, mode="nearest")
+
+                        # clamp correction (protect against datum mistakes and outliers)
+                        if swot_max_correction_m and float(swot_max_correction_m) > 0.0:
+                            resid_grid = np.clip(resid_grid, -float(swot_max_correction_m), float(swot_max_correction_m))
+
+                        # apply weighted correction
+                        wgrid = (wgrid + float(swot_weight or 1.0) * resid_grid).astype(float)
+                except Exception as e:
+                    LOG.warning("SWOT anchoring failed for a flowline segment; continuing without SWOT. Error: %s", e)
 
             # map smoothed profile back to sample points and store for KDTree
             w_s = np.interp(d_kept, dgrid, wgrid)
@@ -462,14 +700,295 @@ def _dmax_from_powerlaw(width_m: np.ndarray, a0: float, bw: float, dmin: float, 
     return d
 
 
+
+def _read_swot_riversp_points(paths, template_crs=None, wse_field=None, qual_field=None, wse_offset_m: float = 0.0):
+    """Read SWOT RiverSP reach/node vector files and return point samples (x,y,wse).
+
+    Notes:
+      - We support Point geometries directly.
+      - If geometries are LineString/MultiLineString (reach products), we sample the midpoint as a representative location.
+      - Vertical datum handling can be done in two steps:
+          (1) Optional user offset via --swot-wse-offset-m (applied additively when reading the data).
+          (2) Optional robust auto-reconciliation in bank_profile mode (see --swot-offset-mode), which estimates
+              a constant offset between SWOT WSE and your bank-derived WSE and subtracts it from SWOT before anchoring.
+    """
+    try:
+        import geopandas as gpd
+        from shapely.geometry import Point, LineString, MultiLineString
+        from pyproj import CRS
+    except Exception as e:
+        LOG.warning("SWOT RiverSP: missing deps: %s", e)
+        return np.zeros((0, 2), dtype=float), np.zeros((0,), dtype=float)
+
+    if not paths:
+        return np.zeros((0, 2), dtype=float), np.zeros((0,), dtype=float)
+
+    cand_wse = [wse_field] if wse_field else []
+    cand_wse += [
+        "wse", "wse_m", "wse_mean", "wse_mean_m", "wse_water", "wse_water_m",
+        "wse_reach", "wse_node", "wse_elev", "wse_elevation",
+        "WSE", "WSE_M", "WSE_MEAN",
+    ]
+
+    pts = []
+    vals = []
+
+    for p in paths:
+        try:
+            gdf = gpd.read_file(p)
+        except Exception as e:
+            LOG.warning("SWOT RiverSP: could not read %s: %s", p, e)
+            continue
+        if gdf is None or len(gdf) == 0:
+            continue
+
+        # Reproject to template CRS if provided
+        try:
+            if template_crs is not None and gdf.crs is not None:
+                c1 = CRS.from_user_input(gdf.crs)
+                c2 = CRS.from_user_input(template_crs)
+                if not c1.equals(c2):
+                    gdf = gdf.to_crs(c2)
+        except Exception as e:
+            LOG.warning("SWOT RiverSP: CRS reprojection failed for %s: %s", p, e)
+
+        # Pick WSE column
+        wcol = None
+        for c in cand_wse:
+            if c and c in gdf.columns:
+                wcol = c
+                break
+        if wcol is None:
+            # try any numeric column with 'wse' substring
+            for c in gdf.columns:
+                if c == "geometry":
+                    continue
+                if "wse" in str(c).lower():
+                    try:
+                        if str(gdf[c].dtype).startswith(("int", "float")):
+                            wcol = c
+                            break
+                    except Exception:
+                        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        if wcol is None:
+            LOG.warning("SWOT RiverSP: could not find a WSE column in %s (provide --swot-wse-field)", p)
+            continue
+
+        # Optional quality filter (defensive):
+        # If qual_field is provided and present, use it. Otherwise attempt to find a reasonable
+        # quality/flag column and apply a conservative filter (keep zeros/False/NaN; drop >0/True).
+        qcol = qual_field if (qual_field and qual_field in gdf.columns) else None
+        if qcol is None:
+            # Common candidate names in RiverSP-like exports
+            cand_q = []
+            for c in gdf.columns:
+                if c == "geometry":
+                    continue
+                cl = str(c).lower()
+                if any(k in cl for k in ("qual", "quality", "flag", "bad", "reject", "valid")):
+                    cand_q.append(c)
+            # Prefer numeric/boolean columns
+            for c in cand_q:
+                try:
+                    dt = str(gdf[c].dtype).lower()
+                    if dt.startswith(("int", "float", "bool")):
+                        qcol = c
+                        break
+                except Exception:
+                    continue
+        if qcol is not None:
+            try:
+                qq = gdf[qcol]
+                if str(qq.dtype).lower().startswith("bool"):
+                    good = (qq.isna()) | (~qq.astype(bool))
+                else:
+                    qv = pd.to_numeric(qq, errors="coerce")
+                    # Keep NaN and 0; drop positive values (treat as bad flags)
+                    good = qv.isna() | (qv <= 0.0)
+                gdf = gdf[good].copy()
+            except Exception:
+                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+
+# Iterate rows
+        for geom, wv in zip(gdf.geometry, gdf[wcol]):
+            if geom is None or geom.is_empty:
+                continue
+            try:
+                wv = float(wv) + float(wse_offset_m or 0.0)
+            except Exception:
+                continue
+            if not np.isfinite(wv):
+                continue
+
+            # Point: use directly; Line: use midpoint
+            try:
+                if geom.geom_type == "Point":
+                    x, y = float(geom.x), float(geom.y)
+                elif geom.geom_type in ("LineString", "LinearRing"):
+                    line = geom
+                    pt = line.interpolate(0.5, normalized=True) if hasattr(line, "interpolate") else None
+                    if pt is None or pt.is_empty:
+                        continue
+                    x, y = float(pt.x), float(pt.y)
+                elif geom.geom_type == "MultiLineString":
+                    # pick longest part midpoint
+                    parts = list(geom.geoms)
+                    if not parts:
+                        continue
+                    parts = sorted(parts, key=lambda g: float(getattr(g, "length", 0.0)), reverse=True)
+                    line = parts[0]
+                    pt = line.interpolate(0.5, normalized=True)
+                    x, y = float(pt.x), float(pt.y)
+                else:
+                    # fallback: representative point
+                    rp = geom.representative_point()
+                    x, y = float(rp.x), float(rp.y)
+            except Exception:
+                continue
+
+            pts.append((x, y))
+            vals.append(wv)
+
+    if not pts:
+        return np.zeros((0, 2), dtype=float), np.zeros((0,), dtype=float)
+
+    # Deduplicate exact coincident points (common when exporting mixed node/reach layers).
+    # Use a robust median for duplicated locations.
+    dd = {}
+    for (x, y), wv in zip(pts, vals):
+        key = (float(x), float(y))
+        dd.setdefault(key, []).append(float(wv))
+    pts2 = []
+    vals2 = []
+    for (x, y), vv in dd.items():
+        vv = np.asarray(vv, dtype=float)
+        vv = vv[np.isfinite(vv)]
+        if vv.size == 0:
+            continue
+        pts2.append((float(x), float(y)))
+        vals2.append(float(np.nanmedian(vv)))
+    if not pts2:
+        return np.zeros((0, 2), dtype=float), np.zeros((0,), dtype=float)
+
+    return np.asarray(pts2, dtype=float), np.asarray(vals2, dtype=float)
+
+
+
+def _estimate_swot_vertical_offset(
+    swot_pts: np.ndarray,
+    swot_wse: np.ndarray,
+    bank_wse: np.ndarray,
+    template_transform,
+    channel: Optional[np.ndarray] = None,
+    mode: str = "median_mad",
+    min_samples: int = 25,
+    mad_z: float = 3.5,
+    max_abs_m: float = 10.0,
+):
+    """Estimate a constant vertical offset between SWOT WSE and bank-derived WSE.
+
+    This is a pragmatic vertical-datum reconciliation step that avoids depending on external
+    VDatum tooling. It estimates a robust constant offset using matched samples:
+        offset ≈ median(SWOT_WSE - BankProfile_WSE)
+
+    If mode is 'median_mad', we apply a MAD-based outlier rejection before taking the median.
+    The returned offset is what should be SUBTRACTED from SWOT WSE to align it to bank_profile WSE.
+    """
+    if swot_pts is None or swot_wse is None:
+        return 0.0, 0, {}
+    if len(swot_pts) == 0:
+        return 0.0, 0, {}
+    try:
+        from rasterio.transform import rowcol
+    except Exception:
+        rowcol = None
+
+    # Sample bank_wse at SWOT point locations (nearest pixel)
+    rows = []
+    cols = []
+    try:
+        if rowcol is not None:
+            rr, cc = rowcol(template_transform, swot_pts[:, 0], swot_pts[:, 1], op=round)
+            rows = np.asarray(rr, dtype=int)
+            cols = np.asarray(cc, dtype=int)
+        else:
+            # manual for affine: x = c + a*col + b*row ; y = f + d*col + e*row (north-up: b=d=0)
+            a = float(template_transform.a)
+            e = float(template_transform.e)
+            c0 = float(template_transform.c)
+            f0 = float(template_transform.f)
+            cols = np.asarray(np.round((swot_pts[:, 0] - c0) / a), dtype=int)
+            rows = np.asarray(np.round((swot_pts[:, 1] - f0) / e), dtype=int)
+    except Exception:
+        return 0.0, 0, {}
+
+    h, w = bank_wse.shape
+    inside = (rows >= 0) & (rows < h) & (cols >= 0) & (cols < w)
+    if channel is not None:
+        try:
+            inside = inside & channel[rows.clip(0, h-1), cols.clip(0, w-1)].astype(bool)
+        except Exception:
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+    if not np.any(inside):
+        return 0.0, 0, {}
+
+    b = bank_wse[rows[inside], cols[inside]].astype(float)
+    s = swot_wse[inside].astype(float)
+
+    good = np.isfinite(b) & np.isfinite(s)
+    if not np.any(good):
+        return 0.0, 0, {}
+
+    diffs = (s[good] - b[good]).astype(float)
+    n0 = int(diffs.size)
+    if n0 < int(min_samples or 0):
+        return 0.0, n0, {"n": n0, "reason": "min_samples"}
+
+    diffs_used = diffs
+    if (mode or "").lower() in ("median_mad", "mad", "robust"):
+        med = float(np.nanmedian(diffs))
+        mad = float(np.nanmedian(np.abs(diffs - med)))
+        if mad > 0:
+            # 1.4826*MAD ≈ sigma for normal
+            sigma = 1.4826 * mad
+            keep = np.abs(diffs - med) <= float(mad_z or 3.5) * sigma
+            diffs_used = diffs[keep]
+        else:
+            diffs_used = diffs
+
+    if diffs_used.size == 0:
+        return 0.0, n0, {"n": n0, "reason": "all_rejected"}
+
+    off = float(np.nanmedian(diffs_used))
+    if max_abs_m is not None and float(max_abs_m) > 0:
+        if abs(off) > float(max_abs_m):
+            off_clamped = float(np.clip(off, -float(max_abs_m), float(max_abs_m)))
+            return off_clamped, int(diffs_used.size), {"n": int(diffs_used.size), "offset_raw": off, "offset_clamped": off_clamped}
+    return off, int(diffs_used.size), {"n": int(diffs_used.size), "offset": off, "offset_p10": float(np.nanpercentile(diffs_used, 10)), "offset_p90": float(np.nanpercentile(diffs_used, 90))}
+
+
 def _read_soundings_file(path: Path):
     """Read an XYZ-ish file into x/y/z arrays.
 
     Supported:
       - .xyz/.txt/.csv/.dat : first 3 numeric columns (header optional)
       - .gpkg/.shp/.geojson/.json : point geometries + a numeric Z/depth/elev/value column
+      - .parquet : expects x/y/z columns (as produced by xs_infer_bathy_raster.py --write-soundings-subset)
     """
     suf = path.suffix.lower()
+    if suf == '.parquet':
+        df = pd.read_parquet(path)
+        # Common columns from our subset writer: x,y,z
+        cols = {c.lower(): c for c in df.columns}
+        xc = cols.get('x') or cols.get('lon') or cols.get('longitude')
+        yc = cols.get('y') or cols.get('lat') or cols.get('latitude')
+        zc = cols.get('z') or cols.get('depth') or cols.get('elev') or cols.get('elevation')
+        if not (xc and yc and zc):
+            raise ValueError(f"Parquet soundings must contain x/y/z columns: {path}")
+        x = pd.to_numeric(df[xc], errors='coerce').to_numpy(dtype='float64')
+        y = pd.to_numeric(df[yc], errors='coerce').to_numpy(dtype='float64')
+        z = pd.to_numeric(df[zc], errors='coerce').to_numpy(dtype='float64')
+        return x, y, z
     if suf in ('.gpkg', '.shp', '.geojson', '.json'):
         gdf = gpd.read_file(path)
         if gdf.empty:
@@ -493,7 +1012,7 @@ def _read_soundings_file(path: Path):
                         zcol = c
                         break
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
         if zcol is None:
             raise ValueError(f"Could not find a numeric Z/depth/elev column in {path}")
         x = gdf.geometry.x.to_numpy(dtype='float64')
@@ -569,6 +1088,8 @@ def _soundings_to_grids(
     dmax_max_m: float,
     mode: str,
     min_r: float,
+    max_points: int = 2_000_000,
+    sample_seed: int = 0,
     cell_percentile: float | None = None,
     wse_map: np.ndarray | None = None,
 ):
@@ -585,6 +1106,7 @@ def _soundings_to_grids(
       * For depths: we keep the **maximum** depth per cell (deeper).
       * dmax inference uses: Dmax = depth / max(r, min_r)^shape_exp, then clamps.
     """
+    H, W = channel.shape
     depth_grid = np.full(channel.shape, np.nan, dtype="float32")
     dmax_grid = np.full(channel.shape, np.nan, dtype="float32")
     bed_grid = np.full(channel.shape, np.nan, dtype="float32")
@@ -601,6 +1123,7 @@ def _soundings_to_grids(
             xform = Transformer.from_crs(src, dst, always_xy=True)
 
     xs_all, ys_all, zs_all = [], [], []
+    sizes = []
     for fp in sounding_files:
         pth = Path(fp)
         if not pth.exists():
@@ -613,11 +1136,34 @@ def _soundings_to_grids(
             xs_all.append(np.asarray(x, dtype="float64"))
             ys_all.append(np.asarray(y, dtype="float64"))
             zs_all.append(np.asarray(z, dtype="float64"))
+            sizes.append(int(len(x)))
         except Exception as e:
             LOG.warning("Failed reading soundings %s: %s", pth, e)
 
     if not xs_all:
         return depth_grid, dmax_grid, bed_grid
+
+    # Downsample guard (prevents OOM-kills for very large authoritative point clouds).
+    # Preserve per-file proportions as a proxy for per-source composition.
+    total_n = int(sum(sizes))
+    if max_points and max_points > 0 and total_n > int(max_points):
+        rng = np.random.default_rng(int(sample_seed) if sample_seed is not None else 0)
+        new_xs, new_ys, new_zs = [], [], []
+        for x_i, y_i, z_i, n_i in zip(xs_all, ys_all, zs_all, sizes):
+            frac = float(n_i) / float(max(total_n, 1))
+            take = max(1, int(round(frac * int(max_points))))
+            if n_i <= take:
+                new_xs.append(x_i)
+                new_ys.append(y_i)
+                new_zs.append(z_i)
+            else:
+                idx = rng.choice(np.arange(n_i, dtype="int64"), size=take, replace=False)
+                new_xs.append(x_i[idx])
+                new_ys.append(y_i[idx])
+                new_zs.append(z_i[idx])
+        xs_all, ys_all, zs_all = new_xs, new_ys, new_zs
+        LOG.warning("Soundings downsampled to ~%d points (from %d) to avoid OOM (soundings_max_points=%d).",
+                    int(sum(len(a) for a in xs_all)), total_n, int(max_points))
 
     x = np.concatenate(xs_all)
     y = np.concatenate(ys_all)
@@ -824,7 +1370,9 @@ def _build_value_field_from_anchors(
         if sigma_px > 0.01:
             num = gaussian_filter(v0 * w, sigma=sigma_px, mode="nearest")
             den = gaussian_filter(w, sigma=sigma_px, mode="nearest")
-            out = np.where(den > 1e-6, (num / den), np.nan).astype("float32")
+            out = np.full_like(num, np.nan, dtype="float32")
+            np.divide(num, den, out=out, where=(den > 1e-6))
+            out = out.astype("float32")
         else:
             out = np.where(w > 0, v_nn.astype("float32"), np.nan).astype("float32")
     else:
@@ -959,6 +1507,292 @@ def _rasterize_tangent_and_curvature(
         ty_r[~good] = np.nan
     return tx_r, ty_r, k_r
 
+
+
+def _densify_linestring(ls, step_m):
+    """Yield points along a LineString at approximately step_m spacing (including endpoints)."""
+    try:
+        import numpy as np
+        from shapely.geometry import Point
+    except Exception:
+        return []
+    if ls is None or ls.length == 0:
+        return []
+    step = max(float(step_m), 1.0)
+    n = int(ls.length // step)
+    dists = [0.0] + [i * step for i in range(1, n + 1)]
+    if dists[-1] < ls.length:
+        dists.append(ls.length)
+    pts = []
+    for d in dists:
+        try:
+            pts.append(ls.interpolate(d))
+        except Exception:
+            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+    return pts
+
+
+def _clamp_profile_slope_curv(z, ds, max_slope=0.0, max_curv=0.0):
+    """Clamp a 1D elevation profile by slope and curvature limits.
+
+    max_slope is |dz/ds| in m/m.
+    max_curv is |d2z/ds2| in 1/m (approx via second difference / ds^2).
+    """
+    import numpy as np
+    z = np.asarray(z, dtype=float)
+    if z.size < 3:
+        return z
+    ds = float(ds)
+    out = z.copy()
+
+    # Slope clamp (forward pass)
+    if max_slope and max_slope > 0:
+        dz_max = abs(float(max_slope)) * ds
+        for i in range(1, out.size):
+            dz = out[i] - out[i-1]
+            if dz > dz_max:
+                out[i] = out[i-1] + dz_max
+            elif dz < -dz_max:
+                out[i] = out[i-1] - dz_max
+        # backward pass to reduce drift
+        for i in range(out.size-2, -1, -1):
+            dz = out[i] - out[i+1]
+            if dz > dz_max:
+                out[i] = out[i+1] + dz_max
+            elif dz < -dz_max:
+                out[i] = out[i+1] - dz_max
+
+    # Curvature clamp (limit slope changes)
+    if max_curv and max_curv > 0 and out.size >= 4:
+        dslope_max = abs(float(max_curv)) * ds  # since dslope ~ d2z/ds2 * ds
+        # work in slopes
+        s = np.diff(out) / ds
+        # forward clamp on slope changes
+        for i in range(1, s.size):
+            dslope = s[i] - s[i-1]
+            if dslope > dslope_max:
+                s[i] = s[i-1] + dslope_max
+            elif dslope < -dslope_max:
+                s[i] = s[i-1] - dslope_max
+        # backward clamp
+        for i in range(s.size-2, -1, -1):
+            dslope = s[i] - s[i+1]
+            if dslope > dslope_max:
+                s[i] = s[i+1] + dslope_max
+            elif dslope < -dslope_max:
+                s[i] = s[i+1] - dslope_max
+        # reconstruct
+        out2 = np.empty_like(out)
+        out2[0] = out[0]
+        for i in range(1, out.size):
+            out2[i] = out2[i-1] + s[i-1] * ds
+        out = out2
+
+    return out
+
+
+def _apply_bed_profile_constraints(
+    bed, template_profile, river_gpkg, channel_mask,
+    step_m=25.0, max_slope=0.0, max_curv=0.0, strength=0.6, power=2.0,
+    logger=None, debug_dir=None,
+):
+    """Apply longitudinal bed-profile constraints using flowline geometry as the 1D support.
+
+    Strategy:
+      1) sample bed along densified flowlines
+      2) clamp the 1D profile by slope/curvature limits
+      3) write a correction field anchored on skeleton pixels
+      4) spread correction into channel with distance-decay weighting
+
+    This is intentionally conservative: it nudges the bed toward a physically plausible
+    longitudinal profile without overriding local anchors everywhere.
+    """
+    import numpy as np
+    import rasterio
+    from rasterio.transform import rowcol
+    from rasterio.crs import CRS
+    from scipy.ndimage import distance_transform_edt
+
+    try:
+        import geopandas as gpd
+        import fiona
+        from shapely.geometry import LineString, MultiLineString
+    except Exception as e:
+        if logger:
+            logger.warning("Bed profile constraints requested but geopandas/fiona not available: %s", e)
+        return bed
+
+    if strength <= 0 or (max_slope <= 0 and max_curv <= 0):
+        return bed
+
+    gpkg = str(river_gpkg)
+    layers = []
+    try:
+        layers = list(fiona.listlayers(gpkg))
+    except Exception as e:
+        if logger:
+            logger.warning("Failed listing layers in %s: %s", gpkg, e)
+        return bed
+
+    # pick first line layer (prefer rivers_aoi / flowlines-ish names)
+    line_layer = None
+    prefer = ['rivers_aoi', 'flowlines', 'nhdflowline', 'rivers']
+    for name in prefer:
+        if name in layers:
+            try:
+                g = gpd.read_file(gpkg, layer=name)
+                if len(g) and g.geometry.iloc[0].geom_type.lower().endswith('linestring'):
+                    line_layer = name
+                    break
+            except Exception:
+                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+    if line_layer is None:
+        for name in layers:
+            try:
+                g = gpd.read_file(gpkg, layer=name)
+                if len(g) and g.geometry.iloc[0].geom_type.lower().endswith('linestring'):
+                    line_layer = name
+                    break
+            except Exception:
+                continue
+
+    if line_layer is None:
+        if logger:
+            logger.warning("No LineString layer found in river gpkg; skipping bed profile constraints")
+        return bed
+
+    gdf = gpd.read_file(gpkg, layer=line_layer)
+    if gdf.empty:
+        return bed
+
+    # Reproject to template CRS
+    try:
+        crs = CRS.from_wkt(template_profile['crs'].to_wkt()) if hasattr(template_profile.get('crs'), 'to_wkt') else CRS.from_user_input(template_profile['crs'])
+    except Exception:
+        crs = CRS.from_user_input(template_profile['crs'])
+    try:
+        gdf = gdf.to_crs(crs)
+    except Exception:
+        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+
+    transform = template_profile['transform']
+    nodata = template_profile.get('nodata', -9999.0)
+
+    seed = np.full(bed.shape, np.nan, dtype='float32')
+
+    # helper to add sample to seed pixel (average if multiple)
+    def _accum(r, c, val):
+        if r < 0 or c < 0 or r >= seed.shape[0] or c >= seed.shape[1]:
+            return
+        if not channel_mask[r, c]:
+            return
+        if np.isnan(seed[r, c]):
+            seed[r, c] = float(val)
+        else:
+            seed[r, c] = 0.5 * (seed[r, c] + float(val))
+
+    # Build constrained profile per geometry and rasterize to seed pixels
+    step = max(float(step_m), 1.0)
+    n_profiles = 0
+    n_pts = 0
+    for geom in gdf.geometry:
+        if geom is None:
+            continue
+        geoms = []
+        if isinstance(geom, LineString):
+            geoms = [geom]
+        elif isinstance(geom, MultiLineString):
+            geoms = list(geom.geoms)
+        else:
+            continue
+        for ls in geoms:
+            pts = _densify_linestring(ls, step)
+            if len(pts) < 3:
+                continue
+            # sample bed at points
+            rc = [rowcol(transform, p.x, p.y) for p in pts]
+            z = []
+            ok_rc = []
+            for (r, c) in rc:
+                if 0 <= r < bed.shape[0] and 0 <= c < bed.shape[1] and channel_mask[r, c]:
+                    val = float(bed[r, c])
+                    if np.isfinite(val) and val != nodata:
+                        z.append(val)
+                        ok_rc.append((r, c))
+                    else:
+                        z.append(np.nan)
+                        ok_rc.append((r, c))
+                else:
+                    z.append(np.nan)
+                    ok_rc.append((r, c))
+            z = np.array(z, dtype=float)
+            # fill small gaps by interpolation to avoid breaking constraints
+            if np.all(~np.isfinite(z)):
+                continue
+            x = np.arange(z.size)
+            m = np.isfinite(z)
+            z_f = z.copy()
+            if m.sum() >= 2:
+                z_f[~m] = np.interp(x[~m], x[m], z[m])
+            else:
+                continue
+            z_c = _clamp_profile_slope_curv(z_f, ds=step, max_slope=max_slope, max_curv=max_curv)
+            for (r, c), val in zip(ok_rc, z_c):
+                _accum(r, c, val)
+            n_profiles += 1
+            n_pts += len(ok_rc)
+
+    if n_profiles == 0:
+        if logger:
+            logger.info("Bed profile constraints: no usable profiles in %s", line_layer)
+        return bed
+
+    # Spread correction from seed to full channel via nearest seed pixel and distance decay
+    seed_mask = np.isfinite(seed)
+    if seed_mask.sum() < 10:
+        return bed
+
+    # distance_transform_edt expects False=features; invert
+    dist, inds = distance_transform_edt(~seed_mask, return_indices=True)
+    # distance in pixels; convert to meters using pixel size
+    px = abs(float(transform.a))
+    d_m = dist * px
+
+    r_idx, c_idx = inds
+    seed_nn = seed[r_idx, c_idx]
+    bed_nn = bed[r_idx, c_idx]
+    delta = (seed_nn - bed_nn).astype('float32')
+
+    # decay weighting
+    sigma = max(step * 2.0, px)
+    w = np.exp(- (d_m / sigma) ** float(power)).astype('float32')
+    w *= float(strength)
+
+    out = bed.copy().astype('float32')
+    apply = channel_mask & seed_mask[r_idx, c_idx] & np.isfinite(delta)
+    out[apply] = out[apply] + w[apply] * delta[apply]
+
+    if logger:
+        logger.info("Applied bed profile constraints: profiles=%d pts=%d max_slope=%.4g max_curv=%.4g strength=%.2f", n_profiles, n_pts, float(max_slope), float(max_curv), float(strength))
+
+    if debug_dir is not None:
+        try:
+            import os
+            os.makedirs(debug_dir, exist_ok=True)
+            from pathlib import Path
+            from rasterio import open as rio_open
+            def _save(name, arr, nod=-9999.0):
+                prof = template_profile.copy()
+                prof.update(dtype='float32', count=1, nodata=nod)
+                with rio_open(str(Path(debug_dir)/name), 'w', **prof) as dst:
+                    dst.write(arr.astype('float32'), 1)
+            _save('bed_profile_seed.tif', np.where(seed_mask, seed, -9999.0), nod=-9999.0)
+            _save('bed_profile_weight.tif', np.where(channel_mask, w, -9999.0), nod=-9999.0)
+        except Exception as e:
+            if logger:
+                logger.warning("Failed writing bed profile debug rasters: %s", e)
+
+    return out
 def main(
 ) -> int:
     p = argparse.ArgumentParser(description="Generate river bed elevations using a channel-skeleton distance-transform method.")
@@ -977,6 +1811,17 @@ def main(
     p.add_argument("--shape-exp", type=float, default=0.5, help="Depth profile exponent (0.5 ~ U-shaped; 1.0 ~ V-shaped)")
     p.add_argument("--dmax-min-m", type=float, default=0.5, help="Clamp minimum Dmax prior (m)")
     p.add_argument("--dmax-max-m", type=float, default=30.0, help="Clamp maximum Dmax prior (m)")
+    # Optional: longitudinal bed profile constraints (applied after bed inference)
+    p.add_argument("--bed-profile-max-slope", type=float, default=0.0,
+                   help="Max absolute bed slope |dz/ds| along flowlines (m/m). 0 disables.")
+    p.add_argument("--bed-profile-max-curv", type=float, default=0.0,
+                   help="Max absolute bed curvature |d2z/ds2| along flowlines (1/m). 0 disables.")
+    p.add_argument("--bed-profile-step-m", type=float, default=25.0,
+                   help="Sampling step (m) along flowlines for building the constrained bed profile (default: 25).")
+    p.add_argument("--bed-profile-strength", type=float, default=0.6,
+                   help="Blend strength (0..1) for applying constrained bed profile back into the raster (default: 0.6).")
+    p.add_argument("--bed-profile-power", type=float, default=2.0,
+                   help="Distance-decay power for spreading constrained bed correction from the skeleton (default: 2.0).")
 
     # Priors (match bathy_main / xs_infer args)
     p.add_argument("--prior-mode", default="powerlaw", choices=["powerlaw", "multivariate"], help="Dmax prior mode")
@@ -1026,9 +1871,100 @@ def main(
         ),
     )
 
+    
+    # Optional: SWOT RiverSP anchoring for wse-mode=bank_profile
+    p.add_argument(
+        "--swot-riversp",
+        nargs="+",
+        default=None,
+        help=(
+            "One or more SWOT RiverSP vector files (reach or node product; e.g., .shp/.gpkg/.geojson) "
+            "containing water surface elevation (WSE). Used only when --wse-mode=bank_profile."
+        ),
+    )
+    p.add_argument(
+        "--swot-wse-field",
+        default=None,
+        help="Column name for SWOT WSE in the RiverSP file(s). If omitted, common candidates will be searched.",
+    )
+    p.add_argument(
+        "--swot-qual-field",
+        default=None,
+        help="Optional column name for a SWOT quality flag; if provided, values >0 are treated as bad and filtered out.",
+    )
+    p.add_argument(
+        "--swot-max-dist-m",
+        type=float,
+        default=300.0,
+        help="Maximum distance (m) from a flowline sample point to accept a SWOT WSE observation.",
+    )
+    p.add_argument(
+        "--swot-min-samples",
+        type=int,
+        default=5,
+        help="Minimum number of SWOT samples on a flowline required to apply anchoring corrections.",
+    )
+    p.add_argument(
+        "--swot-correct-sigma-m",
+        type=float,
+        default=2000.0,
+        help="Smoothing scale (m) for along-channel SWOT correction (Gaussian sigma along distance).",
+    )
+    p.add_argument(
+        "--swot-weight",
+        type=float,
+        default=1.0,
+        help="Weight (0..1) to apply SWOT correction to the bank-derived WSE profile.",
+    )
+    p.add_argument(
+        "--swot-max-correction-m",
+        type=float,
+        default=5.0,
+        help=(
+            "Clamp the along-channel correction magnitude (m) applied from SWOT (helps avoid datum/offset mistakes)."
+        ),
+    )
+    p.add_argument(
+        "--swot-wse-offset-m",
+        type=float,
+        default=0.0,
+        help=(
+            "Constant offset (m) added to SWOT WSE before use. Use this to reconcile vertical datums "
+            "until a full datum transform is implemented."
+        ),
+    )
+
+    p.add_argument(
+        "--swot-offset-mode",
+        default="median_mad",
+        choices=["none", "median_mad"],
+        help=(
+            "Vertical datum reconciliation mode for SWOT WSE vs bank_profile WSE. "
+            "'median_mad' estimates a robust constant offset from overlapping samples and subtracts it from SWOT WSE. "
+            "'none' disables auto offset estimation (use --swot-wse-offset-m instead)."
+        ),
+    )
+    p.add_argument(
+        "--swot-offset-min-samples",
+        type=int,
+        default=25,
+        help="Minimum number of SWOT samples required to estimate an auto vertical offset.",
+    )
+    p.add_argument(
+        "--swot-offset-mad-z",
+        type=float,
+        default=3.5,
+        help="MAD-based outlier rejection threshold (in robust-sigma units) for auto vertical offset estimation.",
+    )
+    p.add_argument(
+        "--swot-offset-max-abs-m",
+        type=float,
+        default=10.0,
+        help="Clamp absolute value of the auto-estimated vertical offset (m). If exceeded, it is clamped and a warning is logged.",
+    )
+
+
     # Junction / confluence handling (skeleton mode can be unstable near confluences)
-
-
 
     p.add_argument(
         "--junction-mode",
@@ -1049,6 +1985,31 @@ def main(
         default=80.0,
         help="Gaussian smoothing sigma (m) used in junction zones when junction-mode=smooth.",
     )
+
+    # Mainstem preserve mask selection
+    p.add_argument(
+        "--mainstem-mode",
+        default="width_proxy",
+        choices=["width_proxy", "graph_trace"],
+        help=(
+            "How to define the mainstem for confluence protection. "
+            "'width_proxy' (default) uses a width proxy derived from the channel mask to identify the widest connected channel. "
+            "'graph_trace' uses stream-order/graph-based tracing."
+        ),
+    )
+    p.add_argument(
+        "--mainstem-width-min-m",
+        type=float,
+        default=60.0,
+        help="Absolute minimum width proxy (m) for pixels to be considered mainstem (width_proxy mode).",
+    )
+    p.add_argument(
+        "--mainstem-width-pctl",
+        type=float,
+        default=85.0,
+        help="Percentile (0-100) of width proxy within channel used as threshold for mainstem (width_proxy mode).",
+    )
+
 
 
     p.add_argument(
@@ -1093,6 +2054,10 @@ def main(
                    help="Per-cell percentile used when binning multiple XYZ points into the same grid cell. If not set: bed_elev uses 5th percentile (deeper, outlier-robust); depth uses 95th percentile (deeper, outlier-robust).")
     p.add_argument("--soundings-max-dist-m", type=float, default=10000.0,
                    help="Max distance (m) from a sounding to influence skeleton Dmax (nearest-sounding within this distance).")
+    p.add_argument("--soundings-max-points", type=int, default=2_000_000,
+                   help="Global cap on number of sounding points used (downsampled with per-file proportions) to prevent OOM-kills.")
+    p.add_argument("--soundings-sample-seed", type=int, default=0,
+                   help="RNG seed for soundings downsampling (for reproducibility).")
     p.add_argument("--soundings-min-r", type=float, default=0.25,
                    help="Minimum r used when converting sounding depth -> implied Dmax (prevents blow-ups near banks).")
     p.add_argument("--no-soundings-enforce", dest="soundings_enforce", action="store_false", default=True,
@@ -1290,6 +2255,61 @@ def main(
             smooth_sigma_m=float(args.wse_smooth_sigma_m or 0.0),
         )
         if wse_bank is not None:
+            swot_pts = None
+            swot_wse = None
+            if getattr(args, "swot_riversp", None):
+                swot_pts, swot_wse = _read_swot_riversp_points(
+                    paths=getattr(args, "swot_riversp", None),
+                    template_crs=template_profile.get("crs"),
+                    wse_field=getattr(args, "swot_wse_field", None),
+                    qual_field=getattr(args, "swot_qual_field", None),
+                    wse_offset_m=float(getattr(args, "swot_wse_offset_m", 0.0) or 0.0),
+                )
+                if swot_pts is not None and len(swot_pts) > 0:
+                    LOG.info(
+                        "Loaded SWOT RiverSP WSE samples: n=%d (user_offset=%.3f m).",
+                        len(swot_pts),
+                        float(getattr(args, "swot_wse_offset_m", 0.0) or 0.0),
+                    )
+
+                    # Auto vertical datum reconciliation: estimate a robust constant offset between SWOT WSE and bank_profile WSE
+                    # using overlapping samples, then subtract it from SWOT WSE.
+                    off_mode = str(getattr(args, "swot_offset_mode", "median_mad") or "median_mad").lower()
+                    if off_mode != "none":
+                        est_off, n_used, est_stats = _estimate_swot_vertical_offset(
+                            swot_pts=swot_pts,
+                            swot_wse=swot_wse,
+                            bank_wse=wse_bank,
+                            template_transform=template_profile.get("transform"),
+                            channel=channel,
+                            mode=off_mode,
+                            min_samples=int(getattr(args, "swot_offset_min_samples", 25) or 0),
+                            mad_z=float(getattr(args, "swot_offset_mad_z", 3.5) or 3.5),
+                            max_abs_m=float(getattr(args, "swot_offset_max_abs_m", 10.0) or 0.0),
+                        )
+                        if n_used > 0 and abs(float(est_off)) > 1e-9:
+                            swot_wse = (swot_wse - float(est_off)).astype(float)
+                            LOG.info(
+                                "SWOT vertical offset estimated: %.3f m (n=%d). Applied as swot_wse -= offset. Stats=%s",
+                                float(est_off), int(n_used), str(est_stats),
+                            )
+                        elif n_used > 0:
+                            LOG.info("SWOT vertical offset estimated ~0.0 m (n=%d).", int(n_used))
+                        else:
+                            LOG.warning(
+                                "SWOT vertical offset could not be estimated (mode=%s). "
+                                "Ensure vertical datums are compatible or provide --swot-wse-offset-m.",
+                                off_mode,
+                            )
+                    else:
+                        # Safety warning: datums are not automatically reconciled.
+                        if abs(float(getattr(args, "swot_wse_offset_m", 0.0) or 0.0)) < 1e-6:
+                            LOG.warning(
+                                "SWOT RiverSP anchoring enabled but auto offset is disabled and swot_wse_offset_m is 0.0. "
+                                "Ensure SWOT WSE is in the same vertical datum as your DEM/WSE proxy (e.g., NAVD88), "
+                                "or set an offset."
+                            )
+
             wse_prof = _build_wse_longitudinal_profile(
                 bank_wse=wse_bank,
                 channel=channel,
@@ -1303,6 +2323,13 @@ def main(
                 max_slope=float(getattr(args, "wse_profile_max_slope", 0.0) or 0.0),
                 min_samples=int(getattr(args, "wse_profile_min_samples", 10) or 10),
                 max_query_dist_m=float(getattr(args, "wse_profile_max_query_dist_m", 250.0) or 0.0),
+                swot_pts=swot_pts,
+                swot_wse=swot_wse,
+                swot_max_dist_m=float(getattr(args, "swot_max_dist_m", 300.0) or 0.0),
+                swot_min_samples=int(getattr(args, "swot_min_samples", 5) or 0),
+                swot_correct_sigma_m=float(getattr(args, "swot_correct_sigma_m", 2000.0) or 0.0),
+                swot_weight=float(getattr(args, "swot_weight", 1.0) or 0.0),
+                swot_max_correction_m=float(getattr(args, "swot_max_correction_m", 5.0) or 0.0),
             )
             if wse_prof is not None:
                 wse_map = wse_prof
@@ -1361,6 +2388,8 @@ def main(
                 dmax_max_m=float(args.dmax_max_m),
                 mode=str(args.soundings_mode),
                 min_r=float(args.soundings_min_r),
+                max_points=int(getattr(args, 'soundings_max_points', 2_000_000) or 0),
+                sample_seed=int(getattr(args, 'soundings_sample_seed', 0) or 0),
                 cell_percentile=args.soundings_cell_percentile,
             wse_map=wse_map,
             )
@@ -1426,6 +2455,7 @@ def main(
         junction_zone = _junction_zone_mask(
             river_gpkg=Path(args.river_gpkg),
             nodes_layer=str(getattr(args, "junction_nodes_layer", "graph_nodes")),
+            river_layer=str(getattr(args, "wse_profile_river_layer", "rivers_clip")),
             template_profile=template_profile,
             transform=transform,
             crs=crs,
@@ -1442,6 +2472,275 @@ def main(
                 jm = jm & (width <= maxw)
                 n_jm = int(np.count_nonzero(jm))
             if n_jm > 0:
+
+                # ------------------------------------------------------------
+                # Mainstem preserve mask (defends the main channel from
+                # confluence smoothing / constraints imprinting tributary artifacts)
+                # Strategy (robust, attribute-tolerant):
+                #   - Build a per-component mainstem polyline by tracing from the
+                #     highest-order seed edge and walking outward, always choosing
+                #     the highest-order continuation (ties by length).
+                #   - Rasterize that polyline, build a corridor using channel
+                #     half-width (distance to bank) and distance to mainstem line.
+                #   - Preserve the corridor everywhere (not only inside jm).
+                preserve_mainstem = None
+                mainstem_corridor = None
+                try:
+                    from pathlib import Path as _Path
+                    debug_jm_path = None
+                    debug_ms_path = None
+                    out_bed_path = _Path(getattr(args, "out_bed", "") or "")
+                    if out_bed_path:
+                        debug_jm_path = out_bed_path.parent / "junction_zone_mask.tif"
+                        debug_ms_path = out_bed_path.parent / "mainstem_preserve_mask.tif"
+                except Exception:
+                    debug_jm_path = None
+                    debug_ms_path = None
+
+                try:
+                    gpkg = getattr(args, "river_gpkg", None)
+                    mainstem_attr = str(getattr(args, "mainstem_order_field", "streamorde") or "streamorde")
+                    if gpkg:
+                        import geopandas as _gpd
+                        from rasterio.features import rasterize as _rasterize
+                        from scipy.ndimage import distance_transform_edt as _edt
+
+                        g_edges = _gpd.read_file(gpkg, layer="graph_edges")
+                        template_crs = template_profile.get("crs", None)
+                        try:
+                            if template_crs is not None and getattr(g_edges, 'crs', None) is not None and str(g_edges.crs) != str(template_crs):
+                                g_edges = g_edges.to_crs(template_crs)
+                        except Exception:
+                            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                        if (g_edges is not None) and (not g_edges.empty):
+                            geoms = list(g_edges.geometry)
+
+                            # Optional stream order
+                            orders = None
+                            if mainstem_attr in g_edges.columns:
+                                try:
+                                    orders = g_edges[mainstem_attr].astype("float64").to_numpy()
+                                except Exception:
+                                    orders = None
+
+                            # Build adjacency graph from edge endpoints
+                            def _key_xy(x: float, y: float, nd: int = 6):
+                                return (round(float(x), nd), round(float(y), nd))
+
+                            adj = {}
+                            edge_ends = []
+                            edge_len = np.zeros(len(geoms), dtype="float64")
+
+                            for i, geom in enumerate(geoms):
+                                if geom is None or geom.is_empty:
+                                    edge_ends.append((None, None))
+                                    edge_len[i] = 0.0
+                                    continue
+                                try:
+                                    c0 = geom.coords[0]
+                                    c1 = geom.coords[-1]
+                                except Exception:
+                                    try:
+                                        lg = max(list(geom.geoms), key=lambda g: g.length)
+                                        c0 = lg.coords[0]
+                                        c1 = lg.coords[-1]
+                                    except Exception:
+                                        edge_ends.append((None, None))
+                                        edge_len[i] = 0.0
+                                        continue
+                                u = _key_xy(c0[0], c0[1])
+                                v = _key_xy(c1[0], c1[1])
+                                edge_ends.append((u, v))
+                                L = float(getattr(geom, "length", 0.0) or 0.0)
+                                edge_len[i] = L
+                                adj.setdefault(u, []).append((v, i, L))
+                                adj.setdefault(v, []).append((u, i, L))
+
+                            # Pick a seed edge: highest finite order, tie by length
+                            seed_idx = None
+                            if orders is not None:
+                                finite = np.isfinite(orders)
+                                if np.any(finite):
+                                    maxo = float(np.nanmax(orders[finite]))
+                                    cand = np.where(finite & (orders >= maxo - 1e-6))[0]
+                                    if cand.size > 0:
+                                        seed_idx = int(cand[np.argmax(edge_len[cand])])
+                            if seed_idx is None:
+                                # Fallback: longest edge
+                                seed_idx = int(np.argmax(edge_len))
+
+                            u0, v0 = edge_ends[seed_idx]
+                            if (u0 is not None) and (v0 is not None):
+                                # Determine the connected component containing the seed
+                                allowed_nodes = set()
+                                stack = [u0]
+                                allowed_nodes.add(u0)
+                                while stack:
+                                    n0 = stack.pop()
+                                    for (nb, ei, L) in adj.get(n0, []):
+                                        if nb not in allowed_nodes:
+                                            allowed_nodes.add(nb)
+                                            stack.append(nb)
+
+                                # Trace mainstem path outward from the seed, choosing best continuation.
+                                mainstem_edge_mask = np.zeros(len(geoms), dtype=bool)
+                                mainstem_edge_mask[seed_idx] = True
+
+                                def _edge_score(ei: int):
+                                    # Prefer higher order, then length
+                                    o = float(orders[ei]) if (orders is not None and np.isfinite(orders[ei])) else -1.0
+                                    return (o, float(edge_len[ei]))
+
+                                def _extend_from(node, prev_node):
+                                    cur = node
+                                    prev = prev_node
+                                    while True:
+                                        # Candidate incident edges that stay inside component and not already used
+                                        cands = []
+                                        for (nb, ei, L) in adj.get(cur, []):
+                                            if nb not in allowed_nodes:
+                                                continue
+                                            if mainstem_edge_mask[ei]:
+                                                continue
+                                            # avoid immediate backtrack if possible
+                                            if prev is not None and nb == prev:
+                                                continue
+                                            cands.append((nb, ei))
+                                        if not cands:
+                                            # allow backtrack edge if it's the only option
+                                            for (nb, ei, L) in adj.get(cur, []):
+                                                if nb not in allowed_nodes:
+                                                    continue
+                                                if mainstem_edge_mask[ei]:
+                                                    continue
+                                                cands.append((nb, ei))
+                                        if not cands:
+                                            break
+                                        # Choose best by score (order, length)
+                                        best_nb, best_ei = max(cands, key=lambda t: _edge_score(t[1]))
+                                        mainstem_edge_mask[best_ei] = True
+                                        prev, cur = cur, best_nb
+
+                                # Extend from both ends of the seed edge
+                                _extend_from(u0, v0)
+                                _extend_from(v0, u0)
+
+                                ms_geoms = [
+                                    geom for geom, keep in zip(geoms, mainstem_edge_mask)
+                                    if keep and geom is not None and (not geom.is_empty)
+                                ]
+                                if ms_geoms:
+                                    ms_line = _rasterize(
+                                        [(geom, 1) for geom in ms_geoms],
+                                        out_shape=channel.shape,
+                                        transform=transform,
+                                        fill=0,
+                                        dtype="uint8",
+                                        all_touched=True,
+                                    )
+                                    ms_sum = int(ms_line.sum())
+                        if ms_sum == 0:
+                            try:
+                                ms_line = _rasterize(
+                                    [(geom.buffer(float(pix)*2.0), 1) for geom in ms_geoms],
+                                    out_shape=channel.shape,
+                                    transform=transform,
+                                    fill=0,
+                                    dtype="uint8",
+                                    all_touched=True,
+                                )
+                                ms_sum = int(ms_line.sum())
+                            except Exception:
+                                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                        if ms_sum > 0:
+                                        # Distance to mainstem line (meters)
+                                        dist_line = _edt(ms_line == 0) * float(pix)
+                                        # Local half-width proxy from channel mask (meters)
+                                        chan_mask = (channel > 0) if channel.dtype != bool else channel
+                                        halfw = _edt(chan_mask) * float(pix)
+                                        if getattr(args, "mainstem_mode", "width_proxy") == "width_proxy":
+                                            # Width-proxy mainstem selection (robust alternative to stream order / graph tracing).
+                                                                                    # Compute an approximate channel width proxy (meters) from the distance-to-bank field.
+                                                                                    w_proxy_m = (2.0 * halfw).astype("float32")
+                                                                                    
+                                                                                    # Define "mainstem candidates" as the wider portion of the channel.
+                                                                                    # Threshold is max(absolute_min_width_m, percentile within channel).
+                                                                                    abs_min_width_m = float(getattr(args, "mainstem_width_min_m", 60.0))
+                                                                                    pctl = float(getattr(args, "mainstem_width_pctl", 85.0))
+                                                                                    try:
+                                                                                        vals = w_proxy_m[channel]
+                                                                                        vals = vals[np.isfinite(vals)]
+                                                                                        thr = float(np.nanpercentile(vals, pctl)) if vals.size else abs_min_width_m
+                                                                                        thr = max(thr, abs_min_width_m)
+                                                                                    except Exception:
+                                                                                        thr = abs_min_width_m
+                                                                                    
+                                                                                    mainstem_wide = channel & (w_proxy_m >= thr)
+                                                                                    
+                                                                                    # Keep only the largest connected component of the wide mask to avoid isolated blobs.
+                                                                                    try:
+                                                                                        from scipy.ndimage import label as _label
+                                                                                        lab, nlab = _label(mainstem_wide.astype("uint8"))
+                                                                                        if nlab > 1:
+                                                                                            # choose largest component by pixel count
+                                                                                            counts = np.bincount(lab.ravel())
+                                                                                            counts[0] = 0
+                                                                                            keep = int(np.argmax(counts))
+                                                                                            mainstem_wide = (lab == keep)
+                                                                                    except Exception:
+                                                                                        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                                                                                    
+                                                                                    # In junction zones, expand protection slightly so tributary smoothing cannot imprint into the mainstem.
+                                                                                    mainstem_corridor = mainstem_wide | (jm & channel & (w_proxy_m >= 0.8 * thr))
+                                                                                    preserve_mainstem = mainstem_corridor
+                                                                                    
+                                                                                    # Overwrite ms_line-based corridor logic below by setting dist_line very small within mainstem_corridor.
+                                                                                    # (This prevents later code paths that rely on dist_line from restricting the corridor.)
+                                                                                    dist_line = np.full(channel.shape, 1e9, dtype="float32")
+                                                                                    dist_line[mainstem_corridor] = 0.0
+                                        
+
+
+                                        # Minimum corridor width to ensure continuity through confluences
+                                        min_corr = max(75.0, 7.0 * float(pix))
+
+                                        # Base corridor inside channel; widen slightly in junction zone
+                                        corr_base = channel & (dist_line <= np.maximum(min_corr, 1.00 * halfw))
+                                        corr_junc = channel & jm & (dist_line <= np.maximum(min_corr, 1.25 * halfw))
+                                        corridor = corr_base | corr_junc
+
+                                        LOG.info(
+                                            "Mainstem corridor: channel_n=%d jm_n=%d corridor_n=%d",
+                                            int(np.count_nonzero(channel)),
+                                            int(np.count_nonzero(jm)),
+                                            int(np.count_nonzero(corridor)),
+                                        )
+                                        try:
+                                            if debug_corr_path is not None:
+                                                _save_f32(debug_corr_path, corridor.astype("float32"), template_profile, nodata=255.0)
+                                        except Exception:
+                                            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                                        mainstem_corridor = corridor
+                                        # preserve_mainstem already set by width-proxy selection
+                                        preserve_mainstem = preserve_mainstem
+                                        if int(np.count_nonzero(preserve_mainstem)) == 0:
+                                            LOG.warning("Mainstem preserve mask is empty; mainstem selection/rasterization likely failed.")
+
+                                        # Debug rasters
+                                        try:
+                                            if debug_jm_path is not None:
+                                                _save_f32(debug_jm_path, jm.astype("uint8"), template_profile, nodata=255.0)
+                                            if (debug_ms_path is not None) and (preserve_mainstem is not None):
+                                                _save_f32(debug_ms_path, preserve_mainstem.astype("uint8"), template_profile, nodata=255.0)
+                                        except Exception:
+                                            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                except Exception:
+                    preserve_mainstem = None
+                    mainstem_corridor = None
+
+                # Snapshot values before any junction smoothing so we can restore mainstem corridor
+                depth_pre_smooth = depth.copy()
+                wse_pre_smooth = wse_map.copy()
                 jmode = str(getattr(args, "junction_mode", "smooth")).strip().lower()
                 if jmode == "mask":
                     depth[jm] = np.nan
@@ -1466,14 +2765,30 @@ def main(
 
                             num = gaussian_filter(filled * w, sigma=sigma_px, mode="nearest")
                             den = gaussian_filter(w, sigma=sigma_px, mode="nearest")
-                            sm = np.where(den > 1e-6, num / den, filled).astype("float32")
+                            sm = filled.astype("float32").copy()
+                            np.divide(num, den, out=sm, where=(den > 1e-6))
+                            sm = sm.astype("float32")
 
                             out[jm] = sm[jm]
                             return out
 
-                        depth = _smooth_in_zone(depth)
+                        # Smooth WSE only (avoid circular 'bullseye' depth artifacts at tributary mouths)
                         wse_map = _smooth_in_zone(wse_map)
-                        LOG.info("Junction mode=smooth: locally smoothed WSE/depth in %d junction-zone cells (sigma=%.1fm).", n_jm, sig_m)
+                        # Recompute depth from (smoothed) WSE and current bed to keep mainstem continuity
+                        try:
+                            depth = (wse_map - bed).astype('float32')
+                            # Depth cannot be negative
+                            depth = np.where(depth >= 0.0, depth, 0.0).astype('float32')
+                        except Exception:
+                            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                        try:
+                            if preserve_mainstem is not None and np.any(preserve_mainstem):
+                                depth[preserve_mainstem] = depth_pre_smooth[preserve_mainstem]
+                                wse_map[preserve_mainstem] = wse_pre_smooth[preserve_mainstem]
+                                LOG.info("Preserved mainstem corridor during junction smoothing (cells=%d).", int(np.count_nonzero(preserve_mainstem)))
+                        except Exception:
+                            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                        LOG.info("Junction mode=smooth: locally smoothed WSE (depth recomputed from WSE-bed) in %d junction-zone cells (sigma=%.1fm).", n_jm, sig_m)
                     else:
                         LOG.info("Junction mode=smooth requested but sigma<=0; no smoothing applied.")
                 else:
@@ -1522,6 +2837,41 @@ def main(
 
     out_bed = Path(args.out_bed)
     out_bed.parent.mkdir(parents=True, exist_ok=True)
+    
+
+    # Optional: longitudinal bed profile constraints (slope/curvature)
+    try:
+        bmaxs = float(getattr(args, 'bed_profile_max_slope', 0.0) or 0.0)
+        bmaxc = float(getattr(args, 'bed_profile_max_curv', 0.0) or 0.0)
+        bstep = float(getattr(args, 'bed_profile_step_m', 25.0) or 25.0)
+        bstr = float(getattr(args, 'bed_profile_strength', 0.6) or 0.0)
+        bpow = float(getattr(args, 'bed_profile_power', 2.0) or 2.0)
+        if (bstr > 0.0) and ((bmaxs > 0.0) or (bmaxc > 0.0)):
+            dbg = None
+            if getattr(args, 'debug_dir', None):
+                dbg = str(Path(args.debug_dir) / 'bed_profile')
+            bed_pre_constraints = bed.copy()
+            bed = _apply_bed_profile_constraints(
+                bed=bed,
+                template_profile=template_profile,
+                river_gpkg=Path(args.river_gpkg),
+                channel_mask=channel,
+                step_m=bstep,
+                max_slope=bmaxs,
+                max_curv=bmaxc,
+                strength=bstr,
+                power=bpow,
+                logger=LOG,
+                debug_dir=dbg,
+            )
+            # Re-impose mainstem corridor after bed profile constraints as well.
+            if (mainstem_corridor is not None) and np.any(mainstem_corridor):
+                bed[mainstem_corridor] = bed_pre_constraints[mainstem_corridor]
+                LOG.info("Mainstem corridor preserved after profile constraints (cells=%d).", int(np.count_nonzero(mainstem_corridor)))
+    except Exception as e:
+        LOG.warning('Bed profile constraints failed; continuing without them. Error: %s', e)
+
+    # NOTE: Use spaces for indentation in this block to avoid TabError.
     _save_f32(out_bed, bed, template_profile)
 
     if args.debug_dir:
@@ -1529,6 +2879,8 @@ def main(
         ddir.mkdir(parents=True, exist_ok=True)
         _save_f32(ddir / "depth_m.tif", depth, template_profile)
         _save_f32(ddir / "wse_m.tif", wse_map, template_profile)
+        _save_f32(ddir / "debug_w_proxy_m.tif", w_proxy_m, template_profile)
+        _save_f32(ddir / "debug_mainstem_corridor_mask.tif", preserve_mainstem.astype("uint8"), template_profile, nodata=255.0)
         _save_f32(ddir / "r.tif", np.where(channel, r, np.nan), template_profile)
         _save_f32(ddir / "d_bank_m.tif", np.where(channel, d_bank, np.nan), template_profile)
         _save_f32(ddir / "d_center_m.tif", np.where(channel, d_center, np.nan), template_profile)
@@ -1541,7 +2893,6 @@ def main(
             _save_f32(ddir / 'snd_dmax_implied_m.tif', np.where(channel, snd_dmax_grid, np.nan), template_profile)
         if snd_dist is not None:
             _save_f32(ddir / 'snd_dist_m.tif', np.where(channel, snd_dist, np.nan), template_profile)
-
 
     LOG.info("Wrote bed raster: %s", out_bed)
     return 0

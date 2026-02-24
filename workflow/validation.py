@@ -12,7 +12,7 @@ Usage:
     result = validate_pipeline_config(config_dict)
     if not result.is_valid:
         for error in result.errors:
-            print(f"ERROR: {error}")
+            log.info(f"ERROR: {error}")
         sys.exit(1)
 """
 
@@ -742,15 +742,15 @@ if __name__ == "__main__":
     )
     
     if len(sys.argv) < 2:
-        print("Usage: python validation.py <config.json>")
-        print("       python validation.py --aoi '-76.5/-76.0/38.5/39.0'")
+        log.info("Usage: python validation.py <config.json>")
+        log.info("       python validation.py --aoi '-76.5/-76.0/38.5/39.0'")
         sys.exit(1)
     
     if sys.argv[1] == "--aoi":
         # Quick AOI validation
         aoi = sys.argv[2] if len(sys.argv) > 2 else None
         if not aoi:
-            print("ERROR: --aoi requires an argument")
+            log.info("ERROR: --aoi requires an argument")
             sys.exit(1)
         result = validate_aoi(aoi)
         result.log_results()
@@ -759,7 +759,7 @@ if __name__ == "__main__":
     # Load and validate config file
     config_path = Path(sys.argv[1])
     if not config_path.exists():
-        print(f"ERROR: Config file not found: {config_path}")
+        log.info(f"ERROR: Config file not found: {config_path}")
         sys.exit(1)
     
     with open(config_path) as f:

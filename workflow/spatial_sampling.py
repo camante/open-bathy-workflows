@@ -15,13 +15,10 @@ Version: 0.7.0
 import numpy as np
 import pandas as pd
 import logging
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, Tuple, Optional, Any
 from dataclasses import dataclass
 import math
 from scipy.spatial import cKDTree
-from scipy.stats import median_abs_deviation
-from sklearn.preprocessing import StandardScaler
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +69,83 @@ class SamplingConfig:
     boundary_buffer_m: float = 50.0
     boundary_grid_reduction: float = 0.5
 
+    # ---------------------------------------------------------------------
+    # Performance guards for extremely dense sources.
+    #
+    # Some sources (especially gridded/derived XYZ) can arrive with millions
+    # of points inside an AOI. Running the full adaptive thinning stack on
+    # tens of millions of points is unnecessary when the final selection is
+    # capped (target_total_points) and can take a very long time.
+    #
+    # Strategy: apply a fast, vectorized grid-based pre-thin per source to
+    # reduce the candidate set to a bounded size *before* adaptive thinning.
+    # ---------------------------------------------------------------------
+    max_points_per_source_prethin: int = 500_000
+    prethin_cell_scale: float = 1.0
+
+
+def _lonlat_to_local_m(points_lonlat: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Convert lon/lat degrees to approximate local meters for grid hashing.
+
+    Uses a local equirectangular approximation about the median latitude.
+    This is used only for *sampling* (not geodesic distance reporting).
+    """
+    if points_lonlat.size == 0:
+        return np.array([], dtype=float), np.array([], dtype=float)
+
+    lon = points_lonlat[:, 0].astype(float)
+    lat = points_lonlat[:, 1].astype(float)
+    lat0 = np.median(lat)
+
+    # meters per degree
+    m_per_deg_lat = 111_320.0
+    m_per_deg_lon = 111_320.0 * math.cos(math.radians(lat0))
+
+    x_m = lon * m_per_deg_lon
+    y_m = lat * m_per_deg_lat
+    return x_m, y_m
+
+
+def fast_grid_prethin_lonlat(
+    points_lonlat: np.ndarray,
+    cell_m: float,
+    max_keep: int,
+    seed: int = 0,
+) -> np.ndarray:
+    """Fast vectorized pre-thinning using a fixed grid in approximate meters.
+
+    Keeps at most one point per grid cell (deterministic by first occurrence).
+    If the resulting set is still larger than max_keep, apply a deterministic
+    random subset.
+
+    Returns a boolean mask of points to keep.
+    """
+    n = len(points_lonlat)
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+
+    cell_m = float(max(cell_m, 1e-6))
+    x_m, y_m = _lonlat_to_local_m(points_lonlat)
+    ix = np.floor(x_m / cell_m).astype(np.int64)
+    iy = np.floor(y_m / cell_m).astype(np.int64)
+
+    # Hash 2D cell indices to 1D key (pairing).
+    key = ix * np.int64(4_000_000_007) + iy
+
+    # Keep first occurrence per cell (stable order)
+    _, first_idx = np.unique(key, return_index=True)
+    keep = np.zeros(n, dtype=bool)
+    keep[first_idx] = True
+
+    kept_idx = np.flatnonzero(keep)
+    if max_keep > 0 and kept_idx.size > max_keep:
+        rng = np.random.default_rng(seed)
+        sel = rng.choice(kept_idx, size=max_keep, replace=False)
+        keep[:] = False
+        keep[sel] = True
+
+    return keep
+
 # Default source configurations
 DEFAULT_SOURCE_CONFIGS = {
     'bathy_lidar': SourceConfig(
@@ -113,6 +187,14 @@ DEFAULT_SOURCE_CONFIGS = {
         retention_target=0.40,
         min_spacing_m=30.0,
         influence_radius_m=50.0
+    ),
+    'extra_xyz_auth': SourceConfig(
+        name='extra_xyz_auth',
+        tier=1,
+        weight=18.0,
+        retention_target=0.80,
+        min_spacing_m=15.0,
+        influence_radius_m=75.0
     ),
     'atl24': SourceConfig(
         name='atl24',
@@ -360,6 +442,15 @@ def adaptive_grid_thinning(
     lo = ~hi & ~med
 
     def _thin(mask: np.ndarray, grid_m: float, allow_multi: bool) -> None:
+        """Thin points in a complexity class by selecting best point(s) per grid cell.
+
+        Performance:
+          The old implementation did:
+              for cell_id in np.unique(cell_ids):
+                  np.where(cell_ids == cell_id)
+          which becomes extremely slow for multi-million point sources.
+          We instead sort once (O(N log N)) and scan contiguous runs (O(N)).
+        """
         if not np.any(mask):
             return
         idx = np.where(mask)[0]
@@ -370,22 +461,42 @@ def adaptive_grid_thinning(
 
         xb = np.floor(x_m[idx] / g).astype(np.int64)
         yb = np.floor(y_m[idx] / g).astype(np.int64)
-        # Combine bins into a single id (avoid collisions)
         cell_ids = xb * 10_000_000 + yb
 
-        for cell_id in np.unique(cell_ids):
-            cell_local = np.where(cell_ids == cell_id)[0]
-            if cell_local.size == 0:
+        # Priority score for selection within a cell
+        cell_priorities = source_values[idx] * (1.0 + complexity_scores[idx])
+
+        order = np.argsort(cell_ids, kind='mergesort')  # stable
+        cell_ids_s = cell_ids[order]
+        prio_s = cell_priorities[order]
+        idx_s = idx[order]
+
+        if cell_ids_s.size == 0:
+            return
+
+        boundaries = np.flatnonzero(np.diff(cell_ids_s)) + 1
+        starts = np.r_[0, boundaries]
+        ends = np.r_[boundaries, cell_ids_s.size]
+
+        for s, e in zip(starts, ends):
+            seg = slice(int(s), int(e))
+            seg_prio = prio_s[seg]
+            if seg_prio.size == 0:
                 continue
-            cell_idx = idx[cell_local]
 
-            cell_priorities = source_values[cell_idx] * (1.0 + complexity_scores[cell_idx])
-            best = cell_idx[np.argmax(cell_priorities)]
-            keep[best] = True
+            best_local = int(np.argmax(seg_prio))
+            best_idx = int(idx_s[seg][best_local])
+            keep[best_idx] = True
 
-            if allow_multi and cell_idx.size > 3:
-                top = cell_idx[np.argsort(cell_priorities)[-3:]]
-                keep[top] = True
+            if allow_multi and (e - s) > 3:
+                k = 3
+                if (e - s) <= k:
+                    top_locals = np.arange(e - s, dtype=np.int64)
+                else:
+                    part = np.argpartition(seg_prio, -k)[-k:]
+                    top_locals = part[np.argsort(seg_prio[part])]
+                for tl in top_locals:
+                    keep[int(idx_s[seg][int(tl)])] = True
 
     _thin(hi, grid_hi, allow_multi=True)
     _thin(med, grid_med, allow_multi=False)
@@ -402,6 +513,28 @@ def adaptive_grid_thinning(
     if desired_n > 0 and kept_n < desired_n:
         # Densify by allowing multiple points per grid cell (still spatially balanced).
         # Use the relaxed min spacing (if any) when densifying.
+        #
+        # NOTE: For very large sources (multi-million points), building a Python dict
+        # of cells->indices can dominate runtime/memory. In those cases, fall back to
+        # a fast vectorized top-k selection from the remaining points.
+        if n_points > 2_000_000:
+            need = int(desired_n - kept_n)
+            if need > 0:
+                rng = np.random.default_rng(int(getattr(config, 'random_seed', 1337)))
+                remaining = np.where(~keep)[0]
+                if remaining.size > 0:
+                    # Prefer higher complexity and slightly prefer deeper points.
+                    prio = (
+                        np.nan_to_num(complexity_scores[remaining], nan=0.0) * 1.0
+                        + np.nan_to_num(np.abs(depths[remaining]), nan=0.0) * 0.05
+                        + rng.random(remaining.size) * 1e-6
+                    )
+                    if need >= remaining.size:
+                        keep[remaining] = True
+                    else:
+                        pick = remaining[np.argpartition(prio, -need)[-need:]]
+                        keep[pick] = True
+            return keep
         g_base = float(max(eff_min_spacing_m, grid_lo / 2.0))
         if g_base <= 0:
             g_base = float(max(eff_min_spacing_m, 30.0))
@@ -512,29 +645,47 @@ def identify_gap_regions(
 ) -> np.ndarray:
     """
     Identify spatial gaps not covered by high-priority data.
-    
+
+    This must be fast for multi-million point sources. Use a vectorized KDTree query.
+
     Args:
-        all_points: All point locations
-        covered_points_kdtree: KDTree of Tier 1 points
-        influence_radius_m: Coverage radius
-        grid_resolution: Grid spacing for gap detection
-    
+        all_points: All point locations (lon/lat degrees)
+        covered_points_kdtree: KDTree of Tier 1 points (lon/lat degrees)
+        influence_radius_m: Coverage radius in meters
+        grid_resolution: (unused; retained for backward compatibility)
+
     Returns:
         Boolean array indicating points in gap regions
     """
-    influence_radius_deg = influence_radius_m / 111000  # Rough conversion
-    
-    in_gap = np.zeros(len(all_points), dtype=bool)
-    
-    for i, point in enumerate(all_points):
-        # Query nearest Tier 1 point
-        distance, _ = covered_points_kdtree.query(point)
-        
-        # If far from any Tier 1 point, it's in a gap
-        if distance > influence_radius_deg:
-            in_gap[i] = True
-    
-    return in_gap
+    if len(all_points) == 0:
+        return np.zeros(0, dtype=bool)
+
+    # If there is no Tier 1 coverage, everything is a gap.
+    try:
+        n_cov = int(getattr(covered_points_kdtree, 'n', 0))
+    except Exception:
+        n_cov = 0
+    if n_cov == 0:
+        return np.ones(len(all_points), dtype=bool)
+
+    # Rough conversion meters -> degrees (OK for small AOIs / local use)
+    influence_radius_deg = float(influence_radius_m) / 111_000.0
+
+    # Vectorized nearest-neighbor distances. Chunk large queries to avoid peak memory
+    # for multi-million point sources.
+    pts = np.asarray(all_points, dtype=np.float32)
+    out = np.empty((len(pts),), dtype=np.float32)
+    chunk = 1_000_000
+    for i0 in range(0, len(pts), chunk):
+        sl = slice(i0, min(i0 + chunk, len(pts)))
+        try:
+            d, _ = covered_points_kdtree.query(pts[sl], k=1, workers=-1)
+        except TypeError:
+            # Older scipy: no 'workers' arg
+            d, _ = covered_points_kdtree.query(pts[sl], k=1)
+        out[sl] = np.asarray(d, dtype=np.float32)
+
+    return out > float(influence_radius_deg)
 
 def adaptive_spatial_sample(
     df: pd.DataFrame,
@@ -586,6 +737,26 @@ def adaptive_spatial_sample(
     
     # Normalize source names
     df['source_normalized'] = df['source'].str.lower().str.strip()
+
+    # Derive a stable source_key used for tiering.
+    # This lets 'extra_xyz' carry per-file provenance (e.g., extra_xyz:hydronos),
+    # and promotes vetted lidar/sonar subsets to Tier 1 by heuristic.
+    AUTH_TAGS = (
+        "hydronos", "ehydro", "lidar", "topobathy", "sonar", "multibeam", "mbes",
+        "singlebeam", "sounding", "noaa", "usace", "usgs"
+    )
+    def _source_key(s: str) -> str:
+        if not isinstance(s, str):
+            return "atl03"
+        s = s.lower().strip()
+        if s.startswith("extra_xyz:"):
+            tag = s.split(":", 1)[1]
+            if any(t in tag for t in AUTH_TAGS):
+                return "extra_xyz_auth"
+            return "extra_xyz"
+        return s
+
+    df['source_key'] = df['source_normalized'].map(_source_key)
     
     # =========================================================================
     # STAGE 1: DEPTH STRATIFICATION
@@ -698,13 +869,13 @@ def adaptive_spatial_sample(
     log.info(f"\n[STAGE 3] Priority-Based Source Preservation")
     
     # Assign tiers and priorities to sources
-    working_df['tier'] = working_df['source_normalized'].map(
+    working_df['tier'] = working_df['source_key'].map(
         lambda s: source_configs.get(s, source_configs['atl03']).tier
     )
-    working_df['source_weight'] = working_df['source_normalized'].map(
+    working_df['source_weight'] = working_df['source_key'].map(
         lambda s: source_configs.get(s, source_configs['atl03']).weight
     )
-    working_df['retention_target'] = working_df['source_normalized'].map(
+    working_df['retention_target'] = working_df['source_key'].map(
         lambda s: source_configs.get(s, source_configs['atl03']).retention_target
     )
     
@@ -733,7 +904,7 @@ def adaptive_spatial_sample(
         for source in tier1_df['source'].unique():
             source_mask = tier1_df['source'] == source
             source_df = tier1_df[source_mask].copy()
-            source_norm = source_df['source_normalized'].iloc[0]
+            source_norm = source_df['source_key'].iloc[0]
             
             if source_norm not in source_configs:
                 log.warning(f"[TIER 1] Unknown source '{source}', using default Tier 1 config")
@@ -818,7 +989,7 @@ def adaptive_spatial_sample(
         for source in tier2_gaps['source'].unique():
             source_mask = tier2_gaps['source'] == source
             source_df = tier2_gaps[source_mask].copy()
-            source_norm = source_df['source_normalized'].iloc[0]
+            source_norm = source_df['source_key'].iloc[0]
             
             if source_norm not in source_configs:
                 source_config = SourceConfig(source_norm, tier=2, weight=6, retention_target=0.3,
@@ -826,7 +997,22 @@ def adaptive_spatial_sample(
             else:
                 source_config = source_configs[source_norm]
             
-            log.info(f"  {source}: {len(source_df)} gap points (target retention: {source_config.retention_target*100:.0f}%)")
+            # Fast pre-thin for extremely dense sources before adaptive thinning.
+            # This prevents pathological runtimes (multi-million point sources)
+            # when the final output is globally capped anyway.
+            max_keep = int(getattr(sampling_config, 'max_points_per_source_prethin', 500_000))
+            if max_keep > 0 and len(source_df) > max_keep:
+                cell_m = float(source_config.min_spacing_m) * float(getattr(sampling_config, 'prethin_cell_scale', 1.0))
+                pts = source_df[['longitude', 'latitude']].values
+                pre_keep = fast_grid_prethin_lonlat(pts, cell_m=cell_m, max_keep=max_keep, seed=0)
+                before_n = len(source_df)
+                source_df = source_df[pre_keep].copy()
+                log.info(
+                    f"  {source}: {before_n:,} gap points → pre-thin to {len(source_df):,} "
+                    f"(cell={cell_m:.1f} m, cap={max_keep:,}; target retention: {source_config.retention_target*100:.0f}%)"
+                )
+            else:
+                log.info(f"  {source}: {len(source_df):,} gap points (target retention: {source_config.retention_target*100:.0f}%)")
             
             # Apply moderate thinning
             keep_mask = adaptive_grid_thinning(
@@ -860,7 +1046,7 @@ def adaptive_spatial_sample(
         for source in tier3_gaps['source'].unique():
             source_mask = tier3_gaps['source'] == source
             source_df = tier3_gaps[source_mask].copy()
-            source_norm = source_df['source_normalized'].iloc[0]
+            source_norm = source_df['source_key'].iloc[0]
             
             if source_norm not in source_configs:
                 source_config = SourceConfig(source_norm, tier=3, weight=3, retention_target=0.1,
@@ -868,7 +1054,19 @@ def adaptive_spatial_sample(
             else:
                 source_config = source_configs[source_norm]
             
-            log.info(f"  {source}: {len(source_df)} gap points (target retention: {source_config.retention_target*100:.0f}%)")
+            max_keep = int(getattr(sampling_config, 'max_points_per_source_prethin', 500_000))
+            if max_keep > 0 and len(source_df) > max_keep:
+                cell_m = float(source_config.min_spacing_m) * float(getattr(sampling_config, 'prethin_cell_scale', 1.0))
+                pts = source_df[['longitude', 'latitude']].values
+                pre_keep = fast_grid_prethin_lonlat(pts, cell_m=cell_m, max_keep=max_keep, seed=0)
+                before_n = len(source_df)
+                source_df = source_df[pre_keep].copy()
+                log.info(
+                    f"  {source}: {before_n:,} gap points → pre-thin to {len(source_df):,} "
+                    f"(cell={cell_m:.1f} m, cap={max_keep:,}; target retention: {source_config.retention_target*100:.0f}%)"
+                )
+            else:
+                log.info(f"  {source}: {len(source_df):,} gap points (target retention: {source_config.retention_target*100:.0f}%)")
             
             # Apply aggressive thinning
             keep_mask = adaptive_grid_thinning(

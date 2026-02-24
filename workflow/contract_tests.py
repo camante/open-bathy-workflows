@@ -14,7 +14,7 @@ import pandas as pd
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -512,13 +512,13 @@ if __name__ == "__main__":
     import sys
     
     if len(sys.argv) < 2:
-        print("Usage: python contract_tests.py <output_dir>")
+        log.info("Usage: python contract_tests.py <output_dir>")
         sys.exit(1)
     
     output_dir = Path(sys.argv[1])
     
     if not output_dir.exists():
-        print(f"Error: Directory not found: {output_dir}")
+        log.info(f"Error: Directory not found: {output_dir}")
         sys.exit(1)
     
     exit_code = run_contract_tests_cli(output_dir)

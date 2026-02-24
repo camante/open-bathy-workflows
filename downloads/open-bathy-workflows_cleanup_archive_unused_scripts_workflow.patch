@@ -1,0 +1,173 @@
+diff --git a/workflow/archive/README.md b/workflow/archive/README.md
+new file mode 100644
+index 0000000..94e4d45
+--- /dev/null
++++ b/workflow/archive/README.md
+@@ -0,0 +1,7 @@
++# Archive
++
++This directory holds scripts and experiments that are not part of the current default `bathy_main.py` execution path.
++
++- `likely_unused/` – scripts that are not referenced by the current pipeline entrypoints (`bathy_main.py`, `sdb_main.py`, `xs_builder.py`, `xs_infer_bathy_raster.py`, `fusion.py`).
++
++If you discover one of these is still needed for your workflow, you can move it back to the repo root (or update imports/calls accordingly).
+diff --git a/workflow/CHANGELOG_v0.7.2.py b/workflow/archive/likely_unused/CHANGELOG_v0.7.2.py
+similarity index 100%
+rename from workflow/CHANGELOG_v0.7.2.py
+rename to workflow/archive/likely_unused/CHANGELOG_v0.7.2.py
+diff --git a/workflow/archive/likely_unused/README.md b/workflow/archive/likely_unused/README.md
+new file mode 100644
+index 0000000..15be2d3
+--- /dev/null
++++ b/workflow/archive/likely_unused/README.md
+@@ -0,0 +1,58 @@
++# Archived scripts (likely unused by `bathy_main.py`)
++
++This folder holds scripts that are **not in the current execution path** when running the end-to-end workflow via:
++
++```bash
++python bathy_main.py ...
++```
++
++They were moved out of the repo root to reduce clutter and make it clearer which scripts are part of the supported pipeline.
++
++## What’s here
++
++The archived scripts are mostly:
++
++- **Old/legacy entrypoints** from earlier workflow iterations
++- **One-off utilities** for QA/QC, plotting, or packaging
++- **Experimental prototypes** (e.g., alternative interpolation or adjustment approaches)
++
++These scripts may still be useful, but they are **not imported or called** by the default pipeline (as of v1.2).
++
++## How to use an archived script
++
++If you want to run an archived script directly:
++
++```bash
++python archive/likely_unused/<script_name>.py --help
++```
++
++If you want to reintegrate one into the pipeline, move it back to the repo root (or a proper module directory) and update any imports/CLI calls accordingly.
++
++## Contents
++
++Currently archived:
++
++- `CHANGELOG_v0.7.2.py`
++- `adaptive_spatial_cv.py`
++- `apply_patches.py`
++- `bank_mask_from_xs.py`
++- `bathy_interp_cli.py`
++- `cudem_river_burn_taper.py`
++- `cudem_river_fill_monotonic.py`
++- `diagnose_bands.py`
++- `generate_script_reference.py`
++- `hyperparameter_tuning.py`
++- `idw_gpu.py`
++- `make_channel_mask.py`
++- `measured_mask_from_points.py`
++- `optical_utils.py`
++- `prediction_validation.py`
++- `river_bathy.py`
++- `river_skeleton.py`
++- `setup.py`
++- `swot_adjust.py`
++- `tidal.py`
++- `tile_blending.py`
++- `unified_bathy_report.py`
++- `waffles_bathy_interp.py`
++- `xs_adjust_monotonic.py`
+diff --git a/workflow/adaptive_spatial_cv.py b/workflow/archive/likely_unused/adaptive_spatial_cv.py
+similarity index 100%
+rename from workflow/adaptive_spatial_cv.py
+rename to workflow/archive/likely_unused/adaptive_spatial_cv.py
+diff --git a/workflow/apply_patches.py b/workflow/archive/likely_unused/apply_patches.py
+similarity index 100%
+rename from workflow/apply_patches.py
+rename to workflow/archive/likely_unused/apply_patches.py
+diff --git a/workflow/bank_mask_from_xs.py b/workflow/archive/likely_unused/bank_mask_from_xs.py
+similarity index 100%
+rename from workflow/bank_mask_from_xs.py
+rename to workflow/archive/likely_unused/bank_mask_from_xs.py
+diff --git a/workflow/bathy_interp_cli.py b/workflow/archive/likely_unused/bathy_interp_cli.py
+similarity index 100%
+rename from workflow/bathy_interp_cli.py
+rename to workflow/archive/likely_unused/bathy_interp_cli.py
+diff --git a/workflow/cudem_river_burn_taper.py b/workflow/archive/likely_unused/cudem_river_burn_taper.py
+similarity index 100%
+rename from workflow/cudem_river_burn_taper.py
+rename to workflow/archive/likely_unused/cudem_river_burn_taper.py
+diff --git a/workflow/cudem_river_fill_monotonic.py b/workflow/archive/likely_unused/cudem_river_fill_monotonic.py
+similarity index 100%
+rename from workflow/cudem_river_fill_monotonic.py
+rename to workflow/archive/likely_unused/cudem_river_fill_monotonic.py
+diff --git a/workflow/diagnose_bands.py b/workflow/archive/likely_unused/diagnose_bands.py
+similarity index 100%
+rename from workflow/diagnose_bands.py
+rename to workflow/archive/likely_unused/diagnose_bands.py
+diff --git a/workflow/generate_script_reference.py b/workflow/archive/likely_unused/generate_script_reference.py
+similarity index 100%
+rename from workflow/generate_script_reference.py
+rename to workflow/archive/likely_unused/generate_script_reference.py
+diff --git a/workflow/hyperparameter_tuning.py b/workflow/archive/likely_unused/hyperparameter_tuning.py
+similarity index 100%
+rename from workflow/hyperparameter_tuning.py
+rename to workflow/archive/likely_unused/hyperparameter_tuning.py
+diff --git a/workflow/idw_gpu.py b/workflow/archive/likely_unused/idw_gpu.py
+similarity index 100%
+rename from workflow/idw_gpu.py
+rename to workflow/archive/likely_unused/idw_gpu.py
+diff --git a/workflow/make_channel_mask.py b/workflow/archive/likely_unused/make_channel_mask.py
+similarity index 100%
+rename from workflow/make_channel_mask.py
+rename to workflow/archive/likely_unused/make_channel_mask.py
+diff --git a/workflow/measured_mask_from_points.py b/workflow/archive/likely_unused/measured_mask_from_points.py
+similarity index 100%
+rename from workflow/measured_mask_from_points.py
+rename to workflow/archive/likely_unused/measured_mask_from_points.py
+diff --git a/workflow/optical_utils.py b/workflow/archive/likely_unused/optical_utils.py
+similarity index 100%
+rename from workflow/optical_utils.py
+rename to workflow/archive/likely_unused/optical_utils.py
+diff --git a/workflow/prediction_validation.py b/workflow/archive/likely_unused/prediction_validation.py
+similarity index 100%
+rename from workflow/prediction_validation.py
+rename to workflow/archive/likely_unused/prediction_validation.py
+diff --git a/workflow/river_bathy.py b/workflow/archive/likely_unused/river_bathy.py
+similarity index 100%
+rename from workflow/river_bathy.py
+rename to workflow/archive/likely_unused/river_bathy.py
+diff --git a/workflow/river_skeleton.py b/workflow/archive/likely_unused/river_skeleton.py
+similarity index 100%
+rename from workflow/river_skeleton.py
+rename to workflow/archive/likely_unused/river_skeleton.py
+diff --git a/workflow/setup.py b/workflow/archive/likely_unused/setup.py
+similarity index 100%
+rename from workflow/setup.py
+rename to workflow/archive/likely_unused/setup.py
+diff --git a/workflow/swot_adjust.py b/workflow/archive/likely_unused/swot_adjust.py
+similarity index 100%
+rename from workflow/swot_adjust.py
+rename to workflow/archive/likely_unused/swot_adjust.py
+diff --git a/workflow/tidal.py b/workflow/archive/likely_unused/tidal.py
+similarity index 100%
+rename from workflow/tidal.py
+rename to workflow/archive/likely_unused/tidal.py
+diff --git a/workflow/tile_blending.py b/workflow/archive/likely_unused/tile_blending.py
+similarity index 100%
+rename from workflow/tile_blending.py
+rename to workflow/archive/likely_unused/tile_blending.py
+diff --git a/workflow/unified_bathy_report.py b/workflow/archive/likely_unused/unified_bathy_report.py
+similarity index 100%
+rename from workflow/unified_bathy_report.py
+rename to workflow/archive/likely_unused/unified_bathy_report.py
+diff --git a/workflow/waffles_bathy_interp.py b/workflow/archive/likely_unused/waffles_bathy_interp.py
+similarity index 100%
+rename from workflow/waffles_bathy_interp.py
+rename to workflow/archive/likely_unused/waffles_bathy_interp.py
+diff --git a/workflow/xs_adjust_monotonic.py b/workflow/archive/likely_unused/xs_adjust_monotonic.py
+similarity index 100%
+rename from workflow/xs_adjust_monotonic.py
+rename to workflow/archive/likely_unused/xs_adjust_monotonic.py
