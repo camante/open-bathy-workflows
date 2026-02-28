@@ -15,6 +15,7 @@ import os
 import shlex
 import subprocess
 import logging
+import re
 from collections import deque
 import threading
 from pathlib import Path
@@ -92,6 +93,24 @@ def run_command(
         universal_newlines=True,
     )
 
+
+    def _log_stderr_line(line: str, pfx: str):
+        """Classify stderr lines to reduce log noise (progress/info on stderr)."""
+        s = line.rstrip()
+        # Many subprocesses write structured logs to stderr (including level tags like [INFO]).
+        # Use a regex so we don't depend on exact spacing.
+        try:
+            if re.search(r"\[\s*ERROR\s*\]", s):
+                log.error(f"{pfx}{s}" if pfx else s)
+            elif re.search(r"\[\s*WARNING\s*\]", s):
+                log.warning(f"{pfx}{s}" if pfx else s)
+            elif re.search(r"\[\s*INFO\s*\]", s):
+                log.info(f"{pfx}{s}" if pfx else s)
+            else:
+                log.warning(f"{pfx}{s}" if pfx else s)
+        except Exception:
+            log.warning(f"{pfx}{s}" if pfx else s)
+
     def _pump(stream, sink, log_fn, pfx: str, enabled: bool, fh=None):
         try:
             for line in iter(stream.readline, ""):
@@ -105,7 +124,10 @@ def run_command(
                         # Best effort; never fail the pipeline due to optional logging.
                         log.debug("Optional log write failed", exc_info=True)
                 if enabled:
-                    log_fn(f"{pfx}{line.rstrip()}" if pfx else line.rstrip())
+                    if log_fn is log.warning and "[stderr]" in (pfx or ""):
+                        _log_stderr_line(line, pfx)
+                    else:
+                        log_fn(f"{pfx}{line.rstrip()}" if pfx else line.rstrip())
         finally:
             try:
                 stream.close()

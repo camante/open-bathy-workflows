@@ -1107,6 +1107,12 @@ def _soundings_to_grids(
       * dmax inference uses: Dmax = depth / max(r, min_r)^shape_exp, then clamps.
     """
     H, W = channel.shape
+    try:
+        u = np.unique(channel)
+        LOG.info("Channel mask unique values: %s", u.tolist() if hasattr(u,'tolist') else str(u))
+    except Exception:
+        pass
+
     depth_grid = np.full(channel.shape, np.nan, dtype="float32")
     dmax_grid = np.full(channel.shape, np.nan, dtype="float32")
     bed_grid = np.full(channel.shape, np.nan, dtype="float32")
@@ -1169,8 +1175,10 @@ def _soundings_to_grids(
     y = np.concatenate(ys_all)
     z = np.concatenate(zs_all)
 
+    n_loaded = int(x.size)
     m = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
     x, y, z = x[m], y[m], z[m]
+    LOG.info("Soundings: loaded=%d finite=%d", n_loaded, int(x.size))
     if x.size == 0:
         return depth_grid, dmax_grid, bed_grid
 
@@ -1184,11 +1192,13 @@ def _soundings_to_grids(
     cc = np.asarray(cc, dtype="int64")
 
     inb = (rr >= 0) & (rr < channel.shape[0]) & (cc >= 0) & (cc < channel.shape[1])
+    LOG.info("Soundings: in_template_bbox=%d", int(np.count_nonzero(inb)))
     rr, cc, z = rr[inb], cc[inb], z[inb]
     if rr.size == 0:
         return depth_grid, dmax_grid, bed_grid
 
     in_ch = channel[rr, cc]
+    LOG.info("Soundings: in_channel_mask=%d", int(np.count_nonzero(in_ch)))
     rr, cc, z = rr[in_ch], cc[in_ch], z[in_ch]
     if rr.size == 0:
         return depth_grid, dmax_grid, bed_grid

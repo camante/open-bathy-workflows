@@ -75,6 +75,31 @@ from pyproj import Transformer
 from plot_utils import lazy_pyplot
 plt = None  # lazy-loaded when plots are enabled
 
+def _mask_has_ocean_pixels(mask_tif: str, *, water_max: float = 0.5, max_dim: int = 1024) -> bool:
+    """Fast check: does a waffles-style land mask contain ANY water/ocean pixels?
+
+    Assumes mask values where water is ~0 and land is ~1. We downsample read for speed.
+    Returns False if the file can't be read (fail-open to avoid skipping unexpectedly).
+    """
+    try:
+        import numpy as np
+        import rasterio
+        from rasterio.enums import Resampling
+        with rasterio.open(mask_tif) as ds:
+            h, w = ds.height, ds.width
+            out_h = min(max_dim, h)
+            out_w = min(max_dim, w)
+            data = ds.read(1, out_shape=(out_h, out_w), resampling=Resampling.nearest)
+            nodata = ds.nodata
+        if nodata is not None:
+            data = data[data != nodata]
+        if data.size == 0:
+            return False
+        return bool((data <= water_max).any())
+    except Exception:
+        return True
+
+
 def _require_sdb_runtime_deps() -> None:
     """Raise a clear error if heavy deps are missing when actually running SDB."""
     require(rasterio, "rasterio", "Needed for raster I/O (GeoTIFF) in SDB pipeline.")
@@ -1239,6 +1264,12 @@ def main():
                         waffles_cache = Path(os.environ.get("WAFFLES_CACHE_ROOT", str(mask_cache)))
                         coast_mask_raw = generate_coastline_mask(None, args.aoi, waffles_cache, None, args.sdb_mode)
                         log.info(f"[MASK] Using waffles coastline mask for S2 date QC: {coast_mask_raw}")
+                        # If the coastline mask indicates *no* water/ocean pixels in this AOI, skip SDB early.
+                        # This avoids wasting time downloading S2/ATL data when the AOI is fully inland (or otherwise non-ocean).
+                        if coast_mask_raw and (not _mask_has_ocean_pixels(str(coast_mask_raw))):
+                            log.warning("[SDB] No ocean/water pixels found in coastline mask for this AOI; skipping SDB.")
+                            return None
+
                     except Exception as exc:
                         log.warning(f"[MASK] Waffles generation failed ({exc}). S2 date QC will be AOI-only.")
                         coast_mask_raw = None
@@ -1743,8 +1774,18 @@ def main():
             except Exception as ex:
                 log.error(f"[FUSION] 0 training points and failed to load model bank model: {ex}")
         if not cached_model:
-            log.error('No valid training points found after Fusion, and no model is available to predict.')
-            return
+            # No valid training points for this AOI and no cached model available.
+            # This is common for inland AOIs when the water/land mask gates out all pixels.
+            # Treat as a graceful skip so the parent pipeline can continue with other methods.
+            log.warning('No valid training points found after Fusion, and no model is available to predict; skipping SDB for this AOI.')
+            try:
+                (out_root / 'SDB_SKIPPED.txt').write_text('SDB skipped: no training points after fusion and no cached model available.\n', encoding='utf-8')
+            except Exception:
+                pass
+            if rr is not None:
+                rr.add('sdb.skipped', True)
+                rr.add('sdb.skip_reason', 'no_training_points_no_model')
+            return 0
 
     # 7. Training & Validation
 
@@ -2475,6 +2516,60 @@ def main():
         unc_src = str(Path(out_tif).with_name(Path(out_tif).stem + "_uncertainty.tif"))
         if os.path.exists(unc_src):
              predict.reproject_to_nad83(unc_src, str(dir_rast / "SDB_Prediction_10m_uncertainty_NAD83.tif"))
+
+    # -------------------------------------------------------------------------
+    # Deterministic outputs: canonical filename + artifact manifest
+    # -------------------------------------------------------------------------
+    # Canonical depth output (EPSG:4269 if NAD83 reprojection is enabled)
+    try:
+        depth_primary = dir_rast / "SDB_Prediction_10m_NAD83.tif"
+        if not depth_primary.exists():
+            depth_primary = Path(out_tif)
+
+        canonical_depth = dir_rast / "sdb_depth_final_epsg4269.tif"
+        try:
+            if canonical_depth.exists():
+                canonical_depth.unlink()
+        except Exception:
+            pass
+
+        # Prefer symlink for speed; fallback to copy for cross-filesystem safety.
+        try:
+            os.symlink(depth_primary, canonical_depth)
+        except Exception:
+            shutil.copy2(depth_primary, canonical_depth)
+
+        # Write manifest (relative paths, rooted at out_root)
+        artifacts = {
+            "run_id": run_id if 'run_id' in locals() else None,
+            "depth_raster": str(canonical_depth.relative_to(out_root)),
+            "depth_primary": str(depth_primary.relative_to(out_root)) if str(depth_primary).startswith(str(out_root)) else str(depth_primary),
+        }
+
+        # Optional artifacts (only if present)
+        unc = Path(str(out_tif)).with_name(Path(str(out_tif)).stem + "_uncertainty.tif")
+        if unc.exists():
+            artifacts["uncertainty_raster"] = str(unc.relative_to(out_root))
+        unc_nad83 = dir_rast / "SDB_Prediction_10m_uncertainty_NAD83.tif"
+        if unc_nad83.exists():
+            artifacts["uncertainty_raster_epsg4269"] = str(unc_nad83.relative_to(out_root))
+
+        land_mask = dir_rast / "LAND_MASK_aligned.tif"
+        if land_mask.exists():
+            artifacts["land_mask"] = str(land_mask.relative_to(out_root))
+
+        rgb = dir_rast / "RGB_10m.tif"
+        if rgb.exists():
+            artifacts["rgb"] = str(rgb.relative_to(out_root))
+        rgb_pred = dir_rast / "RGB_10m_predict.tif"
+        if rgb_pred.exists():
+            artifacts["rgb_predict"] = str(rgb_pred.relative_to(out_root))
+
+        (out_root / "artifacts_sdb.json").write_text(json.dumps(artifacts, indent=2), encoding="utf-8")
+        log.info(f"[ARTIFACTS] Wrote SDB manifest: {out_root / 'artifacts_sdb.json'}")
+        log.info(f"[ARTIFACTS] Canonical depth: {canonical_depth}")
+    except Exception as exc:
+        log.warning(f"[ARTIFACTS] Failed to write canonical outputs/manifest: {exc}")
 
     if df_test_final is not None and not df_test_final.empty:
         try:

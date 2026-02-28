@@ -41,7 +41,7 @@ import hashlib
 import warnings
 
 # Silence GeoPandas GeoSeries.notna() behavior-change warning (we explicitly handle empties).
-warnings.filterwarnings('ignore', message='GeoSeries.notna\(\) previously returned False.*', category=UserWarning)
+warnings.filterwarnings('ignore', message=r'GeoSeries.notna\(\) previously returned False.*', category=UserWarning)
 import json
 import logging
 

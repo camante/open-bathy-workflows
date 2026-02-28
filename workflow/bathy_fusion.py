@@ -180,6 +180,10 @@ class FusionConfig:
     # mask==1 and river has a finite prediction (measured pixels remain highest authority).
     river_domain_mask: Optional[Path] = None
     river_overrides_sdb_in_domain: bool = False
+
+    # Optional ocean/coastal domain mask (WAFFLES ocean-only), convention: water=0, land=1.
+    # When provided and strategy=="seam_blend", SDB contributions are limited to ocean-water pixels.
+    ocean_domain_mask: Optional[Path] = None
     # Output
     out_dir: Path = Path("output/fusion")
     
@@ -555,6 +559,16 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
         else:
             log.warning("[FUSION] river_domain_mask does not exist: %s", str(mp))
 
+
+    # Optional ocean domain mask (WAFFLES ocean-only, aligned using nearest; water==0, land==1)
+    aligned_ocean_mask: Path | None = None
+    if getattr(cfg, "ocean_domain_mask", None):
+        op = Path(getattr(cfg, "ocean_domain_mask"))
+        if op.exists():
+            aligned_ocean_mask = _reproject_to_template_file(op, _aligned_path("ocean_domain_mask"), resampling=Resampling.nearest)
+        else:
+            log.warning("[FUSION] ocean_domain_mask does not exist: %s", str(op))
+
     has_unc_inputs = any(p is not None for p in aligned_unc.values())
 
     # -------------------------
@@ -592,6 +606,7 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
     src_ds: dict[str, rasterio.DatasetReader] = {}
     unc_ds: dict[str, rasterio.DatasetReader] = {}
     domain_ds: rasterio.DatasetReader | None = None
+    ocean_ds: rasterio.DatasetReader | None = None
 
     from contextlib import ExitStack
 
@@ -603,6 +618,13 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
         arr = ds.read(1, window=win, masked=True)
         a = arr.filled(0).astype(np.float32)
         return a > 0.5
+    def _read_waffles_water_win(ds: rasterio.DatasetReader, win: Window) -> np.ndarray:
+        """Read a WAFFLES mask window and return boolean water mask (water==0)."""
+        arr = ds.read(1, window=win, masked=True)
+        a = arr.filled(1).astype(np.float32)  # default to land when masked
+        return a < 0.5
+
+
 
     # Tiles iterator
     if use_chunked and generate_tiles is not None:
@@ -639,6 +661,8 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
                     unc_ds[tag] = rasterio.open(p)
         if aligned_domain_mask is not None:
             domain_ds = rasterio.open(aligned_domain_mask)
+        if aligned_ocean_mask is not None:
+            ocean_ds = rasterio.open(aligned_ocean_mask)
 
         with ExitStack() as stack:
             out_depth = stack.enter_context(rasterio.open(combined_path, "w", **template_profile))
@@ -693,11 +717,12 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
                 meas_u = _read_win(unc_ds["measured"], win_outer) if "measured" in unc_ds else None
 
                 domain_mask = _read_mask_win(domain_ds, win_outer) if domain_ds is not None else None
+                ocean_water = _read_waffles_water_win(ocean_ds, win_outer) if ocean_ds is not None else None
 
                 # Suppress SDB anywhere the river-domain mask is true.
                 # This avoids tile-to-tile seams caused by SDB training differences within the river corridor
                 # and ensures river (or measured) is the only contributor inside the river domain.
-                if (domain_mask is not None) and bool(getattr(cfg, 'river_overrides_sdb_in_domain', False)) and (sdb is not None):
+                if (domain_mask is not None) and (sdb is not None) and bool(getattr(cfg, 'river_overrides_sdb_in_domain', False)) and (strat != 'seam_blend'):
                     sdb = sdb.copy()
                     sdb[domain_mask] = float('nan')
                     if sdb_u is not None:
@@ -935,6 +960,115 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
                             elif river_u is not None:
                                 out_u[both] = river_u[both]
 
+                elif strat == "seam_blend":
+                    # Seam-stable coastal overlap handling with river as authoritative vertical reference.
+                    # Requires:
+                    #   - river_domain_mask (mask==1 inside river domain)
+                    #   - ocean_domain_mask (WAFFLES ocean-only; water==0)
+                    # Policy:
+                    #   - River-only region: river values
+                    #   - Ocean-only region: SDB values
+                    #   - Overlap region: calibrate constant offset (median) then distance-weighted blend
+                    #   - Measured always overrides later.
+                    if (sdb is None) and (river is None):
+                        pass
+                    else:
+                        # Start by assigning single-source pixels
+                        m_sdb = np.isfinite(sdb) if sdb is not None else np.zeros(shape, dtype=bool)
+                        m_riv = np.isfinite(river) if river is not None else np.zeros(shape, dtype=bool)
+
+                        # Domain masks
+                        riv_dom = domain_mask if domain_mask is not None else np.zeros(shape, dtype=bool)
+                        ocn_dom = ocean_water if ocean_water is not None else np.zeros(shape, dtype=bool)
+
+                        # Enforce domain membership for contributions
+                        river_ok = riv_dom & m_riv
+                        sdb_ok = ocn_dom & m_sdb
+
+                        # Define overlap and exclusive regions
+                        overlap = river_ok & sdb_ok
+                        river_only = river_ok & ~ocn_dom
+                        ocean_only = sdb_ok & ~riv_dom
+
+                        # Initialize with nodata
+                        out[:] = np.nan
+
+                        # Fill exclusive regions
+                        if river is not None and river_only.any():
+                            out[river_only] = river[river_only]
+                            prov[river_only] = PROV_RIVER
+                            if out_u is not None and river_u is not None:
+                                out_u[river_only] = river_u[river_only]
+                        if sdb is not None and ocean_only.any():
+                            out[ocean_only] = sdb[ocean_only]
+                            prov[ocean_only] = PROV_SDB
+                            if out_u is not None and sdb_u is not None:
+                                out_u[ocean_only] = sdb_u[ocean_only]
+
+                        # Overlap blending (river authoritative)
+                        if (sdb is not None) and (river is not None) and overlap.any():
+                            # Exclude measured pixels from seam calibration/blend
+                            if meas is not None:
+                                overlap &= ~np.isfinite(meas)
+
+                            if overlap.any():
+                                d = (river - sdb).astype(np.float32)
+                                # robust constant offset
+                                try:
+                                    b = float(np.nanmedian(d[overlap]))
+                                except Exception:
+                                    b = 0.0
+
+                                # Adjust SDB locally toward river
+                                sdb_adj = (sdb + b).astype(np.float32)
+
+                                # Distance-based weights across overlap.
+                                # Prefer a transition from ocean-only → overlap → river-only.
+                                # If either side is missing in this window, fall back to river-dominant.
+                                try:
+                                    if (ocean_only.any()) and (river_only.any()):
+                                        d_r = distance_transform_edt(~river_only).astype(np.float32)
+                                        d_o = distance_transform_edt(~ocean_only).astype(np.float32)
+                                        denom = (d_r + d_o).astype(np.float32)
+                                        denom[denom <= 0] = 1.0
+                                        w_riv = (d_o / denom).astype(np.float32)
+                                        w_riv = np.clip(w_riv, 0.0, 1.0)
+                                    else:
+                                        # If we cannot define a meaningful taper direction, default to river.
+                                        w_riv = np.ones(shape, dtype=np.float32)
+                                except Exception:
+                                    w_riv = np.ones(shape, dtype=np.float32)
+
+                                w_sdb = (1.0 - w_riv).astype(np.float32)
+
+                                out[overlap] = (w_riv[overlap] * river[overlap]) + (w_sdb[overlap] * sdb_adj[overlap])
+                                prov[overlap] = PROV_BLENDED
+
+                                if out_u is not None:
+                                    # Uncertainty propagation using weighted RSS where both uncertainties exist.
+                                    if (river_u is not None) and (sdb_u is not None):
+                                        out_u[overlap] = np.sqrt((w_riv[overlap] * river_u[overlap]) ** 2 + (w_sdb[overlap] * sdb_u[overlap]) ** 2)
+                                    elif river_u is not None:
+                                        out_u[overlap] = river_u[overlap]
+                                    elif sdb_u is not None:
+                                        out_u[overlap] = sdb_u[overlap]
+
+                                # Seam metrics (window-local; aggregated approximately)
+                                try:
+                                    dd = d[overlap]
+                                    if dd.size > 0:
+                                        result.stats.setdefault("seam_overlap", {}).setdefault("n", 0)
+                                        result.stats["seam_overlap"]["n"] += int(dd.size)
+                                        result.stats["seam_overlap"].setdefault("median_delta_samples", []).append(float(np.nanmedian(dd)))
+                                except Exception:
+                                    pass
+
+                        # Fill remaining with DEM if available
+                        if dem is not None:
+                            m_dem = np.isnan(out) & np.isfinite(dem)
+                            out[m_dem] = dem[m_dem]
+                            prov[m_dem] = PROV_DEM
+
                 else:
                     raise ValueError(f"Unknown fusion strategy: {cfg.strategy}")
 
@@ -1039,7 +1173,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-dir", default="output/fusion", help="Output directory")
     
     # Strategy
-    p.add_argument("--strategy", choices=["priority", "uncertainty", "average", "blend", "weighted_overlap", "spatial_taper"],
+    p.add_argument("--strategy", choices=["priority", "uncertainty", "average", "blend", "weighted_overlap", "spatial_taper", "seam_blend"],
                    default="priority", help="Fusion strategy")
     p.add_argument("--priority", default="measured,sdb,river,dem",
                    help="Priority order (comma-separated, highest first)")
@@ -1049,6 +1183,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--primary-weight", type=float, default=0.7, help="Primary weight (weighted_overlap/spatial_taper)")
     p.add_argument("--secondary-weight", type=float, default=0.3, help="Secondary weight (weighted_overlap/spatial_taper)")
     p.add_argument("--river-domain-mask", default=None, help="Optional river domain mask raster (1=river)")
+    p.add_argument("--ocean-domain-mask", default=None, help="WAFFLES ocean-only mask (water=0 land=1) to constrain SDB and overlap blending")
     p.add_argument("--river-overrides-sdb-in-domain", action="store_true", help="Inside river domain mask, river overrides SDB wherever river is finite")
     
     # Template
@@ -1074,6 +1209,7 @@ def main():
         primary_weight=float(getattr(args, "primary_weight", 0.7)),
         secondary_weight=float(getattr(args, "secondary_weight", 0.3)),
         river_domain_mask=Path(getattr(args, "river_domain_mask")) if getattr(args, "river_domain_mask", None) else None,
+        ocean_domain_mask=Path(getattr(args, "ocean_domain_mask")) if getattr(args, "ocean_domain_mask", None) else None,
         river_overrides_sdb_in_domain=bool(getattr(args, "river_overrides_sdb_in_domain", False)),
         template_raster=Path(args.template) if args.template else None,
     )

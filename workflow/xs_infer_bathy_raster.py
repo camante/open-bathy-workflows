@@ -2013,9 +2013,8 @@ def _idw_interpolate_on_mask(
 ) -> np.ndarray:
     """IDW / adaptive IDW interpolation for query coordinates.
 
-    pts_weight (optional): per-control-point multiplicative weights (>=0) applied
-    to the kernel. This is useful for emphasizing thalweg points (WALID-style)
-    without duplicating points.
+    Memory-stable implementation: computes kNN + weights in chunks and writes results
+    directly into the output vector (avoids allocating full n_query×k arrays).
     """
     pts_xy = np.asarray(pts_xy, dtype="float64")
     pts_val = np.asarray(pts_val, dtype="float64").reshape(-1)
@@ -2031,26 +2030,105 @@ def _idw_interpolate_on_mask(
     if Tree is None:
         which = "numpy"
 
-    if len(pts_xy) == 0 or len(q_xy) == 0:
-        return np.full((len(q_xy),), np.nan, dtype="float64")
+    n_pts = int(len(pts_xy))
+    n_q = int(len(q_xy))
+    if n_pts == 0 or n_q == 0:
+        return np.full((n_q,), np.nan, dtype="float64")
+
+    k_eff = int(min(max(1, int(k)), n_pts))
+    out = np.full((n_q,), np.nan, dtype="float64")
+
+    def _compute_vals_from_knn(d: np.ndarray, idx: np.ndarray) -> np.ndarray:
+        d = np.asarray(d, dtype="float64")
+        idx = np.asarray(idx, dtype="int64")
+        if d.ndim == 1:
+            d = d[:, None]
+            idx = idx[:, None]
+
+        if adaptive:
+            d1 = d[:, 0]
+            dK = d[:, -1]
+            ratio = np.clip(dK / np.maximum(d1, eps), 1.0, 10.0)
+            p = 1.5 + (np.log(ratio) / np.log(10.0)) * (4.0 - 1.5)
+            p = p[:, None]
+            w = 1.0 / (np.power(d + eps, p))
+        else:
+            w = 1.0 / (np.power(d + eps, float(power)))
+
+        if pts_weight is not None:
+            w = w * pts_weight[idx]
+
+        # Confluence guard: when multiple river branches contribute nearby control points,
+        # prefer the highest-priority branch (typically main stem) to avoid circular "bullseye" artifacts.
+        if pts_group is not None and pts_priority is not None:
+            pg = np.asarray(pts_group)
+            pp = np.asarray(pts_priority, dtype="float64").reshape(-1)
+            if pg.shape[0] == pts_val.shape[0] and pp.shape[0] == pts_val.shape[0]:
+                try:
+                    g = pg[idx]
+                    # Ignore missing/unknown groups (factorize may encode NaN as -1).
+                    gv = g.astype("float64", copy=False)
+                    gv[gv < 0] = np.nan
+                    gmin = np.nanmin(gv, axis=1)
+                    gmax = np.nanmax(gv, axis=1)
+                    multi = np.isfinite(gmin) & np.isfinite(gmax) & (gmin != gmax)
+                    p = pp[idx]
+                    pmax = np.nanmax(p, axis=1)
+                    pmin = np.nanmin(p, axis=1)
+                    spread = pmax - pmin
+                    apply = multi & np.isfinite(pmax) & np.isfinite(spread) & (spread >= float(priority_min_spread))
+                    if np.any(apply):
+                        keep = p >= (pmax[:, None] - float(priority_delta))
+                        mask_keep = np.ones_like(w, dtype=bool)
+                        mask_keep[apply, :] = keep[apply, :]
+                        w_f = w * mask_keep
+                        den_f = np.sum(w_f, axis=1)
+                        bad = den_f <= eps
+                        if np.any(bad):
+                            # Fallback to unfiltered weights where filtering would remove all neighbors.
+                            w_f[bad, :] = w[bad, :]
+                        w = w_f
+                except Exception:
+                    pass
+
+        v = pts_val[idx]
+        sw = np.sum(w, axis=1)
+        # avoid divide-by-zero
+        good = np.isfinite(sw) & (sw > 0)
+        outv = np.full((idx.shape[0],), np.nan, dtype="float64")
+        outv[good] = np.sum(w[good] * v[good], axis=1) / sw[good]
+        return outv
+
+    # Query neighbors and compute results in chunks (prevents OOM for large n_q).
+    chunk_q = 200000 if which in ("scipy", "sklearn") else 20000
 
     if which == "scipy":
         tree = Tree(pts_xy)
-        try:
-            d, idx = tree.query(q_xy, k=min(k, len(pts_xy)), workers=-1)
-        except TypeError:
-            d, idx = tree.query(q_xy, k=min(k, len(pts_xy)))
+        for i0 in range(0, n_q, chunk_q):
+            q = q_xy[i0 : i0 + chunk_q]
+            try:
+                d_blk, idx_blk = tree.query(q, k=k_eff, workers=-1)
+            except TypeError:
+                d_blk, idx_blk = tree.query(q, k=k_eff)
+            if k_eff == 1:
+                d_blk = np.asarray(d_blk).reshape(-1, 1)
+                idx_blk = np.asarray(idx_blk).reshape(-1, 1)
+            out[i0 : i0 + d_blk.shape[0]] = _compute_vals_from_knn(d_blk, idx_blk)
+
     elif which == "sklearn":
         tree = Tree(pts_xy)
-        d, idx = tree.query(q_xy, k=min(k, len(pts_xy)), return_distance=True)
+        for i0 in range(0, n_q, chunk_q):
+            q = q_xy[i0 : i0 + chunk_q]
+            d_blk, idx_blk = tree.query(q, k=k_eff, return_distance=True)
+            if k_eff == 1:
+                d_blk = np.asarray(d_blk).reshape(-1, 1)
+                idx_blk = np.asarray(idx_blk).reshape(-1, 1)
+            out[i0 : i0 + d_blk.shape[0]] = _compute_vals_from_knn(d_blk, idx_blk)
+
     else:
         # numpy brute-force kNN (chunked)
-        k_eff = int(min(k, len(pts_xy)))
-        d_list = []
-        idx_list = []
-        chunk = 20000
-        for i0 in range(0, len(q_xy), chunk):
-            q = q_xy[i0 : i0 + chunk]
+        for i0 in range(0, n_q, chunk_q):
+            q = q_xy[i0 : i0 + chunk_q]
             dx = q[:, None, 0] - pts_xy[None, :, 0]
             dy = q[:, None, 1] - pts_xy[None, :, 1]
             dist2 = dx * dx + dy * dy
@@ -2062,283 +2140,9 @@ def _idw_interpolate_on_mask(
             idx_sorted = idx_k[row, ord_k]
             d_sorted = np.sqrt(dist2[row, idx_sorted])
 
-            d_list.append(d_sorted)
-            idx_list.append(idx_sorted)
+            out[i0 : i0 + idx_sorted.shape[0]] = _compute_vals_from_knn(d_sorted, idx_sorted)
 
-        d = np.vstack(d_list) if d_list else np.zeros((0, k_eff), dtype="float64")
-        idx = np.vstack(idx_list) if idx_list else np.zeros((0, k_eff), dtype="int64")
-
-    d = np.asarray(d, dtype="float64")
-    idx = np.asarray(idx, dtype="int64")
-    if d.ndim == 1:
-        d = d[:, None]
-        idx = idx[:, None]
-
-    if adaptive:
-        d1 = d[:, 0]
-        dK = d[:, -1]
-        ratio = np.clip(dK / np.maximum(d1, eps), 1.0, 10.0)
-        p = 1.5 + (np.log(ratio) / np.log(10.0)) * (4.0 - 1.5)
-        p = p[:, None]
-        w = 1.0 / (np.power(d + eps, p))
-    else:
-        w = 1.0 / (np.power(d + eps, power))
-
-    if pts_weight is not None:
-        w = w * pts_weight[idx]
-
-    # Confluence guard: when multiple river branches contribute nearby control points,
-    # prefer the highest-priority branch (typically main stem) to avoid circular "bullseye" artifacts.
-    if pts_group is not None and pts_priority is not None:
-        pg = np.asarray(pts_group)
-        pp = np.asarray(pts_priority, dtype='float64').reshape(-1)
-        if pg.shape[0] == pts_val.shape[0] and pp.shape[0] == pts_val.shape[0]:
-            try:
-                g = pg[idx]
-                # Ignore missing/unknown groups (factorize may encode NaN as -1).
-                gv = g.astype('float64', copy=False)
-                gv[gv < 0] = np.nan
-                gmin = np.nanmin(gv, axis=1)
-                gmax = np.nanmax(gv, axis=1)
-                multi = np.isfinite(gmin) & np.isfinite(gmax) & (gmin != gmax)
-                p = pp[idx]
-                pmax = np.nanmax(p, axis=1)
-                pmin = np.nanmin(p, axis=1)
-                spread = pmax - pmin
-                apply = multi & np.isfinite(pmax) & np.isfinite(spread) & (spread >= float(priority_min_spread))
-                if np.any(apply):
-                    keep = p >= (pmax[:, None] - float(priority_delta))
-                    mask_keep = np.ones_like(w, dtype=bool)
-                    mask_keep[apply, :] = keep[apply, :]
-                    w_f = w * mask_keep
-                    den_f = np.sum(w_f, axis=1)
-                    bad = den_f <= eps
-                    if np.any(bad):
-                        # Fallback to unfiltered weights where filtering would remove all neighbors.
-                        w_f[bad, :] = w[bad, :]
-                    w = w_f
-            except Exception:
-                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
-
-    v = pts_val[idx]
-    num = np.sum(w * v, axis=1)
-    den = np.sum(w, axis=1)
-    out = num / np.maximum(den, eps)
-
-    hit = d[:, 0] <= eps
-    if np.any(hit):
-        out[hit] = pts_val[idx[hit, 0]]
     return out
-
-
-
-def _densify_linestring(line: "LineString", step_m: float = 10.0) -> "LineString":
-    """Return a LineString densified to ~step_m vertex spacing.
-
-    Notes
-    -----
-    - Assumes projected CRS (meters).
-    - If `line` is very short or empty, returns it unchanged.
-    """
-    try:
-        if line is None or line.is_empty:
-            return line
-    except Exception:
-        return line
-
-    step_m = float(max(0.01, step_m))
-    length = float(getattr(line, "length", 0.0) or 0.0)
-    if not (length > step_m):
-        return line
-
-    nseg = int(np.ceil(length / step_m))
-    dists = np.linspace(0.0, length, nseg + 1)
-    pts = [line.interpolate(float(d)) for d in dists]
-    return LineString(pts)
-
-
-def _build_thalweg_lines_from_points(
-    thalweg_pts: gpd.GeoDataFrame,
-    *,
-    max_jump_m: float = 250.0,
-    densify_step_m: float = 10.0,
-    wse_col: str = "wse_m",
-) -> Optional[gpd.GeoDataFrame]:
-    """Robustly build thalweg spine line(s) from thalweg control points.
-
-    This avoids brittle `linemerge` dependence on potentially fragmented river networks.
-
-    Algorithm
-    ---------
-    1) Build a radius-neighborhood graph among points (edges where distance <= max_jump_m).
-    2) Split into connected components.
-    3) Within each component, order points using a greedy walk biased to *decrease* WSE
-       downstream (highest WSE starts the walk). This is robust to meanders and modest gaps.
-    4) Build a LineString and densify to ~densify_step_m (critical for 10m rasters).
-
-    Returns
-    -------
-    GeoDataFrame with one LineString per connected component (component_id, length_m).
-    """
-    if thalweg_pts is None or len(thalweg_pts) < 2:
-        return None
-
-    # Require projected CRS for meter distances
-    try:
-        if not CRS.from_user_input(thalweg_pts.crs).is_projected:
-            raise ValueError("thalweg_pts must be in a projected CRS (meters) to build spines.")
-    except Exception as e:
-        raise ValueError(f"thalweg_pts CRS invalid/unset: {e}")
-
-    g = thalweg_pts.copy()
-    g = g[g.geometry.notnull()].copy()
-    if len(g) < 2:
-        return None
-
-    coords = np.asarray([(float(p.x), float(p.y)) for p in g.geometry], dtype="float64")
-
-    # Pick WSE guidance if available; fall back to zeros (geometry-only)
-    if wse_col in g.columns:
-        wse = pd.to_numeric(g[wse_col], errors="coerce").fillna(-9999.0).to_numpy(dtype="float64")
-    else:
-        wse = np.zeros((len(g),), dtype="float64")
-
-    # Build neighbor lists using radius query
-    max_jump_m = float(max(1.0, max_jump_m))
-    densify_step_m = float(max(1.0, densify_step_m))
-
-    neigh_ind: list[list[int]] = []
-    try:
-        from sklearn.neighbors import NearestNeighbors
-        nbrs = NearestNeighbors(radius=max_jump_m, algorithm="kd_tree")
-        nbrs.fit(coords)
-        neigh_ind = nbrs.radius_neighbors(coords, radius=max_jump_m, return_distance=False)
-        neigh_ind = [list(map(int, arr.tolist())) for arr in neigh_ind]
-    except Exception:
-        # Fallback to SciPy cKDTree if sklearn isn't present
-        Tree, _which = _kd_tree()
-        if Tree is None:
-            return None
-        tree = Tree(coords)
-        neigh_ind = [list(map(int, tree.query_ball_point(coords[i], r=max_jump_m))) for i in range(coords.shape[0])]
-
-    n = len(g)
-
-    # Connected components (DFS)
-    comp_ids = np.full((n,), -1, dtype="int32")
-    comps: list[list[int]] = []
-    cid = 0
-    for i in range(n):
-        if comp_ids[i] >= 0:
-            continue
-        stack = [i]
-        comp_ids[i] = cid
-        comp = []
-        while stack:
-            u = stack.pop()
-            comp.append(u)
-            for v in neigh_ind[u]:
-                if comp_ids[v] < 0:
-                    comp_ids[v] = cid
-                    stack.append(v)
-        if len(comp) >= 2:
-            comps.append(comp)
-            cid += 1
-        else:
-            # singletons get ignored
-            comp_ids[comp[0]] = -1
-
-    if not comps:
-        return None
-
-    try:
-        log.info("[THALWEG] Identified %d connected component(s) from %d thalweg points (max_jump_m=%.1f).", len(comps), n, max_jump_m)
-    except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
-
-    out_rows = []
-    for component_id, comp in enumerate(comps):
-        comp_set = set(comp)
-
-        # Start at the highest WSE node in this component
-        start = max(comp, key=lambda ii: wse[ii])
-        path = [start]
-        visited = {start}
-        curr = start
-
-        # Greedy walk: choose nearest unvisited neighbor that does not increase WSE (allow tiny eps)
-        eps_wse = 1e-3
-        while True:
-            candidates = [v for v in neigh_ind[curr] if (v in comp_set and v not in visited)]
-            if not candidates:
-                break
-
-            # Sort by distance, then penalize WSE increases
-            cx, cy = coords[curr]
-            cand_sorted = sorted(
-                candidates,
-                key=lambda v: (
-                    math.hypot(coords[v][0] - cx, coords[v][1] - cy),
-                    0.0 if (wse[v] <= (wse[curr] + eps_wse)) else 1.0,
-                    -wse[v],
-                ),
-            )
-
-            # Prefer the nearest with non-increasing WSE; else take nearest anyway (handles flats/backwater)
-            next_v = None
-            for v in cand_sorted:
-                if wse[v] <= (wse[curr] + eps_wse):
-                    next_v = v
-                    break
-            if next_v is None:
-                next_v = cand_sorted[0]
-
-            path.append(next_v)
-            visited.add(next_v)
-            curr = next_v
-
-            # Hard stop if we get stuck oscillating (shouldn't happen with visited set)
-            if len(path) > len(comp_set):
-                break
-
-        if len(path) < 2:
-            continue
-
-        raw_line = LineString(coords[path])
-        if raw_line.is_empty or raw_line.length <= 0:
-            continue
-
-        final_line = _densify_linestring(raw_line, step_m=densify_step_m)
-
-        out_rows.append(
-            dict(
-                component_id=int(component_id),
-                length_m=float(raw_line.length),
-                geometry=final_line,
-            )
-        )
-
-        try:
-            # spacing diagnostic (raw path)
-            seglens = np.hypot(np.diff(coords[path, 0]), np.diff(coords[path, 1]))
-            med_spacing = float(np.nanmedian(seglens)) if seglens.size else float("nan")
-            log.info(
-                "[THALWEG] Component %d: points=%d raw_len=%.1fm median_spacing=%.1fm densified_vertices=%d",
-                int(component_id),
-                int(len(path)),
-                float(raw_line.length),
-                med_spacing,
-                int(len(final_line.coords)),
-            )
-        except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
-
-    if not out_rows:
-        return None
-
-    return gpd.GeoDataFrame(out_rows, crs=g.crs)
-
-
 
 def _aniso_idw_interpolate_on_mask(
     pts_xy: np.ndarray,
@@ -2403,73 +2207,79 @@ def _aniso_idw_interpolate_on_mask(
     k = int(min(max(1, int(k)), n))
     cand = int(min(n, max(k, k * 5)))
 
-    try:
-        d_eu, idx = tree.query(q_xy, k=cand, workers=-1)
-    except TypeError:
-        d_eu, idx = tree.query(q_xy, k=cand)
-    if cand == 1:
-        d_eu = d_eu.reshape(-1, 1)
-        idx = idx.reshape(-1, 1)
-
     out = np.full((q_xy.shape[0],), np.nan, dtype="float64")
 
-    for i in range(q_xy.shape[0]):
-        ids = idx[i]
-        de = d_eu[i].astype("float64")
+    # Query candidate neighbors in manageable chunks to reduce peak memory.
+    chunk = 200000
+    for i0 in range(0, q_xy.shape[0], chunk):
+        q_blk = q_xy[i0 : i0 + chunk]
         try:
-            s_q = centerline.project(Point(float(q_xy[i, 0]), float(q_xy[i, 1])))
-        except Exception:
-            ids2 = ids[:k]
-            de2 = de[:k]
-            w = 1.0 / (np.maximum(de2, eps) ** float(power))
+            d_eu, idx = tree.query(q_blk, k=cand, workers=-1)
+        except TypeError:
+            d_eu, idx = tree.query(q_blk, k=cand)
+        if cand == 1:
+            d_eu = np.asarray(d_eu).reshape(-1, 1)
+            idx = np.asarray(idx).reshape(-1, 1)
+
+        for j in range(q_blk.shape[0]):
+            i = i0 + j
+
+            ids = idx[j]
+            de = d_eu[j].astype("float64")
+            try:
+                s_q = centerline.project(Point(float(q_xy[i, 0]), float(q_xy[i, 1])))
+            except Exception:
+                ids2 = ids[:k]
+                de2 = de[:k]
+                w = 1.0 / (np.maximum(de2, eps) ** float(power))
+                if pts_weight is not None:
+                    w = w * pts_weight[ids2]
+                vv = pts_val[ids2]
+                sw = np.sum(w)
+                out[i] = float(np.sum(w * vv) / sw) if np.isfinite(sw) and sw > 0 else float(np.nan)
+                continue
+        
+            s_p = s_pts[ids]
+            d_along = np.abs(s_q - s_p)
+        
+            rad = de * de - d_along * d_along
+            valid = rad >= 0
+            d_cross = np.zeros_like(de)
+            d_cross[valid] = np.sqrt(rad[valid])
+            d_cross[~valid] = de[~valid]  # Penalize shortcuts
+        
+            d_eff = np.sqrt((d_along / along_scale_m) ** 2 + (d_cross / cross_scale_m) ** 2) + eps
+        
+            order = np.argsort(d_eff)[:k]
+            ids2 = ids[order]
+            d2 = d_eff[order]
+        
+            w = 1.0 / (d2 ** float(power))
             if pts_weight is not None:
                 w = w * pts_weight[ids2]
+            # Confluence guard: prefer highest-priority branch when multiple groups contribute.
+            if pts_group is not None and pts_priority is not None:
+                try:
+                    g = np.asarray(pts_group)[ids2]
+                    gv = g.astype('float64', copy=False)
+                    gv[gv < 0] = np.nan
+                    gmin = np.nanmin(gv)
+                    gmax = np.nanmax(gv)
+                    if np.isfinite(gmin) and np.isfinite(gmax) and (gmin != gmax):
+                        p = np.asarray(pts_priority, dtype='float64').reshape(-1)[ids2]
+                        pmax = np.nanmax(p)
+                        pmin = np.nanmin(p)
+                        if np.isfinite(pmax) and np.isfinite(pmin) and (pmax - pmin) >= float(priority_min_spread):
+                            keep = p >= (pmax - float(priority_delta))
+                            w_f = w * keep
+                            if np.sum(w_f) > 0:
+                                w = w_f
+                except Exception:
+                    logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
             vv = pts_val[ids2]
             sw = np.sum(w)
             out[i] = float(np.sum(w * vv) / sw) if np.isfinite(sw) and sw > 0 else float(np.nan)
-            continue
-
-        s_p = s_pts[ids]
-        d_along = np.abs(s_q - s_p)
-
-        rad = de * de - d_along * d_along
-        valid = rad >= 0
-        d_cross = np.zeros_like(de)
-        d_cross[valid] = np.sqrt(rad[valid])
-        d_cross[~valid] = de[~valid]  # Penalize shortcuts
-
-        d_eff = np.sqrt((d_along / along_scale_m) ** 2 + (d_cross / cross_scale_m) ** 2) + eps
-
-        order = np.argsort(d_eff)[:k]
-        ids2 = ids[order]
-        d2 = d_eff[order]
-
-        w = 1.0 / (d2 ** float(power))
-        if pts_weight is not None:
-            w = w * pts_weight[ids2]
-        # Confluence guard: prefer highest-priority branch when multiple groups contribute.
-        if pts_group is not None and pts_priority is not None:
-            try:
-                g = np.asarray(pts_group)[ids2]
-                gv = g.astype('float64', copy=False)
-                gv[gv < 0] = np.nan
-                gmin = np.nanmin(gv)
-                gmax = np.nanmax(gv)
-                if np.isfinite(gmin) and np.isfinite(gmax) and (gmin != gmax):
-                    p = np.asarray(pts_priority, dtype='float64').reshape(-1)[ids2]
-                    pmax = np.nanmax(p)
-                    pmin = np.nanmin(p)
-                    if np.isfinite(pmax) and np.isfinite(pmin) and (pmax - pmin) >= float(priority_min_spread):
-                        keep = p >= (pmax - float(priority_delta))
-                        w_f = w * keep
-                        if np.sum(w_f) > 0:
-                            w = w_f
-            except Exception:
-                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
-        vv = pts_val[ids2]
-        sw = np.sum(w)
-        out[i] = float(np.sum(w * vv) / sw) if np.isfinite(sw) and sw > 0 else float(np.nan)
-
+        
     return out
 
 
