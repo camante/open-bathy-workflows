@@ -1,5 +1,10 @@
 # Open Bathy Workflows – Technical Workflow Guide
 
+
+> **Authoritative file list:** Each run writes `io_manifest.json` and `io_manifest.md` into your `--out-dir`.
+> Use those manifests (and `unified_bathy_report.json`) as the *only* source of truth for exact input/output filenames and paths.
+> Do **not** rely on any “canonical” filenames in docs; outputs can vary by enabled methods and configuration.
+
 This repository runs an end-to-end, **reproducible** bathymetry workflow that can generate:
 
 - **Coastal / nearshore bathymetry from Satellite-Derived Bathymetry (SDB)** (Sentinel‑2 optical + calibration/constraints)
@@ -14,7 +19,7 @@ The design goal is **hydrologically safe, domain‑restricted outputs** (no bath
 
 - Depth products are **positive down** (meters) where applicable.
 - Bed elevation products are **NAVD88-referenced** where explicitly named `*_navd88_*`.
-- Final deliverables are commonly warped to **EPSG:4269** (NAD83 geographic) as `*_final_epsg4269.tif`.
+- Final deliverable filenames are not guaranteed/canonical. Treat `io_manifest.json` and `unified_bathy_report.json` as the source of truth for exact output paths.
 
 > Tip: Always verify the input DEM vertical datum and units before interpreting output elevations.
 
@@ -73,8 +78,7 @@ The river method:
   - bed profile constraints (max slope/curvature)
 
 Outputs include:
-- `river/river_depth_final_epsg4269.tif` (depth, +down)
-- `river/river_bottom_navd88_final_epsg4269.tif` (bed elevation, NAVD88)
+- River depth output path (see `io_manifest.json` for exact filename)
 
 ### Stage D — SDB bathymetry (sdb_main.py)
 SDB uses:
@@ -98,16 +102,15 @@ When both modes are enabled, the workflow creates a combined depth surface. The 
 Depending on the run mode(s), the main rasters you should inspect:
 
 ### Always (combined folder)
-- `combined/bathy_depth_final_epsg4269.tif`  
+- `combined/` (see `io_manifest.json` for exact filenames)  
   Final bathymetry depth (meters, +down), warped to EPSG:4269.
 
 If produced:
-- `combined/bathy_bottom_navd88_final_epsg4269.tif`  
+- `combined/` (see `io_manifest.json` for exact filenames)  
   Final bed elevation (NAVD88), warped to EPSG:4269.
 
 ### River outputs (river folder)
-- `river/river_depth_final_epsg4269.tif`
-- `river/river_bottom_navd88_final_epsg4269.tif`
+- River depth output path (see `io_manifest.json`)
 
 ---
 
@@ -160,4 +163,3 @@ PYTHONUNBUFFERED=1 python -u bathy_main.py \
 
 3) **Junction artifacts**  
    River junction handling is controlled in `river_skeleton_bathy.py` (width-proxy mainstem preservation + WSE-only junction smoothing). Check the debug masks (if enabled) to verify mainstem corridor coverage.
-

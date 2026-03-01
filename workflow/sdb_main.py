@@ -384,46 +384,14 @@ def generate_coastline_mask(target_raster_path, aoi, cache_masks, out_mask_tif, 
         except Exception:
             # Fallback check for glob if name varied slightly
             logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
-
         if not base_tif.exists():
-            # Robust discovery: waffles can append suffixes and/or write into a directory
-            patterns = [
-                f"waffles_coastline_{chash}*.tif",
-                f"{base_prefix.name}*.tif",
-                f"{base_prefix.name}*coast*.tif",
-                "*coastline*.tif",
-            ]
-            candidates = []
-            seen = set()
-            for pat in patterns:
-                for p in cache_masks.glob(pat):
-                    if p.suffix.lower() != ".tif":
-                        continue
-                    if p in seen:
-                        continue
-                    seen.add(p)
-                    candidates.append(p)
-            # Some waffles versions write into a directory named after the output prefix
-            prefix_dir = base_prefix
-            if prefix_dir.is_dir():
-                for p in prefix_dir.rglob("*.tif"):
-                    if p not in seen:
-                        seen.add(p)
-                        candidates.append(p)
-            coasty = [p for p in candidates if "coast" in p.name.lower()]
-            if coasty:
-                candidates = coasty
-            if candidates:
-                candidates = sorted(candidates, key=lambda p: p.stat().st_size if p.exists() else 0, reverse=True)
-                base_tif = candidates[0]
-            else:
-                existing = sorted([p.name for p in cache_masks.glob("*.tif")])
-                raise RuntimeError(
-                    "Waffles did not produce a coastline raster. "
-                    f"Expected {base_tif} or a matching *coast*.tif in {cache_masks}. "
-                    f"Existing .tif files: {existing}. "
-                    "Ensure 'waffles' is in your PATH and that the coastline module ran successfully."
-                )
+            existing = sorted([p.name for p in cache_masks.glob('*.tif')])
+            raise RuntimeError(
+                "Waffles did not produce the expected coastline raster. "
+                f"Expected: {base_tif}. "
+                f"Existing .tif files in {cache_masks}: {existing}. "
+                "This workflow requires deterministic WAFFLES outputs; please verify waffles ran successfully."
+            )
 
     # 4. Return Logic
     # If no target provided (e.g. pre-S2 download QC), return raw path
@@ -2241,7 +2209,9 @@ def main():
 
     # 9. Prediction
     log.info("\n--- Prediction ---")
-    out_tif = dir_rast / "SDB_Prediction_10m.tif"
+        # IMPORTANT: do not rely on canonical/guessed filenames. Tie outputs to this run_id.
+    # The authoritative paths are written to artifacts_sdb.json and io_manifest.json.
+    out_tif = dir_rast / f"{run_id}_sdb_depth.tif"
 
     # === NEW: Chunked processing integration (v0.6.2) ===
     use_chunked = False
@@ -2281,6 +2251,7 @@ def main():
                 model_dir=dir_model,
                 band_paths=s2_paths,
                 out_dir=dir_rast,
+                final_out_path=str(out_tif),
                 land_mask_path=str(land_mask_out),
                 max_memory_gb=args.max_memory_gb,
                 tile_size=args.tile_size,
@@ -2348,7 +2319,7 @@ def main():
     out_tif_navd88 = None
     if getattr(args, "convert_sdb_to_navd88", False):
         log.info("\n--- Convert SDB from MSL to NAVD88 ---")
-        out_tif_navd88 = dir_rast / "SDB_Prediction_10m_NAVD88.tif"
+        out_tif_navd88 = dir_rast / f"{out_tif.stem}_bed_navd88.tif"
         
         # Apply MSL metadata to original raster
         apply_sdb_metadata(out_tif, vertical_datum="MSL", vertical_datum_epsg=5714)
@@ -2367,9 +2338,9 @@ def main():
             apply_sdb_metadata(out_tif_navd88, vertical_datum="NAVD88", vertical_datum_epsg=5703)
             
             # Also convert uncertainty raster if it exists
-            unc_tif = Path(str(out_tif).replace(".tif", "_uncertainty.tif"))
+            unc_tif = out_tif.with_name(f"{out_tif.stem}_uncertainty.tif")
             if unc_tif.exists():
-                unc_tif_navd88 = dir_rast / "SDB_Prediction_10m_uncertainty_NAVD88.tif"
+                unc_tif_navd88 = dir_rast / f"{out_tif.stem}_uncertainty_bed_navd88.tif"
                 convert_sdb_msl_to_navd88(
                     input_tif=unc_tif,
                     output_tif=unc_tif_navd88,
@@ -2413,10 +2384,8 @@ def main():
                         nb_pred = nb.get("outputs", {}).get("sdb_prediction", {}).get("path", None)
                     except Exception:
                         nb_pred = None
-                    if not nb_pred:
-                        base = neighbor_in if neighbor_in.is_dir() else neighbor_in.parent
-                        cand = base / "rasters" / "SDB_Prediction_10m.tif"
-                        nb_pred = str(cand) if cand.exists() else None
+                    # No fallback filename guessing for neighbor outputs.
+                    # Neighbor must explicitly record its prediction path in run_report.json.
                     if not nb_pred or not Path(nb_pred).exists():
                         log.warning(f"[QA][OVERLAP] Neighbor prediction raster not found: {nb_pred}")
                     else:
@@ -2512,47 +2481,41 @@ def main():
             log.warning(f"[Post-Process] Failed to create masked RGB: {exc}")
 
     if not args.skip_nad83:
-        predict.reproject_to_nad83(str(out_tif), str(dir_rast / "SDB_Prediction_10m_NAD83.tif"))
-        unc_src = str(Path(out_tif).with_name(Path(out_tif).stem + "_uncertainty.tif"))
+        # Do not impose canonical filenames. Derive NAD83 outputs from the actual primary output name.
+        out_path = Path(out_tif)
+        nad83_depth = out_path.with_name(out_path.stem + "_epsg4269" + out_path.suffix)
+        predict.reproject_to_nad83(str(out_tif), str(nad83_depth))
+        unc_src = str(out_path.with_name(out_path.stem + "_uncertainty" + out_path.suffix))
         if os.path.exists(unc_src):
-             predict.reproject_to_nad83(unc_src, str(dir_rast / "SDB_Prediction_10m_uncertainty_NAD83.tif"))
+            nad83_unc = Path(unc_src).with_name(Path(unc_src).stem + "_epsg4269" + Path(unc_src).suffix)
+            predict.reproject_to_nad83(unc_src, str(nad83_unc))
 
     # -------------------------------------------------------------------------
-    # Deterministic outputs: canonical filename + artifact manifest
+    # Deterministic outputs: artifact manifest (no canonical filename guessing)
     # -------------------------------------------------------------------------
-    # Canonical depth output (EPSG:4269 if NAD83 reprojection is enabled)
+    # Primary depth output (EPSG:4269 if NAD83 reprojection is enabled)
     try:
-        depth_primary = dir_rast / "SDB_Prediction_10m_NAD83.tif"
+        # Prefer the NAD83-reprojected depth if it was created, otherwise use the native output.
+        out_path = Path(out_tif)
+        depth_primary = out_path.with_name(out_path.stem + "_epsg4269" + out_path.suffix)
         if not depth_primary.exists():
-            depth_primary = Path(out_tif)
-
-        canonical_depth = dir_rast / "sdb_depth_final_epsg4269.tif"
-        try:
-            if canonical_depth.exists():
-                canonical_depth.unlink()
-        except Exception:
-            pass
-
-        # Prefer symlink for speed; fallback to copy for cross-filesystem safety.
-        try:
-            os.symlink(depth_primary, canonical_depth)
-        except Exception:
-            shutil.copy2(depth_primary, canonical_depth)
+            depth_primary = out_path
 
         # Write manifest (relative paths, rooted at out_root)
         artifacts = {
             "run_id": run_id if 'run_id' in locals() else None,
-            "depth_raster": str(canonical_depth.relative_to(out_root)),
-            "depth_primary": str(depth_primary.relative_to(out_root)) if str(depth_primary).startswith(str(out_root)) else str(depth_primary),
+            "depth_raster": str(depth_primary.relative_to(out_root)) if str(depth_primary).startswith(str(out_root)) else str(depth_primary),
         }
 
         # Optional artifacts (only if present)
         unc = Path(str(out_tif)).with_name(Path(str(out_tif)).stem + "_uncertainty.tif")
         if unc.exists():
             artifacts["uncertainty_raster"] = str(unc.relative_to(out_root))
-        unc_nad83 = dir_rast / "SDB_Prediction_10m_uncertainty_NAD83.tif"
-        if unc_nad83.exists():
-            artifacts["uncertainty_raster_epsg4269"] = str(unc_nad83.relative_to(out_root))
+        # If NAD83 uncertainty exists, record it (derived from the actual uncertainty filename).
+        if unc.exists():
+            unc_nad83 = unc.with_name(unc.stem + "_epsg4269" + unc.suffix)
+            if unc_nad83.exists():
+                artifacts["uncertainty_raster_epsg4269"] = str(unc_nad83.relative_to(out_root))
 
         land_mask = dir_rast / "LAND_MASK_aligned.tif"
         if land_mask.exists():
@@ -2567,7 +2530,6 @@ def main():
 
         (out_root / "artifacts_sdb.json").write_text(json.dumps(artifacts, indent=2), encoding="utf-8")
         log.info(f"[ARTIFACTS] Wrote SDB manifest: {out_root / 'artifacts_sdb.json'}")
-        log.info(f"[ARTIFACTS] Canonical depth: {canonical_depth}")
     except Exception as exc:
         log.warning(f"[ARTIFACTS] Failed to write canonical outputs/manifest: {exc}")
 
@@ -2762,7 +2724,7 @@ def parse_args():
     p.add_argument("--convert-sdb-to-navd88", action="store_true", default=False,
                    help="Convert SDB from MSL to NAVD88 vertical datum using dlim. "
                         "SDB values are elevations relative to MSL (negative = below MSL). "
-                        "Output: SDB_Prediction_10m_NAVD88.tif. Requires dlim (CUDEM) on PATH.")
+                        "Output: (see artifacts_sdb.json / io_manifest.json for exact filename). Requires dlim (CUDEM) on PATH.")
     p.add_argument("--sdb-source-vdatum", default="epsg:4269+5714",
                    help="Source compound EPSG (default: epsg:4269+5714 = NAD83+MSL). "
                         "SDB is referenced to MSL due to temporal compositing of S2/ICESat-2.")

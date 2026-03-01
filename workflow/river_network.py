@@ -69,6 +69,136 @@ import fiona
 # Use centralized logging - get logger, don't configure root here
 log = logging.getLogger("river_network")
 
+
+# --------------------------------------------------------------------------------------
+# Provenance / determinism helpers
+# --------------------------------------------------------------------------------------
+
+def _sha256_bytes_iter(chunks_iter):
+    h = hashlib.sha256()
+    for ch in chunks_iter:
+        if not ch:
+            continue
+        h.update(ch)
+    return h.hexdigest()
+
+
+def fingerprint_path(path: Path) -> Dict[str, Any]:
+    """Compute a deterministic fingerprint for a dataset path.
+
+    - For regular files: SHA256 of bytes.
+    - For directories (e.g., .gdb): SHA256 over a stable listing of relative paths + size + mtime_ns.
+
+    This is meant to detect unexpected changes in cached datasets across runs/machines.
+    """
+    path = Path(path)
+    if path.is_file():
+        def _iter():
+            with open(path, "rb") as f:
+                while True:
+                    b = f.read(1024 * 1024)
+                    if not b:
+                        break
+                    yield b
+        return {
+            "path": str(path),
+            "type": "file",
+            "sha256": _sha256_bytes_iter(_iter()),
+            "method": "sha256(file_bytes)",
+        }
+    if path.is_dir():
+        # Stable listing hash with lightweight content sampling (avoid mtime-based drift).
+        # More portable across machines than mtimes, while still detecting meaningful changes.
+        def _sample_sha256(fp: Path, max_head: int = 65536, max_tail: int = 65536) -> str:
+            try:
+                size = fp.stat().st_size
+                h = hashlib.sha256()
+                with open(fp, "rb") as f:
+                    head = f.read(min(max_head, size))
+                    h.update(head)
+                    if size > len(head):
+                        tail_len = min(max_tail, max(0, size - len(head)))
+                        if tail_len > 0:
+                            try:
+                                f.seek(max(0, size - tail_len))
+                                h.update(f.read(tail_len))
+                            except Exception:
+                                pass
+                h.update(str(size).encode("utf-8"))
+                return h.hexdigest()
+            except Exception:
+                return "stat_or_read_failed"
+
+        entries = []
+        n_files = 0
+        for fp in sorted([pp for pp in path.rglob("*") if pp.is_file()], key=lambda x: str(x)):
+            try:
+                rel = str(fp.relative_to(path))
+                size = fp.stat().st_size
+                samp = _sample_sha256(fp)
+                entries.append(f"{rel}	{size}	{samp}")
+                n_files += 1
+            except Exception:
+                try:
+                    entries.append(str(fp.relative_to(path)))
+                except Exception:
+                    entries.append(str(fp))
+        payload = ("\n".join(entries)).encode("utf-8", errors="replace")
+        return {
+            "path": str(path),
+            "type": "dir",
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "method": "sha256(dir_listing(relpath,size,sha256(head+tail+size)))",
+            "n_files": n_files,
+        }
+    return {"path": str(path), "type": "missing", "sha256": None, "method": "missing"}
+
+
+def load_lock(path: Path) -> Optional[Dict[str, Any]]:
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        log.warning("Failed to read provenance lock: %s", str(path), exc_info=True)
+        return None
+
+
+def write_lock(path: Path, payload: Dict[str, Any]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def enforce_or_write_lock(lock_path: Optional[Path], provenance: Dict[str, Any]) -> None:
+    """If lock exists, enforce exact match; else write it."""
+    if not lock_path:
+        return
+    lock_path = Path(lock_path)
+    existing = load_lock(lock_path)
+    if existing is None:
+        write_lock(lock_path, provenance)
+        log.info("[PROVENANCE] Wrote river network lock: %s", str(lock_path))
+        return
+    # Exact-match enforcement on key fields
+    keys = ["source_path", "layer", "fingerprint"]
+    mismatches = []
+    for k in keys:
+        if existing.get(k) != provenance.get(k):
+            mismatches.append(k)
+    if mismatches:
+        msg = {
+            "error": "River network provenance lock mismatch",
+            "lock_path": str(lock_path),
+            "mismatched_fields": mismatches,
+            "expected": {k: existing.get(k) for k in keys},
+            "got": {k: provenance.get(k) for k in keys},
+        }
+        raise RuntimeError(json.dumps(msg, indent=2))
+    log.info("[PROVENANCE] River network lock matched: %s", str(lock_path))
+
+
 TNM_PRODUCTS_URL = "https://tnmaccess.nationalmap.gov/api/v1/products"
 TNM_DATASETS_URL = "https://tnmaccess.nationalmap.gov/api/v1/datasets"
 
@@ -621,20 +751,36 @@ def extract_archives(downloads: List[Path], work_dir: Path) -> List[Path]:
 
 
 def find_best_flowline_source(extract_roots: List[Path]) -> Tuple[Optional[Path], Optional[str]]:
+    """Return the single best flowline dataset from extracted roots.
+
+    Determinism / no-guess policy
+    -----------------------------
+    This function is only used for *auto-downloaded* archives (TNM/HydroRIVERS). For strict
+    reproducibility, users should prefer explicit inputs via --nhd-flowlines/--layer.
+
+    We keep a deterministic heuristic for convenience, but we refuse to guess when the
+    choice is ambiguous. Ambiguity is defined as a tie for best score among candidates.
+
+    Returns (path, layer) where layer may be None for single-layer sources.
+    """
     candidates: List[Path] = []
     for root in extract_roots:
         root = Path(root)
         if root.is_file():
             candidates.append(root)
             continue
+        # NOTE: rglob order is filesystem-dependent; we sort later for determinism.
         candidates.extend(root.rglob("*.gpkg"))
         candidates.extend([p for p in root.rglob("*.gdb") if p.is_dir()])
         candidates.extend(root.rglob("*.shp"))
 
+    # De-dup + deterministic order
+    candidates = sorted({Path(c) for c in candidates}, key=lambda p: str(p))
+
     if not candidates:
         return None, None
 
-    layer_pref = ["NHDFlowline", "NHDFlowline_Network", "Flowline", "Flowlines"]
+    layer_pref = ["NHDFlowline", "NHDFlowline_Network", "NetworkNHDFlowline", "Flowline", "Flowlines"]
 
     def score(path: Path, layer: Optional[str]) -> int:
         p = str(path).lower()
@@ -657,15 +803,13 @@ def find_best_flowline_source(extract_roots: List[Path]) -> Tuple[Optional[Path]
                 s -= 200
         return s
 
-    best_path = None
-    best_layer = None
-    best_score = 10**9
+    scored: List[Tuple[int, str, Path, Optional[str]]] = []
 
     for c in candidates:
         try:
+            chosen: Optional[str] = None
             if c.is_dir() and c.suffix.lower() == ".gdb":
                 layers = fiona.listlayers(str(c))
-                chosen = None
                 for lp in layer_pref:
                     if lp in layers:
                         chosen = lp
@@ -677,16 +821,12 @@ def find_best_flowline_source(extract_roots: List[Path]) -> Tuple[Optional[Path]
                             break
                 if chosen is None:
                     continue
-                sc = score(c, chosen)
-                if sc < best_score:
-                    best_score, best_path, best_layer = sc, c, chosen
             else:
-                layers = []
+                layers: List[str] = []
                 try:
                     layers = fiona.listlayers(str(c))
                 except Exception:
                     layers = []
-                chosen = None
                 if layers:
                     for lp in layer_pref:
                         if lp in layers:
@@ -697,15 +837,33 @@ def find_best_flowline_source(extract_roots: List[Path]) -> Tuple[Optional[Path]
                             if "flowline" in l.lower():
                                 chosen = l
                                 break
-                sc = score(c, chosen)
-                if sc < best_score:
-                    best_score, best_path, best_layer = sc, c, chosen
+            sc = score(c, chosen)
+            scored.append((sc, str(c), c, chosen))
         except Exception:
+            logging.getLogger(__name__).debug("Flowline candidate inspect failed: %s", str(c), exc_info=True)
             continue
 
-    return best_path, best_layer
+    if not scored:
+        return None, None
 
+    scored.sort(key=lambda t: (t[0], t[1], t[3] or ""))  # deterministic
 
+    best = scored[0]
+    # Refuse ambiguous best-choice ties (no silent guessing)
+    if len(scored) > 1 and scored[1][0] == best[0]:
+        # Show a small list to help the user decide
+        top = scored[: min(10, len(scored))]
+        msg_lines = [
+            "Ambiguous flowline source selection from auto-downloaded archives:",
+            f"  best_score={best[0]} has multiple ties.",
+            "  Provide explicit --nhd-flowlines/--layer to avoid guessing.",
+            "  Top candidates:",
+        ]
+        for sc, _, pth, lyr in top:
+            msg_lines.append(f"    score={sc:4d} path={pth} layer={lyr}")
+        raise RuntimeError("\n".join(msg_lines))
+
+    return best[2], best[3]
 # --------------------------------------------------------------------------------------
 # HydroRIVERS auto-download
 # --------------------------------------------------------------------------------------
@@ -1016,6 +1174,7 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--aoi", required=True, help="AOI bbox lonmin/lonmax/latmin/latmax")
     p.add_argument("--out-gpkg", required=True, help="Output GeoPackage path")
+    p.add_argument("--provenance-lock", default=None, help="Optional JSON lock file path. If exists, enforce exact match of selected flowlines dataset + fingerprint; otherwise write it.")
 
     p.add_argument("--cache-dir", default="cache/hydrography", help="Cache root for downloads/extracts.")
     p.add_argument("--out-crs", default=None, help="Output CRS (e.g., EPSG:32618). Default: auto UTM.")
@@ -1099,6 +1258,16 @@ def main() -> None:
             gdf["source"] = "nhd_local"
             log.info("[OK] Loaded %d reaches from --nhd-flowlines.", len(gdf))
 
+            # Provenance lock (file-based)
+            prov = {
+                "hydrography_source": "nhd_local",
+                "aoi": args.aoi,
+                "source_path": str(Path(args.nhd_flowlines)),
+                "layer": args.layer,
+                "fingerprint": fingerprint_path(Path(args.nhd_flowlines)),
+            }
+            enforce_or_write_lock(Path(args.provenance_lock) if args.provenance_lock else None, prov)
+
     # 2) Hydrography acquisition (ArcGIS primary by default)
     hydro_src = getattr(args, "hydrography_source", "arcgis").lower().strip()
 
@@ -1144,6 +1313,16 @@ def main() -> None:
 
             if src_path:
                 log.info("[TNM] Using flowlines source: %s (layer=%s)", src_path, src_layer or "<default>")
+
+                # Provenance lock (file-based)
+                prov = {
+                    "hydrography_source": "tnm_nhd",
+                    "aoi": args.aoi,
+                    "source_path": str(Path(src_path)),
+                    "layer": src_layer,
+                    "fingerprint": fingerprint_path(Path(src_path)),
+                }
+                enforce_or_write_lock(Path(args.provenance_lock) if args.provenance_lock else None, prov)
                 gdf = ingest_flowlines(
                     flowlines_path=Path(src_path),
                     layer=src_layer,

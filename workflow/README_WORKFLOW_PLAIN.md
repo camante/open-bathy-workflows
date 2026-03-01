@@ -1,5 +1,10 @@
 # Open Bathy Workflows – Plain-language guide
 
+
+> **Authoritative file list:** Each run writes `io_manifest.json` and `io_manifest.md` into your `--out-dir`.
+> Use those manifests (and `unified_bathy_report.json`) as the *only* source of truth for exact input/output filenames and paths.
+> Do **not** rely on any “canonical” filenames in docs; outputs can vary by enabled methods and configuration.
+
 This project makes “underwater maps” (bathymetry) using a mix of satellite images and river mapping data.
 
 It can do two main jobs:
@@ -40,12 +45,11 @@ This prevents weird outputs like:
 
 After the run finishes, the main output is usually:
 
-- `combined/bathy_depth_final_epsg4269.tif`
+- `combined/` (see `io_manifest.json` for exact filenames)
 
 If you ran the river method, you will also get:
 
-- `river/river_depth_final_epsg4269.tif`
-- `river/river_bottom_navd88_final_epsg4269.tif`
+- River depth output filename varies by configuration/run; see `io_manifest.json` and `unified_bathy_report.json` for exact paths.
 
 ---
 
@@ -78,4 +82,3 @@ It can now also read `bathy_report.json` to find the cached mask automatically.
 ### “Weird circles at stream junctions”
 Those were caused by how junction smoothing blended values from small tributaries into the main channel.
 The river method now uses a “main channel width proxy” approach so the main river stays continuous.
-

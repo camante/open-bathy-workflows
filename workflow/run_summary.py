@@ -301,18 +301,24 @@ def summarize_flight_recorder(fr_path: Path) -> Dict[str, Any]:
 
 
 def _discover_stats(out_dir: Path, run_id: str) -> Dict[str, Any]:
-    """Best-effort: find a run_report/bathy_report JSON near the run outputs."""
-    candidates = []
-    for pat in ["run_report.json", "bathy_report.json", f"*{run_id}*run_report*.json", f"*{run_id}*report*.json"]:
-        candidates.extend(out_dir.rglob(pat))
-    # Prefer shortest path depth (closest to root)
-    candidates = sorted(set(candidates), key=lambda p: (len(p.parts), p.name))
-    for p in candidates:
-        d = _load_json(p)
+    """Load a run report without guessing filenames.
+
+    Policy:
+      - Prefer explicit top-level reports written by bathy_main.py:
+          * unified_bathy_report.json
+          * bathy_report.json
+          * run_report.json
+      - Do not recurse/search; stale or retained folders can mislead.
+    """
+    _ = run_id  # reserved for future use
+    for name in ('unified_bathy_report.json', 'bathy_report.json', 'run_report.json'):
+        pth = out_dir / name
+        d = _load_json(pth)
         if isinstance(d, dict) and d:
-            d.setdefault("_stats_source", str(p))
+            d.setdefault('_stats_source', str(pth))
             return d
     return {}
+
 
 
 def build_technical_summary(stats: Dict[str, Any], fr_summary: Dict[str, Any]) -> str:

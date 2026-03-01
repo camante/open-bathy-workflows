@@ -364,6 +364,7 @@ def _build_wse_longitudinal_profile(
     swot_correct_sigma_m: float = 2000.0,
     swot_weight: float = 1.0,
     swot_max_correction_m: float = 5.0,
+    fit_mode: str = "isotonic",
 ) -> Optional[np.ndarray]:
     """Build a longitudinally-consistent WSE surface from bank-derived WSE samples.
 
@@ -375,6 +376,46 @@ def _build_wse_longitudinal_profile(
 
     Returns: WSE map on the template grid (float32, NaN outside channel), or None on failure.
     """
+
+    def _pava_non_decreasing(y: np.ndarray) -> np.ndarray:
+        """Pool-Adjacent-Violators (PAVA) isotonic regression for non-decreasing sequences.
+
+        Deterministic, O(n), no sklearn dependency.
+        """
+        y = np.asarray(y, dtype=float)
+        n = int(y.size)
+        if n <= 1:
+            return y.astype(float)
+
+        starts: list[int] = []
+        ends: list[int] = []
+        means: list[float] = []
+
+        for i in range(n):
+            starts.append(i)
+            ends.append(i)
+            means.append(float(y[i]))
+
+            while len(means) >= 2 and means[-2] > means[-1]:
+                s0, e0, m0 = starts[-2], ends[-2], means[-2]
+                s1, e1, m1 = starts[-1], ends[-1], means[-1]
+                w0 = (e0 - s0 + 1)
+                w1 = (e1 - s1 + 1)
+                m = (m0 * w0 + m1 * w1) / float(w0 + w1)
+                starts[-2] = s0
+                ends[-2] = e1
+                means[-2] = float(m)
+                starts.pop(); ends.pop(); means.pop()
+
+        out = np.empty(n, dtype=float)
+        for s, e, m in zip(starts, ends, means):
+            out[s:e + 1] = float(m)
+        return out
+
+    def _isotonic_non_increasing(y: np.ndarray) -> np.ndarray:
+        """Isotonic regression enforcing a non-increasing sequence."""
+        y = np.asarray(y, dtype=float)
+        return -_pava_non_decreasing(-y)
     try:
         import geopandas as gpd
         from shapely.geometry import LineString, MultiLineString
@@ -615,6 +656,29 @@ def _build_wse_longitudinal_profile(
                         wgrid = (wgrid + float(swot_weight or 1.0) * resid_grid).astype(float)
                 except Exception as e:
                     LOG.warning("SWOT anchoring failed for a flowline segment; continuing without SWOT. Error: %s", e)
+
+            # Enforce a physically consistent monotonic (non-increasing) WSE trend along the flowline.
+            # We infer the most likely downstream direction from the endpoints (higher -> lower),
+            # then apply an isotonic regression constraint in that direction.
+            fm = str(fit_mode or "").strip().lower()
+            if fm not in ("", "none", "off", "false", "0"):
+                try:
+                    if wgrid.size >= 3 and np.isfinite(wgrid).all():
+                        rev = bool(wgrid[-1] > wgrid[0])
+                        if rev:
+                            wfit = _isotonic_non_increasing(wgrid[::-1])[::-1]
+                        else:
+                            wfit = _isotonic_non_increasing(wgrid)
+                        # Preserve original mean level as a safety against gross shifts.
+                        # (Isotonic changes shape but should not introduce large offsets.)
+                        mu0 = float(np.mean(wgrid))
+                        mu1 = float(np.mean(wfit))
+                        if np.isfinite(mu0) and np.isfinite(mu1):
+                            wgrid = (wfit + (mu0 - mu1)).astype(float)
+                        else:
+                            wgrid = wfit.astype(float)
+                except Exception:
+                    logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
             # map smoothed profile back to sample points and store for KDTree
             w_s = np.interp(d_kept, dgrid, wgrid)
@@ -1881,6 +1945,17 @@ def main(
         ),
     )
 
+    p.add_argument(
+        "--wse-profile-fit",
+        default="isotonic",
+        choices=["isotonic", "none"],
+        help=(
+            "Longitudinal constraint applied to the 1D WSE profile along each flowline segment. "
+            "'isotonic' enforces a non-increasing WSE trend in the inferred downstream direction (higher→lower); "
+            "'none' disables the monotonic constraint."
+        ),
+    )
+
     
     # Optional: SWOT RiverSP anchoring for wse-mode=bank_profile
     p.add_argument(
@@ -2340,6 +2415,7 @@ def main(
                 swot_correct_sigma_m=float(getattr(args, "swot_correct_sigma_m", 2000.0) or 0.0),
                 swot_weight=float(getattr(args, "swot_weight", 1.0) or 0.0),
                 swot_max_correction_m=float(getattr(args, "swot_max_correction_m", 5.0) or 0.0),
+                fit_mode=str(getattr(args, "wse_profile_fit", "isotonic") or "isotonic"),
             )
             if wse_prof is not None:
                 wse_map = wse_prof

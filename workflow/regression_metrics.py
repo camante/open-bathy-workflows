@@ -63,11 +63,6 @@ def _find_first(run_dir: Path, candidates: List[str]) -> Optional[Path]:
         p = run_dir / c
         if p.exists():
             return p
-    # fallback: try recursive match
-    for c in candidates:
-        matches = list(run_dir.rglob(c))
-        if matches:
-            return matches[0]
     return None
 
 

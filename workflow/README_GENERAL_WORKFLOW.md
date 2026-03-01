@@ -1,4 +1,9 @@
 ########################################################################
+
+> **Authoritative file list:** Each run writes `io_manifest.json` and `io_manifest.md` into your `--out-dir`.
+> Use those manifests (and `unified_bathy_report.json`) as the *only* source of truth for exact input/output filenames and paths.
+> Do **not** rely on any “canonical” filenames in docs; outputs can vary by enabled methods and configuration.
+
 # Open Bathy Workflows (v2.0.42)
 ########################################################################
 
@@ -71,7 +76,7 @@ Final merged outputs are written to `output/<name>/combined/`.
 
 - `output/<name>/sdb/` – SDB depth rasters, masks, QC plots, run_report JSON
 - `output/<name>/river/` – river depth/bed rasters, GPKGs (network + XS) and diagnostics
-- `output/<name>/combined/` – fused depth product (e.g. `bathy_depth_final_epsg4269.tif`)
+- `output/<name>/combined/` – fused products (see `io_manifest.json` for exact filenames).
 - `output/<name>/bathy_report.json` – top‑level pipeline report
 
 ## Troubleshooting

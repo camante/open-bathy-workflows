@@ -52,6 +52,7 @@ def predict_scene_chunked(
     model_dir: Path,
     band_paths: Dict[str, Any],
     out_dir: Path,
+    final_out_path: Optional[str] = None,
     land_mask_path: Optional[str] = None,
     tile_size: int = 512,
     overlap: int = 0,
@@ -73,8 +74,13 @@ def predict_scene_chunked(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write to a distinct path so sdb_main.py can copy into its canonical out_tif without SameFileError.
-    out_raster = out_dir / "SDB_Prediction_10m_chunked.tif"
+    # Write to a distinct path so the caller can copy into its chosen final output
+    # (no canonical filename assumptions).
+    if final_out_path is not None:
+        stem = Path(final_out_path).stem
+        out_raster = out_dir / f"{stem}_chunked_tmp.tif"
+    else:
+        out_raster = out_dir / "prediction_chunked_tmp.tif"
 
     rf_model_path = model_dir / "rf_model.pkl"
     meta_json_path = model_dir / "model_meta.json"

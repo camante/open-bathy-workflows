@@ -62,6 +62,7 @@ longitudinal WSE-profile slope fit.
 
 
 import argparse
+import json as _json
 import logging
 import os
 import time
@@ -271,11 +272,17 @@ class InferConfig:
     manning_q_field: Optional[str] = None  # reach attribute field containing Q (m^3/s) when mode='from_field'
     manning_n: float = 0.035
     manning_region: str = "default"
+    manning_n_by_region: dict = None  # optional mapping {region: n}; supplied via --manning-n-by-region
     manning_min_confidence: float = 0.30
     manning_max_weight: float = 0.60
     manning_backwater_slope_thresh: float = 1e-4  # disable when slope below this (backwater/tidal risk)
     manning_dist_to_mouth_field: Optional[str] = None
     manning_dist_to_mouth_km_max: float = 10.0
+
+    # If the run has no soundings, optionally auto-enable a conservative Manning prior
+    # (requires slope + drainage area). This provides a more stable absolute depth scale
+    # in data-sparse reaches.
+    auto_manning_when_no_soundings: bool = True
 
 
 
@@ -298,6 +305,15 @@ class InferConfig:
     regional_curve_depth_type: str = "mean"     # mean | max
     regional_curve_to_dmax: str = "auto"        # auto | factor
     regional_curve_to_dmax_factor: float = 1.25 # used when to_dmax='factor'
+
+    # ---- Geomorphic depth envelope (stabilizes absolute scale in no-sounding areas) ----
+    # Uses the regional curve (DA -> bankfull depth) to compute a conservative upper bound on Dmax.
+    # This is a *cap* applied after anchors/priors: dmax_raw_m = min(dmax_raw_m, dmax_env_m).
+    geomorphic_envelope_enabled: bool = True
+    geomorphic_envelope_region: str = "auto"   # auto -> use regional_curve_region
+    geomorphic_envelope_inflate_unc: bool = True  # if True, multiply by (1 + regional_curve_unc_pct/100)
+    geomorphic_envelope_only_when_no_soundings: bool = True
+
     regional_curve_max_weight: float = 0.60
     regional_curve_min_da_km2: float = 1.0      # ignore very small DA (unstable curves)
 
@@ -317,6 +333,67 @@ def _read_layer(gpkg: Path, layer: str) -> gpd.GeoDataFrame:
     if gdf.crs is None:
         raise RuntimeError(f"Layer '{layer}' has no CRS: {gpkg}")
     return gdf
+
+
+def _read_layer_with_fallback(gpkg: Path, preferred_layer: str, purpose: str = "rivers") -> Tuple[gpd.GeoDataFrame, str]:
+    """Read a layer from a GeoPackage, with deterministic fallback.
+
+    Why: different river-network builders may write different layer names.
+    We try the requested layer name first; if missing, we scan layers and pick
+    the first plausible candidate.
+    """
+    try:
+        gdf = gpd.read_file(gpkg, layer=preferred_layer)
+        if gdf is not None and len(gdf) > 0:
+            if gdf.crs is None:
+                raise RuntimeError(f"Layer '{preferred_layer}' has no CRS: {gpkg}")
+            return gdf, preferred_layer
+    except Exception:
+        pass
+
+    try:
+        import fiona
+
+        layers = list(fiona.listlayers(gpkg))
+    except Exception as e:
+        raise RuntimeError(f"Failed to list layers in {gpkg} ({e})")
+
+    # Deterministic candidate ordering: prefer explicit names, then substring matches.
+    preferred = [
+        preferred_layer,
+        "rivers_clip",
+        "rivers",
+        "river",
+        "flowlines",
+        "flowline",
+        "nhd_flowline",
+        "nhdflowline",
+        "network",
+    ]
+
+    ordered = []
+    seen = set()
+    for name in preferred + layers:
+        if name in seen:
+            continue
+        if name in layers:
+            ordered.append(name)
+            seen.add(name)
+
+    last_err = None
+    for lyr in ordered:
+        try:
+            gdf = gpd.read_file(gpkg, layer=lyr)
+            if gdf is None or len(gdf) == 0:
+                continue
+            if gdf.crs is None:
+                continue
+            return gdf, lyr
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise RuntimeError(f"No usable '{purpose}' layer found in {gpkg} (tried {len(ordered)} candidates; last_err={last_err})")
 
 
 def _safe_float(x) -> float:
@@ -679,11 +756,26 @@ def _attach_curvature_asymmetry(
     return xs_param
 
 
-def _compute_dmax_prior(W: float, cfg: InferConfig) -> float:
+def _compute_dmax_prior(W: float, cfg: InferConfig, acct: Optional[dict] = None) -> float:
+    """Univariate Dmax prior (width-only).
+
+    If acct is provided, updates:
+      - n_prior_total
+      - n_prior_clipped_min
+      - n_prior_clipped_max
+    """
     if not np.isfinite(W) or W <= 0:
         return float("nan")
-    D = cfg.a * (W ** cfg.b)
-    return float(np.clip(D, cfg.dmin_m, cfg.dmax_m))
+    D0 = float(cfg.a) * (float(W) ** float(cfg.b))
+    D = float(np.clip(D0, cfg.dmin_m, cfg.dmax_m))
+    if acct is not None:
+        acct["n_prior_total"] = int(acct.get("n_prior_total", 0)) + 1
+        if np.isfinite(D0):
+            if float(D0) < float(cfg.dmin_m):
+                acct["n_prior_clipped_min"] = int(acct.get("n_prior_clipped_min", 0)) + 1
+            elif float(D0) > float(cfg.dmax_m):
+                acct["n_prior_clipped_max"] = int(acct.get("n_prior_clipped_max", 0)) + 1
+    return D
 def _guess_field(columns, candidates):
     """Return the first candidate present in columns (case-insensitive), else None."""
     if columns is None:
@@ -762,7 +854,7 @@ def _compute_slope_proxy(
 
 
 
-def _compute_dmax_prior_multivariate(row: pd.Series, cfg: InferConfig) -> float:
+def _compute_dmax_prior_multivariate(row: pd.Series, cfg: InferConfig, acct: Optional[dict] = None) -> float:
     """Multivariate Dmax prior.
 
     Dmax = mv_a0 * W^mv_bw * (A_drain + mv_eps_a)^mv_ba * (S + mv_eps_s)^mv_bs
@@ -777,13 +869,46 @@ def _compute_dmax_prior_multivariate(row: pd.Series, cfg: InferConfig) -> float:
     if not np.isfinite(S):
         S = 0.0
 
-    D = (
+    D0 = (
         float(cfg.mv_a0)
         * (W ** float(cfg.mv_bw))
         * ((A + float(cfg.mv_eps_a)) ** float(cfg.mv_ba))
         * ((S + float(cfg.mv_eps_s)) ** float(cfg.mv_bs))
     )
-    return float(np.clip(D, cfg.dmin_m, cfg.dmax_m))
+    D = float(np.clip(D0, cfg.dmin_m, cfg.dmax_m))
+    if acct is not None:
+        acct["n_prior_total"] = int(acct.get("n_prior_total", 0)) + 1
+        if np.isfinite(D0):
+            if float(D0) < float(cfg.dmin_m):
+                acct["n_prior_clipped_min"] = int(acct.get("n_prior_clipped_min", 0)) + 1
+            elif float(D0) > float(cfg.dmax_m):
+                acct["n_prior_clipped_max"] = int(acct.get("n_prior_clipped_max", 0)) + 1
+
+        # Attribute availability accounting (helps diagnose under-constraint)
+        if np.isfinite(float(row.get("drain_area_km2", np.nan) or np.nan)):
+            acct["n_with_da"] = int(acct.get("n_with_da", 0)) + 1
+        if np.isfinite(float(row.get("slope_mpm", np.nan) or np.nan)):
+            acct["n_with_slope"] = int(acct.get("n_with_slope", 0)) + 1
+    return D
+
+
+def _manning_n_effective(cfg: InferConfig) -> float:
+    """Return Manning's n used for inversion, optionally keyed by region.
+
+    This avoids hardcoded region defaults (user supplies mapping) while still allowing
+    deterministic, explicit friction priors.
+    """
+    n = float(getattr(cfg, "manning_n", 0.035))
+    region = str(getattr(cfg, "manning_region", "default") or "default")
+    by_region = getattr(cfg, "manning_n_by_region", None)
+    if isinstance(by_region, dict) and region in by_region:
+        try:
+            n_reg = float(by_region[region])
+            if np.isfinite(n_reg) and n_reg > 0:
+                return n_reg
+        except Exception:
+            pass
+    return n
 
 
 def _compute_dmax_manning(width_m: float, slope_mpm: float, q_cms: float, cfg: InferConfig) -> float:
@@ -806,7 +931,7 @@ def _compute_dmax_manning(width_m: float, slope_mpm: float, q_cms: float, cfg: I
     if not (np.isfinite(W) and W > 0 and np.isfinite(S) and S > 0 and np.isfinite(Q) and Q > 0):
         return float("nan")
 
-    n = float(cfg.manning_n)
+    n = float(_manning_n_effective(cfg))
     with np.errstate(divide="ignore", invalid="ignore"):
         y_mean = ((n * Q) / (W * np.sqrt(S))) ** (3.0 / 5.0)
 
@@ -1088,6 +1213,35 @@ def _load_width_stage_csvs(paths) -> pd.DataFrame:
     out = pd.DataFrame(out_rows)
     out.loc[out["site_no"].astype(str).isin(["nan", "None", "NA", ""]), "site_no"] = pd.NA
     return out
+
+
+def _compute_dmax_geomorphic_envelope(row: pd.Series, cfg: InferConfig) -> Tuple[float, str]:
+    """Compute a conservative upper bound on Dmax using the regional curve.
+
+    This is intended to stabilize absolute depth scale in no-sounding reaches where
+    hydraulic inversion can be weak/unstable (e.g., very low slopes).
+    Returns (dmax_env_m, detail). If unavailable, returns (nan, reason).
+    """
+    if not bool(getattr(cfg, "geomorphic_envelope_enabled", False)):
+        return float("nan"), "disabled"
+    if bool(getattr(cfg, "geomorphic_envelope_only_when_no_soundings", True)):
+        # if soundings were used anywhere, do not apply envelope as a hard cap
+        if str(row.get("calib_src", "")).lower().strip() == "soundings":
+            return float("nan"), "soundings_calibrated"
+    # Reuse the regional curve computation (DA -> depth), but treat as a cap rather than a blend.
+    d_rc, w_rc, det = _compute_dmax_regional_curve(row, cfg)
+    if not np.isfinite(d_rc):
+        return float("nan"), "no_regional_curve:" + str(det)
+    d_env = float(d_rc)
+    if bool(getattr(cfg, "geomorphic_envelope_inflate_unc", True)):
+        try:
+            unc = float(getattr(cfg, "regional_curve_unc_pct", 0.0))
+            if np.isfinite(unc) and unc > 0:
+                d_env *= (1.0 + unc / 100.0)
+        except Exception:
+            pass
+    d_env = float(np.clip(d_env, float(cfg.dmin_m), float(cfg.dmax_m)))
+    return d_env, f"rc_cap({det})"
 
 
 def _fit_width_stage_beta(ws: pd.DataFrame) -> Tuple[Optional[float], int, float]:
@@ -3440,6 +3594,8 @@ def infer_bathy(
     max_query_dist_m: Optional[float] = None,
     thalweg_only: bool = False,
     thalweg_densify_step_m: Optional[float] = None,
+    out_accounting_json: Optional[Path] = None,
+    out_meta_json: Optional[Path] = None,
 ) -> None:
     xs_lines = _read_layer(xs_gpkg, xs_lines_layer)
     xs_pts = _read_layer(xs_gpkg, xs_points_layer)
@@ -3462,10 +3618,25 @@ def infer_bathy(
 
     grouped = pts_df.groupby("xs_id", sort=False)
 
+    # Constraint accounting (to expose where the model is under-constrained)
+    acct: Dict[str, object] = {
+        "prior_mode": str(getattr(cfg, "prior_mode", "width_power") or "width_power"),
+        "dmin_m": float(getattr(cfg, "dmin_m", np.nan)),
+        "dmax_m": float(getattr(cfg, "dmax_m", np.nan)),
+        "manning_mode": str(getattr(cfg, "manning_mode", "off") or "off"),
+        "n_xs_total": 0,
+        "n_prior_total": 0,
+        "n_prior_clipped_min": 0,
+        "n_prior_clipped_max": 0,
+        "n_with_da": 0,
+        "n_with_slope": 0,
+    }
+
     xs_records = []
     wse_by_xs: Dict[str, float] = {}
 
     for _, xsl in xs_lines.iterrows():
+        acct["n_xs_total"] = int(acct.get("n_xs_total", 0)) + 1
         xsid = str(xsl["xs_id"])
         if xsid not in grouped.groups:
             continue
@@ -3499,7 +3670,7 @@ def infer_bathy(
         wse = _estimate_wse_from_profile(xsp, xs_len, bank_left_z, bank_right_z, cfg)
         wse_by_xs[xsid] = wse
 
-        dmax_prior = _compute_dmax_prior(W, cfg)
+        dmax_prior = _compute_dmax_prior(W, cfg, acct=acct)
 
         xs_records.append(
             dict(
@@ -3522,6 +3693,9 @@ def infer_bathy(
     if xs_param.empty:
         raise RuntimeError("No valid cross-sections to process (check bank picks and filters).")
 
+    # XS that survive basic filtering are the effective constraint set.
+    acct["n_xs_used"] = int(len(xs_param))
+
 
 
 
@@ -3532,7 +3706,9 @@ def infer_bathy(
     xs_param["slope_mpm"] = np.nan
     if river_gpkg is not None and Path(river_gpkg).exists():
         try:
-            rivers = _read_layer(Path(river_gpkg), rivers_layer)
+            rivers, rivers_layer_used = _read_layer_with_fallback(Path(river_gpkg), rivers_layer, purpose="rivers")
+            if rivers_layer_used != rivers_layer:
+                log.info("[RIVER][ATTR] rivers layer '%s' not found/usable; using '%s'", str(rivers_layer), str(rivers_layer_used))
             if "river_id" not in rivers.columns:
                 # fall back to common id fields
                 rid_guess = _guess_field(rivers.columns, ["river_id", "RiverID", "RID", "COMID", "comid"])
@@ -3591,20 +3767,8 @@ def infer_bathy(
             xs_param["drain_area_km2"] = np.nan
     else:
         da_ok = False
-
-    if "slope_mpm" in xs_param.columns:
-        sl_vals = pd.to_numeric(xs_param["slope_mpm"], errors="coerce")
-        sl_ok = np.isfinite(sl_vals).any()
-        if not sl_ok:
-            log.warning("[RIVER][ATTR] No valid slope values found; disabling slope-dependent priors.")
-            xs_param["slope_mpm"] = np.nan
-    else:
-        sl_ok = False
-
-    # If multivariate priors were requested but the necessary reach attributes are missing, fall back.
-    if getattr(cfg, "prior_mode", "").lower() == "multivariate" and not (da_ok and sl_ok):
-        log.warning("[PRIOR] multivariate prior requested but reach attributes are missing; falling back to powerlaw.")
-        cfg.prior_mode = "powerlaw"
+    # slope_mpm may be missing in network attributes; we compute a slope proxy below if needed.
+    sl_ok = False
 
 
 
@@ -3631,15 +3795,30 @@ def infer_bathy(
         except Exception as e:
             log.warning("[SWOT][WSE] Failed to load/attach WSE observations (%s). Using DEM/topo proxy.", e)
 
+    # --------------------------------------------------------------------------------------
+    # Slope estimation / proxy (stage)
+    # --------------------------------------------------------------------------------------
+    # If reach slope was not provided by the network source, estimate a stabilized water-surface slope.
+    # We prefer a fitted longitudinal WSE profile (if available) and fall back to a robust slope proxy.
+    #
+    # This is a key constraint for hydraulically consistent depths. Without it, inference collapses to
+    # width-only priors + smoothing.
+    slope_missing = True
+    if "slope_mpm" in xs_param.columns:
+        sl_vals = pd.to_numeric(xs_param["slope_mpm"], errors="coerce")
+        slope_missing = (not np.isfinite(sl_vals).any()) or bool(getattr(cfg, "force_slope_proxy", False))
+
     # If requested, keep observed stage for bed elevations but do NOT let it drive slope fitting.
     if (getattr(cfg, "swot_wse", None) is not None) and (not bool(getattr(cfg, "swot_use_for_slope", True))):
         xs_param["_wse_blended_m"] = xs_param["wse_m"]
         if "wse_proxy_m" in xs_param.columns:
             xs_param["wse_m"] = xs_param["wse_proxy_m"]
-        # If slope was not provided, estimate a stabilized water-surface slope from a fitted
-        # longitudinal WSE profile (preferred) and fall back to the legacy slope proxy.
+
+    if slope_missing:
         xs_param["wse_fit_m"] = np.nan
         xs_param["slope_wse_mpm"] = np.nan
+
+        # 1) Fit a longitudinal WSE profile (preferred) if the helper is available.
         if bool(getattr(cfg, "wse_profile_enabled", True)):
             try:
                 wcfg = WSEFitConfig(
@@ -3651,13 +3830,14 @@ def infer_bathy(
                     slope_max=float(cfg.slope_max),
                 )
                 if fit_wse_profile is None:
-                    raise RuntimeError('river_wse module not available')
+                    raise RuntimeError("river_wse module not available")
                 wse_fit, slope_fit = fit_wse_profile(xs_param, cfg=wcfg)
                 xs_param["wse_fit_m"] = wse_fit
                 xs_param["slope_wse_mpm"] = slope_fit
             except Exception as e:
                 log.warning("[RIVER][WSE] WSE profile fit failed, falling back to slope proxy (%s)", e)
 
+        # 2) Always compute a robust slope proxy as a fallback.
         xs_param["slope_proxy_mpm"] = _compute_slope_proxy(
             xs_param,
             window=cfg.slope_proxy_window,
@@ -3665,21 +3845,40 @@ def infer_bathy(
             slope_max=cfg.slope_max,
             min_n=cfg.slope_proxy_min_n,
         )
-        # Prefer slope from WSE profile if available; otherwise fallback to slope_proxy
-        if xs_param["slope_mpm"].isna().all():
-            if xs_param["slope_wse_mpm"].notna().any():
-                xs_param["slope_mpm"] = xs_param["slope_wse_mpm"]
-            else:
-                xs_param["slope_mpm"] = xs_param["slope_proxy_mpm"]
+
+        # Prefer slope from fitted WSE profile if available; otherwise fallback to slope_proxy.
+        if xs_param["slope_wse_mpm"].notna().any():
+            xs_param["slope_mpm"] = xs_param["slope_wse_mpm"]
+        else:
+            xs_param["slope_mpm"] = xs_param["slope_proxy_mpm"]
 
 
+    # Validate / finalize slope availability after proxy computation.
+    if "slope_mpm" in xs_param.columns:
+        sl_vals = pd.to_numeric(xs_param["slope_mpm"], errors="coerce")
+        sl_ok = np.isfinite(sl_vals).any()
+        if not sl_ok:
+            log.warning("[RIVER][ATTR] No valid slope values found (even after slope proxy); disabling slope-dependent priors.")
+            xs_param["slope_mpm"] = np.nan
+    else:
+        sl_ok = False
+
+    # If multivariate priors were requested but required reach attributes are missing, fall back.
+    if str(getattr(cfg, "prior_mode", "")).lower() == "multivariate" and not (da_ok and sl_ok):
+        log.warning("[PRIOR] multivariate prior requested but reach attributes missing (da_ok=%s slope_ok=%s); falling back to powerlaw.", da_ok, sl_ok)
+        cfg.prior_mode = "powerlaw"
     # Restore blended WSE after slope estimation if we suppressed SWOT stage during slope fitting.
     if "_wse_blended_m" in xs_param.columns:
         xs_param["wse_m"] = xs_param["_wse_blended_m"]
         xs_param = xs_param.drop(columns=["_wse_blended_m"])
     # Upgrade prior if requested
     if str(cfg.prior_mode).lower().strip() == "multivariate":
-        xs_param["dmax_prior_m"] = xs_param.apply(lambda r: _compute_dmax_prior_multivariate(r, cfg), axis=1)
+        def _mv_prior_row(r: pd.Series) -> float:
+            return _compute_dmax_prior_multivariate(r, cfg, acct=acct)
+        xs_param["dmax_prior_m"] = xs_param.apply(_mv_prior_row, axis=1)
+        acct["prior_mode_effective"] = "multivariate"
+    else:
+        acct["prior_mode_effective"] = "powerlaw"
 
     # ---- Optional soft priors (blended into dmax_prior_m) ----
     # 1) Regional hydraulic geometry curves (DA -> bankfull depth)
@@ -3698,6 +3897,11 @@ def infer_bathy(
         d1 = xs_param["dmax_regional_curve_m"].astype("float64")
         use = np.isfinite(d0) & np.isfinite(d1) & (w > 0)
         xs_param.loc[use, "dmax_prior_m"] = (1.0 - w[use]) * d0[use] + w[use] * d1[use]
+        acct["n_regional_curve_applied"] = int(np.sum(use))
+        try:
+            acct["regional_curve_weight_mean"] = float(np.nanmean(w[use])) if np.any(use) else 0.0
+        except Exception:
+            acct["regional_curve_weight_mean"] = 0.0
 
     # 2) Manning inversion prior (requires Q, width, slope)
     xs_param["manning_q_cms_used"] = np.nan
@@ -3706,6 +3910,22 @@ def infer_bathy(
     xs_param["manning_conf"] = 0.0
     xs_param["manning_wt"] = 0.0
     xs_param["manning_flags"] = ""
+
+    # Auto-enable (conservative) Manning prior when no soundings were provided.
+    # This is specifically to stabilize absolute depth scale in data-sparse reaches.
+    if (
+        bool(getattr(cfg, "auto_manning_when_no_soundings", True))
+        and (str(cfg.manning_mode).lower().strip() == "off")
+        and (not soundings_path)
+        and da_ok
+        and sl_ok
+        and (estimate_q2_from_drainage_area is not None)
+    ):
+        cfg.manning_mode = "q2_regional"
+        log.info(
+            "[PRIOR][MANNING] auto-enabled manning_mode=q2_regional (no soundings; da_ok=%s slope_ok=%s region=%s)",
+            str(da_ok), str(sl_ok), str(getattr(cfg, "manning_region", "default"))
+        )
 
     if str(cfg.manning_mode).lower().strip() != "off":
         m_mode = str(cfg.manning_mode).lower().strip()
@@ -4167,6 +4387,32 @@ def infer_bathy(
             log.warning("[CALIB][USGS] failed to apply USGS measurement calibration: %s", e)
 
     # Clip and proceed
+
+    # ---- Geomorphic envelope cap (stabilizes absolute depth scale) ----
+    xs_param["dmax_env_m"] = np.nan
+    xs_param["env_detail"] = ""
+    if bool(getattr(cfg, "geomorphic_envelope_enabled", False)):
+        try:
+            env = xs_param.apply(lambda r: _compute_dmax_geomorphic_envelope(r, cfg), axis=1)
+            xs_param["dmax_env_m"] = env.apply(lambda t: float(t[0]) if isinstance(t, tuple) else float("nan"))
+            xs_param["env_detail"] = env.apply(lambda t: str(t[1]) if isinstance(t, tuple) else "")
+            d = pd.to_numeric(xs_param["dmax_raw_m"], errors="coerce")
+            e = pd.to_numeric(xs_param["dmax_env_m"], errors="coerce")
+            use = np.isfinite(d) & np.isfinite(e)
+            if use.any():
+                d_new = d.copy()
+                d_new.loc[use] = np.minimum(d.loc[use].astype("float64"), e.loc[use].astype("float64"))
+                xs_param["dmax_raw_m"] = pd.to_numeric(d_new, errors="coerce")
+                if acct is not None:
+                    acct["n_env_total"] = int(np.sum(use))
+                    acct["n_env_clipped"] = int(np.sum(use & (d_new < d)))
+                    try:
+                        acct["env_clip_frac"] = float(acct["n_env_clipped"]) / float(max(1, acct["n_env_total"]))
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.warning("[ENVELOPE] failed to apply geomorphic envelope cap: %s", e)
+
     xs_param["dmax_raw_m"] = pd.to_numeric(xs_param["dmax_raw_m"], errors="coerce").clip(cfg.dmin_m, cfg.dmax_m)
 
     # Smooth along stationing within component
@@ -4424,6 +4670,74 @@ def infer_bathy(
                 else:
                     log.info("[WRITE] bathy raster ok (%d bytes)", out_bathy_raster.stat().st_size)
 
+                    # ------------------------------------------------------------------
+                    # Explicit constraint metadata sidecar (NO filename guessing)
+                    # ------------------------------------------------------------------
+                    # Downstream pipeline stages should *not* infer which constraints were used.
+                    # Write a deterministic sidecar next to the requested output raster.
+                    try:
+                        import json as _json
+
+                        # Soundings constraint
+                        snd_used = False
+                        snd_total = 0
+                        if "soundings_n" in xs_param.columns:
+                            sn = pd.to_numeric(xs_param["soundings_n"], errors="coerce").fillna(0)
+                            snd_total = int(sn.sum())
+                            snd_used = bool((sn > 0).any())
+
+                        # Drainage area constraint
+                        da_used = False
+                        if "drain_area_km2" in xs_param.columns:
+                            da_used = bool(np.isfinite(pd.to_numeric(xs_param["drain_area_km2"], errors="coerce")).any())
+
+                        # Slope constraint + source
+                        slope_used = False
+                        slope_source = "none"
+                        if "slope_mpm" in xs_param.columns:
+                            slope_used = bool(np.isfinite(pd.to_numeric(xs_param["slope_mpm"], errors="coerce")).any())
+                            if slope_used:
+                                slope_source = "network"
+                                if "slope_proxy_mpm" in xs_param.columns and np.isfinite(pd.to_numeric(xs_param["slope_proxy_mpm"], errors="coerce")).any():
+                                    slope_source = "proxy"
+                                if "slope_wse_mpm" in xs_param.columns and np.isfinite(pd.to_numeric(xs_param["slope_wse_mpm"], errors="coerce")).any():
+                                    slope_source = "wse_fit"
+
+                        # WSE source (anchoring for bed elevations)
+                        wse_source = "dem_proxy"
+                        if "swot_wse_m" in xs_param.columns and np.isfinite(pd.to_numeric(xs_param["swot_wse_m"], errors="coerce")).any():
+                            wse_source = "swot"
+
+                        # Constraint level
+                        if snd_used:
+                            level = "CALIBRATED"
+                        elif slope_used or da_used:
+                            level = "PARTIALLY_CONSTRAINED"
+                        else:
+                            level = "PRIOR_ONLY"
+
+                        meta = {
+                            "constraints": {
+                                "soundings_used": bool(snd_used),
+                                "soundings_total_matched": int(snd_total),
+                                "drainage_area_used": bool(da_used),
+                                "slope_used": bool(slope_used),
+                                "slope_source": str(slope_source),
+                                "wse_source": str(wse_source),
+                                "level": str(level),
+                            },
+                            "outputs": {
+                                "out_bathy_raster": str(out_bathy_raster),
+                                "out_gpkg": str(out_gpkg),
+                            },
+                        }
+
+                        meta_path = Path(out_meta_json) if out_meta_json else Path(str(out_bathy_raster) + ".meta.json")
+                        meta_path.write_text(_json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
+                        log.info("[WRITE] constraint meta -> %s", str(meta_path))
+                    except Exception as e:
+                        log.warning("[WRITE] Failed to write constraint meta sidecar (%s)", e)
+
             if out_mask_raster:
                 out_mask_raster = Path(out_mask_raster)
                 out_mask_raster.parent.mkdir(parents=True, exist_ok=True)
@@ -4456,6 +4770,29 @@ def infer_bathy(
     # Strict output validation
     # --------------------------------------------------------------------------------------
     # If raster outputs were requested, ensure they were actually written.
+
+    # Final derived accounting (calibration sources)
+    try:
+        if "calib_src" in xs_param.columns:
+            vc = xs_param["calib_src"].value_counts(dropna=False).to_dict()
+            acct["calib_src_counts"] = {str(k): int(v) for k, v in vc.items()}
+            acct["n_width_stage_applied"] = int(vc.get("width_stage", 0))
+            acct["n_usgs_applied"] = int(vc.get("usgs", 0))
+            acct["n_soundings_calib_applied"] = int(vc.get("soundings", 0))
+    except Exception:
+        pass
+
+    # Optional: write constraint accounting JSON (explicit path; no guessing)
+    if out_accounting_json is not None:
+        out_accounting_json = Path(out_accounting_json)
+        out_accounting_json.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out_accounting_json.with_suffix(out_accounting_json.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            _json.dump(acct, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(str(tmp), str(out_accounting_json))
+        _fsync_dir(out_accounting_json.parent)
+
     if out_bathy_raster is not None and not _exists_with_retry(out_bathy_raster):
         raise RuntimeError(f"Requested bathy raster was not written: {out_bathy_raster}. "
                            f"This usually means no valid bathy points survived filtering or the interpolation domain was empty. "
@@ -4549,11 +4886,17 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--manning-q-field", default=None, help="River attribute field containing Q (m^3/s) used when --manning-mode=from_field.")
     p.add_argument("--manning-n", type=float, default=0.035, help="Manning roughness n (typical 0.03-0.08).")
     p.add_argument("--manning-region", default="default", help="Region key for --manning-mode=q2_regional (used with drainage area). Provide published coefficients in manning_inversion.py or override in code.")
+    p.add_argument("--manning-n-by-region", action="append", default=[],
+               help="Optional mapping region=n (repeatable), e.g. --manning-n-by-region default=<n> --manning-n-by-region piedmont=<n>. If provided, overrides --manning-n for matching region.")
     p.add_argument("--manning-min-confidence", type=float, default=0.30, help="Minimum confidence required to apply Manning prior (0-1).")
     p.add_argument("--manning-max-weight", type=float, default=0.60, help="Maximum blend weight for Manning prior (0-1).")
     p.add_argument("--manning-backwater-slope-thresh", type=float, default=1e-4, help="Disable Manning prior when slope is below this (backwater/tidal risk).")
     p.add_argument("--manning-dist-to-mouth-field", default=None, help="Optional river attribute field containing distance-to-mouth (km).")
     p.add_argument("--manning-dist-to-mouth-km-max", type=float, default=10.0, help="If dist-to-mouth is provided, disable Manning prior when distance <= this (km).")
+
+    p.add_argument("--no-auto-manning-when-no-soundings", dest="auto_manning_when_no_soundings", action="store_false",
+                   help="Disable auto-enabling the q2_regional Manning prior when no soundings are provided.")
+    p.set_defaults(auto_manning_when_no_soundings=True)
 
 
     # Regional hydraulic geometry curves (Drainage Area -> bankfull depth)
@@ -4569,6 +4912,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--regional-curve-to-dmax-factor", type=float, default=1.25, help="Used when --regional-curve-to-dmax=factor.")
     p.add_argument("--regional-curve-unc-pct", type=float, default=40.0, help="Uncertainty percent (used to downweight).")
     p.add_argument("--regional-curve-max-weight", type=float, default=0.60, help="Maximum blend weight for regional-curve prior (0-1).")
+    # Geomorphic envelope cap (DA/region-based upper bound on Dmax)
+    p.add_argument("--no-geomorphic-envelope", action="store_true", help="Disable geomorphic envelope cap (regional-curve-based Dmax upper bound).")
+    p.add_argument("--geomorphic-envelope-inflate-unc", action="store_true", help="Inflate envelope by (1 + regional_curve_unc_pct/100). Default: on.")
+    p.add_argument("--geomorphic-envelope-no-inflate-unc", action="store_true", help="Do not inflate envelope by regional_curve_unc_pct.")
+    p.add_argument("--geomorphic-envelope-only-when-no-soundings", action="store_true", help="Apply envelope cap only for XS not calibrated by soundings (default behavior).")
+    p.add_argument("--geomorphic-envelope-always", action="store_true", help="Apply envelope cap even when soundings exist (not recommended).")
     p.add_argument("--regional-curve-min-da-km2", type=float, default=1.0, help="Ignore DA smaller than this (km^2) for the curve prior.")
 
     p.add_argument("--width-stage-max-weight", type=float, default=0.8, help="Maximum blend weight for width–stage anchor.")
@@ -4673,6 +5022,16 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--out-bathy-raster", default=None, help="Optional output GeoTIFF of predicted bed elevation (z_bed_pred_m) on template grid")
     p.add_argument("--out-mask-raster", default=None, help="Optional output GeoTIFF mask (1 where bathy raster has data)")
     p.add_argument("--out-uncert-raster", default=None, help="Optional output GeoTIFF uncertainty (meters) on template grid")
+    p.add_argument(
+        "--out-accounting-json",
+        default=None,
+        help="Optional output JSON with constraint-accounting statistics (e.g., % of XS where priors hit dmin/dmax, and which priors/anchors were applied).",
+    )
+    p.add_argument(
+        "--out-meta-json",
+        default=None,
+        help="Optional output JSON for constraint metadata sidecar (avoids deriving/guessing a filename from --out-bathy-raster).",
+    )
 
     # Continuous surface options (affects raster outputs only)
     p.add_argument("--continuous", choices=["median", "walid", "aidw", "aniso", "walid_aniso"], default="walid_aniso",
@@ -4707,6 +5066,42 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+
+    # Parse optional Manning n-by-region mapping (explicit; no built-in defaults).
+    manning_n_by_region = {}
+    try:
+        for item in (getattr(args, "manning_n_by_region", None) or []):
+            if not item:
+                continue
+            if "=" not in str(item):
+                continue
+            k, v = str(item).split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            if not k:
+                continue
+            try:
+                fv = float(v)
+                if np.isfinite(fv) and fv > 0:
+                    manning_n_by_region[k] = fv
+            except Exception:
+                continue
+    except Exception:
+        manning_n_by_region = {}
+
+    # Geomorphic envelope toggles (defaults are conservative)
+    geomorphic_envelope_enabled = not bool(getattr(args, "no_geomorphic_envelope", False))
+    inflate_unc = True
+    if bool(getattr(args, "geomorphic_envelope_no_inflate_unc", False)):
+        inflate_unc = False
+    if bool(getattr(args, "geomorphic_envelope_inflate_unc", False)):
+        inflate_unc = True
+    only_no_soundings = True
+    if bool(getattr(args, "geomorphic_envelope_always", False)):
+        only_no_soundings = False
+    if bool(getattr(args, "geomorphic_envelope_only_when_no_soundings", False)):
+        only_no_soundings = True
+
 
     # Provide river network path to the continuous interpolator (best-effort)
     # for junction/confluence artifact suppression.
@@ -4853,11 +5248,13 @@ def main() -> None:
         manning_q_field=str(args.manning_q_field) if args.manning_q_field else None,
         manning_n=float(args.manning_n),
         manning_region=str(args.manning_region),
+        manning_n_by_region=manning_n_by_region,
         manning_min_confidence=float(args.manning_min_confidence),
         manning_max_weight=float(args.manning_max_weight),
         manning_backwater_slope_thresh=float(args.manning_backwater_slope_thresh),
         manning_dist_to_mouth_field=str(args.manning_dist_to_mouth_field) if args.manning_dist_to_mouth_field else None,
         manning_dist_to_mouth_km_max=float(args.manning_dist_to_mouth_km_max),
+        auto_manning_when_no_soundings=bool(getattr(args, "auto_manning_when_no_soundings", True)),
         regional_curve_enabled=bool(args.regional_curve_enabled),
         regional_curve_region=str(args.regional_curve_region),
         allow_builtin_regional_curves=bool(args.allow_builtin_regional_curves),
@@ -4868,6 +5265,9 @@ def main() -> None:
         regional_curve_depth_type=str(args.regional_curve_depth_type),
         regional_curve_to_dmax=str(args.regional_curve_to_dmax),
         regional_curve_to_dmax_factor=float(args.regional_curve_to_dmax_factor),
+        geomorphic_envelope_enabled=bool(geomorphic_envelope_enabled),
+        geomorphic_envelope_inflate_unc=bool(inflate_unc),
+        geomorphic_envelope_only_when_no_soundings=bool(only_no_soundings),
         regional_curve_unc_pct=float(args.regional_curve_unc_pct),
         regional_curve_max_weight=float(args.regional_curve_max_weight),
         regional_curve_min_da_km2=float(args.regional_curve_min_da_km2),
@@ -4938,6 +5338,8 @@ def main() -> None:
         channel_mask_inside_value=int(args.channel_mask_inside_value),
         channel_mask_invert=bool(args.channel_mask_invert),
         max_query_dist_m=(float(args.max_query_dist_m) if args.max_query_dist_m is not None else None),
+        out_accounting_json=Path(args.out_accounting_json) if getattr(args, "out_accounting_json", None) else None,
+        out_meta_json=Path(args.out_meta_json) if getattr(args, "out_meta_json", None) else None,
     )
 
 

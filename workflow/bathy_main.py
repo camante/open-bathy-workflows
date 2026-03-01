@@ -41,6 +41,7 @@ import math
 import json
 import os
 import re
+import shlex
 import shutil
 from vdatum_utils import convert_sdb_msl_to_navd88
 from process_utils import run_cmd
@@ -98,36 +99,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-def _discover_waffles_coastline_ocean_only(out_dir: Path, derived_cache_root: Path) -> Optional[Path]:
-    """Best-effort discovery of waffles coastline (ocean-only) mask (water=0, land=1)."""
-    pats = [
-        "waffles_coastline_ocean_only*.tif",
-        "waffles*ocean_only*.tif",
-        "*coastline*ocean*only*.tif",
-    ]
-    # IMPORTANT: never discover masks from out_dir.
-    # out_dir may contain stale products from previous runs; only current-run
-    # derived_cache_root is allowed for derived products.
-    bases: List[Path] = []
-    for base in [derived_cache_root]:
-        if base and Path(base).exists():
-            base = Path(base)
-            for sub in ["masks", "mask", "waffles", "coastline"]:
-                cand = base / sub
-                if cand.exists():
-                    bases.append(cand)
-            bases.append(base)
-
-    for base in bases:
-        for pat in pats:
-            hits = list(Path(base).rglob(pat))
-            if hits:
-                hits = sorted(hits, key=lambda p: (len(str(p)), str(p)))
-                return hits[0]
-    return None
-
-
-
 def _apply_final_domain_policy(cfg: "BathyConfig", out_dir: Path, derived_cache_root: Path) -> None:
     """Apply final domain clipping rules:
 
@@ -149,14 +120,55 @@ def _apply_final_domain_policy(cfg: "BathyConfig", out_dir: Path, derived_cache_
     sdb_on = "sdb" in methods
     river_on = "river" in methods
 
-    # Deliverables (canonical filenames)
-    combined_depth = out_dir / "combined" / "bathy_depth_final_epsg4269.tif"
-    combined_bottom = out_dir / "combined" / "bathy_bottom_navd88_final_epsg4269.tif"
-    sdb_depth = out_dir / "sdb" / "sdb_depth_final_epsg4269.tif"
-    river_depth = out_dir / "river" / "river_depth_final_epsg4269.tif"
-    river_bottom = out_dir / "river" / "river_bottom_navd88_final_epsg4269.tif"
-    root_copy = out_dir / "bathy_depth_final_epsg4269.tif"
+    # Collect deliverable rasters explicitly recorded in run reports (no filename assumptions).
+    def _collect_recorded_rasters(_out_dir: Path) -> List[Path]:
+        candidates: List[Path] = []
+        for rep_name in ("unified_bathy_report.json", "bathy_report.json"): 
+            rp = _out_dir / rep_name
+            if not rp.exists():
+                continue
+            try:
+                data = json.loads(rp.read_text(encoding="utf-8"))
+            except Exception:
+                continue
 
+            def _walk(obj: Any) -> None:
+                if isinstance(obj, dict):
+                    for v in obj.values():
+                        _walk(v)
+                elif isinstance(obj, list):
+                    for v in obj:
+                        _walk(v)
+                elif isinstance(obj, str):
+                    s = obj.strip()
+                    if not s:
+                        return
+                    if s.lower().endswith((".tif", ".tiff")):
+                        p = Path(s)
+                        if not p.is_absolute():
+                            p = _out_dir / p
+                        if p.exists():
+                            candidates.append(p.resolve())
+
+            # Prefer explicit outputs blocks if present, but fall back to walking the full report.
+            if isinstance(data, dict) and isinstance(data.get("outputs"), dict):
+                _walk(data.get("outputs"))
+            else:
+                _walk(data)
+
+        # De-duplicate while preserving order
+        seen: set[str] = set()
+        out: List[Path] = []
+        for p in candidates:
+            sp = str(p)
+            if sp in seen:
+                continue
+            seen.add(sp)
+            out.append(p)
+        return out
+
+    deliverable_rasters = _collect_recorded_rasters(out_dir)
+    river_rasters = [p for p in deliverable_rasters if ("river" in p.parts)]
     def _clip(path: Path, mask: Path, *, inside_value: int, nodata: float) -> None:
         if path.exists() and mask.exists():
             _clip_raster_to_mask_reproject(path, mask, inside_value=inside_value, invert=False, nodata=nodata)
@@ -167,170 +179,77 @@ def _apply_final_domain_policy(cfg: "BathyConfig", out_dir: Path, derived_cache_
     wm_ocean = Path(wm_ocean) if wm_ocean else None
     wm_nhd = Path(wm_nhd) if wm_nhd else None
 
-    # Fallback discovery (run-scoped only) if cfg fields are missing for any reason.
-    if wm_ocean is None or (not wm_ocean.exists()):
-        wm_ocean = _discover_waffles_coastline_ocean_only(out_dir, derived_cache_root)
-    if wm_nhd is None or (not wm_nhd.exists()):
-        wm_nhd = _discover_waffles_coastline_with_nhd(out_dir, derived_cache_root)
+    # No guessing: WAFFLES masks must be provided by domain inference (shared cache staged into derived_cache).
+    if wm_ocean is not None and (not wm_ocean.exists()):
+        wm_ocean = None
+    if wm_nhd is not None and (not wm_nhd.exists()):
+        wm_nhd = None
+        wm_nhd = None
 
     if sdb_on and river_on:
         wm = wm_nhd
         if not (wm and wm.exists()):
             raise RuntimeError("Final domain policy requires WAFFLES with-NHD mask, but it was not found.")
-        for p in [combined_depth, combined_bottom, sdb_depth, river_depth, river_bottom, root_copy]:
-            _clip(p, wm, inside_value=0, nodata=float(getattr(cfg, "final_nodata", -9999.0)))
+        for pth in deliverable_rasters:
+            _clip(pth, wm, inside_value=0, nodata=float(getattr(cfg, "final_nodata", -9999.0)))
     elif sdb_on and (not river_on):
         wm = wm_ocean if (wm_ocean and wm_ocean.exists()) else wm_nhd
         if not (wm and wm.exists()):
             raise RuntimeError("Final domain policy requires a WAFFLES water mask (ocean-only or with-NHD), but none were found.")
-        for p in [combined_depth, combined_bottom, sdb_depth, root_copy]:
-            _clip(p, wm, inside_value=0, nodata=float(getattr(cfg, "final_nodata", -9999.0)))
+        for pth in deliverable_rasters:
+            _clip(pth, wm, inside_value=0, nodata=float(getattr(cfg, "final_nodata", -9999.0)))
     elif river_on and (not sdb_on):
         wm = wm_nhd if (wm_nhd and wm_nhd.exists()) else wm_ocean
         if not (wm and wm.exists()):
-            raise RuntimeError("Final domain policy requires a WAFFLES water mask for river-only runs, but none were found.")
-        for p in [river_depth, river_bottom, combined_bottom]:
-            _clip(p, wm, inside_value=0, nodata=float(getattr(cfg, "river_nodata", -9999.0)))
+            raise RuntimeError("Final domain policy requires a WAFFLES water mask (with-NHD preferred), but none were found.")
+        for pth in deliverable_rasters:
+            _clip(pth, wm, inside_value=0, nodata=float(getattr(cfg, "final_nodata", -9999.0)))
 
-        rm = _discover_river_channel_mask(out_dir, derived_cache_root)
-        if not (rm and rm.exists()):
-            raise RuntimeError("Final domain policy requires a river_channel_mask.tif for river-only runs, but it was not found.")
-        for p in [river_depth, river_bottom]:
-            _clip(p, rm, inside_value=1, nodata=float(getattr(cfg, "river_nodata", -9999.0)))
+        # Additionally restrict river deliverables to the river channel mask (inside=1).
+        ch = getattr(cfg, "river_channel_mask", None)
+        ch = Path(ch) if ch else None
+        if ch is not None and ch.exists():
+            for pth in river_rasters:
+                _clip(pth, ch, inside_value=1, nodata=float(getattr(cfg, "final_nodata", -9999.0)))
+    else:
+        for src in to_handle:
+            try:
+                src.unlink(missing_ok=True)
+            except Exception:
+                logging.getLogger(__name__).debug("Failed to delete %s", src, exc_info=True)
 
-
-
-def _discover_waffles_coastline_with_nhd(out_dir: Path, derived_cache_root: Path) -> Optional[Path]:
-    """Best-effort discovery of waffles coastline+NHD mask (water=0, land=1).
-
-    We deliberately search common subdirectories (e.g., *masks/*) first because the
-    pipeline often stores waffles products there.
-    """
-    pats = [
-        "waffles_coastline_with_nhd*.tif",
-        "waffles*coastline*nhd*.tif",
-        "*coastline*with*nhd*.tif",
-        "*waffles*with*nhd*.tif",
-    ]
-    # IMPORTANT: never discover masks from out_dir.
-    # out_dir may contain stale products from previous runs; only current-run
-    # derived_cache_root is allowed for derived products.
-    bases: List[Path] = []
-    for base in [derived_cache_root]:
-        if base and Path(base).exists():
-            base = Path(base)
-            # prefer explicit masks/ directories
-            for sub in ["masks", "mask", "waffles", "coastline"]:
-                cand = base / sub
-                if cand.exists():
-                    bases.append(cand)
-            bases.append(base)
-
-    for base in bases:
-        for pat in pats:
-            hits = list(Path(base).rglob(pat))
-            if hits:
-                # prefer shorter path (less likely to be an old copy elsewhere)
-                hits = sorted(hits, key=lambda p: (len(str(p)), str(p)))
-                return hits[0]
-    return None
+    # Remove empty directories (deepest-first), leaving out_dir and debug_dir
+    for d in sorted([p for p in out_dir.rglob("*") if p.is_dir()], key=lambda p: len(p.parts), reverse=True):
+        if d == out_dir:
+            continue
+        if d == debug_dir:
+            continue
+        if debug_dir.exists() and debug_dir in d.parents:
+            continue
+        try:
+            next(d.iterdir())
+        except StopIteration:
+            try:
+                d.rmdir()
+            except Exception:
+                pass
 
 
-
-
-def _discover_river_channel_mask(out_dir: Path, derived_cache_root: Path) -> Optional[Path]:
-    """Find river channel mask (NHDArea-derived) produced by river_domain_mask.py (inside=1)."""
-    pats = [
-        "river_channel_mask.tif",
-        "*river_channel_mask*.tif",
-        "*channel_mask*.tif",
-    ]
-    # IMPORTANT: never discover masks from out_dir.
-    # out_dir may contain stale products from previous runs; only current-run
-    # derived_cache_root is allowed for derived products.
-    bases: List[Path] = []
-    for base in [derived_cache_root / "river", derived_cache_root]:
-        if base and Path(base).exists():
-            bases.append(Path(base))
-    for base in bases:
-        for pat in pats:
-            hits = list(base.rglob(pat))
-            if hits:
-                hits = sorted(hits, key=lambda p: (len(str(p)), str(p)))
-                return hits[0]
-    return None
 
 
 def _ensure_output_contract(out_dir: Path, cache_root: Path) -> None:
-    """Ensure expected output filenames exist for downstream debug/metrics.
+    """Deprecated: output contracts should be derived from explicit manifests.
 
-    This is a pure bookkeeping step: it creates symlinks (or copies as fallback)
-    to standard names when alternative names exist.
+    Older versions created symlinks/copies to canonical filenames (e.g.
+    *_final_epsg4269.tif). That violates the "no filename guessing" invariant.
+    The pipeline now relies on io_manifest.json and report-recorded outputs.
+
+    This function is intentionally a no-op and kept only for backwards
+    compatibility with older call sites.
     """
-    river_dir = out_dir / "river"
-    combined_dir = out_dir / "combined"
-    river_dir.mkdir(parents=True, exist_ok=True)
-    combined_dir.mkdir(parents=True, exist_ok=True)
-
-    def _link(target: Path, source: Path) -> None:
-        try:
-            if target.exists():
-                return
-            target.symlink_to(source.resolve())
-        except Exception:
-            try:
-                shutil.copy2(source, target)
-            except Exception:
-                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
-
-    # Standard river depth name
-    std_depth = river_dir / "river_depth_final_epsg4269.tif"
-    if not std_depth.exists():
-        for cand in [
-            river_dir / "river_depth_terrain_final_epsg4269.tif",
-            river_dir / "river_depth_terrain_patch.tif",
-            river_dir / "river_depth_patch.tif",
-            river_dir / "river_depth.tif",
-        ]:
-            if cand.exists():
-                _link(std_depth, cand)
-                break
-
-    # Standard river bottom name
-    std_bottom = river_dir / "river_bottom_navd88_final_epsg4269.tif"
-    if not std_bottom.exists():
-        for cand in [
-            river_dir / "river_bottom_navd88_patch_epsg4269.tif",
-            river_dir / "river_bottom_navd88.tif",
-            river_dir / "river_bottom.tif",
-        ]:
-            if cand.exists():
-                _link(std_bottom, cand)
-                break
-
-    # Combined NAVD88 bottom output should exist if river bottom exists
-    comb_bottom = combined_dir / "bathy_bottom_navd88_final_epsg4269.tif"
-    if (not comb_bottom.exists()) and std_bottom.exists():
-        _link(comb_bottom, std_bottom)
-
-    
-    # Final domain clipping is handled by _apply_final_domain_policy(cfg, out_dir, cache_root)
-    # after the pipeline completes, so we do not apply unconditional clipping here.
-# Import new improvement modules
-try:
-    VALIDATION_AVAILABLE = True
-except ImportError:
-    VALIDATION_AVAILABLE = False
-    
-try:
-    CHECKPOINTS_AVAILABLE = True
-except ImportError:
-    CHECKPOINTS_AVAILABLE = False
-
-try:
-    PARALLEL_PREDICT_AVAILABLE = True
-except ImportError:
-    PARALLEL_PREDICT_AVAILABLE = False
+    _ = out_dir
+    _ = cache_root
+    return
 
 
 # -----------------------------------------------------------------------------
@@ -503,6 +422,239 @@ def _river_cache_key_and_manifest(cfg: "BathyConfig") -> tuple[str, Dict[str, An
 
 # -----------------------------------------------------------------------------
 # Config
+
+# -----------------------------------------------------------------------------
+# IO manifest helpers (explicit paths only; no filename guessing)
+# -----------------------------------------------------------------------------
+
+def _is_probably_path(s: str) -> bool:
+    if not isinstance(s, str) or not s:
+        return False
+    # Reject whitespace-containing strings (e.g., full command lines); this manifest is paths only.
+    if any(ch.isspace() for ch in s):
+        return False
+    # Avoid URLs
+    if "://" in s:
+        return False
+    # Heuristic: has a path separator or looks like a filename with extension
+    if "/" in s or "\\" in s:
+        return True
+    if re.search(r"\.[A-Za-z0-9]{2,6}$", s):
+        return True
+    return False
+
+
+def _collect_paths_from_obj(obj: Any, out: list[str]) -> None:
+    """Collect explicit path-like strings from nested dict/list structures."""
+    try:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                _collect_paths_from_obj(v, out)
+        elif isinstance(obj, (list, tuple)):
+            for v in obj:
+                _collect_paths_from_obj(v, out)
+        elif isinstance(obj, str):
+            if _is_probably_path(obj):
+                out.append(obj)
+    except Exception:
+        return
+
+
+def _parse_paths_from_command(cmd: str) -> dict[str, list[str]]:
+    """
+    Parse subprocess command strings and extract explicit file paths from known flags.
+    Returns {"inputs": [...], "outputs": [...]}.
+    """
+    ins: list[str] = []
+    outs: list[str] = []
+    if not isinstance(cmd, str) or not cmd.strip():
+        return {"inputs": ins, "outputs": outs}
+    try:
+        toks = shlex.split(cmd)
+    except Exception:
+        toks = cmd.split()
+
+    # Flags where the next token is a path
+    out_flags = {
+        "-O", "--out", "--out-dir", "--out_gpkg", "--out-gpkg", "--out_tif", "--out-tif",
+        "--out-xyz", "--out-csv", "--out-json", "--out-md", "--out-mask", "--out-raster",
+        "--output", "--output-dir", "--output-path",
+        "--dem-out", "--mask-out",
+    }
+    in_flags = {
+        "-i", "--in", "--input", "--input-path",
+        "--dem", "--template", "--template-raster", "--mask", "--mask-raster",
+        "--ocean-mask", "--water-mask", "--river-mask",
+        "--xs", "--xs-gpkg", "--network", "--network-gpkg",
+        "--soundings", "--xyz", "--extra-xyz",
+    }
+
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t in out_flags and i + 1 < len(toks):
+            p = toks[i + 1]
+            if _is_probably_path(p):
+                outs.append(p)
+            i += 2
+            continue
+        if t in in_flags and i + 1 < len(toks):
+            p = toks[i + 1]
+            if _is_probably_path(p):
+                ins.append(p)
+            i += 2
+            continue
+        # Common pattern: --flag=/path
+        if t.startswith("--") and "=" in t:
+            flag, val = t.split("=", 1)
+            if _is_probably_path(val):
+                if flag in out_flags:
+                    outs.append(val)
+                elif flag in in_flags:
+                    ins.append(val)
+                else:
+                    # Unknown role: treat as input (conservative)
+                    ins.append(val)
+        i += 1
+
+    return {"inputs": ins, "outputs": outs}
+
+
+def build_io_manifest(report: dict[str, Any]) -> dict[str, Any]:
+    """
+    Build an explicit IO manifest from the *actual* run report and executed commands.
+    This contains only paths observed in the report/commands. No canonical naming assumptions.
+    """
+    manifest: dict[str, Any] = {
+        "created_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "run_id": report.get("run_id"),
+        "out_dir": report.get("out_dir"),
+        "inputs": [],
+        "outputs": [],
+    }
+
+    # 1) Collect explicit paths from report structure (bathy_report / unified report already store them)
+    collected: list[str] = []
+    _collect_paths_from_obj(report, collected)
+
+    # 2) Collect inputs/outputs from step command lines
+    steps_obj = None
+    try:
+        steps_obj = (report.get("river", {}) or {}).get("steps")
+    except Exception:
+        steps_obj = None
+
+    step_list = []
+    if isinstance(steps_obj, dict):
+        step_list = list(steps_obj.values())
+    elif isinstance(steps_obj, list):
+        step_list = steps_obj
+
+    for step in step_list:
+        cmd = step.get("command") if isinstance(step, dict) else None
+        parsed = _parse_paths_from_command(cmd or "")
+        collected.extend(parsed.get("inputs", []))
+        collected.extend(parsed.get("outputs", []))
+
+    # De-duplicate while preserving order
+    seen = set()
+    uniq = []
+    for p in collected:
+        if p in seen:
+            continue
+        seen.add(p)
+        uniq.append(p)
+
+    # Split into inputs/outputs using explicit report fields where possible
+    # - Anything listed under report["outputs"] or nested "*outputs" dicts -> outputs
+    out_paths: set[str] = set()
+    def _collect_outputs(obj: Any):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k == "outputs" and isinstance(v, dict):
+                    for vv in v.values():
+                        if isinstance(vv, str) and _is_probably_path(vv):
+                            out_paths.add(vv)
+                _collect_outputs(v)
+        elif isinstance(obj, (list, tuple)):
+            for v in obj:
+                _collect_outputs(v)
+    _collect_outputs(report)
+
+    # Also treat explicit step outputs as outputs
+    for step in step_list:
+        cmd = step.get("command") if isinstance(step, dict) else ""
+        parsed = _parse_paths_from_command(cmd or "")
+        for p in parsed.get("outputs", []):
+            out_paths.add(p)
+
+    inputs = []
+    outputs = []
+    for p in uniq:
+        if p in out_paths:
+            outputs.append(p)
+        else:
+            inputs.append(p)
+
+    manifest["inputs"] = inputs
+    manifest["outputs"] = outputs
+    return manifest
+
+
+def write_io_manifest(out_dir: Path, report: dict[str, Any]) -> tuple[Path, Path]:
+    """Write io_manifest.json and io_manifest.md into out_dir."""
+    io = build_io_manifest(report)
+    p_json = out_dir / "io_manifest.json"
+    p_md = out_dir / "io_manifest.md"
+
+    # JSON
+    with open(p_json, "w", encoding="utf-8") as f:
+        json.dump(io, f, indent=2, sort_keys=True)
+
+    # MD
+    lines = []
+    lines.append("# IO manifest")
+    lines.append("")
+    lines.append(f"- run_id: `{io.get('run_id')}`")
+    lines.append(f"- out_dir: `{io.get('out_dir')}`")
+    lines.append("")
+    lines.append("## Inputs (explicit paths observed)")
+    for p in io.get("inputs", []):
+        lines.append(f"- `{p}`")
+    lines.append("")
+    lines.append("## Outputs (explicit paths observed)")
+    for p in io.get("outputs", []):
+        lines.append(f"- `{p}`")
+    lines.append("")
+    p_md.write_text("\n".join(lines), encoding="utf-8")
+
+    return p_json, p_md
+
+
+def _emit_artifacts_from_report(report: dict[str, Any]) -> None:
+    """
+    Best-effort: emit artifact_written events for paths explicitly recorded in the report.
+    This is used only for run summaries/flight recorder; it never guesses filenames.
+    """
+    try:
+        from flight_recorder import emit_artifact_written
+    except Exception:
+        return
+
+    # Emit outputs from report["outputs"] dicts only
+    def _emit_outputs(obj: Any):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k == "outputs" and isinstance(v, dict):
+                    for name, path in v.items():
+                        if isinstance(path, str) and _is_probably_path(path):
+                            emit_artifact_written(Path(path), kind="file", role=str(name))
+                _emit_outputs(v)
+        elif isinstance(obj, (list, tuple)):
+            for v in obj:
+                _emit_outputs(v)
+    _emit_outputs(report)
+
 # -----------------------------------------------------------------------------
 
 @dataclass
@@ -537,6 +689,11 @@ class BathyConfig:
 
 
     out_dir: Path = Path("output/unified")
+    # Output retention policy
+    # Default (save_intermediates=False): keep only final deliverables + run metadata/logs.
+    # If enabled: move all non-deliverable artifacts into out_dir/<intermediates_dirname>/...
+    save_intermediates: bool = False
+    intermediates_dirname: str = "debug"
     methods: List[str] = field(default_factory=lambda: ["sdb", "river"])
     priority: str = "sdb"  # "sdb" or "river"
 
@@ -564,6 +721,9 @@ class BathyConfig:
     # we compute a WGS84 UTM zone from the AOI center.
     working_srs: str = "auto"
     working_vcrs_epsg: int = 5703  # NAVD88 height (EPSG:5703)
+
+    # River constraint guardrail (fusion gating)
+    require_river_constraints: str = "none"
 
     # Final output CRS for rasters (default NAD83 geographic (horizontal-only) height)
     final_out_srs: str = "EPSG:4269"
@@ -733,29 +893,15 @@ class BathyConfig:
 # Helpers
 # -----------------------------------------------------------------------------
 
-def _find_latest_waffles_mask(cache_root: Path) -> Optional[Path]:
-    """Find the most recent waffles coastline mask in cache_root/masks/.
-
-    Returns None if no mask is present.
-    """
-    try:
-        masks_dir = Path(cache_root).resolve() / "masks"
-        pats = sorted(masks_dir.glob("waffles_coastline_*.tif"), key=lambda p: p.stat().st_mtime, reverse=True)
-        return pats[0] if pats else None
-    except Exception:
-        return None
-
-
 def _choose_waffles_mask_for_river(cfg: "BathyConfig", report: Dict[str, Any]) -> Optional[Path]:
     """Choose the *least destructive* WAFFLES mask for clipping river outputs.
 
     Invariant: never wipe valid river pixels just because an *ocean-only* WAFFLES
     mask happens to be the newest under cache_root/masks.
 
-    Preference order:
+    Preference order (explicit only, no guessing):
       1) Run-scoped domain inference mask (with NHD), if available.
       2) River report's recorded waffles water mask (from river_domain_mask step).
-      3) Last-resort: newest waffles_coastline_*.tif under cache_root/masks.
 
     Returns None if nothing is available.
     """
@@ -777,14 +923,6 @@ def _choose_waffles_mask_for_river(cfg: "BathyConfig", report: Dict[str, Any]) -
             pp = Path(wm)
             if pp.exists() and pp.stat().st_size > 0:
                 return pp
-    except Exception:
-        pass
-
-    # 3) Last resort
-    try:
-        p = _find_latest_waffles_mask(Path(cfg.cache_root))
-        if p and p.exists() and p.stat().st_size > 0:
-            return p
     except Exception:
         pass
 
@@ -829,6 +967,30 @@ def _count_mask_water_pixels(mask_tif: Path, aoi_bounds_wgs84: Tuple[float, floa
 
 
 
+
+
+def _stage_cached_waffles_mask(src: Path, dst: Path, log: Optional[logging.Logger]=None) -> Path:
+    """Stage a cached WAFFLES mask into a run-scoped directory without regenerating it.
+
+    This creates a symlink when possible (fast, deterministic). Falls back to copying.
+    The returned path is the staged destination (which may already exist).
+    """
+    ensure_dir(dst.parent)
+    try:
+        if dst.exists():
+            return dst
+        # Prefer symlink to avoid copies and ensure exact reuse.
+        try:
+            os.symlink(src, dst)
+            return dst
+        except Exception:
+            shutil.copy2(src, dst)
+            return dst
+    except Exception as e:
+        if log:
+            log.warning(f"[WAFFLES] Failed to stage cached mask {src} -> {dst}: {e}")
+        # Best effort: return source so callers can still proceed.
+        return src
 
 def _ensure_waffles_coastline_mask(
     cache_masks: Path,
@@ -917,22 +1079,29 @@ def _ensure_waffles_coastline_mask(
     if out_tif_path.exists() and out_tif_path.stat().st_size > 0:
         return out_tif_path
 
-    # WAFFLES sometimes writes additional suffixes; pick the best matching candidate.
-    cands = sorted(cache_masks.glob(f"{out_prefix.name}*.tif"))
-    cands = [c for c in cands if c.exists() and c.stat().st_size > 0]
-    if not cands:
-        raise RuntimeError(f"WAFFLES did not produce expected mask: {out_tif_path}")
-    # Prefer exact match, else first candidate.
-    for c in cands:
-        if c.name == out_tif_path.name:
-            return c
-    return cands[0]
+    # No guessing: require the exact expected output path.
+    # If WAFFLES produced something unexpected, fail loudly with a directory listing.
+    existing = sorted([p.name for p in cache_masks.glob("*.tif")])
+    raise RuntimeError(
+        f"WAFFLES did not produce expected mask: {out_tif_path}. Existing in {cache_masks}: {existing[:50]}"
+    )
 def _waffles_water_fraction(mask_tif: Path, max_samples: int = 200000) -> float:
     """
-    Compute fraction of water pixels (value==0) in a WAFFLES mask.
+    Compute fraction of water pixels in a WAFFLES coastline mask.
 
-    WAFFLES convention: water=0, land=1.
-    Uses deterministic window sampling to avoid loading huge rasters.
+    Background / gotcha:
+      - WAFFLES coastline masks are typically binary (water vs land), but the GTiff can
+        carry a NODATA value.
+      - If NODATA is set to 0 (or a driver interprets 0 as nodata), reading with
+        rasterio.read(masked=True) will *mask out* valid water pixels (value==0),
+        causing false "no water" results and skipping SDB/river.
+
+    Implementation:
+      - Read *unmasked* data (masked=False), and use the GDAL validity mask
+        (read_masks) when available.
+      - Treat WAFFLES convention water=0, land=1 (the value-based convention),
+        but do not allow NODATA masking to erase water pixels.
+
     Returns 0.0 if raster missing or has no valid pixels.
     """
     try:
@@ -955,15 +1124,27 @@ def _waffles_water_fraction(mask_tif: Path, max_samples: int = 200000) -> float:
             for y0 in range(0, h, step_y):
                 for x0 in range(0, w, step_x):
                     win = Window(col_off=x0, row_off=y0, width=min(256, w - x0), height=min(256, h - y0))
-                    a = ds.read(1, window=win, masked=True)
+
+                    # IMPORTANT: masked=False to avoid nodata==0 erasing water pixels.
+                    a = ds.read(1, window=win, masked=False)
+
                     if a is None:
                         continue
-                    aa = np.asarray(a)
-                    m = ~np.ma.getmaskarray(a)
-                    if not np.any(m):
-                        continue
+
+                    # Prefer dataset validity mask; if unavailable/empty, treat all as valid.
+                    try:
+                        vm = ds.read_masks(1, window=win)
+                        m = (vm > 0)
+                    except Exception:
+                        m = np.ones_like(a, dtype=bool)
+
+                    if m is None or (not np.any(m)):
+                        # Some files don't carry a mask; fall back to all-valid.
+                        m = np.ones_like(a, dtype=bool)
+
                     total += int(np.sum(m))
-                    water += int(np.sum((aa == 0) & m))
+                    water += int(np.sum((a == 0) & m))
+
                     if total >= int(max_samples):
                         break
                 if total >= int(max_samples):
@@ -1007,32 +1188,34 @@ def _determine_effective_methods_from_waffles(cfg: "BathyConfig", report: Dict[s
     if not (want_sdb or want_river or want_fuse):
         return requested, {"requested": requested, "effective": requested, "waffles": {}}
 
-    cache_masks = Path(cfg.derived_cache_root) / "masks"
-    cache_masks.mkdir(parents=True, exist_ok=True)
+    cache_masks_shared = Path(getattr(cfg, "cache_root", ".")).resolve() / "masks"
+    ensure_dir(cache_masks_shared)
 
-    ocean_mask_tif = cache_masks / "waffles_coastline_ocean_only.tif"
-    nhd_mask_tif = cache_masks / "waffles_coastline_with_nhd.tif"
-    ocean_mask = _ensure_waffles_coastline_mask(
-        cache_masks=cache_masks,
+    # Reuse WAFFLES coastline masks across runs for the same AOI + resolution + module params.
+    # These masks should not depend on time range, extra_xyz, or run_id.
+    ocean_mask_cache = _ensure_waffles_coastline_mask(
+        cache_masks=cache_masks_shared,
         aoi=str(getattr(cfg, "aoi", "")),
         inc_arcsec=float(getattr(cfg, "waffles_inc_arcsec", 1.0) or 1.0),
         want_nhd=False,
         want_lakes=False,
-        out_tif=ocean_mask_tif,
-        force=True,
         prefix="waffles_coastline_ocean_only",
+        force=False,
     )
-    nhd_mask = _ensure_waffles_coastline_mask(
-        cache_masks=cache_masks,
+    nhd_mask_cache = _ensure_waffles_coastline_mask(
+        cache_masks=cache_masks_shared,
         aoi=str(getattr(cfg, "aoi", "")),
         inc_arcsec=float(getattr(cfg, "waffles_inc_arcsec", 1.0) or 1.0),
         want_nhd=True,
         want_lakes=False,
-        out_tif=nhd_mask_tif,
-        force=True,
         prefix="waffles_coastline_with_nhd",
+        force=False,
     )
 
+    # Stage into run-scoped derived_cache for easy inspection (symlink/copy), but do not regenerate.
+    cache_masks_run = Path(cfg.derived_cache_root) / "masks"
+    ocean_mask = _stage_cached_waffles_mask(ocean_mask_cache, cache_masks_run / "waffles_coastline_ocean_only.tif", log=logging.getLogger("bathy_main"))
+    nhd_mask = _stage_cached_waffles_mask(nhd_mask_cache, cache_masks_run / "waffles_coastline_with_nhd.tif", log=logging.getLogger("bathy_main"))
     ocean_frac = _waffles_water_fraction(ocean_mask) if ocean_mask else 0.0
     nhd_frac = _waffles_water_fraction(nhd_mask) if nhd_mask else 0.0
 
@@ -1082,6 +1265,8 @@ def _determine_effective_methods_from_waffles(cfg: "BathyConfig", report: Dict[s
         "waffles": {
             "ocean_only_mask": str(ocean_mask) if ocean_mask else None,
             "with_nhd_mask": str(nhd_mask) if nhd_mask else None,
+            "ocean_only_mask_cache": str(ocean_mask_cache) if "ocean_mask_cache" in locals() else None,
+            "with_nhd_mask_cache": str(nhd_mask_cache) if "nhd_mask_cache" in locals() else None,
             "ocean_water_fraction": ocean_frac,
             "with_nhd_water_fraction": nhd_frac,
             "min_water_fraction": min_frac,
@@ -1729,20 +1914,18 @@ def _is_depth_raster_like(path: Path, expect_negative: bool = True) -> tuple[boo
         return False, f"exception:{e}"
 
 def find_sdb_depth_raster(sdb_dir: Path) -> Optional[Path]:
-    """Deterministically locate the SDB depth product raster under *sdb_dir*.
+    """Locate the SDB depth product raster under *sdb_dir* using explicit manifests only.
 
-    No heuristic scanning is allowed. Resolution order:
+    No filename guessing and no directory scanning is allowed.
 
-    1) <sdb_dir>/artifacts_sdb.json : explicit artifact manifest written by sdb_main.py
-    2) Canonical filename: <sdb_dir>/rasters/sdb_depth_final_epsg4269.tif
-    3) Back-compat fixed filenames (exact paths only; still deterministic)
+    Resolution order:
+      1) <sdb_dir>/artifacts_sdb.json : explicit artifact manifest written by sdb_main.py
 
     Returns None if the artifact is not present (e.g., SDB was skipped for this AOI).
     """
     if not sdb_dir.exists():
         return None
 
-    # 1) Manifest (preferred)
     manifest = sdb_dir / "artifacts_sdb.json"
     if manifest.exists():
         try:
@@ -1753,85 +1936,52 @@ def find_sdb_depth_raster(sdb_dir: Path) -> Optional[Path]:
                 if p.exists():
                     return p
         except Exception:
-            logging.getLogger(__name__).debug("Failed to read SDB artifact manifest; continuing.", exc_info=True)
-
-    # 2) Canonical filename (human-legible)
-    canonical = sdb_dir / "rasters" / "sdb_depth_final_epsg4269.tif"
-    if canonical.exists():
-        return canonical.resolve()
-
-    # 3) Back-compat fixed names (exact; no scanning)
-    fixed = [
-        sdb_dir / "rasters" / "SDB_Prediction_10m_NAD83.tif",
-        sdb_dir / "rasters" / "SDB_Prediction_10m.tif",
-        sdb_dir / "rasters" / "SDB_Prediction_10m_NAVD88.tif",
-        sdb_dir / "rasters" / "SDB_Prediction_10m_NAD83_NAVD88.tif",
-        sdb_dir / "rasters" / "SDB_RF_10m.tif",
-        sdb_dir / "rasters" / "SDB_RF_10m_ALIGNED.tif",
-        sdb_dir / "product" / "SDB_RF_10m.tif",
-        sdb_dir / "product" / "SDB_RF_10m_ALIGNED.tif",
-        sdb_dir / "output" / "SDB_RF_10m.tif",
-        sdb_dir / "output" / "SDB_RF_10m_ALIGNED.tif",
-    ]
-    for c in fixed:
-        if c.exists():
-            return c.resolve()
+            logging.getLogger(__name__).debug("Failed to read SDB artifact manifest.", exc_info=True)
 
     return None
-
-
 def find_sdb_land_mask(sdb_dir: Path) -> Optional[Path]:
-    """Locate the aligned land mask produced by sdb_main.py.
+    """Locate the aligned land mask produced by sdb_main.py using explicit artifacts.
 
-    Convention: sdb_main writes rasters/LAND_MASK_aligned.tif where land=1, water=0.
-    """
-    try:
-        c = sdb_dir / "rasters" / "LAND_MASK_aligned.tif"
-        if c.exists():
-            return c
-        # fallback search
-        for t in sdb_dir.rglob("LAND_MASK_aligned.tif"):
-            return t
-    except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
-    return None
-
-
-def find_sdb_wse_navd88_raster(sdb_dir: Path) -> Optional[Path]:
-    """Best-effort locator for an SDB water-surface elevation raster (NAVD88).
-
-    Some workflows optionally output a rasterized/warped water surface (WSE)
-    referenced to NAVD88. If present, we can convert SDB depths (positive-down)
-    to bottom elevations as: bottom = WSE - depth.
+    This function is intentionally *no-guess*: it only uses the SDB artifact manifest
+    (<sdb_dir>/artifacts_sdb.json). If the land mask is not recorded there, returns None.
     """
     if not sdb_dir.exists():
         return None
-    cand = []
-    for t in sdb_dir.rglob("*.tif"):
-        n = t.name.lower()
-        if ("wse" in n or "water_surface" in n or "waterlevel" in n) and ("navd88" in n or "vert" in n):
-            cand.append(t)
-    if not cand:
+    manifest = sdb_dir / "artifacts_sdb.json"
+    if not manifest.exists():
         return None
-    # Prefer aligned/final naming
-    def _score(p: Path) -> float:
-        n = p.name.lower()
-        s = 0.0
-        if "aligned" in n or "final" in n:
-            s += 2.0
-        try:
-            s += min(p.stat().st_size / 1e8, 5.0)
-        except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
-        return s
-    cand.sort(key=_score, reverse=True)
-    return cand[0]
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        rel = data.get("land_mask", None)
+        if isinstance(rel, str) and rel.strip():
+            p = (sdb_dir / rel).resolve() if not os.path.isabs(rel) else Path(rel).resolve()
+            if p.exists():
+                return p
+    except Exception:
+        logging.getLogger(__name__).debug("Failed to read SDB artifact manifest for land_mask.", exc_info=True)
+    return None
 
+def find_sdb_wse_navd88_raster(sdb_dir: Path) -> Optional[Path]:
+    """Locate an SDB water-surface elevation raster (NAVD88) using explicit artifacts only.
 
+    No-guess policy: only consult <sdb_dir>/artifacts_sdb.json. If not present, return None.
+    """
+    if not sdb_dir.exists():
+        return None
+    manifest = sdb_dir / "artifacts_sdb.json"
+    if not manifest.exists():
+        return None
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        rel = data.get("wse_navd88", None) or data.get("water_surface_navd88", None)
+        if isinstance(rel, str) and rel.strip():
+            p = (sdb_dir / rel).resolve() if not os.path.isabs(rel) else Path(rel).resolve()
+            if p.exists():
+                return p
+    except Exception:
+        logging.getLogger(__name__).debug("Failed to read SDB artifact manifest for WSE.", exc_info=True)
+    return None
 
-# -----------------------------------------------------------------------------
-# SDB
-# -----------------------------------------------------------------------------
 
 def run_sdb(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
     log.info("=" * 60)
@@ -1843,8 +1993,8 @@ def run_sdb(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
     # Early skip: if waffles coastline mask indicates no ocean pixels in this AOI, skip SDB entirely.
     # This avoids unnecessary S2/ATL acquisition for inland tiles.
     waffles_mask = (
-        _discover_waffles_coastline_ocean_only(cfg.out_dir, cfg.derived_cache_root)
-        or _discover_waffles_coastline_with_nhd(cfg.out_dir, cfg.derived_cache_root)
+        None
+        or None
     )
     if waffles_mask and waffles_mask.exists():
         n_water = _count_mask_water_pixels(waffles_mask, cfg.aoi)
@@ -2031,12 +2181,36 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
     log.info("[RIVER] Step 1: Extracting river network...")
     network_gpkg = work_dir / "river_network.gpkg"
 
+    # River network provenance lock (deterministic key; prevents silent dataset drift)
+    prov_dir = Path(cfg.cache_root) / "provenance"
+    prov_dir.mkdir(parents=True, exist_ok=True)
+    # Canonicalize AOI string for provenance key (stable float formatting)
+    aoi_key = str(cfg.aoi)
+    try:
+        _parts = aoi_key.split('/')
+        if len(_parts) >= 4:
+            _vals = [float(_parts[0]), float(_parts[1]), float(_parts[2]), float(_parts[3])]
+            aoi_key = '/'.join([f"{v:.6f}" for v in _vals])
+    except Exception:
+        pass
+    prov_key = {
+        "aoi": aoi_key,
+        "hydrography_source": str(cfg.river_hydrography_source),
+        "tnm_dataset": str(cfg.tnm_dataset),
+        "tnm_enable": bool(cfg.tnm_enable),
+        "snap_m": float(cfg.snap_m),
+    }
+    prov_hash = hashlib.sha1(json.dumps(prov_key, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    river_network_lock = prov_dir / f"river_network_lock_{prov_hash}.json"
+
+
     # SECURITY FIX: Use list-based command construction (no shell injection)
     cmd = [
         sys.executable, "river_network.py",
         f"--aoi={cfg.aoi}",
         f"--cache-dir={raw_hydro_cache}",
         f"--out-gpkg={network_gpkg}",
+        f"--provenance-lock={river_network_lock}",
         f"--hydrography-source={cfg.river_hydrography_source}",
         f"--tnm-dataset={cfg.tnm_dataset}",
         f"--snap-m={cfg.snap_m}",
@@ -2077,38 +2251,48 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
         open_water_mask_tif = _work_dir / "open_water_mask.tif"
         mainstem_mask_tif = _work_dir / "mainstem_mask.tif"
 
-        cache_masks = Path(cfg.derived_cache_root) / "masks"
+        # Reuse WAFFLES coastline masks across runs for the same AOI + resolution + module params.
+        cache_masks_shared = Path(getattr(cfg, "cache_root", ".")).resolve() / "masks"
+        ensure_dir(cache_masks_shared)
+        cache_masks_run = Path(cfg.derived_cache_root) / "masks"
+        ensure_dir(cache_masks_run)
         aoi_buf = str(cfg.aoi)
+        inc_arcsec = float(getattr(cfg, "waffles_inc_arcsec", 1.0) or 1.0)
 
         ocean_mask = None
         with_nhd_mask = None
         try:
-            ocean_mask = _ensure_waffles_coastline_mask(
-                cache_masks=cache_masks,
+            ocean_cache = _ensure_waffles_coastline_mask(
+                cache_masks=cache_masks_shared,
                 aoi=aoi_buf,
-                inc_arcsec=1.0,
+                inc_arcsec=inc_arcsec,
                 want_nhd=False,
                 want_lakes=False,
                 prefix="waffles_coastline_ocean_only",
                 log=log,
+                force=False,
             )
+            ocean_mask = _stage_cached_waffles_mask(ocean_cache, cache_masks_run / "waffles_coastline_ocean_only.tif", log=log)
         except Exception as e:
             log.warning(f"[WAFFLES] Ocean-only mask unavailable; ocean bleed protection degraded: {e}")
             ocean_mask = None
 
         try:
-            with_nhd_mask = _ensure_waffles_coastline_mask(
-                cache_masks=cache_masks,
+            nhd_cache = _ensure_waffles_coastline_mask(
+                cache_masks=cache_masks_shared,
                 aoi=aoi_buf,
-                inc_arcsec=1.0,
+                inc_arcsec=inc_arcsec,
                 want_nhd=True,
                 want_lakes=False,
                 prefix="waffles_coastline_with_nhd",
                 log=log,
+                force=False,
             )
+            with_nhd_mask = _stage_cached_waffles_mask(nhd_cache, cache_masks_run / "waffles_coastline_with_nhd.tif", log=log)
         except Exception as e:
             log.warning(f"[WAFFLES] With-NHD mask unavailable (TNM flaky?): {e}. Proceeding with corridor+ArcGIS NHD flowlines + ocean-only mask.")
             with_nhd_mask = None
+
 
         if strict:
             # River domain building relies on a WAFFLES water mask to prevent ocean/land bleed
@@ -2342,6 +2526,8 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
         log.info("[RIVER] Step 3b: Inferring mainstem bathymetry from XS...")
         bed_xs_tif = work_dir / "river_bed_elev_xs_mainstem.tif"
         bathy_gpkg = work_dir / "river_bathy_xs_mainstem.gpkg"
+        xs_mainstem_meta_json = work_dir / "xs_mainstem_constraints_meta.json"
+        xs_mainstem_acct_json = work_dir / "xs_mainstem_constraints_accounting.json"
 
         cmd = [
             sys.executable, "xs_infer_bathy_raster.py",
@@ -2349,6 +2535,8 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
             f"--template-raster={cfg.river_dem}",
             f"--out-gpkg={bathy_gpkg}",
             f"--out-bathy-raster={bed_xs_tif}",
+            f"--out-meta-json={xs_mainstem_meta_json}",
+            f"--out-accounting-json={xs_mainstem_acct_json}",
             f"--continuous={getattr(cfg, 'river_continuous', 'walid_aniso')}",
             f"--continuous-k={getattr(cfg, 'river_continuous_k', 12)}",
             f"--idw-power={getattr(cfg, 'river_idw_power', 2.0)}",
@@ -2441,12 +2629,12 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
                 # If subset exists but meta is missing or doesn't match, rebuild.
                 if soundings_subset_path.exists():
                     try:
-                        import json
+                        import json as _json
                         if not soundings_subset_meta.exists():
                             log.info("[RIVER] Cached soundings subset exists but meta missing; rebuilding for safety.")
                             soundings_subset_path.unlink(missing_ok=True)
                         else:
-                            meta = json.loads(soundings_subset_meta.read_text(encoding="utf-8"))
+                            meta = _json.loads(soundings_subset_meta.read_text(encoding="utf-8"))
                             if meta.get("signature") != sig_now:
                                 log.info("[RIVER] Cached soundings subset signature mismatch; rebuilding.")
                                 soundings_subset_path.unlink(missing_ok=True)
@@ -2461,12 +2649,16 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
                 if not soundings_subset_path.exists():
                     _tmp_out_gpkg = work_dir / "_tmp_soundings_subset_only.gpkg"
                     _tmp_out_tif = work_dir / "_tmp_soundings_subset_only.tif"
+                    _tmp_meta_json = work_dir / "_tmp_soundings_subset_only_constraints_meta.json"
+                    _tmp_acct_json = work_dir / "_tmp_soundings_subset_only_constraints_accounting.json"
                     cmd_subset = [
                         sys.executable, "xs_infer_bathy_raster.py",
                         f"--xs-gpkg={xs_gpkg}",
                         f"--template-raster={cfg.river_dem}",
                         f"--out-gpkg={_tmp_out_gpkg}",
                         f"--out-bathy-raster={_tmp_out_tif}",
+                        f"--out-meta-json={_tmp_meta_json}",
+                        f"--out-accounting-json={_tmp_acct_json}",
                         f"--continuous={getattr(cfg, 'river_continuous', 'walid_aniso')}",
                         f"--nodata={getattr(cfg, 'river_nodata', -9999.0)}",
                         f"--write-soundings-subset={soundings_subset_path}",
@@ -2488,7 +2680,7 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
                     # Write a tiny meta sidecar for reproducibility / stale-cache protection.
                     if soundings_subset_path is not None and soundings_subset_path.exists():
                         try:
-                            import json
+                            import json as _json
                             import pandas as _pd
                             meta = {
                                 "signature": sig_now,
@@ -2507,7 +2699,7 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
                                         meta["n_subset"] = int(len(df))
                             except Exception:
                                 pass
-                            soundings_subset_meta.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
+                            soundings_subset_meta.write_text(_json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
                         except Exception:
                             logging.getLogger(__name__).debug("Failed to write subset meta; continuing.", exc_info=True)
 
@@ -2536,7 +2728,38 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
                 log.warning("[RIVER] XS mainstem inference completed but raster missing; hybrid will fall back to skeleton-only.")
             bed_xs_tif = None
 
+        # Capture explicit constraint metadata produced by xs_infer_bathy_raster.py (if present).
+        try:
+            import json as _json
+            meta_path = Path(_tmp_meta_json) if "_tmp_meta_json" in locals() else Path(str(_tmp_out_tif) + ".meta.json")
+            if meta_path.exists():
+                meta = _json.loads(meta_path.read_text(encoding="utf-8"))
+                report.setdefault("river", {}).setdefault("constraints", {})["xs_mainstem"] = meta.get("constraints", {})
+                report.setdefault("river", {}).setdefault("outputs", {})["xs_mainstem_constraint_meta"] = str(meta_path)
+
+            acct_path = Path(_tmp_acct_json) if "_tmp_acct_json" in locals() else None
+            if acct_path is not None and acct_path.exists():
+                acct = _json.loads(acct_path.read_text(encoding="utf-8"))
+                report.setdefault("river", {}).setdefault("constraint_accounting", {})["soundings_subset_step"] = acct
+                report.setdefault("river", {}).setdefault("outputs", {})["soundings_subset_constraint_accounting"] = str(acct_path)
+        except Exception:
+            logging.getLogger(__name__).debug("Failed to read XS constraint meta; continuing.", exc_info=True)
+
         # Note: cfg.river_soundings may already point at the cached subset (preferred).
+
+        # Capture explicit constraint meta + accounting produced by xs_infer_bathy_raster.py (no guessing).
+        try:
+            import json as _json
+            if xs_mainstem_meta_json.exists():
+                meta = _json.loads(xs_mainstem_meta_json.read_text(encoding="utf-8"))
+                report.setdefault("river", {}).setdefault("constraints", {})["xs_mainstem"] = meta.get("constraints", {})
+                report.setdefault("river", {}).setdefault("outputs", {})["xs_mainstem_constraint_meta"] = str(xs_mainstem_meta_json)
+            if xs_mainstem_acct_json.exists():
+                acct = _json.loads(xs_mainstem_acct_json.read_text(encoding="utf-8"))
+                report.setdefault("river", {}).setdefault("constraint_accounting", {})["xs_mainstem"] = acct
+                report.setdefault("river", {}).setdefault("outputs", {})["xs_mainstem_constraint_accounting"] = str(xs_mainstem_acct_json)
+        except Exception:
+            logging.getLogger(__name__).debug("Failed to read XS mainstem constraint meta/accounting; continuing.", exc_info=True)
 
         # Step 3c: Skeleton for full river network
         log.info("[RIVER] Step 3c: Inferring bathymetry from skeleton (full network)...")
@@ -2643,36 +2866,44 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
         # Waffles-derived masks:
         #   1) ocean-only (want_nhd=False) always attempted first to prevent ocean bleed (resilient if TNM is flaky).
         #   2) with-NHD (want_nhd=True) attempted second; if it fails we still proceed using corridor+ArcGIS flowlines.
-        cache_masks = Path(cfg.derived_cache_root) / "masks"
-        # Buffer AOI slightly for waffles so the mask fully covers the corridor near edges.
+        # Reuse WAFFLES coastline masks across runs for the same AOI + resolution + module params.
+        cache_masks_shared = Path(getattr(cfg, "cache_root", ".")).resolve() / "masks"
+        ensure_dir(cache_masks_shared)
+        cache_masks_run = Path(cfg.derived_cache_root) / "masks"
+        ensure_dir(cache_masks_run)
         aoi_buf = str(cfg.aoi)
+        inc_arcsec = float(getattr(cfg, "waffles_inc_arcsec", 1.0) or 1.0)
 
         ocean_mask = None
         with_nhd_mask = None
         try:
-            ocean_mask = _ensure_waffles_coastline_mask(
-                cache_masks=cache_masks,
+            ocean_cache = _ensure_waffles_coastline_mask(
+                cache_masks=cache_masks_shared,
                 aoi=aoi_buf,
-                inc_arcsec=1.0,
+                inc_arcsec=inc_arcsec,
                 want_nhd=False,
                 want_lakes=False,
                 prefix="waffles_coastline_ocean_only",
                 log=log,
+                force=False,
             )
+            ocean_mask = _stage_cached_waffles_mask(ocean_cache, cache_masks_run / "waffles_coastline_ocean_only.tif", log=log)
         except Exception as e:
             log.warning(f"[WAFFLES] Ocean-only mask unavailable; ocean bleed protection degraded: {e}")
             ocean_mask = None
 
         try:
-            with_nhd_mask = _ensure_waffles_coastline_mask(
-                cache_masks=cache_masks,
+            nhd_cache = _ensure_waffles_coastline_mask(
+                cache_masks=cache_masks_shared,
                 aoi=aoi_buf,
-                inc_arcsec=1.0,
+                inc_arcsec=inc_arcsec,
                 want_nhd=True,
                 want_lakes=False,
                 prefix="waffles_coastline_with_nhd",
                 log=log,
+                force=False,
             )
+            with_nhd_mask = _stage_cached_waffles_mask(nhd_cache, cache_masks_run / "waffles_coastline_with_nhd.tif", log=log)
         except Exception as e:
             log.warning(f"[WAFFLES] With-NHD mask unavailable (TNM flaky?): {e}. Proceeding with corridor+ArcGIS NHD flowlines + ocean-only mask.")
             with_nhd_mask = None
@@ -2966,35 +3197,44 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
 
         # Reuse the same domain-mask logic used by the skeleton method for consistency.
         # This ensures river outputs cannot bleed into ocean/lakes when using XS method.
-        cache_masks = Path(cfg.derived_cache_root) / "masks"
+        # Reuse WAFFLES coastline masks across runs for the same AOI + resolution + module params.
+        cache_masks_shared = Path(getattr(cfg, "cache_root", ".")).resolve() / "masks"
+        ensure_dir(cache_masks_shared)
+        cache_masks_run = Path(cfg.derived_cache_root) / "masks"
+        ensure_dir(cache_masks_run)
         aoi_buf = str(cfg.aoi)
+        inc_arcsec = float(getattr(cfg, "waffles_inc_arcsec", 1.0) or 1.0)
 
         ocean_mask = None
         with_nhd_mask = None
         try:
-            ocean_mask = _ensure_waffles_coastline_mask(
-                cache_masks=cache_masks,
+            ocean_cache = _ensure_waffles_coastline_mask(
+                cache_masks=cache_masks_shared,
                 aoi=aoi_buf,
-                inc_arcsec=1.0,
+                inc_arcsec=inc_arcsec,
                 want_nhd=False,
                 want_lakes=False,
                 prefix="waffles_coastline_ocean_only",
                 log=log,
+                force=False,
             )
+            ocean_mask = _stage_cached_waffles_mask(ocean_cache, cache_masks_run / "waffles_coastline_ocean_only.tif", log=log)
         except Exception as e:
             log.warning(f"[WAFFLES] Ocean-only mask unavailable; ocean bleed protection degraded: {e}")
             ocean_mask = None
 
         try:
-            with_nhd_mask = _ensure_waffles_coastline_mask(
-                cache_masks=cache_masks,
+            nhd_cache = _ensure_waffles_coastline_mask(
+                cache_masks=cache_masks_shared,
                 aoi=aoi_buf,
-                inc_arcsec=1.0,
+                inc_arcsec=inc_arcsec,
                 want_nhd=True,
                 want_lakes=False,
                 prefix="waffles_coastline_with_nhd",
                 log=log,
+                force=False,
             )
+            with_nhd_mask = _stage_cached_waffles_mask(nhd_cache, cache_masks_run / "waffles_coastline_with_nhd.tif", log=log)
         except Exception as e:
             log.warning(f"[WAFFLES] With-NHD mask unavailable (TNM flaky?): {e}. Proceeding with corridor+ArcGIS NHD flowlines + ocean-only mask.")
             with_nhd_mask = None
@@ -3076,6 +3316,8 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
         log.info("[RIVER] Step 3: Inferring bathymetry...")
         bed_tif = cached_bed_tif
         bathy_gpkg = work_dir / "river_bathy.gpkg"
+        xs_meta_json = work_dir / "xs_constraints_meta.json"
+        xs_acct_json = work_dir / "xs_constraints_accounting.json"
 
         # SECURITY FIX: Use list-based command construction
         cmd = [
@@ -3084,6 +3326,8 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
             f"--template-raster={cfg.river_dem}",
             f"--out-gpkg={bathy_gpkg}",
             f"--out-bathy-raster={bed_tif}",
+            f"--out-meta-json={xs_meta_json}",
+            f"--out-accounting-json={xs_acct_json}",
             f"--continuous={getattr(cfg, 'river_continuous', 'walid_aniso')}",
             f"--continuous-k={getattr(cfg, 'river_continuous_k', 12)}",
             f"--idw-power={getattr(cfg, 'river_idw_power', 2.0)}",
@@ -3214,6 +3458,21 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
         
     report["river"]["status"] = "success"
     log.info(f"[RIVER] Success: {bed_tif}")
+
+    # Capture explicit XS constraint meta + accounting (no guessing).
+    try:
+        import json as _json
+        if xs_meta_json.exists():
+            meta = _json.loads(xs_meta_json.read_text(encoding="utf-8"))
+            report.setdefault("river", {}).setdefault("constraints", {})["xs"] = meta.get("constraints", {})
+            report.setdefault("river", {}).setdefault("outputs", {})["xs_constraint_meta"] = str(xs_meta_json)
+        if xs_acct_json.exists():
+            acct = _json.loads(xs_acct_json.read_text(encoding="utf-8"))
+            report.setdefault("river", {}).setdefault("constraint_accounting", {})["xs"] = acct
+            report.setdefault("river", {}).setdefault("outputs", {})["xs_constraint_accounting"] = str(xs_acct_json)
+    except Exception:
+        logging.getLogger(__name__).debug("Failed to read XS constraint meta/accounting; continuing.", exc_info=True)
+
     # Materialize into run output folder for convenience
     # Compute depth relative to DEM terrain surface (negative down): depth = bed_elev - dem
     try:
@@ -3317,10 +3576,55 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
     except Exception:
         logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
-    report["river"]["outputs"] = {
-        "depth_terrain": str(out_depth),
-        "bottom_elevation": str(out_bed),
-    }
+    report.setdefault("river", {}).setdefault("outputs", {}).update(
+        {
+            "depth_terrain": str(out_depth),
+            "bottom_elevation": str(out_bed),
+        }
+    )
+
+    # ------------------------------------------------------------------
+    # Constraint summary (explicit; no filename guessing)
+    # ------------------------------------------------------------------
+    # Prefer the xs_infer constraint sidecar if available.
+    try:
+        cs = {
+            "level": "UNKNOWN",
+            "soundings_used": False,
+            "drainage_area_used": False,
+            "slope_used": False,
+            "slope_source": "unknown",
+            "wse_source": "unknown",
+            "requirement": str(getattr(cfg, "require_river_constraints", "none")),
+            "meets_requirement": None,
+            "unmet_reasons": [],
+        }
+        xs_meta = report.get("river", {}).get("constraints", {}).get("xs_mainstem", {})
+        if not (isinstance(xs_meta, dict) and xs_meta):
+            xs_meta = report.get("river", {}).get("constraints", {}).get("xs", {})
+        if isinstance(xs_meta, dict) and xs_meta:
+            cs["level"] = str(xs_meta.get("level", "UNKNOWN"))
+            cs["soundings_used"] = bool(xs_meta.get("soundings_used", False))
+            cs["drainage_area_used"] = bool(xs_meta.get("drainage_area_used", False))
+            cs["slope_used"] = bool(xs_meta.get("slope_used", False))
+            cs["slope_source"] = str(xs_meta.get("slope_source", "unknown"))
+            cs["wse_source"] = str(xs_meta.get("wse_source", "unknown"))
+
+        req = str(getattr(cfg, "require_river_constraints", "none") or "none").lower().strip()
+        unmet = []
+        if req != "none":
+            if "soundings" in req and not cs["soundings_used"]:
+                unmet.append("soundings_required")
+            if "slope" in req and not cs["slope_used"]:
+                unmet.append("slope_required")
+            if "da" in req and not cs["drainage_area_used"]:
+                unmet.append("drainage_area_required")
+            cs["unmet_reasons"] = unmet
+            cs["meets_requirement"] = (len(unmet) == 0)
+
+        report.setdefault("river", {})["constraints_summary"] = cs
+    except Exception:
+        logging.getLogger(__name__).debug("Failed to write constraint summary; continuing.", exc_info=True)
 
     # Persist cache manifest after successful products
     try:
@@ -3666,7 +3970,8 @@ def fuse(cfg: BathyConfig, sdb_raster: Optional[Path], river_raster: Optional[Pa
 
         if river_domain_mask_for_fusion is None or (not river_domain_mask_for_fusion.exists()):
             try:
-                river_domain_mask_for_fusion = _discover_river_channel_mask(cfg.out_dir, cfg.cache_root)
+                ch = getattr(cfg, 'river_channel_mask', None)
+                river_domain_mask_for_fusion = Path(str(ch)) if ch else None
             except Exception:
                 river_domain_mask_for_fusion = None
 
@@ -3902,6 +4207,32 @@ def parse_args() -> argparse.Namespace:
                    help="Disable tile edge tapering (use raw clipped outputs).")
     p.set_defaults(tile_edge_taper_enabled=True)
 
+    # Adjacent-tile seam comparison (explicit inputs; no guessing)
+    p.add_argument(
+        "--seam-compare-with-io",
+        action="append",
+        default=[],
+        help=(
+            "Path to a neighboring tile's io_manifest.json to compute seam metrics against. "
+            "May be specified multiple times. Explicit-only (no auto-discovery)."
+        ),
+    )
+    p.add_argument(
+        "--seam-strip-px",
+        type=int,
+        default=3,
+        help="Strip width in pixels sampled on each side of the seam (default 3).",
+    )
+    p.add_argument(
+        "--seam-compare-with-io-list",
+        type=str,
+        default=None,
+        help=(
+            "Path to a text file listing neighboring io_manifest.json paths (one per line; '#' comments allowed) "
+            "to compute seam metrics against in batch. Explicit-only (no auto-discovery)."
+        ),
+    )
+
     # SDB cross-tile consistency (DEFAULT): bounded model bank reservoir + periodic retrain
     p.add_argument("--sdb-model-bank", default="auto",
                    help="Model bank directory for incremental SDB training. 'auto' => <cache-root>/model_bank/sdb_global_v1")
@@ -3926,6 +4257,10 @@ def parse_args() -> argparse.Namespace:
 
 
     p.add_argument("--out-dir", default="output/unified")
+    p.add_argument("--save-intermediates", action="store_true", default=False,
+                   help="Preserve intermediate artifacts (rasters/caches) by moving them under <out-dir>/<intermediates-dirname>/... (default: off; intermediates are deleted).")
+    p.add_argument("--intermediates-dirname", default="debug",
+                   help="Subfolder name under <out-dir> to store intermediates when --save-intermediates is enabled (default: debug).")
     p.add_argument("--methods", default="sdb,river,fuse")
     p.add_argument("--priority", default="sdb", choices=["sdb", "river"])
 
@@ -3958,6 +4293,25 @@ def parse_args() -> argparse.Namespace:
     # River
     p.add_argument("--river-dem", default=None)
 
+    # River constraint guardrails
+    p.add_argument(
+        "--require-river-constraints",
+        default="none",
+        choices=[
+            "none",
+            "slope",
+            "slope+da",
+            "soundings",
+            "soundings+slope",
+            "soundings+slope+da",
+        ],
+        help=(
+            "Guardrail: require specific constraints for river bathy before fusion. "
+            "If unmet, river outputs may still be written but fusion will be skipped and the run report will be flagged. "
+            "Choices: none, slope, slope+da, soundings, soundings+slope, soundings+slope+da. Default: none."
+        ),
+    )
+
     p.add_argument("--working-srs", default="auto",
                    help="Working horizontal CRS for meter-based operations (thinning, river DEM warps). "
                         "Use 'auto' to detect from cached Sentinel-2 RGB_10m.tif or fall back to AOI-center UTM (WGS84).")
@@ -3969,7 +4323,7 @@ def parse_args() -> argparse.Namespace:
     # Vertical datum transformation (MSL → NAVD88)
     p.add_argument("--convert-sdb-to-navd88", action="store_true", default=False,
                    help="Convert SDB from MSL to NAVD88 vertical datum using dlim. "
-                        "Output: SDB_Prediction_10m_NAVD88.tif. Requires dlim (CUDEM) on PATH.")
+                        "Output path is recorded in the run reports/manifests. Requires dlim (CUDEM) on PATH.")
     p.add_argument("--sdb-source-vdatum", default="epsg:4269+5714",
                    help="Source compound EPSG (default: epsg:4269+5714 = NAD83+MSL).")
     p.add_argument("--sdb-target-vdatum", default="epsg:4269+5703",
@@ -4419,6 +4773,215 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _apply_output_retention_policy(cfg, log, report, final_path=None, final_for_user_path=None):
+    """Enforce output retention policy.
+
+    Default (cfg.save_intermediates=False):
+      - Keep only final deliverables + run metadata/logs in cfg.out_dir.
+      - Delete everything else under cfg.out_dir.
+
+    If cfg.save_intermediates=True:
+      - Move everything else under cfg.out_dir/<cfg.intermediates_dirname>/... and keep deliverables in place.
+
+    This function operates ONLY on cfg.out_dir (never touches cfg.cache_root).
+    """
+    import shutil
+    from pathlib import Path
+    import fnmatch
+    import uuid
+
+    out_dir = Path(cfg.out_dir)
+    if not out_dir.exists():
+        return
+
+    # --- Build explicit keep list from run reports (NO filename guessing) ---
+    keep_abs = set()  # absolute paths
+
+    def _collect_output_paths(report_obj):
+        out_paths = set()
+        def _walk(o):
+            if isinstance(o, dict):
+                for k, v in o.items():
+                    if k == "outputs" and isinstance(v, dict):
+                        for vv in v.values():
+                            if isinstance(vv, str) and _is_probably_path(vv):
+                                out_paths.add(vv)
+                    _walk(v)
+            elif isinstance(o, list):
+                for it in o:
+                    _walk(it)
+        _walk(report_obj)
+        return out_paths
+
+    # Prefer unified report if present, else fall back to bathy_report
+    report_paths = [out_dir / "unified_bathy_report.json", out_dir / "bathy_report.json"]
+    for rp in report_paths:
+        if rp.exists() and rp.is_file():
+            try:
+                robj = json.loads(rp.read_text(encoding="utf-8"))
+                for s in _collect_output_paths(robj):
+                    try:
+                        pp = Path(s)
+                        keep_abs.add(pp if pp.is_absolute() else (out_dir / pp).resolve())
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+    # Also keep io_manifest outputs if present (explicit list)
+    io_json = out_dir / "io_manifest.json"
+    if io_json.exists() and io_json.is_file():
+        try:
+            io = json.loads(io_json.read_text(encoding="utf-8"))
+            for s in (io.get("outputs") or []):
+                if isinstance(s, str) and _is_probably_path(s):
+                    pp = Path(s)
+                    keep_abs.add(pp if pp.is_absolute() else (out_dir / pp).resolve())
+        except Exception:
+            pass
+
+    # Always keep run logs + summaries/reports
+    keep_dirs = {"run_logs"}
+    keep_globs = [
+        "run_summary*.json",
+        "run_summary*.md",
+        "unified_bathy_report*.json",
+        "unified_bathy_report*.md",
+        "bathy_report*.json",
+        "bathy_report*.md",
+        "metrics_summary*.csv",
+    ]
+
+    # Only enforce policy if we produced a final deliverable
+    final_ok = False
+
+    # Prefer explicit outputs recorded in reports/manifest
+    if keep_abs:
+        for pth in list(keep_abs):
+            try:
+                if Path(pth).exists():
+                    final_ok = True
+                    break
+            except Exception:
+                continue
+
+    # Fall back to final paths passed in
+    if (not final_ok) and final_for_user_path:
+        final_ok = Path(final_for_user_path).exists()
+    if (not final_ok) and final_path:
+        final_ok = Path(final_path).exists()
+
+    if not final_ok:
+        log.info("[OUTPUT] Retention policy skipped (no final deliverable found).")
+        return
+
+    # Stage kept files into a temp folder to allow deterministic cleanup of everything else.
+    tmp = out_dir / f"keep_tmp_{uuid.uuid4().hex[:10]}"
+    tmp.mkdir(parents=True, exist_ok=True)
+
+    try:
+
+        def _copy_rel(relpath: str):
+            src = out_dir / relpath
+            if src.exists() and src.is_file():
+                dst = tmp / relpath
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(src), str(dst))
+
+        # Copy explicitly recorded output files (relative within out_dir when possible)
+        for ap in sorted(keep_abs, key=lambda x: str(x)):
+            try:
+                ap = Path(ap)
+                if (not ap.exists()) or (not ap.is_file()):
+                    continue
+                try:
+                    rel = ap.resolve().relative_to(out_dir.resolve())
+                except Exception:
+                    # If output is outside out_dir, copy into tmp/_external/ for inspection
+                    rel = Path("_external") / ap.name
+                dst = tmp / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(ap), str(dst))
+            except Exception as e:
+                log.warning('[OUTPUT] Failed to stage output %s (%s). Continuing.', str(ap), e)
+
+        # Copy report-ish files in out_dir root
+        for p in out_dir.iterdir():
+            if p.is_file():
+                for g in keep_globs:
+                    if fnmatch.fnmatch(p.name, g):
+                        dst = tmp / p.name
+                        shutil.copy2(str(p), str(dst))
+                        break
+
+        # Copy run_logs directory (as-is)
+        run_logs = out_dir / "run_logs"
+        if run_logs.exists() and run_logs.is_dir():
+            dst = tmp / "run_logs"
+            shutil.copytree(str(run_logs), str(dst), dirs_exist_ok=True)
+
+        # If saving intermediates, move everything except tmp and intermediates dir under intermediates.
+        intermediates_dir = out_dir / str(getattr(cfg, "intermediates_dirname", "debug") or "debug")
+
+        if getattr(cfg, "save_intermediates", False):
+            intermediates_dir.mkdir(parents=True, exist_ok=True)
+            for child in list(out_dir.iterdir()):
+                if child.name == tmp.name:
+                    continue
+                if child.resolve() == intermediates_dir.resolve():
+                    continue
+                # Move everything into intermediates dir
+                dest = intermediates_dir / child.name
+                if dest.exists():
+                    if dest.is_dir():
+                        try:
+                            shutil.rmtree(str(dest))
+                        except Exception as e:
+                            log.warning('[OUTPUT] Failed to remove existing dest dir %s (%s). Continuing.', str(dest), e)
+                    else:
+                        try:
+                            dest.unlink()
+                        except Exception as e:
+                            log.warning('[OUTPUT] Failed to remove existing dest file %s (%s). Continuing.', str(dest), e)
+                try:
+                    shutil.move(str(child), str(dest))
+                except Exception as e:
+                    log.warning('[OUTPUT] Failed to move %s -> %s (%s). Continuing.', str(child), str(dest), e)
+            log.info("[OUTPUT] Saved intermediates under: %s", str(intermediates_dir))
+        else:
+            # Delete everything except tmp
+            for child in list(out_dir.iterdir()):
+                if child.name == tmp.name:
+                    continue
+                if child.is_dir():
+                    try:
+                        shutil.rmtree(str(child))
+                    except Exception as e:
+                        log.warning('[OUTPUT] Failed to delete dir %s (%s). Continuing.', str(child), e)
+                else:
+                    try:
+                        child.unlink(missing_ok=True)
+                    except Exception as e:
+                        log.warning('[OUTPUT] Failed to delete file %s (%s). Continuing.', str(child), e)
+            log.info("[OUTPUT] Deleted intermediates (kept deliverables + run metadata only).")
+
+        # Restore kept content from tmp
+        for src in tmp.rglob("*"):
+            if src.is_dir():
+                continue
+            rel = src.relative_to(tmp)
+            dst = out_dir / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src), str(dst))
+
+        # Remove tmp
+        shutil.rmtree(str(tmp), ignore_errors=True)
+    finally:
+        # Always attempt to remove temp staging folder (crash-safe retention)
+        if tmp.exists():
+            shutil.rmtree(str(tmp), ignore_errors=True)
+
+
 def main() -> int:
     args = parse_args()
     # ---------------------------------------------------------------------
@@ -4455,6 +5018,15 @@ def main() -> int:
         log.info("[AOI] Data buffer enabled: --buff=%s -> aoi_data=%s (aoi_tile=%s)", buff_frac, args.aoi, args.aoi_tile)
     else:
         log.info("[AOI] No data buffer: --buff=0 -> aoi_data=aoi_tile=%s", args.aoi_tile)
+
+    # ---------------------------------------------------------------------
+    # Hydraulic modeling context buffer (river seam stability)
+    # ---------------------------------------------------------------------
+    # Rule:
+    #   - River modeling MUST run on the buffered AOI (aoi_data == args.aoi)
+    #   - Final deliverables MUST be clipped back to the original tile AOI (args.aoi_tile)
+    # This stabilizes longitudinal fits and boundary conditions across adjacent tiles.
+    args.aoi_hydro = getattr(args, "aoi", None)
 
     # ---------------------------------------------------------------------
     # Run-scoped logging + flight recorder
@@ -4623,6 +5195,8 @@ def main() -> int:
             sdb_model_cache_enabled=bool(getattr(args, "sdb_model_cache_enabled", False)),
             sdb_model_cache_key=str(getattr(args, "sdb_model_cache_key", "auto")),
             out_dir=Path(args.out_dir).resolve(),
+            save_intermediates=bool(getattr(args, "save_intermediates", False)),
+            intermediates_dirname=str(getattr(args, "intermediates_dirname", "debug")),
             methods=[m.strip().lower() for m in args.methods.split(",") if m.strip()],
             priority=args.priority,
     
@@ -4642,6 +5216,7 @@ def main() -> int:
             working_srs=args.working_srs,
             working_vcrs_epsg=args.working_vcrs_epsg,
             final_out_srs=args.final_out_srs,
+            require_river_constraints=str(getattr(args, "require_river_constraints", "none")),
             river_dem_auto=args.river_dem_auto,
             river_dem_source=args.river_dem_source,
             river_dem_res_m=args.river_dem_res_m,
@@ -4782,112 +5357,6 @@ def main() -> int:
     log.info(f"Output: {cfg.out_dir}")
     log.info("=" * 70)
 
-    # Optional: auto-download external soundings via CUDEM `dlim` providers.
-    # This is a convenience wrapper around commands like:
-    #   dlim -R="W/E/S/N" hydronos -P epsg:4269 > nos.xyz
-    #   dlim -R="W/E/S/N" ehydro   -P epsg:4269 > usace.xyz
-    # (Depth semantics are tracked via GeoTIFF metadata rather than via a compound CRS.)
-    if getattr(args, "extra_xyz_cudem", None):
-        requested = []
-        for item in args.extra_xyz_cudem:
-            if item is None:
-                continue
-            requested.extend([p.strip() for p in str(item).split(",") if p.strip()])
-
-        if requested:
-            # Determine output CRS for dlim.
-            # For *depth* soundings we prefer a projected working CRS so thinning happens in meters.
-            # We intentionally keep this **horizontal-only** (no +NAVD88) because depth is relative
-            # to the water surface, not an orthometric height.
-            #
-            # Preference:
-            #   1) user-specified --extra-xyz-cudem-crs
-            #   2) working projected CRS (horizontal-only)
-            #   3) fallback EPSG:4269 (horizontal-only)
-            user_crs = str(getattr(args, "extra_xyz_cudem_crs", "")).strip().lower()
-            if user_crs and user_crs not in ("", "auto"):
-                dlim_crs = user_crs
-            else:
-                try:
-                    dlim_crs = str(cfg.working_srs)
-                except Exception:
-                    dlim_crs = "epsg:4269"
-            
-            auto_xyz, auto_rep = fetch_cudem_soundings_via_dlim(
-                aoi=cfg.aoi,
-                sources=requested,
-                cache_root=Path(cfg.cache_root),
-                out_crs=dlim_crs,
-                thin_res_m=float(getattr(args, "extra_xyz_cudem_thin_res_m", 10.0))
-                    if float(getattr(args, "extra_xyz_cudem_thin_res_m", 10.0)) > 0 else None,
-                filter_spec=getattr(args, "extra_xyz_cudem_filter", None),
-                force=bool(getattr(args, "extra_xyz_cudem_force", False)),
-            )
-            # Attach to run report
-            # (report is initialized a bit later; stash on args for now)
-            setattr(args, "_xyz_auto_report", auto_rep)
-
-            # Make these participate in the normal --extra-xyz normalization flow
-            if auto_xyz:
-                # Reproject XYZ files from dlim CRS (often epsg:4269) to working CRS
-                # This ensures the soundings match the S2/working coordinate system
-                # Use the already-resolved working CRS for consistency across modules.
-                working_crs = str(cfg.working_srs)
-                reprojected_xyz = []
-                for xyz_path in auto_xyz:
-                    try:
-                        reproj_path = _reproject_xyz_file(
-                            xyz_path, 
-                            # Source CRS is the dlim output CRS (horizontal-only). Z is preserved.
-                            src_crs=dlim_crs,  # e.g., EPSG:32616 or EPSG:4269
-                            dst_crs=working_crs,  # e.g., EPSG:32616
-                            cache_dir=Path(cfg.cache_root) / "xyz"
-                        )
-                        reprojected_xyz.append(reproj_path)
-                        log.info("[XYZ][DLIM] Reprojected %s -> %s (%s)", 
-                                xyz_path.name, reproj_path.name, working_crs)
-                    except Exception as e:
-                        log.warning("[XYZ][DLIM] Failed to reproject %s: %s. Using original.", xyz_path.name, e)
-                        reprojected_xyz.append(xyz_path)
-                
-                if not getattr(args, "extra_xyz", None):
-                    args.extra_xyz = []
-                args.extra_xyz.extend([str(p) for p in reprojected_xyz])
-
-                # Set the CRS to working CRS since we reprojected
-                cfg.extra_xyz_crs = working_crs
-
-    # Normalize extra XYZ inputs (files or directories). Prefer --extra-xyz; --river-soundings is a hidden alias.
-    # Supports repeats, comma-separated lists, and directories.
-    if getattr(args, "extra_xyz", None):
-        xyz_files = []
-        for item in args.extra_xyz:
-            if item is None:
-                continue
-            parts = [p.strip() for p in str(item).split(",") if p.strip()]
-            for part in parts:
-                pth = Path(part)
-                if pth.is_dir():
-                    for ext in ("*.xyz", "*.csv", "*.txt", "*.dat", "*.gpkg", "*.shp", "*.geojson", "*.json"):
-                        xyz_files.extend(sorted(pth.glob(ext)))
-                else:
-                    xyz_files.append(pth)
-
-        # de-dup while preserving order
-        seen = set()
-        xyz_files2 = []
-        for pth in xyz_files:
-            sp = str(pth)
-            if sp not in seen:
-                seen.add(sp)
-                xyz_files2.append(pth)
-
-        if xyz_files2:
-            cfg.river_soundings = ",".join(str(p) for p in xyz_files2)
-            log.info("[XYZ] Using %d external bathymetry file(s):", len(xyz_files2))
-            for pth in xyz_files2:
-                log.info("   - %s", str(pth))
-    
     # ---------------------------------------------------------------------
     # WAFFLES-driven domain inference: decide which methods are applicable
     # ---------------------------------------------------------------------
@@ -4900,10 +5369,15 @@ def main() -> int:
 
         # One-line operational log for scanability
         skipped = (_meta or {}).get("skipped", {}) if isinstance(_meta, dict) else {}
+        waffles_meta = (_meta or {}).get("waffles", {}) if isinstance(_meta, dict) else {}
         if skipped:
-            log.info("[DOMAIN] WAFFLES inference: requested=%s -> effective=%s (skipped=%s)",
+            # Include key numeric diagnostics in the one-line log so "no water" decisions are auditable.
+            log.info("[DOMAIN] WAFFLES inference: requested=%s -> effective=%s (skipped=%s; ocean_frac=%.6f; nhd_frac=%.6f; min_frac=%.6f)",
                      ",".join(cfg.methods_requested), ",".join(cfg.methods_effective),
-                     ",".join([f"{k}:{v}" for k, v in skipped.items()]))
+                     ",".join([f"{k}:{v}" for k, v in skipped.items()]),
+                     float(waffles_meta.get("ocean_water_fraction", 0.0) or 0.0),
+                     float(waffles_meta.get("with_nhd_water_fraction", 0.0) or 0.0),
+                     float(waffles_meta.get("min_water_fraction", 0.0) or 0.0))
         else:
             log.info("[DOMAIN] WAFFLES inference: requested=%s -> effective=%s",
                      ",".join(cfg.methods_requested), ",".join(cfg.methods_effective))
@@ -4914,6 +5388,111 @@ def main() -> int:
         log.error("[DOMAIN][FATAL] WAFFLES domain inference failed; aborting run (exit=2).", exc_info=True)
         log.error("[DOMAIN][FATAL] Fix WAFFLES/mask generation issues, then re-run. Common causes: missing WAFFLES deps/data, GDAL/PROJ errors, or stale/corrupt mask cache under derived_cache_root.")
         raise SystemExit(2)
+
+    # ---------------------------------------------------------------------
+    # External soundings (extra XYZ): only fetch/normalize if any water method
+    # will actually run (WAFFLES already decided effective methods above).
+    # ---------------------------------------------------------------------
+    need_xyz = ("sdb" in cfg.methods) or ("river" in cfg.methods)
+
+    if not need_xyz:
+        if getattr(args, "extra_xyz_cudem", None) or getattr(args, "extra_xyz", None):
+            log.info("[XYZ] Skipping extra XYZ fetch/normalization: no effective water methods (methods=%s).",
+                     ",".join(cfg.methods_effective or cfg.methods_requested or cfg.methods))
+    else:
+        # Optional: auto-download external soundings via CUDEM `dlim` providers.
+        # (Only after WAFFLES inference, so inland/no-water AOIs avoid unnecessary downloads.)
+        if getattr(args, "extra_xyz_cudem", None):
+            requested = []
+            for item in args.extra_xyz_cudem:
+                if item is None:
+                    continue
+                requested.extend([p.strip() for p in str(item).split(",") if p.strip()])
+
+            if requested:
+                # Determine output CRS for dlim.
+                # For *depth* soundings we prefer a projected working CRS so thinning happens in meters.
+                # Keep this horizontal-only; Z is preserved as depth.
+                user_crs = str(getattr(args, "extra_xyz_cudem_crs", "")).strip().lower()
+                if user_crs and user_crs not in ("", "auto"):
+                    dlim_crs = user_crs
+                else:
+                    try:
+                        dlim_crs = str(cfg.working_srs)
+                    except Exception:
+                        dlim_crs = "epsg:4269"
+
+                auto_xyz, auto_rep = fetch_cudem_soundings_via_dlim(
+                    aoi=cfg.aoi,
+                    sources=requested,
+                    cache_root=Path(cfg.cache_root),
+                    out_crs=dlim_crs,
+                    thin_res_m=float(getattr(args, "extra_xyz_cudem_thin_res_m", 10.0))
+                        if float(getattr(args, "extra_xyz_cudem_thin_res_m", 10.0)) > 0 else None,
+                    filter_spec=getattr(args, "extra_xyz_cudem_filter", None),
+                    force=bool(getattr(args, "extra_xyz_cudem_force", False)),
+                )
+
+                # Attach to run report (report is initialized later; stash on args for now)
+                setattr(args, "_xyz_auto_report", auto_rep)
+
+                # Make these participate in the normal --extra-xyz normalization flow
+                if auto_xyz:
+                    working_crs = str(cfg.working_srs)
+                    reprojected_xyz = []
+                    for xyz_path in auto_xyz:
+                        try:
+                            reproj_path = _reproject_xyz_file(
+                                xyz_path,
+                                # Source CRS is the dlim output CRS (horizontal-only). Z is preserved.
+                                src_crs=dlim_crs,
+                                dst_crs=working_crs,
+                                cache_dir=Path(cfg.cache_root) / "xyz",
+                            )
+                            reprojected_xyz.append(reproj_path)
+                            log.info("[XYZ][DLIM] Reprojected %s -> %s (%s)",
+                                     xyz_path.name, reproj_path.name, working_crs)
+                        except Exception as e:
+                            log.warning("[XYZ][DLIM] Failed to reproject %s: %s. Using original.", xyz_path.name, e)
+                            reprojected_xyz.append(xyz_path)
+
+                    if not getattr(args, "extra_xyz", None):
+                        args.extra_xyz = []
+                    args.extra_xyz.extend([str(p) for p in reprojected_xyz])
+
+                    # Set the CRS to working CRS since we reprojected
+                    cfg.extra_xyz_crs = working_crs
+
+        # Normalize extra XYZ inputs (files or directories). Prefer --extra-xyz; --river-soundings is a hidden alias.
+        # Supports repeats, comma-separated lists, and directories.
+        if getattr(args, "extra_xyz", None):
+            xyz_files = []
+            for item in args.extra_xyz:
+                if item is None:
+                    continue
+                parts = [p.strip() for p in str(item).split(",") if p.strip()]
+                for part in parts:
+                    pth = Path(part)
+                    if pth.is_dir():
+                        for ext in ("*.xyz", "*.csv", "*.txt", "*.dat", "*.gpkg", "*.shp", "*.geojson", "*.json"):
+                            xyz_files.extend(sorted(pth.glob(ext)))
+                    else:
+                        xyz_files.append(pth)
+
+            # de-dup while preserving order
+            seen = set()
+            xyz_files2 = []
+            for pth in xyz_files:
+                sp = str(pth)
+                if sp not in seen:
+                    seen.add(sp)
+                    xyz_files2.append(pth)
+
+            if xyz_files2:
+                cfg.river_soundings = ",".join(str(p) for p in xyz_files2)
+                log.info("[XYZ] Using %d external bathymetry file(s):", len(xyz_files2))
+                for pth in xyz_files2:
+                    log.info("   - %s", str(pth))
 
 # If glint correction was requested but SDB isn't being run, accept the flag but ignore it.
     if getattr(cfg, "glint_correct", False) and ("sdb" not in cfg.methods):
@@ -4948,6 +5527,7 @@ def main() -> int:
             "end": cfg.end_date,
             "methods": cfg.methods,
             "priority": cfg.priority,
+            "require_river_constraints": str(getattr(cfg, "require_river_constraints", "none")),
             "out_dir": str(cfg.out_dir),
             "river_dem": str(cfg.river_dem) if cfg.river_dem else None,
             "working_srs": str(cfg.working_srs),
@@ -4978,7 +5558,46 @@ def main() -> int:
     if "river" in cfg.methods:
         river_raster = run_river(cfg, report)
 
-    final = fuse(cfg, sdb_raster, river_raster, report)
+    # ------------------------------------------------------------------
+    # Guardrail: do not fuse PRIOR-ONLY (or otherwise under-constrained) river
+    # unless it meets the requested constraint requirement.
+    # ------------------------------------------------------------------
+    river_for_fuse = river_raster
+    river_excluded = None
+    try:
+        req = str(getattr(cfg, "require_river_constraints", "none") or "none").lower().strip()
+        cs = report.get("river", {}).get("constraints_summary", {})
+        if req != "none" and isinstance(cs, dict) and (cs.get("meets_requirement") is False):
+            river_for_fuse = None
+            river_excluded = {
+                "reason": "river_constraints_unmet",
+                "requirement": req,
+                "unmet_reasons": list(cs.get("unmet_reasons", [])),
+                "level": cs.get("level", "UNKNOWN"),
+            }
+            log.warning(
+                "[RIVER][CONSTRAINTS] Excluding river from fusion (requirement=%s unmet=%s level=%s).",
+                req,
+                ",".join(river_excluded.get("unmet_reasons") or []),
+                str(river_excluded.get("level")),
+            )
+    except Exception:
+        logging.getLogger(__name__).debug("Constraint guardrail check failed; continuing.", exc_info=True)
+
+    # If fusion would have no sources after guardrails, skip it explicitly.
+    if sdb_raster is None and river_for_fuse is None:
+        report["fusion"] = {
+            "status": "skipped",
+            "reason": "no_fusable_sources",
+            "note": "Both sources missing or river excluded by constraint guardrail.",
+            "river_excluded": river_excluded,
+        }
+        final = None
+    else:
+        final = fuse(cfg, sdb_raster, river_for_fuse, report)
+        if river_excluded is not None:
+            report.setdefault("fusion", {}).setdefault("notes", [])
+            report["fusion"]["notes"].append(river_excluded)
 
     # Optional intelligent gap filling (Tier 1–2): prior + residual interpolation
     if cfg.gapfill_enabled and final:
@@ -5074,49 +5693,68 @@ def main() -> int:
     # Default: also emit reprojected rasters in final_out_srs (horizontal-only; depth metadata tags included).
     try:
         dst_srs = cfg.final_out_srs
+        # Derive a deterministic tag from the destination SRS for filenames (no canonical guessing).
+        try:
+            m = re.search(r"(\d{4,6})", str(dst_srs))
+            dst_tag = f"epsg{m.group(1)}" if m else "dst"
+        except Exception:
+            dst_tag = "dst"
+        # Determine horizontal EPSG code for seam-stability logic (handles compound CRS like epsg:4269+5714).
+        dst_horiz_epsg = None
+        try:
+            m2 = re.search(r"(\d{4,6})", str(dst_srs))
+            dst_horiz_epsg = int(m2.group(1)) if m2 else None
+        except Exception:
+            dst_horiz_epsg = None
+        dst_is_4269 = (dst_horiz_epsg == 4269)
+
         if final:
             final_p = Path(final)
             combined_dir = ensure_dir(cfg.out_dir / "combined")
-            warped = warp_raster_to_srs(final_p, combined_dir / "bathy_depth_final_epsg4269.tif", dst_srs)
+            out_name = f"{final_p.stem}_{dst_tag}.tif"
+            warped = warp_raster_to_srs(final_p, combined_dir / out_name, dst_srs)
             if warped:
-                report.setdefault("outputs", {})["combined_warped"] = str(warped)
-                final_for_user = str(warped)
+                report.setdefault("outputs", {})["combined_warped_context"] = str(warped)
 
-                # Optional "root copy" for convenience
+                # Tile deliverable: always clip back to the original tile AOI when destination is EPSG:4269.
+                bbox_tile = _parse_aoi_bbox(getattr(cfg, "aoi_tile", None) or getattr(cfg, "aoi", None))
+                deliverable = Path(warped)
                 try:
-                    root_copy = cfg.out_dir / "bathy_depth_final_epsg4269.tif"
-                    if Path(warped) != root_copy:
-                        shutil.copy2(str(warped), str(root_copy))
-                        report.setdefault("outputs", {})["combined_root_copy"] = str(root_copy)
+                    if bbox_tile and dst_is_4269:
+                        clipped = combined_dir / f"{deliverable.stem}_tile.tif"
+                        clipped = _clip_raster_to_bbox(deliverable, bbox_tile, clipped, nodata=float(getattr(cfg, 'final_nodata', -9999.0)))
+                        if clipped and Path(clipped).exists():
+                            deliverable = Path(clipped)
+                            report.setdefault("outputs", {})["combined_warped"] = str(deliverable)
+                        else:
+                            report.setdefault("outputs", {})["combined_warped"] = str(deliverable)
+                    else:
+                        report.setdefault("outputs", {})["combined_warped"] = str(deliverable)
                 except Exception:
                     logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                    report.setdefault("outputs", {})["combined_warped"] = str(deliverable)
+
+                final_for_user = str(deliverable)
 
             else:
                 # Treat requested final reprojection failures as fatal: users depend on stable
                 # EPSG:4269 outputs for tile-to-tile comparisons and downstream tooling.
-                msg = f"Final warp failed: {final_p.name} -> bathy_depth_final_epsg4269.tif ({dst_srs})"
+                msg = f"Final warp failed: {final_p.name} -> {out_name} ({dst_srs})"
                 fatal_errors.append(msg)
                 report.setdefault("outputs", {})["combined_warped"] = None
                 log.error("[WARP] %s", msg)
 
             if warped:
                 # Final domain clipping is handled by _apply_final_domain_policy() after pipeline completion.
-                # Optional extra crop to AOI bbox (acts as a hard safety-net when upstream masks don't cover full grid).
+                # Seam-stability edge taper (operational tiling) on the *tile deliverable*.
                 try:
                     bbox = _parse_aoi_bbox(getattr(cfg, "aoi_tile", None) or getattr(cfg, "aoi", None))
-                    if bbox and str(dst_srs).upper().endswith("4269"):
-                        _crop_raster_extent_to_bbox(Path(warped), bbox, nodata=float(getattr(cfg, 'final_nodata', -9999.0)))
-                        try:
-                            root_copy = cfg.out_dir / "bathy_depth_final_epsg4269.tif"
-                            if root_copy.exists():
-                                _crop_raster_extent_to_bbox(root_copy, bbox, nodata=float(getattr(cfg, 'final_nodata', -9999.0)))
-                        except Exception:
-                            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
-                        # Seam-stability edge taper (operational tiling)
+                    deliver = Path(report.get("outputs", {}).get("combined_warped") or warped)
+                    if bbox and dst_is_4269 and deliver.exists():
                         try:
                             if bool(getattr(cfg, "tile_edge_taper_enabled", True)) and float(getattr(cfg, "tile_edge_taper_km", 0.0) or 0.0) > 0:
                                 m = _compute_edge_band_metrics_epsg4269(
-                                    Path(warped),
+                                    deliver,
                                     bbox,
                                     band_km=float(getattr(cfg, "tile_edge_metrics_band_km", 2.0) or 2.0),
                                     smooth_sigma_km=float(getattr(cfg, "tile_edge_smooth_sigma_km", 10.0) or 10.0),
@@ -5124,22 +5762,15 @@ def main() -> int:
                                 )
                                 report.setdefault("seams", {})["combined_edge_metrics"] = m
                                 tapered = _apply_tile_edge_taper_epsg4269(
-                                    Path(warped),
+                                    deliver,
                                     bbox,
                                     taper_km=float(getattr(cfg, "tile_edge_taper_km", 2.0) or 2.0),
                                     smooth_sigma_km=float(getattr(cfg, "tile_edge_smooth_sigma_km", 10.0) or 10.0),
                                     nodata=float(getattr(cfg, "final_nodata", -9999.0)),
                                 )
                                 if tapered and Path(tapered).exists():
-                                    # Replace deliverable with tapered version
-                                    shutil.move(str(tapered), str(Path(warped)))
-                                    report.setdefault("outputs", {})["combined_edge_tapered"] = str(Path(warped))
-                                    try:
-                                        root_copy = cfg.out_dir / "bathy_depth_final_epsg4269.tif"
-                                        if root_copy.exists():
-                                            shutil.copy2(str(Path(warped)), str(root_copy))
-                                    except Exception:
-                                        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                                    shutil.move(str(tapered), str(deliver))
+                                    report.setdefault("outputs", {})["combined_edge_tapered"] = str(deliver)
                         except Exception:
                             logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
                 except Exception:
@@ -5149,11 +5780,23 @@ def main() -> int:
         if sdb_raster:
             sdb_p = Path(sdb_raster)
             sdb_dir = ensure_dir(cfg.out_dir / "sdb")
-            warped = warp_raster_to_srs(sdb_p, sdb_dir / "sdb_depth_final_epsg4269.tif", dst_srs)
+            sdb_out_name = f"{sdb_p.stem}_{dst_tag}.tif"
+            warped = warp_raster_to_srs(sdb_p, sdb_dir / sdb_out_name, dst_srs)
             if warped:
-                report.setdefault("outputs", {})["sdb_warped"] = str(warped)
+                report.setdefault("outputs", {})["sdb_warped_context"] = str(warped)
+                deliverable = Path(warped)
+                try:
+                    bbox_tile = _parse_aoi_bbox(getattr(cfg, "aoi_tile", None) or getattr(cfg, "aoi", None))
+                    if bbox_tile and dst_is_4269:
+                        clipped = sdb_dir / f"{deliverable.stem}_tile.tif"
+                        clipped = _clip_raster_to_bbox(deliverable, bbox_tile, clipped, nodata=float(getattr(cfg, 'final_nodata', -9999.0)))
+                        if clipped and Path(clipped).exists():
+                            deliverable = Path(clipped)
+                except Exception:
+                    logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                report.setdefault("outputs", {})["sdb_warped"] = str(deliverable)
             else:
-                msg = f"SDB warp failed: {sdb_p.name} -> sdb_depth_final_epsg4269.tif ({dst_srs})"
+                msg = f"SDB warp failed: {sdb_p.name} -> {sdb_out_name} ({dst_srs})"
                 fatal_errors.append(msg)
                 report.setdefault("outputs", {})["sdb_warped"] = None
                 log.error("[WARP] %s", msg)
@@ -5161,9 +5804,24 @@ def main() -> int:
         if river_raster:
             r_p = Path(river_raster)
             river_dir = ensure_dir(cfg.out_dir / "river")
-            warped = warp_raster_to_srs(r_p, river_dir / "river_depth_final_epsg4269.tif", dst_srs)
+            river_out_name = f"{r_p.stem}_{dst_tag}.tif"
+            warped = warp_raster_to_srs(r_p, river_dir / river_out_name, dst_srs)
             if warped:
-                report.setdefault("outputs", {})["river_warped"] = str(warped)
+                report.setdefault("outputs", {})["river_warped_context"] = str(warped)
+
+                # Tile deliverable: clip back to original tile AOI when destination is EPSG:4269.
+                deliverable = Path(warped)
+                try:
+                    bbox_tile = _parse_aoi_bbox(getattr(cfg, "aoi_tile", None) or getattr(cfg, "aoi", None))
+                    if bbox_tile and dst_is_4269:
+                        clipped = river_dir / f"{deliverable.stem}_tile.tif"
+                        clipped = _clip_raster_to_bbox(deliverable, bbox_tile, clipped, nodata=float(getattr(cfg, 'river_nodata', -9999.0)))
+                        if clipped and Path(clipped).exists():
+                            deliverable = Path(clipped)
+                except Exception:
+                    logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+
+                report.setdefault("outputs", {})["river_warped"] = str(deliverable)
 
                 # Final safety clip: keep river outputs inside waffles water mask (water=0, land=1).
                 try:
@@ -5171,22 +5829,17 @@ def main() -> int:
                     ro = report.get("river", {}).get("outputs", {}) if isinstance(report.get("river", {}), dict) else {}
                     wm = ro.get("waffles_water_mask")
                     if wm and Path(wm).exists():
-                        _clip_raster_to_mask_reproject(Path(warped), Path(wm), inside_value=0, invert=False, nodata=float(getattr(cfg, 'river_nodata', -9999.0)))
+                        _clip_raster_to_mask_reproject(Path(deliverable), Path(wm), inside_value=0, invert=False, nodata=float(getattr(cfg, 'river_nodata', -9999.0)))
                 except Exception:
                     logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
-            else:
-                msg = f"River warp failed: {r_p.name} -> river_depth_final_epsg4269.tif ({dst_srs})"
-                fatal_errors.append(msg)
-                report.setdefault("outputs", {})["river_warped"] = None
-                log.error("[WARP] %s", msg)
-                # Optional crop to tile AOI bbox (EPSG:4269 only) + edge seam taper
+
+                # Optional edge seam taper on the tile deliverable
                 try:
                     bbox = _parse_aoi_bbox(getattr(cfg, "aoi_tile", None) or getattr(cfg, "aoi", None))
-                    if bbox and str(dst_srs).upper().endswith("4269"):
-                        _crop_raster_extent_to_bbox(Path(warped), bbox, nodata=float(getattr(cfg, 'river_nodata', -9999.0)))
+                    if bbox and dst_is_4269 and deliverable.exists():
                         if bool(getattr(cfg, "tile_edge_taper_enabled", True)) and float(getattr(cfg, "tile_edge_taper_km", 0.0) or 0.0) > 0:
                             m = _compute_edge_band_metrics_epsg4269(
-                                Path(warped),
+                                deliverable,
                                 bbox,
                                 band_km=float(getattr(cfg, "tile_edge_metrics_band_km", 2.0) or 2.0),
                                 smooth_sigma_km=float(getattr(cfg, "tile_edge_smooth_sigma_km", 10.0) or 10.0),
@@ -5194,17 +5847,23 @@ def main() -> int:
                             )
                             report.setdefault("seams", {})["river_edge_metrics"] = m
                             tapered = _apply_tile_edge_taper_epsg4269(
-                                Path(warped),
+                                deliverable,
                                 bbox,
                                 taper_km=float(getattr(cfg, "tile_edge_taper_km", 2.0) or 2.0),
                                 smooth_sigma_km=float(getattr(cfg, "tile_edge_smooth_sigma_km", 10.0) or 10.0),
                                 nodata=float(getattr(cfg, "river_nodata", -9999.0)),
                             )
                             if tapered and Path(tapered).exists():
-                                shutil.move(str(tapered), str(Path(warped)))
-                                report.setdefault("outputs", {})["river_edge_tapered"] = str(Path(warped))
+                                shutil.move(str(tapered), str(deliverable))
+                                report.setdefault("outputs", {})["river_edge_tapered"] = str(deliverable)
                 except Exception:
                     logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            else:
+                msg = f"River warp failed: {r_p.name} -> {river_out_name} ({dst_srs})"
+                fatal_errors.append(msg)
+                report.setdefault("outputs", {})["river_warped"] = None
+                log.error("[WARP] %s", msg)
+                # (No post-processing; warp failed)
 
             # Also warp river bottom elevation (orthometric heights, typically NAVD88) if available.
             try:
@@ -5212,16 +5871,31 @@ def main() -> int:
                 bed_src = river_outputs.get("bottom_elevation")
                 if bed_src and Path(bed_src).exists():
                     bed_p = Path(bed_src)
+                    bed_out_name = f"{bed_p.stem}_{dst_tag}.tif"
                     bed_warp = warp_raster_to_srs(
                         bed_p,
-                        river_dir / "river_bottom_navd88_final_epsg4269.tif",
+                        river_dir / bed_out_name,
                         dst_srs,
                         write_depth_metadata=False,
                     )
                     if bed_warp:
-                        report.setdefault("outputs", {})["river_bottom_warped"] = str(bed_warp)
+                        report.setdefault("outputs", {})["river_bottom_warped_context"] = str(bed_warp)
+
+                        deliverable = Path(bed_warp)
+                        # Tile deliverable: clip back to original tile AOI when destination is EPSG:4269.
                         try:
-                            apply_elevation_metadata(Path(bed_warp), vertical_datum="NAVD88")
+                            bbox_tile = _parse_aoi_bbox(getattr(cfg, "aoi_tile", None) or getattr(cfg, "aoi", None))
+                            if bbox_tile and dst_is_4269:
+                                clipped = river_dir / f"{deliverable.stem}_tile.tif"
+                                clipped = _clip_raster_to_bbox(deliverable, bbox_tile, clipped, nodata=float(getattr(cfg, 'river_nodata', -9999.0)))
+                                if clipped and Path(clipped).exists():
+                                    deliverable = Path(clipped)
+                        except Exception:
+                            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+
+                        report.setdefault("outputs", {})["river_bottom_warped"] = str(deliverable)
+                        try:
+                            apply_elevation_metadata(deliverable, vertical_datum="NAVD88")
                         except Exception:
                             logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
@@ -5231,18 +5905,17 @@ def main() -> int:
                             ro = report.get("river", {}).get("outputs", {}) if isinstance(report.get("river", {}), dict) else {}
                             wm = ro.get("waffles_water_mask")
                             if wm and Path(wm).exists():
-                                _clip_raster_to_mask_reproject(Path(bed_warp), Path(wm), inside_value=0, invert=False, nodata=float(getattr(cfg, 'river_nodata', -9999.0)))
+                                _clip_raster_to_mask_reproject(deliverable, Path(wm), inside_value=0, invert=False, nodata=float(getattr(cfg, 'river_nodata', -9999.0)))
                         except Exception:
                             logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
-                        # Optional extra crop to AOI bbox (EPSG:4269 only).
+                        # Optional edge seam taper on tile deliverable
                         try:
                             bbox = _parse_aoi_bbox(getattr(cfg, "aoi_tile", None) or getattr(cfg, "aoi", None))
-                            if bbox and str(dst_srs).upper().endswith("4269"):
-                                _crop_raster_extent_to_bbox(Path(bed_warp), bbox, nodata=float(getattr(cfg, 'river_nodata', -9999.0)))
+                            if bbox and dst_is_4269 and deliverable.exists():
                                 if bool(getattr(cfg, "tile_edge_taper_enabled", True)) and float(getattr(cfg, "tile_edge_taper_km", 0.0) or 0.0) > 0:
                                     m = _compute_edge_band_metrics_epsg4269(
-                                        Path(bed_warp),
+                                        deliverable,
                                         bbox,
                                         band_km=float(getattr(cfg, "tile_edge_metrics_band_km", 2.0) or 2.0),
                                         smooth_sigma_km=float(getattr(cfg, "tile_edge_smooth_sigma_km", 10.0) or 10.0),
@@ -5250,15 +5923,15 @@ def main() -> int:
                                     )
                                     report.setdefault("seams", {})["river_bottom_edge_metrics"] = m
                                     tapered = _apply_tile_edge_taper_epsg4269(
-                                        Path(bed_warp),
+                                        deliverable,
                                         bbox,
                                         taper_km=float(getattr(cfg, "tile_edge_taper_km", 2.0) or 2.0),
                                         smooth_sigma_km=float(getattr(cfg, "tile_edge_smooth_sigma_km", 10.0) or 10.0),
                                         nodata=float(getattr(cfg, "river_nodata", -9999.0)),
                                     )
                                     if tapered and Path(tapered).exists():
-                                        shutil.move(str(tapered), str(Path(bed_warp)))
-                                        report.setdefault("outputs", {})["river_bottom_edge_tapered"] = str(Path(bed_warp))
+                                        shutil.move(str(tapered), str(deliverable))
+                                        report.setdefault("outputs", {})["river_bottom_edge_tapered"] = str(deliverable)
                         except Exception:
                             logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
             except Exception:
@@ -5270,7 +5943,7 @@ def main() -> int:
             import rasterio
             import numpy as np
 
-            out_combined_bottom = ensure_dir(cfg.out_dir / "combined") / "bathy_bottom_navd88_final_epsg4269.tif"
+            out_combined_bottom = ensure_dir(cfg.out_dir / "combined") / f"bathy_bottom_navd88_{dst_tag}.tif"
 
             river_bottom = report.get("outputs", {}).get("river_bottom_warped")
             sdb_depth = report.get("outputs", {}).get("sdb_warped")
@@ -5341,7 +6014,7 @@ def main() -> int:
                 # Optional crop/taper to tile AOI for combined bottom output
                 try:
                   bbox = _parse_aoi_bbox(getattr(cfg, "aoi_tile", None) or getattr(cfg, "aoi", None))
-                  if bbox and str(dst_srs).upper().endswith("4269"):
+                  if bbox and dst_is_4269:
                       _crop_raster_extent_to_bbox(out_combined_bottom, bbox, nodata=float(getattr(cfg, 'river_nodata', -9999.0)))
                       if bool(getattr(cfg, "tile_edge_taper_enabled", True)) and float(getattr(cfg, "tile_edge_taper_km", 0.0) or 0.0) > 0:
                           m = _compute_edge_band_metrics_epsg4269(
@@ -5375,14 +6048,91 @@ def main() -> int:
 
     report_path = cfg.out_dir / "bathy_report.json"
     write_json(report_path, report)
+    # Explicit IO manifest (paths observed in report + executed commands; no guessing)
+    try:
+        io_json, io_md = write_io_manifest(cfg.out_dir, report)
+    except Exception as e:
+        log.debug("Optional IO manifest write failed: %s", e)
+        io_json, io_md = None, None
     try:
         from flight_recorder import emit_artifact_written
         emit_artifact_written(report_path, kind="json", role="bathy_report")
+        if io_json is not None:
+            emit_artifact_written(io_json, kind="json", role="io_manifest")
+        if io_md is not None:
+            emit_artifact_written(io_md, kind="md", role="io_manifest")
         # Also emit all artifacts we know about from the report (so summaries can be derived from the flight recorder)
         _emit_artifacts_from_report(report)
     except Exception as e:
         logging.getLogger(__name__).debug("Optional flight-recorder emit failed: %s", e)
     log.info(f"Report written: {report_path}")
+
+    # Adjacent-tile seam comparisons (explicit neighbor io_manifest.json paths; no auto-discovery)
+    try:
+        seam_ios = list(getattr(args, "seam_compare_with_io", []) or [])
+        seam_io_list_path = getattr(args, "seam_compare_with_io_list", None)
+        if seam_io_list_path:
+            p = Path(str(seam_io_list_path))
+            if p.exists():
+                for line in p.read_text(encoding="utf-8").splitlines():
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    seam_ios.append(s)
+            else:
+                raise FileNotFoundError(f"--seam-compare-with-io-list not found: {p}")
+        if seam_ios:
+            from seam_metrics import compute_seam_metrics, load_primary_raster_from_io_manifest
+            import json as _json
+
+            this_raster = None
+            if final_for_user:
+                this_raster = Path(str(final_for_user))
+            elif final:
+                this_raster = Path(str(final))
+            if this_raster is None or (not this_raster.exists()):
+                raise RuntimeError("Seam compare requested but this run has no final raster output.")
+
+            seam_results = []
+            for nio in seam_ios:
+                nio_p = Path(str(nio))
+                # Explicit-only: require the manifest file to exist
+                if not nio_p.exists():
+                    seam_results.append({
+                        "status": "error",
+                        "neighbor_io_manifest": str(nio_p),
+                        "error": "Neighbor io_manifest.json not found",
+                    })
+                    continue
+                try:
+                    neighbor_raster = load_primary_raster_from_io_manifest(nio_p)
+                    m = compute_seam_metrics(this_raster, neighbor_raster, strip_px=int(getattr(args, "seam_strip_px", 3)))
+                    m["neighbor_io_manifest"] = str(nio_p)
+                    seam_results.append(m)
+                except Exception as e:
+                    seam_results.append({
+                        "status": "error",
+                        "neighbor_io_manifest": str(nio_p),
+                        "error": str(e),
+                    })
+
+            out_seam_json = Path(cfg.out_dir) / "seam_comparisons.json"
+            out_seam_json.write_text(_json.dumps({
+                "this_raster": str(this_raster),
+                "strip_px": int(getattr(args, "seam_strip_px", 3)),
+                "comparisons": seam_results,
+            }, indent=2), encoding="utf-8")
+
+            report.setdefault("seams", {})["adjacent_tile_comparisons"] = seam_results
+            report.setdefault("outputs", {})["seam_comparisons_json"] = str(out_seam_json)
+            # Update report on disk to include seam results
+            try:
+                write_json(report_path, report)
+            except Exception:
+                pass
+            log.info(f"Seam comparisons written: {out_seam_json}")
+    except Exception:
+        logging.getLogger(__name__).debug("Optional seam comparison step failed; continuing.", exc_info=True)
     
     # NEW v0.7.1: Create unified bathymetry report
     try:
@@ -5490,12 +6240,27 @@ def main() -> int:
     except Exception:
         logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
 
+    # Output retention policy: keep only deliverables by default.
+    # Only run this step when the pipeline produced at least one final output and there were no fatal errors.
+    try:
+        if (not fatal_errors) and (final_for_user or final):
+            _organize_outputs(cfg)
+    except Exception:
+        # Do not turn a successful scientific run into a failure just because cleanup/move failed.
+        logging.getLogger(__name__).debug("Output organization failed; continuing.", exc_info=True)
+
     # If any requested final reprojection outputs failed, treat the run as failed.
     if fatal_errors:
         report["status"] = "failed"
         report["fatal_errors"] = list(fatal_errors)
         for m in fatal_errors:
             log.error("[FATAL] %s", m)
+    # Output retention policy (final outputs only by default; intermediates optional)
+    if (not fatal_errors) and final:
+        try:
+            _apply_output_retention_policy(cfg, log, report, final_path=final, final_for_user_path=final_for_user)
+        except Exception as e:
+            log.error("[OUTPUT][WARN] Retention policy failed (leaving outputs as-is): %s", str(e))
 
     log.info("=" * 70)
     log.info("PIPELINE COMPLETE")
