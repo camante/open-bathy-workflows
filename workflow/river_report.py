@@ -95,7 +95,7 @@ class RiverReport:
                 end = datetime.fromisoformat(self.data["timestamp_end"])
                 self.data["duration_seconds"] = (end - start).total_seconds()
             except (ValueError, TypeError) as e:
-                log.debug(f"Could not calculate duration: {e}")
+                log.debug("Could not calculate duration: %s", e)
                 pass
         
         self.data["status"] = status
@@ -105,7 +105,7 @@ class RiverReport:
         with open(report_path, 'w') as f:
             json.dump(self.data, f, indent=2)
         
-        log.info(f"[RIVER REPORT] Written to {report_path}")
+        log.info("[RIVER REPORT] Written to %s", report_path)
         return report_path
     
     def to_dict(self) -> Dict[str, Any]:
@@ -240,7 +240,7 @@ def create_network_metadata(
             if 'stream_order' in network.columns:
                 metadata["statistics"]["max_stream_order"] = int(network['stream_order'].max())
         except Exception as e:
-            log.warning(f"[RIVER REPORT] Could not read network stats: {e}")
+            log.warning("[RIVER REPORT] Could not read network stats: %s", e)
     
     return metadata
 
@@ -296,7 +296,7 @@ def create_xs_metadata(
                         "mean": float(widths.mean())
                     }
         except Exception as e:
-            log.warning(f"[RIVER REPORT] Could not read XS stats: {e}")
+            log.warning("[RIVER REPORT] Could not read XS stats: %s", e)
     
     return metadata
 
@@ -360,10 +360,10 @@ def create_inference_metadata(
                             "total_pixels": int(src.width * src.height)
                         }
                 except (ValueError, IndexError) as e:
-                    log.debug(f"Could not compute raster statistics: {e}")
+                    log.debug("Could not compute raster statistics: %s", e)
                     pass
         except Exception as e:
-            log.warning(f"[RIVER REPORT] Could not read raster stats: {e}")
+            log.warning("[RIVER REPORT] Could not read raster stats: %s", e)
     
     return metadata
 

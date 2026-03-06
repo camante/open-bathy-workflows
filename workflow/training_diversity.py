@@ -425,10 +425,10 @@ def analyze_training_diversity(
     log.info(f"[Diversity] Spatial coverage: {spatial_score*100:.0f}%")
     log.info(f"[Diversity] Depth coverage: {depth_score*100:.0f}%")
     log.info(f"[Diversity] Spectral diversity: {spectral_score*100:.0f}%")
-    log.info(f"[Diversity] Unique tracks: {n_tracks}")
+    log.info("[Diversity] Unique tracks: %s", n_tracks)
     log.info(f"[Diversity] Overall score: {overall*100:.0f}%")
     for rec in recommendations:
-        log.info(f"[Diversity] → {rec}")
+        log.info("[Diversity] → %s", rec)
     
     return report
 
@@ -520,7 +520,7 @@ def plot_diversity_analysis(
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     
-    log.info(f"[Diversity] Saved analysis plot: {output_path}")
+    log.info("[Diversity] Saved analysis plot: %s", output_path)
 
 
 def suggest_additional_tracks(
@@ -603,7 +603,7 @@ def add_diversity_analysis_to_training(
         }
         
     except Exception as e:
-        log.warning(f"[Diversity] Analysis failed: {e}")
+        log.warning("[Diversity] Analysis failed: %s", e)
         return {"error": str(e)}
 
 
@@ -648,4 +648,4 @@ if __name__ == "__main__":
     
     log.info("\nRecommendations:")
     for rec in report.recommendations:
-        log.info(f"  • {rec}")
+        log.info("  • %s", rec)

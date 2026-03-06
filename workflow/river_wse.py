@@ -167,7 +167,12 @@ def fit_wse_profile(
             with np.errstate(divide="ignore", invalid="ignore"):
                 sl = np.abs(dw / ds)
             sl = np.concatenate([[np.nan], sl, [np.nan]])
-            sl = np.clip(sl, float(cfg.slope_min), float(cfg.slope_max))
+            # Preserve NaN (endpoint or missing) and set physically-invalid near-zero
+            # slopes to NaN rather than silently flooring them to slope_min.
+            # A flat-pool XS (slope ≈ 0) should propagate NaN so Manning inversion
+            # skips it rather than receiving a spurious 1e-5 slope.
+            _valid = np.isfinite(sl) & (sl >= float(cfg.slope_min))
+            sl = np.where(_valid, np.clip(sl, float(cfg.slope_min), float(cfg.slope_max)), np.nan)
         else:
             sl = np.full_like(s, np.nan, dtype="float64")
 

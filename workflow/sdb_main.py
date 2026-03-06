@@ -333,12 +333,12 @@ def generate_coastline_mask(target_raster_path, aoi, cache_masks, out_mask_tif, 
                 import rasterio
                 with rasterio.open(out_mask_tif) as ds:
                     if ds.nodata == 0:
-                        log.warning(f"[MASK] Found cached mask with nodata=0 (BUG). Deleting to regenerate: {out_mask_tif}")
+                        log.warning("[MASK] Found cached mask with nodata=0 (BUG). Deleting to regenerate: %s", out_mask_tif)
                         out_mask_tif.unlink()
                     else:
                         return str(out_mask_tif)
             except Exception:
-                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True) # Re-generate if check fails
+                log.debug("Optional step failed; continuing.", exc_info=True) # Re-generate if check fails
 
     # 2. Setup Cache and Params
     aoi_buf = _buffer_aoi(aoi, pct=0.05)
@@ -383,7 +383,7 @@ def generate_coastline_mask(target_raster_path, aoi, cache_masks, out_mask_tif, 
             _run_safe(cmd_list)
         except Exception:
             # Fallback check for glob if name varied slightly
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
         if not base_tif.exists():
             existing = sorted([p.name for p in cache_masks.glob('*.tif')])
             raise RuntimeError(
@@ -430,10 +430,10 @@ def _write_report(out_dir: Path, status: str, **kwargs):
                 # best-effort: emit artifacts from the assembled kwargs
                 _emit_artifacts_from_report(kwargs or {})
             except Exception as e:
-                logging.getLogger(__name__).debug("Optional emit failed: %s", e)
+                log.debug("Optional emit failed: %s", e)
             return
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
 
     report = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -449,7 +449,7 @@ def _write_report(out_dir: Path, status: str, **kwargs):
         emit_artifact_written(report_path, kind="json", role="sdb_run_report")
         _emit_artifacts_from_report(report)
     except Exception as e:
-        logging.getLogger(__name__).debug("Optional flight-recorder emit failed: %s", e)
+        log.debug("Optional flight-recorder emit failed: %s", e)
 
 
 
@@ -481,14 +481,14 @@ def _rr_add(rr, key: str, value):
         if rr is not None:
             rr.add(key, value)
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
 
 def _rr_artifact(rr, name: str, path: str):
     try:
         if rr is not None and hasattr(rr, "record_artifact"):
             rr.record_artifact(name, str(path))
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
 
 def _rr_merge_json(rr, key: str, path: Path):
     try:
@@ -501,7 +501,7 @@ def _rr_merge_json(rr, key: str, path: Path):
             rr.add_dict(key, d if isinstance(d, dict) else {"value": d})
             _rr_artifact(rr, key.replace(".", "_") + "_json", str(p))
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
 
 def shift_start_back_one_month(start_str: str) -> str:
     """Backoff utility for retry loop."""
@@ -514,7 +514,7 @@ def shift_start_back_one_month(start_str: str) -> str:
 
 def _save_training_gpkg(out_path: Path, df_all, df_train, df_test):
     """Saves training data artifacts to a multi-layer GeoPackage."""
-    log.info(f"[GPKG] Saving training data to {out_path}...")
+    log.info("[GPKG] Saving training data to %s...", out_path)
 
     def _to_gdf(df):
         if df is None or df.empty: return None
@@ -545,7 +545,7 @@ def _save_training_gpkg(out_path: Path, df_all, df_train, df_test):
 
         log.info("[GPKG] Export complete.")
     except Exception as exc:
-        log.warning(f"[GPKG] Failed to save GeoPackage: {exc}")
+        log.warning("[GPKG] Failed to save GeoPackage: %s", exc)
 
 # -----------------------------------------------------------------------------
 # Config Loading Helper
@@ -588,7 +588,7 @@ def load_config_overrides(aoi_bbox: list, config_path: str = "sdb_config.json") 
         return config
 
     except Exception as e:
-        log.warning(f"[Config] Failed to load config: {e}")
+        log.warning("[Config] Failed to load config: %s", e)
         return {}
 
 # -----------------------------------------------------------------------------
@@ -662,7 +662,7 @@ def evaluate_raster_against_points(
 
     raster_path = str(raster_path)
     if not os.path.exists(raster_path):
-        log.warning(f"[EVAL] Raster not found: {raster_path}")
+        log.warning("[EVAL] Raster not found: %s", raster_path)
         return {}
 
     log.info(f"[EVAL] Evaluating raster '{raster_path}' against {len(df_points)} points.")
@@ -916,10 +916,10 @@ def main():
         add_file_handler(out_dir / "run_logs" / f"run_{run_id}.log", level=logging.INFO)
         fr_path = start_flight_recorder(out_dir, run_id=run_id)
         if fr_path is not None:
-            log.info(f"[RUN] Flight recorder: {fr_path}")
-        log.info(f"[RUN] run_id={run_id}")
+            log.info("[RUN] Flight recorder: %s", fr_path)
+        log.info("[RUN] run_id=%s", run_id)
     except Exception as e:
-        log.debug(f"[RUN] Unable to initialize run logs/flight recorder: {e}")
+        log.debug("[RUN] Unable to initialize run logs/flight recorder: %s", e)
 
     try:
         w, e, s, n = [float(x) for x in args.aoi.split("/")]
@@ -949,11 +949,11 @@ def main():
         if not validation_result.is_valid:
             log.error("Configuration validation failed. Exiting.")
             for err in validation_result.errors:
-                log.error(f"  - {err}")
+                log.error("  - %s", err, exc_info=True)
             sys.exit(1)
         elif validation_result.warnings:
             for warn in validation_result.warnings:
-                log.warning(f"  - {warn}")
+                log.warning("  - %s", warn)
     
     # ------------------------------------------------------------------
     # NEW: Initialize checkpoint manager if available
@@ -971,7 +971,7 @@ def main():
             if progress.get("completed_stages"):
                 log.info(f"[CHECKPOINT] Resuming from checkpoint: {progress['completed_stages']}")
         except Exception as e:
-            log.warning(f"[CHECKPOINT] Could not initialize: {e}")
+            log.warning("[CHECKPOINT] Could not initialize: %s", e)
             checkpoint = None
 
 
@@ -1011,7 +1011,7 @@ def main():
         for key, value in config_settings.items():
             if key == "preferred_months":
                 setattr(args, "preferred_months", value)
-                log.info(f"   [Auto-Config] Set preferred_months: {value}")
+                log.info("   [Auto-Config] Set preferred_months: %s", value)
                 continue
 
             if not hasattr(args, key):
@@ -1082,7 +1082,7 @@ def main():
     printed_keys = set()
 
     for group_name, keys in arg_groups.items():
-        log.info(f"--- {group_name} ---")
+        log.info("--- %s ---", group_name)
         for k in keys:
             if hasattr(args, k):
                 val = getattr(args, k)
@@ -1152,8 +1152,8 @@ def main():
     _rr_add(rr, "run.args", vars(args))
     _rr_add(rr, "sdb.max_depth.auto.rmse_target_m", float(getattr(args,'rmse_target_sdb',0.5)))
     _rr_add(rr, "run.aoi", {"w": w, "e": e, "s": s, "n": n})
-    _rr_add(rr, "config.active_profile", active_profile if "active_profile" in locals() else "unknown")
-    _rr_add(rr, "config.overrides_applied", overrides_applied if "overrides_applied" in locals() else [])
+    _rr_add(rr, "config.active_profile", active_profile if active_profile is not None else "unknown")
+    _rr_add(rr, "config.overrides_applied", overrides_applied if overrides_applied is not None else [])
 
     _rr_artifact(rr, "out_root", str(out_root))
     _rr_artifact(rr, "dir_data", str(dir_data))
@@ -1172,7 +1172,7 @@ def main():
         try:
             Path(_d).mkdir(parents=True, exist_ok=True)
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
@@ -1200,7 +1200,7 @@ def main():
     model_bank_dir_run = model_bank_dir  # may be partitioned later by source mix/depth regime
     model_cache_dir = None
     log.info(f"--- Starting SDB Run [{args.sdb_mode}] ---")
-    log.info(f"Output Directory: {out_root}")
+    log.info("Output Directory: %s", out_root)
 
     # 3. Data Acquisition
     current_start = args.start
@@ -1231,7 +1231,7 @@ def main():
                     try:
                         waffles_cache = Path(os.environ.get("WAFFLES_CACHE_ROOT", str(mask_cache)))
                         coast_mask_raw = generate_coastline_mask(None, args.aoi, waffles_cache, None, args.sdb_mode)
-                        log.info(f"[MASK] Using waffles coastline mask for S2 date QC: {coast_mask_raw}")
+                        log.info("[MASK] Using waffles coastline mask for S2 date QC: %s", coast_mask_raw)
                         # If the coastline mask indicates *no* water/ocean pixels in this AOI, skip SDB early.
                         # This avoids wasting time downloading S2/ATL data when the AOI is fully inland (or otherwise non-ocean).
                         if coast_mask_raw and (not _mask_has_ocean_pixels(str(coast_mask_raw))):
@@ -1239,7 +1239,7 @@ def main():
                             return None
 
                     except Exception as exc:
-                        log.warning(f"[MASK] Waffles generation failed ({exc}). S2 date QC will be AOI-only.")
+                        log.warning("[MASK] Waffles generation failed (%s). S2 date QC will be AOI-only.", exc)
                         coast_mask_raw = None
 
 
@@ -1292,7 +1292,7 @@ def main():
                     allowed = set(sig.parameters.keys())
                     s2_kwargs = {k: v for k, v in s2_kwargs.items() if k in allowed}
                 except Exception:
-                    logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                    log.debug("Optional step failed; continuing.", exc_info=True)
 
                 s2_paths = s2_optics.build_weighted_shared_date_composite(**s2_kwargs)
 
@@ -1307,7 +1307,7 @@ def main():
                                 _rr_artifact(rr, f"s2_{k}".lower(), v)
                         _rr_merge_json(rr, "s2.date_qc", s2_out / "S2_DATE_QC.json")
                 except Exception:
-                    logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                    log.debug("Optional step failed; continuing.", exc_info=True)
                 log.info("[S2] Composite acquired.")
 
                 if getattr(args, 'cloud_report_only', False):
@@ -1319,10 +1319,10 @@ def main():
                     rgb_dst = dir_rast / "RGB_10m.tif"
                     shutil.copy(rgb_src, rgb_dst)
                 else:
-                    log.warning(f"[S2] RGB_10m.tif not found in {s2_out}")
+                    log.warning("[S2] RGB_10m.tif not found in %s", s2_out)
 
             except Exception as exc:
-                log.warning(f"[S2] Failed: {exc}")
+                log.warning("[S2] Failed: %s", exc)
                 s2_paths = None
 
         if (not args.atl_only) and (s2_paths is not None):
@@ -1352,7 +1352,7 @@ def main():
                         atl_files_map["ATL24"] = f24
 
             except Exception as exc:
-                log.warning(f"[ATL] Failed: {exc}")
+                log.warning("[ATL] Failed: %s", exc)
 
         has_s2 = (s2_paths is not None) or args.atl_only
         has_atl = (len(atl_files_map["ATL03"]) > 0 or len(atl_files_map["ATL24"]) > 0) or args.s2_only
@@ -1380,7 +1380,7 @@ def main():
         try:
             generate_coastline_mask(s2_paths["B02"], args.aoi, waffles_cache, land_mask_out, args.sdb_mode)
         except Exception as exc:
-            log.warning(f"Mask generation failed ({exc}).")
+            log.warning("Mask generation failed (%s).", exc)
 
 
     # Ensure land mask exists even if waffles generation failed
@@ -1393,9 +1393,9 @@ def main():
                 data = np.zeros((src.height, src.width), dtype="uint8")  # 0 = water everywhere (no land gate)
             with rasterio.open(land_mask_out, "w", **prof) as dst:
                 dst.write(data, 1)
-            log.warning(f"[MASK] LAND mask missing; created fallback all-water mask: {land_mask_out}")
+            log.warning("[MASK] LAND mask missing; created fallback all-water mask: %s", land_mask_out)
         except Exception as _e:
-            log.error(f"[MASK] Failed to create fallback LAND mask ({_e}); cannot proceed.")
+            log.error("[MASK] Failed to create fallback LAND mask (%s); cannot proceed.", _e, exc_info=True)
             raise
 
     log.info(f"[MASK] Using LAND mask as hard gate: keep pixels where LAND <= {args.land_max} (0.0 = waffles water-only).")
@@ -1417,7 +1417,7 @@ def main():
             rr.add("mask.land_mask_type", land_mask_type)
             rr.add("mask.land_mask_threshold", land_mask_threshold)
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
 
     if atl_files_map["ATL03"]:
@@ -1572,7 +1572,7 @@ def main():
 
         except Exception as ex:
             # Fail closed: do not silently keep unguarded extra_xyz in SDB training.
-            log.error(f"[XYZ][SDB] Auto guard failed; excluding extra_xyz from SDB training. Reason: {ex}")
+            log.error("[XYZ][SDB] Auto guard failed; excluding extra_xyz from SDB training. Reason: %s", ex, exc_info=True)
             log.debug("[XYZ][SDB] Guard exception details", exc_info=True)
             return None
 
@@ -1611,7 +1611,7 @@ def main():
         if fused_df is not None and len(fused_df) > 0:
             if "source" in fused_df.columns:
                 src_counts = fused_df["source"].value_counts(dropna=False).to_dict()
-                log.info(f"[FUSION] Point provenance after fusion: {src_counts}")
+                log.info("[FUSION] Point provenance after fusion: %s", src_counts)
             else:
                 log.info(f"[FUSION] Fused training points: n={len(fused_df)} (no 'source' column present)")
         else:
@@ -1649,7 +1649,7 @@ def main():
             log.info(f"[TRAIN][PRESAMPLE] Source counts after: {vc_after.to_dict()}")
             return df_out
         except Exception as ex:
-            log.warning(f"[TRAIN][PRESAMPLE] Per-source cap failed; continuing without cap: {ex}")
+            log.warning("[TRAIN][PRESAMPLE] Per-source cap failed; continuing without cap: %s", ex)
             return df_in
 
     fused_df = _cap_per_source_presampling(fused_df, cap_per_source=250000, seed=int(getattr(args, 'seed', 42)))
@@ -1660,7 +1660,7 @@ def main():
     try:
         if "source" in fused_df.columns:
             src_counts = fused_df["source"].value_counts(dropna=False).to_dict()
-            log.info(f"[FUSION] Fused point sources: {src_counts}")
+            log.info("[FUSION] Fused point sources: %s", src_counts)
         else:
             log.info("[FUSION] Fused dataframe has no 'source' column; provenance counts unavailable.")
     except Exception:
@@ -1698,14 +1698,14 @@ def main():
                 except Exception:
                     df_train_final = None
                     df_test_final = None
-                log.info(f"[MODEL_CACHE] HIT: using cached model from {model_cache_dir}")
+                log.info("[MODEL_CACHE] HIT: using cached model from %s", model_cache_dir)
                 if rr is not None:
                     rr.add("model_cache.hit", True)
             else:
                 if rr is not None:
                     rr.add("model_cache.hit", False)
     except Exception as e:
-        log.warning(f"[MODEL_CACHE] Could not use cached model: {e}")
+        log.warning("[MODEL_CACHE] Could not use cached model: %s", e)
         if rr is not None:
             rr.add("model_cache.hit", False)
             rr.add("model_cache.error", str(e))
@@ -1740,7 +1740,7 @@ def main():
                 else:
                     log.error('[FUSION] 0 training points and model bank has no trained model yet.')
             except Exception as ex:
-                log.error(f"[FUSION] 0 training points and failed to load model bank model: {ex}")
+                log.error("[FUSION] 0 training points and failed to load model bank model: %s", ex, exc_info=True)
         if not cached_model:
             # No valid training points for this AOI and no cached model available.
             # This is common for inland AOIs when the water/land mask gates out all pixels.
@@ -1772,7 +1772,7 @@ def main():
         try:
             if "source" in df_with_s2.columns:
                 src_counts2 = df_with_s2["source"].value_counts(dropna=False).to_dict()
-                log.info(f"[TRAIN][PROVENANCE] After S2 sampling/masking: {src_counts2}")
+                log.info("[TRAIN][PROVENANCE] After S2 sampling/masking: %s", src_counts2)
         except Exception:
             log.warning("[TRAIN][PROVENANCE] Could not compute source counts after S2 sampling.", exc_info=True)
 
@@ -1834,7 +1834,7 @@ def main():
                         rr.add('model_bank.partition', mb_part)
             except Exception as ex:
                 model_bank_dir_run = model_bank_dir
-                log.warning(f"[MODEL_BANK] Partitioning failed; falling back to base bank dir. Reason: {ex}")
+                log.warning("[MODEL_BANK] Partitioning failed; falling back to base bank dir. Reason: %s", ex)
 
         log.info("[TRAIN] Running Standard Training (Random Split)...")
 
@@ -2054,7 +2054,7 @@ def main():
                 with open(dir_model / "model_meta.json", "w") as f:
                     json.dump(model_meta, f, indent=2)
             except Exception:
-                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("Optional step failed; continuing.", exc_info=True)
 
 
             report_lines = [
@@ -2134,7 +2134,7 @@ def main():
                     shutil.copy2(dir_model / 'model_meta.json', model_bank_dir_run / 'model_meta.json')
                     if (dir_model / 'stumpf_lr.pkl').exists():
                         shutil.copy2(dir_model / 'stumpf_lr.pkl', model_bank_dir_run / 'stumpf_lr.pkl')
-                    log.info(f"[MODEL_BANK] SAVED model artifacts to {model_bank_dir_run}")
+                    log.info("[MODEL_BANK] SAVED model artifacts to %s", model_bank_dir_run)
                     try:
                         meta_p = model_bank_dir_run / 'bank_meta.json'
                         if meta_p.exists():
@@ -2164,7 +2164,7 @@ def main():
                             'r2': model_bank_gate_r2,
                         })
         except Exception as e:
-            log.warning(f"[MODEL_BANK] Failed to save model artifacts: {e}")
+            log.warning("[MODEL_BANK] Failed to save model artifacts: %s", e)
             if rr is not None:
                 rr.add('model_bank.model_saved', False)
                 rr.add('model_bank.model_save_error', str(e))
@@ -2205,7 +2205,7 @@ def main():
                     depth_mode="n_multiplier"
                 )
             except Exception as exc:
-                log.warning(f"[VIS] Plot generation failed: {exc}")
+                log.warning("[VIS] Plot generation failed: %s", exc)
 
     # 9. Prediction
     log.info("\n--- Prediction ---")
@@ -2237,7 +2237,7 @@ def main():
             log.info(f"[PREDICT] Memory estimation: {estimated_gb:.1f} GB (threshold: {args.max_memory_gb} GB)")
             log.info(f"[PREDICT] Chunked processing: {'ENABLED (auto)' if use_chunked else 'DISABLED (auto)'}")
         except Exception as e:
-            log.warning(f"[PREDICT] Failed to estimate memory: {e}. Using standard prediction.")
+            log.warning("[PREDICT] Failed to estimate memory: %s. Using standard prediction.", e)
             use_chunked = False
     
     if use_chunked:
@@ -2265,7 +2265,7 @@ def main():
             # Copy output to expected location
             if result['output_raster'].exists():
                 shutil.copy2(result['output_raster'], out_tif)
-                log.info(f"[PREDICT] Chunked prediction complete: {out_tif}")
+                log.info("[PREDICT] Chunked prediction complete: %s", out_tif)
             else:
                 raise FileNotFoundError(f"Chunked output not found: {result['output_raster']}")
                 
@@ -2273,7 +2273,7 @@ def main():
             log.error("[PREDICT] predict_chunked module not available. Falling back to standard prediction.")
             use_chunked = False
         except Exception as e:
-            log.error(f"[PREDICT] Chunked processing failed: {e}. Falling back to standard prediction.")
+            log.error("[PREDICT] Chunked processing failed: %s. Falling back to standard prediction.", e, exc_info=True)
             use_chunked = False
     
     if not use_chunked:
@@ -2296,7 +2296,7 @@ def main():
             linf_deepwater_nir_max=args.linf_deepwater_nir_max,
             linf_deepwater_bright_max=args.linf_deepwater_bright_max,
             linf_percentile=args.linf_percentile,
-            # Post-prediction alignment (Palaseanu-Lovejoy et al. 2026)
+            # Post-prediction alignment (optional; keep conservative and report deltas)
             align_mode=args.align_mode,
             align_tie_points_gpkg=str(dir_data / "icesat_depths.gpkg") if (dir_data / "icesat_depths.gpkg").exists() else None,
             align_min_points=args.align_min_points,
@@ -2355,7 +2355,7 @@ def main():
                 rr.add("vdatum_conversion.target", args.sdb_target_vdatum)
                 rr.add("vdatum_conversion.output", str(out_tif_navd88))
         else:
-            log.warning(f"[VDATUM] Conversion failed: {msg}")
+            log.warning("[VDATUM] Conversion failed: %s", msg)
             if rr is not None:
                 rr.add("vdatum_conversion.status", "failed")
                 rr.add("vdatum_conversion.error", msg)
@@ -2366,7 +2366,7 @@ def main():
             neighbor_in = Path(str(args.overlap_neighbor))
             neighbor_rr = neighbor_in / "run_report.json" if neighbor_in.is_dir() else neighbor_in
             if not neighbor_rr.exists():
-                log.warning(f"[QA][OVERLAP] Neighbor run_report not found: {neighbor_rr}")
+                log.warning("[QA][OVERLAP] Neighbor run_report not found: %s", neighbor_rr)
             else:
                 with open(neighbor_rr, "r") as f:
                     nb = json.load(f)
@@ -2387,7 +2387,7 @@ def main():
                     # No fallback filename guessing for neighbor outputs.
                     # Neighbor must explicitly record its prediction path in run_report.json.
                     if not nb_pred or not Path(nb_pred).exists():
-                        log.warning(f"[QA][OVERLAP] Neighbor prediction raster not found: {nb_pred}")
+                        log.warning("[QA][OVERLAP] Neighbor prediction raster not found: %s", nb_pred)
                     else:
                         w, e, s, n = [float(x) for x in args.aoi.split("/")[:4]] if isinstance(args.aoi, str) else aoi_wesn
                         cur_aoi = {"w": float(w), "e": float(e), "s": float(s), "n": float(n)}
@@ -2406,7 +2406,7 @@ def main():
                         rr.add_dict("qa.overlap_consistency", res)
                         log.info(f"[QA][OVERLAP] {res.get('status')} n_valid={res.get('n_samples_valid')} median_diff={res.get('median_diff_m')} m p90_abs={res.get('p90_abs_diff_m')} m")
         except Exception as e:
-            log.warning(f"[QA][OVERLAP] Failed to compute overlap consistency diagnostic: {e}")
+            log.warning("[QA][OVERLAP] Failed to compute overlap consistency diagnostic: %s", e)
 
     # --- Post-Process Brightness Masking (Smart) ---
     if args.mask_bright_pixels is not None and s2_paths and "B02" in s2_paths:
@@ -2426,7 +2426,7 @@ def main():
 
             if bool(args.allow_bright_shallow_pixels) and ("B08" in s2_paths) and (s2_paths.get("B08") is not None):
                 nir_thr = float(args.bright_shallow_nir_max) if args.bright_shallow_nir_max is not None else 0.03
-                log.info(f"[Post-Process] Bright-shallow escape hatch enabled (B08 < {nir_thr})")
+                log.info("[Post-Process] Bright-shallow escape hatch enabled (B08 < %s)", nir_thr)
                 with rasterio.open(s2_paths["B08"]) as src_b8:
                     b8_data = src_b8.read(1, out_shape=dst.shape, resampling=rasterio.enums.Resampling.nearest)
                 b8_norm = b8_data / scale_factor
@@ -2438,17 +2438,17 @@ def main():
             if mask_count > 0:
                 sdb_data[bad_mask] = nodata
                 dst.write(sdb_data, 1)
-                log.info(f"[Post-Process] Masked {mask_count} pixels (cloud/glint).")
+                log.info("[Post-Process] Masked %s pixels (cloud/glint).", mask_count)
             else:
                 log.info("[Post-Process] No pixels masked by brightness gate.")
     except Exception as exc:
-        log.warning(f"[Post-Process] Brightness masking failed: {exc}")
+        log.warning("[Post-Process] Brightness masking failed: %s", exc)
 
     # --- NEW: Create Masked RGB (Prediction Only) ---
     rgb_full = dir_rast / "RGB_10m.tif"
     if rgb_full.exists():
         rgb_masked_out = dir_rast / "RGB_10m_predict.tif"
-        log.info(f"[Post-Process] Creating Masked RGB: {rgb_masked_out}")
+        log.info("[Post-Process] Creating Masked RGB: %s", rgb_masked_out)
         try:
             with rasterio.open(str(out_tif)) as src_sdb:
                 sdb_arr = src_sdb.read(1)
@@ -2478,7 +2478,7 @@ def main():
                         dst_rgb.write(b, 3)
 
         except Exception as exc:
-            log.warning(f"[Post-Process] Failed to create masked RGB: {exc}")
+            log.warning("[Post-Process] Failed to create masked RGB: %s", exc)
 
     if not args.skip_nad83:
         # Do not impose canonical filenames. Derive NAD83 outputs from the actual primary output name.
@@ -2503,7 +2503,7 @@ def main():
 
         # Write manifest (relative paths, rooted at out_root)
         artifacts = {
-            "run_id": run_id if 'run_id' in locals() else None,
+            "run_id": run_id if run_id is not None else None,
             "depth_raster": str(depth_primary.relative_to(out_root)) if str(depth_primary).startswith(str(out_root)) else str(depth_primary),
         }
 
@@ -2531,7 +2531,7 @@ def main():
         (out_root / "artifacts_sdb.json").write_text(json.dumps(artifacts, indent=2), encoding="utf-8")
         log.info(f"[ARTIFACTS] Wrote SDB manifest: {out_root / 'artifacts_sdb.json'}")
     except Exception as exc:
-        log.warning(f"[ARTIFACTS] Failed to write canonical outputs/manifest: {exc}")
+        log.warning("[ARTIFACTS] Failed to write canonical outputs/manifest: %s", exc)
 
     if df_test_final is not None and not df_test_final.empty:
         try:
@@ -2564,7 +2564,7 @@ def main():
             rr.write(status="ok")
             log.info("\n=== SDB Pipeline Completed Successfully ===")
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
 
 
 def parse_args():
@@ -2905,6 +2905,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        log.error(f"Pipeline Failed: {exc}")
+        log.error("Pipeline Failed: %s", exc, exc_info=True)
         traceback.print_exc()
         sys.exit(1)

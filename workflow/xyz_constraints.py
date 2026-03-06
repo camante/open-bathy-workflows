@@ -25,6 +25,8 @@ from typing import Iterable, List, Tuple
 import numpy as np
 import rasterio
 
+log = logging.getLogger("xyz_constraints")
+
 
 @dataclass
 class RasterizedConstraints:
@@ -75,7 +77,7 @@ def _read_csv_xyz(path: Path) -> np.ndarray:
                 x = float(row[kx]); y = float(row[ky]); z = float(row[kz])
                 out.append((x,y,z)); continue
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
         # fallback: first 3 numeric fields
         vals=[]
         for v in row.values():

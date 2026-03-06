@@ -86,7 +86,7 @@ import compat_pandas  # noqa: F401
 
 # Longitudinal WSE profile fitting (stabilizes slope for Manning / multivariate priors)
 try:
-    from river_wse import WSEFitConfig
+    from river_wse import WSEFitConfig, fit_wse_profile
 except Exception:  # pragma: no cover
     WSEFitConfig = None
     fit_wse_profile = None
@@ -165,6 +165,7 @@ class InferConfig:
 
     # bed shape (used to distribute Dmax across the XS)
     bottom_width_frac: float = TRAPEZOID_BOTTOM_FRAC
+    xs_profile_shape: str = "cosine_trapezoid"  # linear_trapezoid | cosine_trapezoid
 
     # WSE estimation (proxy from DEM/topo profile)
     wse_center_frac: float = 0.10
@@ -187,9 +188,8 @@ class InferConfig:
 
     # Curvature-driven cross-section asymmetry (optional)
     # Computes a signed curvature proxy from the sequence of XS center points (per component),
-    # then shifts the trapezoid "flat bottom" toward the outer bend. This approximates the
-    # thalweg skew using only planform geometry (see Liang & Merwade, 2026).
-    # Curvature-based thalweg asymmetry proxy (Liang & Merwade, 2026; J. Hydrology 664:134450)
+    # then shifts the trapezoid "flat bottom" toward the outer bend. This approximates
+    # thalweg skew using only planform geometry (a conservative proxy; not a sediment model).
     curv_asymmetry_enabled: bool = True
     curv_window_m: float = 500.0          # half-window for local polynomial fit (meters)
     curv_min_points: int = 7              # minimum XS points per fit window
@@ -231,6 +231,20 @@ class InferConfig:
     wse_profile_min_n: int = 7
     wse_profile_monotonic: bool = True
 
+    # Optional: reach-scale 1D energy-consistent depth solver (flag-controlled)
+    energy_solver_enabled: bool = False
+    energy_solver_only_when_no_soundings: bool = True
+    energy_max_weight: float = 0.25     # max weight for 1-D energy solver depths
+    energy_min_confidence: float = 0.30 # min solver confidence to apply weight
+    force_slope_proxy: bool = False      # override reach slope with WSE proxy even when NHD slope available
+    # Safety gate: if the only WSE anchor is a DEM/topo proxy (no observed stage),
+    # skip the energy solver by default to avoid creating a false sense of
+    # observational hydraulic constraint. Can be overridden explicitly.
+    energy_allow_dem_proxy_wse: bool = False
+    out_1d_solver_inputs_json: str | None = None
+    out_1d_solver_outputs_json: str | None = None
+    out_1d_solver_accounting_json: str | None = None
+
     # smoothing
     smooth_window: int = 7
 
@@ -247,6 +261,11 @@ class InferConfig:
     # Intended to be passed from bathy_main.py.
     write_soundings_subset: Optional[str] = None
     only_write_soundings_subset: bool = False
+
+    # Pass 2 explicit soundings handoff: when provided, this pre-clipped parquet is loaded
+    # INSTEAD of the raw --soundings files. Hard-fail if missing or empty.
+    # Set by bathy_main.py after Pass 1 validates the subset row-count > 0.
+    soundings_subset: Optional[str] = None
 
     # Tier-1 calibration anchors (no bed data required)
     usgs_max_dist_m: float = 5000.0          # meters (distance from gage to XS center)
@@ -529,6 +548,64 @@ def _trapezoid_depth_profile(
     return out
 
 
+def _cosine_trapezoid_depth_profile(
+    dist_from_left: np.ndarray,
+    W: float,
+    Dmax: float,
+    bottom_frac: float,
+    offset_frac: float = 0.0,
+) -> np.ndarray:
+    """Trapezoidal profile with *smooth* cosine side slopes.
+
+    This is a small but high-impact physical improvement over the piecewise-linear
+    trapezoid: banks tend to have low curvature at the edges, and the cosine ramp
+    avoids sharp slope discontinuities that can amplify interpolation artifacts.
+
+    The profile is still strictly width-constrained (0 depth at banks, max depth
+    limited to Dmax) and still supports thalweg asymmetry via offset_frac.
+    """
+    out = np.full_like(dist_from_left, np.nan, dtype="float64")
+    if not np.isfinite(W) or W <= 0 or not np.isfinite(Dmax) or Dmax <= 0:
+        return out
+
+    Wb = float(np.clip(bottom_frac, 0.0, 0.95) * W)
+    Wb = max(Wb, 1e-6)
+
+    max_off = (1.0 - float(bottom_frac)) / 2.0 - 0.05
+    max_off = float(np.clip(max_off, 0.0, 0.45))
+    off = float(np.clip(offset_frac, -max_off, max_off))
+    center = (W / 2.0) + (off * W)
+    center = float(np.clip(center, Wb / 2.0, W - (Wb / 2.0)))
+
+    left_edge = center - (Wb / 2.0)
+    right_edge = center + (Wb / 2.0)
+
+    left_run = max(left_edge, 1e-6)
+    right_run = max(W - right_edge, 1e-6)
+
+    d = dist_from_left
+    inside = (d >= 0.0) & (d <= W)
+
+    # Left ramp: 0 -> Dmax with zero slope at both ends
+    left = inside & (d < left_edge)
+    if left.any():
+        x = np.clip(d[left] / left_run, 0.0, 1.0)
+        out[left] = 0.5 * (1.0 - np.cos(np.pi * x)) * Dmax
+
+    # Flat bottom
+    mid = inside & (d >= left_edge) & (d <= right_edge)
+    out[mid] = Dmax
+
+    # Right ramp: Dmax -> 0 with zero slope at both ends
+    right = inside & (d > right_edge)
+    if right.any():
+        x = np.clip((W - d[right]) / right_run, 0.0, 1.0)
+        out[right] = 0.5 * (1.0 - np.cos(np.pi * x)) * Dmax
+
+    out[inside] = np.clip(out[inside], 0.0, Dmax)
+    return out
+
+
 def _local_quad_derivatives(
     s: np.ndarray,
     v: np.ndarray,
@@ -621,7 +698,7 @@ def _attach_curvature_asymmetry(
     ordered by `s_center_m` (if available). We map curvature to a signed thalweg offset fraction,
     shifting the flat-bottom portion of the trapezoid toward the outer bend.
 
-    By default we use a dimensionless curvature κ* = κ×W (Liang & Merwade, 2026):
+    By default we use a dimensionless curvature κ* = κ×W (a common non-dimensionalization):
 
         offset_frac = tanh(κ* * curv_kappa_star_scale) * curv_max_offset_frac
 
@@ -629,9 +706,9 @@ def _attach_curvature_asymmetry(
 
         offset_frac = tanh(κ / curv_kappa_scale_1pm) * curv_max_offset_frac
 
-    Reference:
-        Liang & Merwade (2026), Journal of Hydrology 664:134450,
-        "Predicting river bathymetry in data sparse regions using a generative deep learning model"
+    Note:
+        This is a conservative geometric proxy intended to reduce symmetric-channel artifacts.
+        It is not a substitute for hydraulic/sediment-transport modeling.
     """
     xs_param = xs_param.copy()
     xs_param["curv_kappa_1pm"] = np.nan
@@ -639,7 +716,7 @@ def _attach_curvature_asymmetry(
     xs_param["thalweg_offset_m"] = 0.0
     xs_param["thalweg_side"] = "center"
 
-    if not bool(getattr(cfg, "curv_asymmetry_enabled", False)):
+    if not cfg.curv_asymmetry_enabled:
         return xs_param
 
     if xs_lines is None or xs_lines.empty:
@@ -691,11 +768,11 @@ def _attach_curvature_asymmetry(
             svals.append(pd.Series(s, index=gg.index))
         g_m["_s_m"] = pd.concat(svals).sort_index()
 
-    half_w = float(max(1.0, getattr(cfg, "curv_window_m", 500.0))) / 2.0
-    min_pts = int(max(5, getattr(cfg, "curv_min_points", 7)))
-    kscale = float(max(1e-9, getattr(cfg, "curv_kappa_scale_1pm", 0.002)))
-    max_off = float(np.clip(getattr(cfg, "curv_max_offset_frac", 0.25), 0.0, 0.45))
-    lag_m = float(getattr(cfg, "curv_lag_m", 0.0))
+    half_w = float(max(1.0, cfg.curv_window_m)) / 2.0
+    min_pts = int(max(5, cfg.curv_min_points))
+    kscale = float(max(1e-9, cfg.curv_kappa_scale_1pm))
+    max_off = float(np.clip(cfg.curv_max_offset_frac, 0.0, 0.45))
+    lag_m = cfg.curv_lag_m
 
     out_rows = []
     for cid, gg in g_m.groupby("component_id", dropna=False):
@@ -712,10 +789,10 @@ def _attach_curvature_asymmetry(
             kappa = np.interp(s + lag_m, s, kappa, left=np.nan, right=np.nan)
 
         # Map curvature to offset fraction
-        use_dim = bool(getattr(cfg, "curv_use_dimensionless", False))
+        use_dim = cfg.curv_use_dimensionless
         if use_dim:
             # κ* = κ×W (dimensionless); adapt to local width
-            scale_star = float(getattr(cfg, "curv_kappa_star_scale", 1.0))
+            scale_star = cfg.curv_kappa_star_scale
             w = pd.to_numeric(gg.get("width_m"), errors="coerce").to_numpy(dtype=float)
             if np.isfinite(w).any():
                 w_fill = float(np.nanmedian(w))
@@ -898,9 +975,9 @@ def _manning_n_effective(cfg: InferConfig) -> float:
     This avoids hardcoded region defaults (user supplies mapping) while still allowing
     deterministic, explicit friction priors.
     """
-    n = float(getattr(cfg, "manning_n", 0.035))
-    region = str(getattr(cfg, "manning_region", "default") or "default")
-    by_region = getattr(cfg, "manning_n_by_region", None)
+    n = cfg.manning_n
+    region = str(cfg.manning_region or "default")
+    by_region = cfg.manning_n_by_region
     if isinstance(by_region, dict) and region in by_region:
         try:
             n_reg = float(by_region[region])
@@ -944,7 +1021,7 @@ def _compute_dmax_manning(width_m: float, slope_mpm: float, q_cms: float, cfg: I
 
 
 def _compute_manning_weight(row: pd.Series, cfg: InferConfig) -> float:
-    """Compute a blend weight for the Manning prior, with simple backwater/tidal guards."""
+    """Compute a 0–1 guard factor for Manning/energy priors (separate from max weight)."""
     if str(cfg.manning_mode).lower().strip() == "off":
         return 0.0
 
@@ -962,7 +1039,7 @@ def _compute_manning_weight(row: pd.Series, cfg: InferConfig) -> float:
         if np.isfinite(dkm) and float(dkm) <= float(cfg.manning_dist_to_mouth_km_max):
             return 0.0
 
-    return float(np.clip(float(cfg.manning_max_weight), 0.0, 1.0))
+    return 1.0
 
 
 
@@ -982,6 +1059,269 @@ REGIONAL_CURVE_DEFAULTS = {
     "great_plains": (0.15, 0.30, "km2", "m", "mean", 55.0),
 }
 
+
+
+
+
+def _apply_1d_energy_solver(xs_param: pd.DataFrame, cfg: InferConfig, soundings_path: str | None, acct: dict | None = None) -> pd.DataFrame:
+    """Option A: Solve (mean) depth from local WSE energy slope and Manning friction, then convert to Dmax."""
+    def _acct_set(reason: str) -> None:
+        if acct is None:
+            return
+        acct["energy_solver_requested"] = cfg.energy_solver_enabled
+        acct["energy_solver_reason"] = str(reason)
+        acct.setdefault("energy_solver_n_total", 0)
+        acct.setdefault("energy_solver_n_applied", 0)
+
+    if not cfg.energy_solver_enabled:
+        _acct_set("disabled")
+        return xs_param
+    if cfg.energy_solver_only_when_no_soundings and soundings_path:
+        _acct_set("skipped_soundings_present")
+        return xs_param
+
+    required_cols = {"component_id", "s_center_m", "width_m"}
+    if not required_cols.issubset(set(xs_param.columns)):
+        _acct_set("missing_required_cols")
+        return xs_param
+    if "manning_q_cms_used" not in xs_param.columns:
+        _acct_set("missing_manning_q")
+        return xs_param
+
+    has_wse_m = "wse_m" in xs_param.columns
+    has_wse_fit = ("wse_fit_m" in xs_param.columns) and xs_param["wse_fit_m"].notna().any()
+    if (not has_wse_m) and (not has_wse_fit):
+        _acct_set("missing_wse")
+        return xs_param
+
+    # Use fitted WSE where available, but fall back to per-XS proxy WSE when fit is missing.
+    # The previous implementation selected a single column globally, which could silently drop
+    # most stations if wse_fit_m is only partially populated.
+    wse_mode = "wse_m"
+    if has_wse_fit and has_wse_m:
+        wse_mode = "wse_fit_m_fallback_wse_m"
+    elif has_wse_fit:
+        wse_mode = "wse_fit_m"
+
+    if acct is not None:
+        acct["energy_solver_wse_source"] = str(wse_mode)
+        acct["energy_solver_wse_fit_used_n"] = 0
+        acct["energy_solver_wse_raw_used_n"] = 0
+        acct["energy_solver_groups_total"] = 0
+        acct["energy_solver_groups_used"] = 0
+        acct["energy_solver_groups_skipped_lt2"] = 0
+        acct["energy_solver_ok_rows"] = 0
+        acct["energy_solver_ok_pairs"] = 0
+
+    n_val = float(_manning_n_effective(cfg))
+    if not (np.isfinite(n_val) and n_val > 0):
+        _acct_set("missing_manning_n")
+        return xs_param
+
+    # Safety gate: if upstream indicates the WSE anchor is DEM/topo proxy only,
+    # skip unless explicitly permitted. This prevents "physics" adjustments from
+    # being over-interpreted as observation-constrained when they are not.
+    if acct is not None:
+        wse_anchor = str(acct.get("wse_anchor_source", "unknown"))
+        if (wse_anchor == "dem_proxy") and (not cfg.energy_allow_dem_proxy_wse):
+            _acct_set("skipped_dem_proxy_wse")
+            return xs_param
+
+    mean_to_dmax = float(2.0 / (1.0 + float(cfg.bottom_width_frac)))
+
+    rows_in: list[dict] = []
+    rows_out: list[dict] = []
+
+    n_total = 0
+    n_applied = 0
+    n_capped_min = 0
+    n_capped_max = 0
+    resid_vals: list[float] = []
+    conf_vals: list[float] = []
+
+    xs_param = xs_param.copy()
+    xs_param["energy_slope_mpm"] = np.nan
+    xs_param["energy_depth_mean_m"] = np.nan
+    xs_param["energy_dmax_m"] = np.nan
+    xs_param["energy_residual_mpm"] = np.nan
+    xs_param["energy_conf"] = np.nan
+    xs_param["energy_flags"] = ""
+
+    for comp, g in xs_param.groupby("component_id", dropna=False, sort=False):
+        # Robust ordering: xs_id may not exist depending on upstream steps.
+        sort_cols = ["s_center_m"]
+        if "xs_id" in g.columns:
+            sort_cols.append("xs_id")
+        gg = g.sort_values(sort_cols).copy()
+        s = pd.to_numeric(gg["s_center_m"], errors="coerce").astype("float64").values
+        wse_m = (
+            pd.to_numeric(gg["wse_m"], errors="coerce").astype("float64").values
+            if has_wse_m else np.full(len(gg), np.nan, dtype="float64")
+        )
+        wse_fit = (
+            pd.to_numeric(gg["wse_fit_m"], errors="coerce").astype("float64").values
+            if has_wse_fit else np.full(len(gg), np.nan, dtype="float64")
+        )
+        wse = wse_fit
+        if has_wse_m:
+            wse = np.where(np.isfinite(wse_fit), wse_fit, wse_m)
+        B = pd.to_numeric(gg["width_m"], errors="coerce").astype("float64").values
+        Q = pd.to_numeric(gg["manning_q_cms_used"], errors="coerce").astype("float64").values
+
+        ok = np.isfinite(s) & np.isfinite(wse) & np.isfinite(B) & (B > 0) & np.isfinite(Q) & (Q > 0)
+        if acct is not None:
+            acct["energy_solver_groups_total"] = int(acct.get("energy_solver_groups_total", 0) or 0) + 1
+            acct["energy_solver_ok_rows"] = int(acct.get("energy_solver_ok_rows", 0) or 0) + int(np.sum(ok))
+            if has_wse_fit:
+                acct["energy_solver_wse_fit_used_n"] = int(acct.get("energy_solver_wse_fit_used_n", 0) or 0) + int(np.sum(ok & np.isfinite(wse_fit)))
+                if has_wse_m:
+                    acct["energy_solver_wse_raw_used_n"] = int(acct.get("energy_solver_wse_raw_used_n", 0) or 0) + int(np.sum(ok & (~np.isfinite(wse_fit)) & np.isfinite(wse_m)))
+        if ok.sum() < 2:
+            if acct is not None:
+                acct["energy_solver_groups_skipped_lt2"] = int(acct.get("energy_solver_groups_skipped_lt2", 0) or 0) + 1
+            continue
+
+        slope = np.full_like(s, np.nan, dtype="float64")
+        pairs_ok = 0
+        for i in range(len(s) - 1):
+            if not (ok[i] and ok[i + 1]):
+                continue
+            dx = float(s[i + 1] - s[i])
+            if not (np.isfinite(dx) and abs(dx) > 0):
+                continue
+            se = float((wse[i] - wse[i + 1]) / dx)
+            if not np.isfinite(se):
+                continue
+            se = abs(se)
+            se = float(np.clip(se, float(cfg.slope_min), float(cfg.slope_max)))
+            slope[i] = se
+            pairs_ok += 1
+        if len(slope) >= 2:
+            slope[-1] = slope[-2]
+        gg["energy_slope_mpm"] = slope
+
+        if acct is not None:
+            acct["energy_solver_ok_pairs"] = int(acct.get("energy_solver_ok_pairs", 0) or 0) + int(pairs_ok)
+            if pairs_ok > 0:
+                acct["energy_solver_groups_used"] = int(acct.get("energy_solver_groups_used", 0) or 0) + 1
+
+        dmin = float(cfg.dmin_m)
+        if "dmax_env_m" in gg.columns:
+            env = pd.to_numeric(gg["dmax_env_m"], errors="coerce").astype("float64").values
+        else:
+            env = np.full(len(gg), np.nan, dtype="float64")
+        dmax_global = float(cfg.dmax_m)
+
+        depth = np.full_like(s, np.nan, dtype="float64")
+        dmax_energy = np.full_like(s, np.nan, dtype="float64")
+        residual = np.full_like(s, np.nan, dtype="float64")
+        conf = np.full_like(s, np.nan, dtype="float64")
+        flags = [""] * len(s)
+
+        for i in range(len(s)):
+            if not ok[i] or not np.isfinite(slope[i]) or slope[i] <= 0:
+                continue
+            n_total += 1
+            sf = float(slope[i])
+            Bi = float(B[i])
+            Qi = float(Q[i])
+            with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                h = float(((n_val * n_val * Qi * Qi) / (Bi * Bi * sf)) ** (3.0 / 10.0))
+            if not (np.isfinite(h) and h > 0):
+                continue
+
+            dmax_i = dmax_global
+            if np.isfinite(env[i]) and env[i] > 0:
+                dmax_i = float(min(dmax_i, env[i]))
+            h_max = float(max(dmin, dmax_i / mean_to_dmax))
+
+            f: list[str] = []
+            if h < dmin:
+                h = dmin
+                n_capped_min += 1
+                f.append("cap_dmin")
+            if h > h_max:
+                h = h_max
+                n_capped_max += 1
+                f.append("cap_dmax")
+
+            depth[i] = h
+            dm = float(np.clip(h * mean_to_dmax, float(cfg.dmin_m), dmax_global))
+            dmax_energy[i] = dm
+
+            with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                sf_implied = float((n_val * n_val * Qi * Qi) / (Bi * Bi * (h ** (10.0 / 3.0))))
+            if np.isfinite(sf_implied):
+                residual[i] = float(sf_implied - sf)
+                resid_vals.append(residual[i])
+
+                # A simple, parameter-light confidence score based on relative residual.
+                # rel=|S_implied - S_est| / S_est. Use exp(-rel) to keep it conservative.
+                rel = float(abs(residual[i]) / max(sf, 1e-12))
+                conf[i] = float(np.exp(-rel))
+                conf_vals.append(conf[i])
+
+            flags[i] = "|".join(f)
+
+            rows_in.append(dict(xs_id=str(gg.iloc[i].get("xs_id")), component_id=int(gg.iloc[i].get("component_id", -1)) if pd.notna(gg.iloc[i].get("component_id", np.nan)) else -1,
+                                s_center_m=float(s[i]), width_m=float(Bi), wse_m=float(wse[i]), wse_source=str(wse_mode), manning_n=float(n_val),
+                                discharge_cms=float(Qi), energy_slope_mpm=float(sf), dmax_env_m=float(env[i]) if np.isfinite(env[i]) else None))
+            rows_out.append(dict(xs_id=str(gg.iloc[i].get("xs_id")), energy_depth_mean_m=float(h), energy_dmax_m=float(dm),
+                                 energy_residual_mpm=float(residual[i]) if np.isfinite(residual[i]) else None, flags=flags[i]))
+            n_applied += 1
+
+        gg["energy_depth_mean_m"] = depth
+        gg["energy_dmax_m"] = dmax_energy
+        gg["energy_residual_mpm"] = residual
+        gg["energy_conf"] = conf
+        gg["energy_flags"] = flags
+        xs_param.loc[gg.index, ["energy_slope_mpm", "energy_depth_mean_m", "energy_dmax_m", "energy_residual_mpm", "energy_conf", "energy_flags"]] = gg[
+            ["energy_slope_mpm", "energy_depth_mean_m", "energy_dmax_m", "energy_residual_mpm", "energy_conf", "energy_flags"]
+        ]
+
+    # Summarize solver outcome for debuggability.
+    reason = "ok"
+    if n_total == 0:
+        reason = "no_valid_stations"
+        log.warning("[ENERGY] No valid solver stations (need >=2 XS per component with finite Q/width/WSE).")
+    elif n_applied == 0:
+        reason = "no_applied"
+        log.warning("[ENERGY] Solver had candidate stations but did not apply to any (numerical/filters).")
+
+    if acct is not None:
+        acct["energy_solver_enabled"] = True
+        acct["energy_solver_reason"] = str(reason)
+        acct["energy_solver_wse_source"] = str(wse_mode)
+        acct["energy_solver_n_total"] = int(n_total)
+        acct["energy_solver_n_applied"] = int(n_applied)
+        acct["energy_solver_cap_dmin"] = int(n_capped_min)
+        acct["energy_solver_cap_dmax"] = int(n_capped_max)
+
+    try:
+        in_p = cfg.out_1d_solver_inputs_json
+        out_p = cfg.out_1d_solver_outputs_json
+        acct_p = cfg.out_1d_solver_accounting_json
+        if in_p:
+            Path(str(in_p)).parent.mkdir(parents=True, exist_ok=True)
+            Path(str(in_p)).write_text(_json.dumps({"stations": rows_in}, indent=2, sort_keys=True), encoding="utf-8")
+        if out_p:
+            Path(str(out_p)).parent.mkdir(parents=True, exist_ok=True)
+            Path(str(out_p)).write_text(_json.dumps({"stations": rows_out}, indent=2, sort_keys=True), encoding="utf-8")
+        if acct_p:
+            payload = {"enabled": True, "reason": str(reason), "wse_source": str(wse_mode), "n_total": int(n_total), "n_applied": int(n_applied),
+                       "cap_dmin": int(n_capped_min), "cap_dmax": int(n_capped_max)}
+            if resid_vals:
+                payload["residual_mean_mpm"] = float(np.nanmean(resid_vals))
+                payload["residual_abs_p95_mpm"] = float(np.nanpercentile(np.abs(resid_vals), 95))
+            if conf_vals:
+                payload["confidence_mean"] = float(np.nanmean(conf_vals))
+                payload["confidence_p05"] = float(np.nanpercentile(conf_vals, 5))
+            Path(str(acct_p)).parent.mkdir(parents=True, exist_ok=True)
+            Path(str(acct_p)).write_text(_json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    except Exception as e:
+        log.warning("[ENERGY] Failed to write 1D solver artifacts: %s", e)
+
+    return xs_param
 
 def _convert_da_units(da_km2: float, to_units: str) -> float:
     """Convert DA in km^2 to requested units."""
@@ -1014,14 +1354,14 @@ def _compute_dmax_regional_curve(row: pd.Series, cfg: InferConfig) -> Tuple[floa
 
     Returns (dmax_m, weight, detail). If unavailable, returns (nan, 0, "").
     """
-    if not bool(getattr(cfg, "regional_curve_enabled", False)):
+    if not cfg.regional_curve_enabled:
         return (float("nan"), 0.0, "")
 
     # Drainage area
     # Try configured field first, then common NHDPlus / StreamStats-style names.
     da = float("nan")
     cand_fields = []
-    if getattr(cfg, "regional_curve_da_field", None):
+    if cfg.regional_curve_da_field:
         cand_fields.append(str(cfg.regional_curve_da_field))
     cand_fields.extend([
         "drain_area_km2", "drainage_area_km2", "DA_km2", "DA_KM2", "DA_sqkm", "TotDASqKM", "DrainArKm2",
@@ -1033,7 +1373,7 @@ def _compute_dmax_regional_curve(row: pd.Series, cfg: InferConfig) -> Tuple[floa
             if np.isfinite(da):
                 # If we fell back to a mi2 field, update units to mi2 unless user forced otherwise.
                 if f.lower().endswith("mi2") or "sqmi" in f.lower() or f.lower().endswith("sqmi") or f.lower().endswith("dasqmi"):
-                    if getattr(cfg, "regional_curve_da_units", None) is None:
+                    if cfg.regional_curve_da_units is None:
                         cfg.regional_curve_da_units = "mi2"  # type: ignore
                 break
 
@@ -1041,13 +1381,13 @@ def _compute_dmax_regional_curve(row: pd.Series, cfg: InferConfig) -> Tuple[floa
         return (float("nan"), 0.0, "")
 
     # Ignore tiny basins (curves unstable; also often headwater morphology)
-    if float(da) < float(getattr(cfg, "regional_curve_min_da_km2", 1.0)):
+    if float(da) < cfg.regional_curve_min_da_km2:
         return (float("nan"), 0.0, "")
 
     # Coefficients
-    c = getattr(cfg, "regional_curve_c", None)
-    f = getattr(cfg, "regional_curve_f", None)
-    reg_raw = getattr(cfg, "regional_curve_region", None)
+    c = cfg.regional_curve_c
+    f = cfg.regional_curve_f
+    reg_raw = cfg.regional_curve_region
 
     # Anti-slop guard: built-in coefficients are illustrative placeholders and must be explicitly opted into.
     # If the user did not provide explicit (c,f), require that they *explicitly* provided a region key.
@@ -1062,21 +1402,21 @@ def _compute_dmax_regional_curve(row: pd.Series, cfg: InferConfig) -> Tuple[floa
     if c is None or f is None:
         c0, f0, da_u0, depth_u0, depth_t0, unc0 = REGIONAL_CURVE_DEFAULTS.get(reg, REGIONAL_CURVE_DEFAULTS["default"])
         used_builtin = True
-        if not bool(getattr(cfg, "allow_builtin_regional_curves", False)):
+        if not cfg.allow_builtin_regional_curves:
             return (float("nan"), 0.0, "rc:builtin_not_allowed")
         if c is None:
             c = c0
         if f is None:
             f = f0
-        da_units = getattr(cfg, "regional_curve_da_units", da_u0)
-        depth_units = getattr(cfg, "regional_curve_depth_units", depth_u0)
-        depth_type = getattr(cfg, "regional_curve_depth_type", depth_t0)
-        unc_pct = float(getattr(cfg, "regional_curve_unc_pct", unc0))
+        da_units = cfg.regional_curve_da_units
+        depth_units = cfg.regional_curve_depth_units
+        depth_type = cfg.regional_curve_depth_type
+        unc_pct = cfg.regional_curve_unc_pct
     else:
-        da_units = getattr(cfg, "regional_curve_da_units", "km2")
-        depth_units = getattr(cfg, "regional_curve_depth_units", "m")
-        depth_type = getattr(cfg, "regional_curve_depth_type", "mean")
-        unc_pct = float(getattr(cfg, "regional_curve_unc_pct", 40.0))
+        da_units = cfg.regional_curve_da_units
+        depth_units = cfg.regional_curve_depth_units
+        depth_type = cfg.regional_curve_depth_type
+        unc_pct = cfg.regional_curve_unc_pct
     da_use = _convert_da_units(float(da), str(da_units)) if str(da_units).lower().strip() != "km2" else float(da)
     # (If da_units is km2, da_use is km2; if mi2, converted.)
     # Bankfull depth
@@ -1088,14 +1428,14 @@ def _compute_dmax_regional_curve(row: pd.Series, cfg: InferConfig) -> Tuple[floa
         return (float("nan"), 0.0, "")
 
     # Convert to Dmax if needed
-    to_dmax_mode = str(getattr(cfg, "regional_curve_to_dmax", "auto") or "auto").lower().strip()
+    to_dmax_mode = str(cfg.regional_curve_to_dmax or "auto").lower().strip()
     if str(depth_type).lower().strip() == "max":
         dmax = d_bkf_m
         conv = "bkf=max"
     else:
         if to_dmax_mode == "factor":
-            dmax = d_bkf_m * float(getattr(cfg, "regional_curve_to_dmax_factor", 1.25))
-            conv = f"bkf=mean*{float(getattr(cfg, 'regional_curve_to_dmax_factor', 1.25)):.2f}"
+            dmax = d_bkf_m * cfg.regional_curve_to_dmax_factor
+            conv = f"bkf=mean*{cfg.regional_curve_to_dmax_factor:.2f}"
         else:
             # trapezoid mean-to-dmax conversion
             mean_to_dmax = float(2.0 / (1.0 + float(cfg.bottom_width_frac)))
@@ -1106,7 +1446,7 @@ def _compute_dmax_regional_curve(row: pd.Series, cfg: InferConfig) -> Tuple[floa
 
     # Weight: inverse of uncertainty, capped
     # Basic: weight = max_weight * (1 - unc_pct/100) clipped
-    max_w = float(getattr(cfg, "regional_curve_max_weight", 0.6))
+    max_w = cfg.regional_curve_max_weight
     w = max(0.0, min(1.0, 1.0 - float(unc_pct) / 100.0))
     w = float(np.clip(max_w * w, 0.0, 1.0))
 
@@ -1222,9 +1562,9 @@ def _compute_dmax_geomorphic_envelope(row: pd.Series, cfg: InferConfig) -> Tuple
     hydraulic inversion can be weak/unstable (e.g., very low slopes).
     Returns (dmax_env_m, detail). If unavailable, returns (nan, reason).
     """
-    if not bool(getattr(cfg, "geomorphic_envelope_enabled", False)):
+    if not cfg.geomorphic_envelope_enabled:
         return float("nan"), "disabled"
-    if bool(getattr(cfg, "geomorphic_envelope_only_when_no_soundings", True)):
+    if cfg.geomorphic_envelope_only_when_no_soundings:
         # if soundings were used anywhere, do not apply envelope as a hard cap
         if str(row.get("calib_src", "")).lower().strip() == "soundings":
             return float("nan"), "soundings_calibrated"
@@ -1233,9 +1573,9 @@ def _compute_dmax_geomorphic_envelope(row: pd.Series, cfg: InferConfig) -> Tuple
     if not np.isfinite(d_rc):
         return float("nan"), "no_regional_curve:" + str(det)
     d_env = float(d_rc)
-    if bool(getattr(cfg, "geomorphic_envelope_inflate_unc", True)):
+    if cfg.geomorphic_envelope_inflate_unc:
         try:
-            unc = float(getattr(cfg, "regional_curve_unc_pct", 0.0))
+            unc = cfg.regional_curve_unc_pct
             if np.isfinite(unc) and unc > 0:
                 d_env *= (1.0 + unc / 100.0)
         except Exception:
@@ -1380,6 +1720,9 @@ def _load_soundings(
 
     if suf == ".parquet":
         df = pd.read_parquet(path)
+        if df.empty:
+            log.warning("[SOUNDINGS] Parquet soundings file is empty (0 rows): %s", path)
+            return None
         # Expect x/y/z columns; allow lon/lat as fallback.
         if x_col is None or y_col is None:
             for xc, yc in [("x", "y"), ("lon", "lat"), ("longitude", "latitude"), ("easting", "northing")]:
@@ -1391,7 +1734,7 @@ def _load_soundings(
         # CRS is stored as a string column when produced by our subset writer.
         if soundings_crs:
             src_crs = CRS.from_user_input(soundings_crs)
-        elif "crs" in df.columns and str(df["crs"].iloc[0]).strip():
+        elif "crs" in df.columns and df["crs"].notna().any() and str(df["crs"].iloc[0]).strip():
             src_crs = CRS.from_user_input(str(df["crs"].iloc[0]))
         else:
             src_crs = _guess_xy_crs(df[x_col].to_numpy(), df[y_col].to_numpy(), target_crs, x_col, y_col)
@@ -1593,16 +1936,43 @@ def _write_soundings_subset(path: Path, soundings: gpd.GeoDataFrame) -> None:
         # Parquet: store explicit x/y + z + src + crs.
         try:
             import pyarrow  # noqa: F401
+            # Coalesce vertical values: prefer depth (positive-down) when valid, fall back to
+            # z_m/z (elevation). This is critical for elevation-only sources like eHydro XYZ
+            # where _depth_m is NaN and the elevation lives in _z_m.
+            # BUG FIX: the old code did `out["depth"] if "depth" in columns` which always triggered
+            # (depth column is always created above, just set to NaN for elevation-only data),
+            # resulting in an all-NaN z column and an empty parquet after the isfinite filter.
+            _depth_s = pd.to_numeric(out["depth"], errors="coerce") if "depth" in out.columns else pd.Series(np.nan, index=out.index, dtype="float64")
+            _z_s = (
+                pd.to_numeric(out["z_m"], errors="coerce") if "z_m" in out.columns
+                else pd.to_numeric(out["z"], errors="coerce") if "z" in out.columns
+                else pd.Series(np.nan, index=out.index, dtype="float64")
+            )
+            # z = coalesced primary filter column (depth if valid, else elevation)
+            _z_coalesced = _depth_s.combine_first(_z_s)
             tbl = pd.DataFrame({
                 "x": out.geometry.x.astype("float64"),
                 "y": out.geometry.y.astype("float64"),
-                # Prefer depth (positive-down) when present, else z.
-                "z": pd.to_numeric(out["depth"], errors="coerce") if ("depth" in out.columns) else pd.to_numeric(out.get("z"), errors="coerce"),
+                # Canonical coalesced column for the isfinite filter (never all-NaN).
+                "z": _z_coalesced,
+                # Explicit semantic columns so _load_soundings finds the right one by name:
+                # depth_m  -> _depth_m (positive-down; NaN when source is elevation-only)
+                # z_m      -> _z_m (elevation in vertical datum; NaN when source is depth-only)
+                "depth_m": _depth_s,
+                "z_m": _z_s,
                 "_src_file": out.get("_src_file", "unknown"),
                 "crs": str(out.crs) if out.crs is not None else "",
             })
             tbl = tbl[np.isfinite(tbl["x"]) & np.isfinite(tbl["y"]) & np.isfinite(tbl["z"])].copy()
+            if tbl.empty:
+                log.warning(
+                    "[SOUNDINGS] Subset parquet would be empty after finite filter "
+                    "(all rows had NaN for both depth and z_m). Check sounding vertical datum. "
+                    "Falling back to GPKG to preserve raw geometry."
+                )
+                raise ValueError("empty after finite filter")
             tbl.to_parquet(path, index=False)
+            log.debug("[SOUNDINGS] Subset parquet written: %d rows, columns=%s", len(tbl), list(tbl.columns))
             return
         except Exception as e:
             log.warning("[SOUNDINGS] Parquet write failed (%s); falling back to GPKG.", e)
@@ -1842,7 +2212,7 @@ def _attach_swot_wse_to_xs(
         tmp = tmp.merge(sw, on="xs_id", how="left")
         tmp = tmp.sort_values(["component_id", "s_center_m", "xs_id"]).reset_index(drop=True)
         tmp["_wse_smooth"] = tmp.groupby("component_id", dropna=False)["swot_wse_m"].apply(
-            lambda s: _rolling_smooth(s, int(max(3, getattr(cfg, "wse_profile_window", 9))))
+            lambda s: _rolling_smooth(s, int(max(3, cfg.wse_profile_window)))
         ).reset_index(level=0, drop=True)
         resid = tmp["swot_wse_m"] - tmp["_wse_smooth"]
         med = resid.groupby(tmp["component_id"]).transform("median")
@@ -1852,7 +2222,7 @@ def _attach_swot_wse_to_xs(
         tmp.loc[z > float(cfg.swot_outlier_mad_z), "swot_wse_m"] = np.nan
         sw = tmp[["xs_id", "swot_wse_m", "swot_dist_m"]]
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
 
     xs_param = xs_param.merge(sw, on="xs_id", how="left")
     xs_param["swot_wse_m"] = xs_param["swot_wse_m"] + float(cfg.swot_vertical_offset_m)
@@ -2429,7 +2799,7 @@ def _aniso_idw_interpolate_on_mask(
                             if np.sum(w_f) > 0:
                                 w = w_f
                 except Exception:
-                    logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                    log.debug("Optional step failed; continuing.", exc_info=True)
             vv = pts_val[ids2]
             sw = np.sum(w)
             out[i] = float(np.sum(w * vv) / sw) if np.isfinite(sw) and sw > 0 else float(np.nan)
@@ -2628,7 +2998,7 @@ def _continuous_surface(
             pts_t = gpd.GeoDataFrame({value_col: agg_vals}, geometry=gpd.points_from_xy(xs, ys), crs=template_ds.crs)
 
         else:
-            log.warning(f"[continuous] Unknown overlap_reducer='{overlap_reducer}', using 'min'.")
+            log.warning("[continuous] Unknown overlap_reducer=%r, using 'min'.", overlap_reducer)
             agg_vals = np.minimum.reduceat(vals_s, start)
             sel = []
             for s, e in zip(start, ends):
@@ -2646,7 +3016,7 @@ def _continuous_surface(
             pts_t.set_crs(template_ds.crs, inplace=True)
             pts_t[value_col] = agg_vals
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
         vals = np.asarray(agg_vals, dtype="float64")
 
@@ -2754,7 +3124,7 @@ def _continuous_surface(
                 pos = pos[pos >= 0]
                 pts_weight[pos] = float(thalweg_weight)
             except Exception as e:
-                log.warning(f"[continuous] Thalweg weighting failed; continuing unweighted. ({e})")
+                log.warning("[continuous] Thalweg weighting failed; continuing unweighted: %s", e)
                 pts_weight = None
         else:
             log.debug("[continuous] WALID requested but xs_id not present; skipping thalweg weighting.")
@@ -3007,7 +3377,7 @@ def _continuous_surface(
             if np.any(overwrite):
                 out[overwrite] = out_m[overwrite]
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
 
     # ---------------------------------------------------------------------
@@ -3358,7 +3728,7 @@ def _continuous_surface(
                 except Exception:
                     out[overwrite] = out_m[overwrite]
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
     return out, mask_out
 
@@ -3377,7 +3747,7 @@ def _exists_with_retry(path: Path, tries: int = 10, sleep_s: float = 0.2, min_si
                 except FileNotFoundError:
                     pass
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
         time.sleep(sleep_s * (1.0 + 0.15 * i))
     return False
 
@@ -3444,13 +3814,13 @@ def _write_geotiff_gdal(path: Path, arr: np.ndarray, tmpl: rasterio.io.DatasetRe
         try:
             ds.SetProjection(tmpl.crs.to_wkt())
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
     band = ds.GetRasterBand(1)
     try:
         band.SetNoDataValue(float(nodata))
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
 
     band.WriteArray(arr.astype(dtype, copy=False))
     band.FlushCache()
@@ -3509,9 +3879,9 @@ def _write_geotiff(path: Path, arr: np.ndarray, tmpl: rasterio.io.DatasetReader,
         try:
             _write_geotiff_gdal(tmp, arr, tmpl, nodata=nodata, dtype=dtype)
             wrote = _exists_with_retry(tmp, tries=8, sleep_s=0.15, min_size_bytes=1)
-        except Exception as e:
+        except Exception:
             if last_err is not None:
-                log.error(f"[WRITE] rasterio write failed: {last_err}")
+                log.error("[WRITE] rasterio write failed: %s", last_err)
             raise
 
     if not wrote:
@@ -3620,10 +3990,10 @@ def infer_bathy(
 
     # Constraint accounting (to expose where the model is under-constrained)
     acct: Dict[str, object] = {
-        "prior_mode": str(getattr(cfg, "prior_mode", "width_power") or "width_power"),
-        "dmin_m": float(getattr(cfg, "dmin_m", np.nan)),
-        "dmax_m": float(getattr(cfg, "dmax_m", np.nan)),
-        "manning_mode": str(getattr(cfg, "manning_mode", "off") or "off"),
+        "prior_mode": str(cfg.prior_mode or "width_power"),
+        "dmin_m": cfg.dmin_m,
+        "dmax_m": cfg.dmax_m,
+        "manning_mode": str(cfg.manning_mode or "off"),
         "n_xs_total": 0,
         "n_prior_total": 0,
         "n_prior_clipped_min": 0,
@@ -3742,12 +4112,34 @@ def infer_bathy(
 
                 xs_param["_river_id_str"] = xs_param["river_id"].astype(str)
                 rdf["_river_id_str"] = rdf["river_id"].astype(str)
+                rdf_cols = ["_river_id_str", "drain_area_km2", "slope_mpm", "manning_q_cms", "dist_to_mouth_km"]
+                for _c in rdf_cols:
+                    if _c not in rdf.columns:
+                        rdf[_c] = np.nan
+
                 xs_param = xs_param.merge(
-                    rdf[["_river_id_str", "drain_area_km2", "slope_mpm", "manning_q_cms", "dist_to_mouth_km"]],
+                    rdf[rdf_cols],
                     on="_river_id_str",
                     how="left",
                     suffixes=("", "_r"),
                 )
+                # NOTE: xs_param already contains placeholder columns (drain_area_km2, slope_mpm, ...).
+                # After merge, pandas keeps the left-hand placeholders and writes the attached values
+                # to *_r columns. We must explicitly fill placeholders from the attached columns.
+                for _base in ["drain_area_km2", "slope_mpm", "manning_q_cms", "dist_to_mouth_km"]:
+                    _r = f"{_base}_r"
+                    if _base in xs_param.columns and _r in xs_param.columns:
+                        _lhs = pd.to_numeric(xs_param[_base], errors="coerce")
+                        _rhs = pd.to_numeric(xs_param[_r], errors="coerce")
+                        # Treat common placeholder defaults (e.g., 0) as missing so real attached
+                        # attributes are not silently ignored.
+                        keep = np.isfinite(_lhs)
+                        if _base in ("drain_area_km2", "slope_mpm", "manning_q_cms"):
+                            keep = keep & (_lhs > 0)
+                        elif _base == "dist_to_mouth_km":
+                            keep = keep & (_lhs >= 0)
+                        xs_param[_base] = np.where(keep, _lhs, _rhs)
+                        xs_param = xs_param.drop(columns=[_r])
                 xs_param = xs_param.drop(columns=["_river_id_str"])
         except Exception as e:
             log.warning("[RIVER][ATTR] failed to attach river attributes from %s:%s (%s)", river_gpkg, rivers_layer, e)
@@ -3760,7 +4152,11 @@ def infer_bathy(
     sl_ok = True
 
     if "drain_area_km2" in xs_param.columns:
+        # Drainage area should be strictly positive. Treat non-positive or non-finite values as missing
+        # so DA-dependent priors do not silently activate on DA=0 headwater rows.
         da_vals = pd.to_numeric(xs_param["drain_area_km2"], errors="coerce")
+        da_vals = da_vals.where(np.isfinite(da_vals) & (da_vals > 0), np.nan)
+        xs_param["drain_area_km2"] = da_vals
         da_ok = np.isfinite(da_vals).any()
         if not da_ok:
             log.warning("[RIVER][ATTR] No valid drainage area values found; disabling DA-dependent priors.")
@@ -3777,15 +4173,15 @@ def infer_bathy(
 # ------------------------
 # If provided, blend/replace the DEM/topo-derived WSE proxy with observed WSE (e.g., SWOT)
     # BEFORE we fit a longitudinal WSE profile and BEFORE any anchor that uses WSE.
-    if getattr(cfg, "swot_wse", None) is not None:
+    if cfg.swot_wse is not None:
         try:
             swot = _load_wse_obs(
                 path=Path(cfg.swot_wse),
                 target_crs=xs_lines.crs,
-                wse_col=str(getattr(cfg, "swot_wse_col", "wse_m")),
-                x_col=getattr(cfg, "swot_x_col", None),
-                y_col=getattr(cfg, "swot_y_col", None),
-                csv_crs=str(getattr(cfg, "swot_csv_crs", "EPSG:4326")),
+                wse_col=cfg.swot_wse_col,
+                x_col=cfg.swot_x_col,
+                y_col=cfg.swot_y_col,
+                csv_crs=cfg.swot_csv_crs,
             )
             if swot is not None and not swot.empty:
                 xs_param, wse_by_xs = _attach_swot_wse_to_xs(xs_lines, xs_param, swot, cfg)
@@ -3794,6 +4190,18 @@ def infer_bathy(
                 log.info("[SWOT][WSE] WSE observations empty; using DEM/topo proxy.")
         except Exception as e:
             log.warning("[SWOT][WSE] Failed to load/attach WSE observations (%s). Using DEM/topo proxy.", e)
+
+    # Record the *anchoring* WSE source for downstream logic (e.g., energy solver gating).
+    # This is intentionally conservative: unless we have actual observed stage values
+    # attached, we treat WSE as DEM/topo proxy.
+    try:
+        wse_anchor_source = "dem_proxy"
+        if "swot_wse_m" in xs_param.columns:
+            if np.isfinite(pd.to_numeric(xs_param["swot_wse_m"], errors="coerce")).any():
+                wse_anchor_source = "swot"
+        acct["wse_anchor_source"] = str(wse_anchor_source)
+    except Exception:
+        acct["wse_anchor_source"] = "unknown"
 
     # --------------------------------------------------------------------------------------
     # Slope estimation / proxy (stage)
@@ -3806,10 +4214,17 @@ def infer_bathy(
     slope_missing = True
     if "slope_mpm" in xs_param.columns:
         sl_vals = pd.to_numeric(xs_param["slope_mpm"], errors="coerce")
-        slope_missing = (not np.isfinite(sl_vals).any()) or bool(getattr(cfg, "force_slope_proxy", False))
+        slope_missing = (not np.isfinite(sl_vals).any()) or cfg.force_slope_proxy
+    if not slope_missing:
+        n_sl = int(np.isfinite(pd.to_numeric(xs_param.get("slope_mpm", pd.Series([])), errors="coerce")).sum())
+        log.info("[RIVER][SLOPE] Using reach slope from network attributes (NHD): n_valid_xs=%d. "
+                 "Depth estimates will be AOI-independent.", n_sl)
+    else:
+        log.warning("[RIVER][SLOPE] No reach slope from network; will estimate from WSE profile. "
+                    "Depth estimates near AOI edges may vary by up to ~1 m between runs with different AOI extents.")
 
     # If requested, keep observed stage for bed elevations but do NOT let it drive slope fitting.
-    if (getattr(cfg, "swot_wse", None) is not None) and (not bool(getattr(cfg, "swot_use_for_slope", True))):
+    if (cfg.swot_wse is not None) and (not cfg.swot_use_for_slope):
         xs_param["_wse_blended_m"] = xs_param["wse_m"]
         if "wse_proxy_m" in xs_param.columns:
             xs_param["wse_m"] = xs_param["wse_proxy_m"]
@@ -3819,13 +4234,13 @@ def infer_bathy(
         xs_param["slope_wse_mpm"] = np.nan
 
         # 1) Fit a longitudinal WSE profile (preferred) if the helper is available.
-        if bool(getattr(cfg, "wse_profile_enabled", True)):
+        if cfg.wse_profile_enabled:
             try:
                 wcfg = WSEFitConfig(
                     enabled=True,
-                    window=int(getattr(cfg, "wse_profile_window", cfg.slope_proxy_window)),
-                    min_n=int(getattr(cfg, "wse_profile_min_n", cfg.slope_proxy_min_n)),
-                    enforce_monotonic=bool(getattr(cfg, "wse_profile_monotonic", True)),
+                    window=cfg.wse_profile_window,
+                    min_n=cfg.wse_profile_min_n,
+                    enforce_monotonic=cfg.wse_profile_monotonic,
                     slope_min=float(cfg.slope_min),
                     slope_max=float(cfg.slope_max),
                 )
@@ -3849,8 +4264,13 @@ def infer_bathy(
         # Prefer slope from fitted WSE profile if available; otherwise fallback to slope_proxy.
         if xs_param["slope_wse_mpm"].notna().any():
             xs_param["slope_mpm"] = xs_param["slope_wse_mpm"]
+            n_wse = int(xs_param["slope_wse_mpm"].notna().sum())
+            log.info("[RIVER][SLOPE] Source: WSE-profile fit (n=%d XS). AOI-boundary dependent.", n_wse)
         else:
             xs_param["slope_mpm"] = xs_param["slope_proxy_mpm"]
+            n_prx = int(xs_param["slope_proxy_mpm"].notna().sum())
+            log.warning("[RIVER][SLOPE] Source: rolling WSE proxy (n=%d XS). AOI-boundary dependent. "
+                        "Add Slope field to NHD fetch or provide SWOT WSE for stable results.", n_prx)
 
 
     # Validate / finalize slope availability after proxy computation.
@@ -3864,7 +4284,7 @@ def infer_bathy(
         sl_ok = False
 
     # If multivariate priors were requested but required reach attributes are missing, fall back.
-    if str(getattr(cfg, "prior_mode", "")).lower() == "multivariate" and not (da_ok and sl_ok):
+    if cfg.prior_mode.lower() == "multivariate" and not (da_ok and sl_ok):
         log.warning("[PRIOR] multivariate prior requested but reach attributes missing (da_ok=%s slope_ok=%s); falling back to powerlaw.", da_ok, sl_ok)
         cfg.prior_mode = "powerlaw"
     # Restore blended WSE after slope estimation if we suppressed SWOT stage during slope fitting.
@@ -3885,7 +4305,7 @@ def infer_bathy(
     xs_param["dmax_regional_curve_m"] = np.nan
     xs_param["regional_curve_wt"] = 0.0
     xs_param["regional_curve_detail"] = ""
-    if bool(getattr(cfg, "regional_curve_enabled", False)):
+    if cfg.regional_curve_enabled:
         def _rc_apply(r):
             d, w, det = _compute_dmax_regional_curve(r, cfg)
             return pd.Series({"dmax_regional_curve_m": d, "regional_curve_wt": w, "regional_curve_detail": det})
@@ -3910,11 +4330,13 @@ def infer_bathy(
     xs_param["manning_conf"] = 0.0
     xs_param["manning_wt"] = 0.0
     xs_param["manning_flags"] = ""
+    xs_param["manning_q2_equation_id"] = ""
+    xs_param["manning_q2_uncertainty_pct"] = np.nan
 
     # Auto-enable (conservative) Manning prior when no soundings were provided.
     # This is specifically to stabilize absolute depth scale in data-sparse reaches.
     if (
-        bool(getattr(cfg, "auto_manning_when_no_soundings", True))
+        cfg.auto_manning_when_no_soundings
         and (str(cfg.manning_mode).lower().strip() == "off")
         and (not soundings_path)
         and da_ok
@@ -3924,25 +4346,29 @@ def infer_bathy(
         cfg.manning_mode = "q2_regional"
         log.info(
             "[PRIOR][MANNING] auto-enabled manning_mode=q2_regional (no soundings; da_ok=%s slope_ok=%s region=%s)",
-            str(da_ok), str(sl_ok), str(getattr(cfg, "manning_region", "default"))
+            str(da_ok), str(sl_ok), cfg.manning_region
         )
 
     if str(cfg.manning_mode).lower().strip() != "off":
         m_mode = str(cfg.manning_mode).lower().strip()
         def _m_apply(r):
             W = float(r.get("width_m", np.nan))
+            q2_eq_id = ""
+            q2_unc_pct = np.nan
             S = float(r.get("slope_mpm", np.nan))
             if not (np.isfinite(W) and W > 0 and np.isfinite(S) and S > 0):
-                return pd.Series({"manning_q_cms_used": np.nan, "manning_depth_mean_m": np.nan, "manning_dmax_m": np.nan, "manning_conf": 0.0, "manning_wt": 0.0, "manning_flags": ""})
+                return pd.Series({"manning_q_cms_used": np.nan, "manning_depth_mean_m": np.nan, "manning_dmax_m": np.nan, "manning_conf": 0.0, "manning_wt": 0.0, "manning_flags": "", "manning_q2_equation_id": q2_eq_id, "manning_q2_uncertainty_pct": q2_unc_pct})
 
             # Guard weight (simple slope/mouth filters)
             w_guard = _compute_manning_weight(r, cfg)
             if w_guard <= 0:
-                return pd.Series({"manning_q_cms_used": np.nan, "manning_depth_mean_m": np.nan, "manning_dmax_m": np.nan, "manning_conf": 0.0, "manning_wt": 0.0, "manning_flags": "guard"})
+                return pd.Series({"manning_q_cms_used": np.nan, "manning_depth_mean_m": np.nan, "manning_dmax_m": np.nan, "manning_conf": 0.0, "manning_wt": 0.0, "manning_flags": "guard", "manning_q2_equation_id": q2_eq_id, "manning_q2_uncertainty_pct": q2_unc_pct})
 
             # Discharge
             Q = np.nan
             qsrc = ""
+            q2_eq_id = ""
+            q2_unc_pct = np.nan
             if m_mode == "constant":
                 Q = float(cfg.manning_q_cms) if cfg.manning_q_cms is not None else np.nan
                 qsrc = "constant"
@@ -3959,19 +4385,21 @@ def infer_bathy(
                 if estimate_q2_from_drainage_area is None or not (np.isfinite(da) and da > 0):
                     Q = np.nan
                 else:
-                    q2 = estimate_q2_from_drainage_area(da, region=str(getattr(cfg, "manning_region", "default")))
+                    q2 = estimate_q2_from_drainage_area(da, region=cfg.manning_region)
                     Q = float(getattr(q2, "q2_m3s", np.nan))
-                    qsrc = f"q2_{str(getattr(cfg, 'manning_region', 'default'))}"
+                    q2_eq_id = str(getattr(q2, "equation_id", "") or "")
+                    q2_unc_pct = float(getattr(q2, "uncertainty_pct", np.nan))
+                    qsrc = f"q2_{cfg.manning_region}"
 
             if not (np.isfinite(Q) and Q > 0):
-                return pd.Series({"manning_q_cms_used": Q, "manning_depth_mean_m": np.nan, "manning_dmax_m": np.nan, "manning_conf": 0.0, "manning_wt": 0.0, "manning_flags": f"noQ_{qsrc}"})
+                return pd.Series({"manning_q_cms_used": Q, "manning_depth_mean_m": np.nan, "manning_dmax_m": np.nan, "manning_conf": 0.0, "manning_wt": 0.0, "manning_flags": f"noQ_{qsrc}", "manning_q2_equation_id": q2_eq_id, "manning_q2_uncertainty_pct": q2_unc_pct})
 
             # Depth estimate
             conf = 0.7  # default
             tidal = False
             backwater = False
             if invert_manning_for_depth is not None:
-                res = invert_manning_for_depth(discharge_m3s=Q, width_m=W, slope=S, manning_n=float(cfg.manning_n), discharge_source=qsrc)
+                res = invert_manning_for_depth(discharge_m3s=Q, width_m=W, slope=S, manning_n=float(_manning_n_effective(cfg)), discharge_source=qsrc)
                 y = float(getattr(res, "depth_m", np.nan))
                 conf = float(getattr(res, "confidence", 0.0) or 0.0)
                 tidal = bool(getattr(res, "tidal_flag", False))
@@ -3979,16 +4407,16 @@ def infer_bathy(
             else:
                 # Fallback to simple wide-channel inversion (mean depth)
                 with np.errstate(divide="ignore", invalid="ignore"):
-                    y = ((float(cfg.manning_n) * Q) / (W * np.sqrt(S))) ** (3.0 / 5.0)
+                    y = ((float(_manning_n_effective(cfg)) * Q) / (W * np.sqrt(S))) ** (3.0 / 5.0)
 
             if not (np.isfinite(y) and y > 0):
-                return pd.Series({"manning_q_cms_used": Q, "manning_depth_mean_m": y, "manning_dmax_m": np.nan, "manning_conf": 0.0, "manning_wt": 0.0, "manning_flags": f"badY_{qsrc}"})
+                return pd.Series({"manning_q_cms_used": Q, "manning_depth_mean_m": y, "manning_dmax_m": np.nan, "manning_conf": 0.0, "manning_wt": 0.0, "manning_flags": f"badY_{qsrc}", "manning_q2_equation_id": q2_eq_id, "manning_q2_uncertainty_pct": q2_unc_pct})
 
             mean_to_dmax = float(2.0 / (1.0 + float(cfg.bottom_width_frac)))
             dmax = float(np.clip(y * mean_to_dmax, cfg.dmin_m, cfg.dmax_m))
 
             # Final weight: guard * max_weight * confidence
-            min_conf = float(getattr(cfg, "manning_min_confidence", 0.30))
+            min_conf = cfg.manning_min_confidence
             if conf < min_conf:
                 w = 0.0
             else:
@@ -3999,10 +4427,10 @@ def infer_bathy(
                 flags += "|tidal"
             if backwater:
                 flags += "|backwater"
-            return pd.Series({"manning_q_cms_used": Q, "manning_depth_mean_m": y, "manning_dmax_m": dmax, "manning_conf": conf, "manning_wt": w, "manning_flags": flags})
+            return pd.Series({"manning_q_cms_used": Q, "manning_depth_mean_m": y, "manning_dmax_m": dmax, "manning_conf": conf, "manning_wt": w, "manning_flags": flags, "manning_q2_equation_id": q2_eq_id, "manning_q2_uncertainty_pct": q2_unc_pct})
 
         mm = xs_param.apply(_m_apply, axis=1)
-        xs_param[["manning_q_cms_used", "manning_depth_mean_m", "manning_dmax_m", "manning_conf", "manning_wt", "manning_flags"]] = mm
+        xs_param[["manning_q_cms_used", "manning_depth_mean_m", "manning_dmax_m", "manning_conf", "manning_wt", "manning_flags", "manning_q2_equation_id", "manning_q2_uncertainty_pct"]] = mm
 
         # Blend
         w = xs_param["manning_wt"].astype("float64").clip(0.0, 1.0)
@@ -4011,9 +4439,120 @@ def infer_bathy(
         use = np.isfinite(d0) & np.isfinite(d1) & (w > 0)
         xs_param.loc[use, "dmax_prior_m"] = (1.0 - w[use]) * d0[use] + w[use] * d1[use]
 
+
+
+    
+    # Receipt: expose Manning prior/Q usage so discharge-driven behavior is debuggable.
+    try:
+        if cfg.manning_mode.lower().strip() != "off":
+            w = pd.to_numeric(xs_param.get("manning_wt", 0.0), errors="coerce").fillna(0.0)
+            q = pd.to_numeric(xs_param.get("manning_q_cms_used", np.nan), errors="coerce")
+            n_total = int(len(xs_param))
+            n_eff = float(_manning_n_effective(cfg))
+            n_q = int(np.sum(np.isfinite(q) & (q > 0)))
+            n_used = int(np.sum(w > 0))
+            w_mean = float(np.nanmean(w.values)) if n_total > 0 else 0.0
+
+            flags = xs_param.get("manning_flags", "").astype(str)
+            src = flags.str.split("\\|", n=1, expand=False).str[0].replace("", "unknown")
+            src_counts = src.value_counts(dropna=False).to_dict() if n_total > 0 else {}
+
+            eqid = xs_param.get("manning_q2_equation_id", "").astype(str)
+            eq_counts = eqid.replace("", "none").value_counts(dropna=False).to_dict() if n_total > 0 else {}
+
+            # Warn if we're relying on coarse built-ins (intentionally non-authoritative).
+            n_simplified = int(np.sum(eqid.astype(str).str.contains("_simplified", na=False)))
+            n_placeholder = int(np.sum(eqid.astype(str).str.contains("placeholder", case=False, na=False)))
+            if n_placeholder > 0:
+                log.warning(
+                    "[PRIOR][MANNING] Q2 regression metadata indicates placeholders for %d XS (replace with published coefficients in sdb_config.json).",
+                    n_placeholder,
+                )
+
+            if n_simplified > 0:
+                log.warning(
+                    "[PRIOR][MANNING] Q2 regression used simplified fallback for %d XS (provide published coefficients via sdb_config.json river.registry.q2_regressions).",
+                    n_simplified,
+                )
+
+            q50 = float(q[q > 0].median()) if n_q > 0 else float("nan")
+            qmin = float(q[q > 0].min()) if n_q > 0 else float("nan")
+            qmax = float(q[q > 0].max()) if n_q > 0 else float("nan")
+
+            log.info(
+                "[PRIOR][MANNING] mode=%s region=%s q_valid=%d/%d used=%d w_mean=%.3f n=%.4f Q(m3/s) median=%.4g range=[%.4g, %.4g] sources=%s q2_eq=%s",
+                cfg.manning_mode,
+                cfg.manning_region,
+                n_q,
+                n_total,
+                n_used,
+                w_mean, n_eff,
+                q50,
+                qmin,
+                qmax,
+                str(src_counts),
+                str(eq_counts),
+            )
+    except Exception:
+        pass
+    # Receipt: echo energy-solver gating inputs so activation is debuggable from logs.
+    try:
+        wse_anchor = "unknown"
+        if isinstance(acct, dict):
+            wse_anchor = str(acct.get("wse_anchor_source", "unknown"))
+        log.info(
+            "[ENERGY] requested=%s allow_dem_proxy_wse=%s wse_anchor=%s",
+            cfg.energy_solver_enabled,
+            cfg.energy_allow_dem_proxy_wse,
+            wse_anchor,
+        )
+    except Exception:
+        pass
+
     # ------------------------
     # Calibration anchors
     # ------------------------
+    # --soundings-subset: explicit Pass 2 handoff from bathy_main.py.
+    # When provided, use the pre-clipped parquet INSTEAD of the raw --soundings files.
+    # Hard-fail if the file is missing or empty so the wire-sever bug is caught immediately
+    # rather than silently producing a prior-only result that looks like a successful run.
+    _subset_path = str(cfg.soundings_subset or "").strip()
+    if _subset_path:
+        _subset_p = Path(_subset_path)
+        if not _subset_p.exists():
+            log.error(
+                "[CALIB][HARD-FAIL] --soundings-subset was specified (%s) but the file does not exist. "
+                "This means Pass 1 (--only-write-soundings-subset) did not complete successfully, "
+                "or bathy_main.py passed a wrong path. Aborting to prevent a silent prior-only run.",
+                _subset_path,
+            )
+            raise SystemExit(2)
+        try:
+            import pandas as _pd_check
+            _n_check = len(_pd_check.read_parquet(_subset_p))
+        except Exception as _e_check:
+            log.error(
+                "[CALIB][HARD-FAIL] --soundings-subset (%s) could not be read: %s. Aborting.",
+                _subset_path, _e_check,
+            )
+            raise SystemExit(2)
+        if _n_check == 0:
+            log.error(
+                "[CALIB][HARD-FAIL] --soundings-subset (%s) contains 0 rows after loading. "
+                "The parquet was written empty — most likely the z/depth column was all-NaN "
+                "after the finite filter in _write_soundings_subset (eHydro elevation-only data). "
+                "Fix _write_soundings_subset so depth_m/z_m are coalesced before filtering. "
+                "Aborting to prevent a silent prior-only run.",
+                _subset_path,
+            )
+            raise SystemExit(2)
+        log.info("[CALIB] --soundings-subset validated: n=%d rows. Using subset instead of raw --soundings.", _n_check)
+        # Override soundings_path so the rest of the function uses the validated subset.
+        soundings_path = [_subset_path]
+        # Subset parquet has a 'crs' column; do not override with caller's soundings_crs
+        # (which points at the raw source CRS, not the template-projected subset CRS).
+        soundings_crs = None
+
     # Soundings calibration (optional)
     calib_df = pd.DataFrame(columns=["xs_id", "calib_n", "calib_depth_stat"])
     if soundings_path:
@@ -4030,9 +4569,9 @@ def infer_bathy(
             n_in_all = int(len(soundings))
             log.info("[CALIB] Loaded soundings: n=%d", n_in_all)
             # Guard against massive point clouds (e.g., Hydronos/eHydro exports).
-            max_n = int(getattr(cfg, "soundings_max_points", 0) or 0)
+            max_n = int(cfg.soundings_max_points or 0)
             if max_n > 0 and len(soundings) > max_n:
-                seed = int(getattr(cfg, "soundings_sample_seed", 0) or 0)
+                seed = int(cfg.soundings_sample_seed or 0)
                 rng = np.random.default_rng(seed)
                 total = int(len(soundings))
                 # Preserve relative source-file composition when possible.
@@ -4054,7 +4593,7 @@ def infer_bathy(
                             int(len(soundings)), total, int(max_n))
 
             # Optional: write the unified (possibly downsampled) set for reuse by downstream steps.
-            if getattr(cfg, "write_soundings_subset", None):
+            if cfg.write_soundings_subset:
                 try:
                     out_path = Path(str(cfg.write_soundings_subset))
                     _write_soundings_subset(out_path, soundings)
@@ -4067,7 +4606,7 @@ def infer_bathy(
                             by_src[kk] = int(v)
                     log.info("[CALIB] %s", _soundings_one_line(out_path, int(len(soundings)), n_in_all, by_src))
 
-                    if bool(getattr(cfg, "only_write_soundings_subset", False)):
+                    if cfg.only_write_soundings_subset:
                         log.info("[CALIB] --only-write-soundings-subset requested; exiting after subset write.")
                         raise SystemExit(0)
                 except SystemExit:
@@ -4086,6 +4625,147 @@ def infer_bathy(
     xs_param["soundings_n"] = pd.to_numeric(xs_param["calib_n"], errors="coerce").fillna(0).astype("int64")
     xs_param["soundings_dmax_m"] = pd.to_numeric(xs_param["calib_depth_stat"], errors="coerce")
     xs_param = xs_param.drop(columns=["calib_n", "calib_depth_stat"])
+    # ---- Optional: 1D energy-consistent depth solver (flag-controlled) ----
+    # NOTE: To avoid tile-to-tile discontinuities, treat “soundings present” as
+    # “at least one XS has usable soundings after masking/subsetting”, not merely
+    # “a soundings file path was provided”.
+    if cfg.energy_solver_enabled:
+        _soundings_effective = False
+        try:
+            _sn = pd.to_numeric(xs_param.get("soundings_n", 0), errors="coerce").fillna(0)
+            _soundings_effective = bool((_sn > 0).any())
+        except Exception:
+            _soundings_effective = False
+        _soundings_gate = soundings_path if _soundings_effective else None
+        try:
+            xs_param = _apply_1d_energy_solver(xs_param=xs_param, cfg=cfg, soundings_path=_soundings_gate, acct=acct)
+            if "energy_dmax_m" in xs_param.columns:
+                # Conservative blend: guardrails * energy confidence * energy max weight.
+                w_guard = xs_param.apply(lambda r: _compute_manning_weight(r, cfg), axis=1).astype("float64").clip(0.0, 1.0)
+                econf = pd.to_numeric(xs_param.get("energy_conf", np.nan), errors="coerce").astype("float64").clip(0.0, 1.0).fillna(0.0)
+
+                # Default conservative cap for production unless explicitly configured.
+                # NOTE: This is intentionally separate from manning_max_weight to avoid
+                # over-weighting the energy solver when Q or slope are uncertain.
+                emax = cfg.energy_max_weight
+                emin = cfg.energy_min_confidence
+                w = w_guard * econf * emax
+                w = w.where(econf >= emin, 0.0)
+                d0 = xs_param["dmax_prior_m"].astype("float64")
+                d1 = pd.to_numeric(xs_param["energy_dmax_m"], errors="coerce").astype("float64")
+                use = np.isfinite(d0) & np.isfinite(d1) & (w > 0)
+                if use.any():
+                    # Track magnitude of the physics adjustment (for verifiability).
+                    before = d0.copy()
+                    xs_param.loc[use, "dmax_prior_m"] = (1.0 - w[use]) * d0[use] + w[use] * d1[use]
+                    after = xs_param["dmax_prior_m"].astype("float64")
+                    delta = (after - before).abs()
+                    # Only summarize where we actually blended.
+                    delta_use = pd.to_numeric(delta[use], errors="coerce").astype("float64")
+                    if acct is not None:
+                        acct["energy_solver_blend_n"] = int(np.sum(use))
+                        acct["energy_solver_blend_max_weight"] = float(emax)
+                        acct["energy_solver_blend_min_conf"] = float(emin)
+                        try:
+                            # Robust summary statistics for scientific interpretation.
+                            dv = delta_use[np.isfinite(delta_use.values)].values
+                            if dv.size:
+                                acct["energy_solver_delta_dmax_m_median"] = float(np.nanmedian(dv))
+                                acct["energy_solver_delta_dmax_m_p95"] = float(np.nanpercentile(dv, 95))
+                            else:
+                                acct["energy_solver_delta_dmax_m_median"] = 0.0
+                                acct["energy_solver_delta_dmax_m_p95"] = 0.0
+
+                            # Additional sanity metrics: how many rows truly changed, and
+                            # the longest contiguous run of changes along-stream.
+                            # This avoids a false sense of security when the median is small
+                            # but changes are spatially concentrated.
+                            changed = np.zeros(len(xs_param), dtype=bool)
+                            # Use a strict >0 threshold; values are floats but the blend is deterministic.
+                            changed_idx = use.values.copy()
+                            # Only treat as changed where delta is finite and > 0.
+                            try:
+                                dmask = np.isfinite(delta.values) & (delta.values > 0)
+                                changed_idx = changed_idx & dmask
+                            except Exception:
+                                pass
+                            changed[changed_idx] = True
+                            acct["energy_solver_changed_n"] = int(np.sum(changed))
+
+                            max_run = 0
+                            if int(np.sum(changed)) > 0 and ("s_center_m" in xs_param.columns):
+                                try:
+                                    order = np.argsort(pd.to_numeric(xs_param["s_center_m"], errors="coerce").values)
+                                    c = changed[order]
+                                    run = 0
+                                    for v in c:
+                                        if bool(v):
+                                            run += 1
+                                            if run > max_run:
+                                                max_run = run
+                                        else:
+                                            run = 0
+                                except Exception:
+                                    max_run = 0
+                            acct["energy_solver_changed_max_run"] = int(max_run)
+                        except Exception:
+                            pass
+        except Exception as e:
+            log.warning("[ENERGY] Energy solver failed; continuing without it (%s)", e)
+
+        # Always emit a single "receipt" line when the solver is requested so runs are
+        # verifiable from logs (and not inferred from side-effects).
+        try:
+            reason = str(acct.get("energy_solver_reason", "unknown"))
+            n_total = int(acct.get("energy_solver_n_total", 0) or 0)
+            n_applied = int(acct.get("energy_solver_n_applied", 0) or 0)
+            wse_src = str(acct.get("energy_solver_wse_source", "none"))
+            wse_anchor = str(acct.get("wse_anchor_source", "unknown"))
+            blend_n = int(acct.get("energy_solver_blend_n", 0) or 0)
+            changed_n = int(acct.get("energy_solver_changed_n", 0) or 0)
+            max_run = int(acct.get("energy_solver_changed_max_run", 0) or 0)
+            dmed = float(acct.get("energy_solver_delta_dmax_m_median", 0.0) or 0.0)
+            dp95 = float(acct.get("energy_solver_delta_dmax_m_p95", 0.0) or 0.0)
+            log.info(
+                "[ENERGY] status: enabled=%s reason=%s n_total=%d n_applied=%d blend_n=%d changed_n=%d max_run=%d wse_source=%s wse_anchor=%s |delta_dmax| median=%.4g p95=%.4g",
+                cfg.energy_solver_enabled, reason, n_total, n_applied, blend_n, changed_n, max_run, wse_src, wse_anchor, dmed, dp95,
+            )
+        except Exception:
+            pass
+    # Write an energy solver receipt alongside the XS constraint meta so the run is
+    # inspectable without grepping logs.
+    try:
+        # NOTE: do not bind the name "Path" inside infer_bathy(); it is already
+        # imported at module scope, and rebinding it here makes it a local variable
+        # which can trigger UnboundLocalError earlier in the function.
+        from pathlib import Path as _Path
+        import json as _json
+        if out_meta_json:
+            _receipt_path = _Path(out_meta_json).with_name("energy_solver_receipt.json")
+        else:
+            _receipt_path = _Path(out_gpkg).with_name("energy_solver_receipt.json")
+
+        _receipt = {
+            "requested": bool(acct.get("energy_solver_requested", cfg.energy_solver_enabled)),
+            "enabled": bool(acct.get("energy_solver_enabled", False)),
+            "allow_dem_proxy_wse": cfg.energy_allow_dem_proxy_wse,
+            "wse_anchor_source": str(acct.get("wse_anchor_source", "unknown")),
+            "wse_source": str(acct.get("energy_solver_wse_source", "none")),
+            "reason": str(acct.get("energy_solver_reason", "unknown")),
+            "n_total": int(acct.get("energy_solver_n_total", 0) or 0),
+            "n_applied": int(acct.get("energy_solver_n_applied", 0) or 0),
+            "blend_n": int(acct.get("energy_solver_blend_n", 0) or 0),
+            "changed_n": int(acct.get("energy_solver_changed_n", 0) or 0),
+            "changed_max_run": int(acct.get("energy_solver_changed_max_run", 0) or 0),
+            "delta_dmax_m_abs_median": float(acct.get("energy_solver_delta_dmax_m_median", 0.0) or 0.0),
+            "delta_dmax_m_abs_p95": float(acct.get("energy_solver_delta_dmax_m_p95", 0.0) or 0.0),
+        }
+        _receipt_path.write_text(_json.dumps(_receipt, indent=2, sort_keys=True) + "\n")
+        log.info("[ENERGY] Receipt written: %s", _receipt_path)
+    except Exception as e:
+        log.warning("[ENERGY] Failed to write receipt: %s", e)
+
+
 
     # Final selection fields
     xs_param["calib_src"] = "prior"
@@ -4257,7 +4937,9 @@ def infer_bathy(
                 "[CALIB][WIDTH_STAGE] site=%s n=%d r2=%.3f beta=%.6f w=%.2f Wtop=%.1f Dmax=%.2f (applied=%d)",
                 site_no,
                 nfit,
+                float(r2) if r2 is not None else float('nan'),
                 float(beta),
+                float(w_ws),
                 float(Wtop),
                 float(dmax_ws),
                 int(m_apply.sum()),
@@ -4391,7 +5073,7 @@ def infer_bathy(
     # ---- Geomorphic envelope cap (stabilizes absolute depth scale) ----
     xs_param["dmax_env_m"] = np.nan
     xs_param["env_detail"] = ""
-    if bool(getattr(cfg, "geomorphic_envelope_enabled", False)):
+    if cfg.geomorphic_envelope_enabled:
         try:
             env = xs_param.apply(lambda r: _compute_dmax_geomorphic_envelope(r, cfg), axis=1)
             xs_param["dmax_env_m"] = env.apply(lambda t: float(t[0]) if isinstance(t, tuple) else float("nan"))
@@ -4438,6 +5120,11 @@ def infer_bathy(
     xs_pts_geom["xs_id"] = xs_pts_geom["xs_id"].astype(str)
 
     pred_rows = []
+    shape = str(cfg.xs_profile_shape or "linear_trapezoid").strip().lower()
+    if shape in ("cosine", "cosine_trapezoid", "smooth", "smooth_trapezoid"):
+        profile_fn = _cosine_trapezoid_depth_profile
+    else:
+        profile_fn = _trapezoid_depth_profile
     if bool(thalweg_only):
         # One control point per XS at the thalweg (deepest point)
         for _, xs in xs_lines.iterrows():
@@ -4467,7 +5154,7 @@ def infer_bathy(
             wse = float(p.get('wse_m', np.nan))
             if not (np.isfinite(Dmax) and np.isfinite(wse)):
                 continue
-            depth = _trapezoid_depth_profile(
+            depth = profile_fn(
                 np.array([dist_from_left], dtype='float64'),
                 W=W,
                 Dmax=Dmax,
@@ -4523,7 +5210,7 @@ def infer_bathy(
             Dmax = float(p["dmax_smooth_m"])
             wse = float(p["wse_m"])
 
-            depth = _trapezoid_depth_profile(
+            depth = profile_fn(
                 np.array([dist_from_left], dtype="float64"),
                 W=W,
                 Dmax=Dmax,
@@ -4607,7 +5294,7 @@ def infer_bathy(
                                 if not (px > 0):
                                     raise ValueError("non-positive pixel size")
                         except Exception as e:
-                            log.warning(f"[THALWEG] Could not read template raster pixel size; defaulting px=10 m. ({e})")
+                            log.warning("[THALWEG] Could not read template raster pixel size; defaulting px=10 m: %s", e)
 
                         if thalweg_densify_step_m is not None and float(thalweg_densify_step_m) > 0:
                             thalweg_densify_step_m_eff = float(thalweg_densify_step_m)
@@ -4725,6 +5412,27 @@ def infer_bathy(
                                 "slope_source": str(slope_source),
                                 "wse_source": str(wse_source),
                                 "level": str(level),
+                                "manning": {
+                                    "enabled": bool(cfg.manning_mode.lower().strip() != "off"),
+                                    "mode": cfg.manning_mode,
+                                    "region": cfg.manning_region,
+                                    "n_q_valid": int(np.sum(np.isfinite(pd.to_numeric(xs_param.get("manning_q_cms_used", np.nan), errors="coerce")) & (pd.to_numeric(xs_param.get("manning_q_cms_used", np.nan), errors="coerce") > 0))) if ("manning_q_cms_used" in xs_param.columns) else 0,
+                                    "n_used": int(np.sum(pd.to_numeric(xs_param.get("manning_wt", 0.0), errors="coerce").fillna(0.0) > 0)) if ("manning_wt" in xs_param.columns) else 0,
+                                    "q_source_counts": (xs_param.get("manning_flags", "").astype(str).str.split("\\|", n=1, expand=False).str[0].replace("", "unknown").value_counts(dropna=False).to_dict() if ("manning_flags" in xs_param.columns) else {}),
+                                    "q2_equation_id_counts": (xs_param.get("manning_q2_equation_id", "").astype(str).replace("", "none").value_counts(dropna=False).to_dict() if ("manning_q2_equation_id" in xs_param.columns) else {}),
+                                },
+                            },
+                            "energy_solver": {
+                                "requested": cfg.energy_solver_enabled,
+                                "enabled": bool(acct.get("energy_solver_enabled", False)),
+                                "reason": str(acct.get("energy_solver_reason", "unknown")),
+                                "wse_source": str(acct.get("energy_solver_wse_source", "none")),
+                                "wse_anchor_source": str(acct.get("wse_anchor_source", "unknown")),
+                                "n_total": int(acct.get("energy_solver_n_total", 0) or 0),
+                                "n_applied": int(acct.get("energy_solver_n_applied", 0) or 0),
+                                "blend_n": int(acct.get("energy_solver_blend_n", 0) or 0),
+                                "delta_dmax_m_median": float(acct.get("energy_solver_delta_dmax_m_median", 0.0) or 0.0),
+                                "delta_dmax_m_p95": float(acct.get("energy_solver_delta_dmax_m_p95", 0.0) or 0.0),
                             },
                             "outputs": {
                                 "out_bathy_raster": str(out_bathy_raster),
@@ -4779,6 +5487,18 @@ def infer_bathy(
             acct["n_width_stage_applied"] = int(vc.get("width_stage", 0))
             acct["n_usgs_applied"] = int(vc.get("usgs", 0))
             acct["n_soundings_calib_applied"] = int(vc.get("soundings", 0))
+    except Exception:
+        pass
+
+
+    # Attribute availability accounting (helps diagnose under-constraint).
+    # Note: prior-mode-specific functions only update these counters in some modes;
+    # compute them here for consistency across all runs.
+    try:
+        da = pd.to_numeric(xs_param.get("drain_area_km2", np.nan), errors="coerce")
+        acct["n_with_da"] = int(np.sum(np.isfinite(da) & (da > 0)))
+        sl = pd.to_numeric(xs_param.get("slope_mpm", np.nan), errors="coerce")
+        acct["n_with_slope"] = int(np.sum(np.isfinite(sl) & (sl > 0)))
     except Exception:
         pass
 
@@ -4848,6 +5568,18 @@ def _parse_args() -> argparse.Namespace:
         "--only-write-soundings-subset",
         action="store_true",
         help="If set, load + downsample soundings, write --write-soundings-subset, print a one-line summary, then exit 0 (no XS inference).",
+    )
+    p.add_argument(
+        "--soundings-subset",
+        default=None,
+        dest="soundings_subset",
+        help=(
+            "Path to a pre-clipped, validated soundings parquet produced by Pass 1 "
+            "(--only-write-soundings-subset). When provided, this file is used INSTEAD of "
+            "--soundings for calibration so the two-pass handoff is an explicit, auditable "
+            "step. The script will hard-fail (rc=2) if this file is missing or contains 0 "
+            "rows, preventing the 'Soundings empty' silent-success bug."
+        ),
     )
     p.add_argument("--calib-max-dist-m", type=float, default=200.0, help="Max distance from sounding to XS line to use")
     p.add_argument("--calib-stat", choices=["p90", "max", "median"], default="p90", help="Per-XS depth stat from soundings")
@@ -4930,6 +5662,15 @@ def _parse_args() -> argparse.Namespace:
 
     # Bed model + priors
     p.add_argument("--bottom-width-frac", type=float, default=0.30, help="Flat bottom width fraction of channel width")
+    p.add_argument(
+        "--xs-profile-shape",
+        choices=["linear_trapezoid", "cosine_trapezoid"],
+        default="cosine_trapezoid",
+        help=(
+            "Cross-section depth profile family. 'cosine_trapezoid' keeps the same width-constrained "
+            "trapezoid concept but uses smooth cosine side slopes (reduces corner artifacts)."
+        ),
+    )
     p.add_argument("--a", type=float, default=0.18, help="Width→depth prior coefficient (Dmax=a*W^b)")
     p.add_argument("--b", type=float, default=0.50, help="Width→depth prior exponent")
     p.add_argument("--dmin-m", type=float, default=0.50, help="Minimum Dmax (m)")
@@ -4969,6 +5710,20 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--wse-profile-monotonic", dest="wse_profile_monotonic", action="store_true", help="Enforce monotonic WSE along stationing (default).")
     p.add_argument("--no-wse-profile-monotonic", dest="wse_profile_monotonic", action="store_false", help="Disable monotonic constraint.")
     p.set_defaults(wse_profile_monotonic=True)
+    p.add_argument("--enable-1d-energy-solver", dest="energy_solver_enabled", action="store_true",
+               help="Enable reach-scale 1D energy-consistent depth solver (Option A). Default: off.")
+    p.add_argument("--no-1d-energy-solver", dest="energy_solver_enabled", action="store_false",
+               help="Disable 1D energy solver.")
+    p.set_defaults(energy_solver_enabled=False)
+    p.add_argument("--energy-allow-dem-proxy-wse", dest="energy_allow_dem_proxy_wse", action="store_true",
+               help="Allow energy solver to run even when WSE anchoring is DEM/topo proxy only (no observed stage). Default: off (safety gate).")
+    p.set_defaults(energy_allow_dem_proxy_wse=False)
+    p.add_argument("--out-1d-solver-inputs-json", dest="out_1d_solver_inputs_json", default=None,
+               help="Write 1D solver station inputs JSON to this explicit path.")
+    p.add_argument("--out-1d-solver-outputs-json", dest="out_1d_solver_outputs_json", default=None,
+               help="Write 1D solver station outputs JSON to this explicit path.")
+    p.add_argument("--out-1d-solver-accounting-json", dest="out_1d_solver_accounting_json", default=None,
+               help="Write 1D solver accounting JSON to this explicit path.")
 
     # WSE proxy
 
@@ -5108,7 +5863,7 @@ def main() -> None:
     try:
         _continuous_surface._river_gpkg = args.river_gpkg
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
 
     # Backwards-compatible alias
     if getattr(args, "manning_enabled", False) and str(getattr(args, "manning_mode", "off")) == "off":
@@ -5181,6 +5936,16 @@ def main() -> None:
     if not args.xs_gpkg or not args.out_gpkg:
         raise RuntimeError("Inference mode requires --xs-gpkg and --out-gpkg (or use --raster-from-gpkg for raster-only).")
 
+    # Hard requirement: if the 1D energy solver is enabled, the longitudinal WSE fitter
+    # must be available. Silent fallbacks make runs look 'successful' while skipping
+    # the intended physics stabilization.
+    if bool(getattr(args, "enable_1d_energy_solver", False)) and bool(getattr(args, "wse_profile_enabled", True)):
+        if fit_wse_profile is None or WSEFitConfig is None:
+            raise RuntimeError(
+                "1D energy solver requested, but river_wse.fit_wse_profile is unavailable. "
+                "Ensure river_wse.py is on PYTHONPATH and imports succeed."
+            )
+
     # Parse mean→max depth conversion. Use 'auto' to derive Dmax/mean for a trapezoid: 2/(1+bottom_width_frac).
     if str(args.usgs_mean_to_dmax).strip().lower() == "auto":
         usgs_mean_to_dmax_val = -1.0
@@ -5189,6 +5954,7 @@ def main() -> None:
 
     cfg = InferConfig(
         bottom_width_frac=float(args.bottom_width_frac),
+        xs_profile_shape=str(getattr(args, "xs_profile_shape", "cosine_trapezoid")),
         wse_center_frac=float(args.wse_center_frac),
         wse_quantile=float(args.wse_quantile),
         wse_fallback_drop_m=float(args.wse_fallback_drop_m),
@@ -5227,6 +5993,11 @@ def main() -> None:
         wse_profile_window=int(getattr(args, "wse_profile_window", args.slope_proxy_window)),
         wse_profile_min_n=int(getattr(args, "wse_profile_min_n", args.slope_proxy_min_n)),
         wse_profile_monotonic=bool(getattr(args, "wse_profile_monotonic", True)),
+        energy_solver_enabled=bool(getattr(args, "energy_solver_enabled", False)),
+        energy_allow_dem_proxy_wse=bool(getattr(args, "energy_allow_dem_proxy_wse", False)),
+        out_1d_solver_inputs_json=getattr(args, "out_1d_solver_inputs_json", None),
+        out_1d_solver_outputs_json=getattr(args, "out_1d_solver_outputs_json", None),
+        out_1d_solver_accounting_json=getattr(args, "out_1d_solver_accounting_json", None),
         smooth_window=int(args.smooth_window),
         calib_max_dist_m=float(args.calib_max_dist_m),
         calib_stat=str(args.calib_stat),
@@ -5274,6 +6045,7 @@ def main() -> None:
         only_with_banks=not bool(args.allow_missing_banks),
         write_soundings_subset=(str(args.write_soundings_subset) if args.write_soundings_subset else None),
         only_write_soundings_subset=bool(getattr(args, "only_write_soundings_subset", False)),
+        soundings_subset=(str(args.soundings_subset) if getattr(args, "soundings_subset", None) else None),
     )
 
     def _split_multi(vals):

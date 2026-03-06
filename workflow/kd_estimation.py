@@ -263,7 +263,7 @@ def estimate_kd_from_rasters(
     
     n_water = np.count_nonzero(water_mask)
     if n_water < 100:
-        log.warning(f"[Kd] Insufficient water pixels ({n_water}) for Kd estimation")
+        log.warning("[Kd] Insufficient water pixels (%s) for Kd estimation", n_water)
         return {"error": "insufficient_water_pixels", "n_water": n_water}
     
     # Sample pixels for speed
@@ -512,7 +512,7 @@ def compute_physics_based_max_depth(
             })
             
     except Exception as e:
-        log.warning(f"[Kd] Physics-based estimation failed: {e}")
+        log.warning("[Kd] Physics-based estimation failed: %s", e)
         result["error"] = str(e)
         result["physics_max_depth_m"] = None
     
@@ -615,7 +615,7 @@ def generate_kd_qc_layer(
             dst.write(max_depth_map, 1)
             dst.set_band_description(1, 'max_optical_depth_m')
     
-    log.info(f"[Kd] Wrote QC layer: {output_path}")
+    log.info("[Kd] Wrote QC layer: %s", output_path)
     return str(output_path)
 
 

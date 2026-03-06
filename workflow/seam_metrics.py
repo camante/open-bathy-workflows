@@ -214,3 +214,118 @@ def load_primary_raster_from_io_manifest(
         return (-pri, len(s))
 
     return sorted(outs, key=score)[0]
+
+
+def compute_mask_boundary_seam_metrics(
+    *,
+    river_raster: str,
+    fused_raster: str,
+    mask_raster: str,
+    mask_threshold: float = 0.5,
+    boundary_mode: str = "inner",
+) -> dict:
+    """Compute seam-like difference stats at the boundary of a mask.
+
+    Intended use: quantify how the fused product diverges from the river-only raster
+    right at the river-domain transition (a common artifact zone).
+
+    Parameters
+    ----------
+    river_raster : str
+        Raster of river-bottom (or river patch) elevations on the output grid.
+    fused_raster : str
+        Raster of fused/combined elevations on the same grid.
+    mask_raster : str
+        Raster mask defining river domain (non-zero = river).
+    mask_threshold : float
+        Threshold for mask_raster to be considered True.
+    boundary_mode : str
+        "inner" -> boundary pixels inside the mask only
+        "both"  -> boundary pixels on both sides (inner + immediate exterior)
+
+    Returns
+    -------
+    dict
+        Summary statistics and counts. Empty stats if no valid pixels.
+    """
+
+    import numpy as np
+    import rasterio
+
+    def _read(path: str):
+        with rasterio.open(path) as ds:
+            a = ds.read(1)
+            nodata = ds.nodata
+        return a, nodata
+
+    r, r_nodata = _read(river_raster)
+    f, f_nodata = _read(fused_raster)
+    m, m_nodata = _read(mask_raster)
+
+    if (r.shape != f.shape) or (r.shape != m.shape):
+        return {
+            "ok": False,
+            "reason": "shape_mismatch",
+            "river_shape": list(r.shape),
+            "fused_shape": list(f.shape),
+            "mask_shape": list(m.shape),
+        }
+
+    m_valid = np.ones_like(m, dtype=bool)
+    if m_nodata is not None:
+        m_valid &= (m != m_nodata)
+    mask = m_valid & (m.astype("float64") > float(mask_threshold))
+
+    if not mask.any():
+        return {"ok": False, "reason": "empty_mask", "n_mask": int(mask.sum())}
+
+    shifts = [
+        (-1, -1), (-1, 0), (-1, 1),
+        (0, -1),           (0, 1),
+        (1, -1),  (1, 0),  (1, 1),
+    ]
+
+    boundary_inner = np.zeros_like(mask, dtype=bool)
+    for dy, dx in shifts:
+        rolled = np.roll(mask, shift=(dy, dx), axis=(0, 1))
+        boundary_inner |= (mask & ~rolled)
+
+    if boundary_mode not in ("inner", "both"):
+        boundary_mode = "inner"
+
+    boundary = boundary_inner
+    if boundary_mode == "both":
+        boundary_outer = np.zeros_like(mask, dtype=bool)
+        for dy, dx in shifts:
+            rolled = np.roll(mask, shift=(dy, dx), axis=(0, 1))
+            boundary_outer |= (~mask & rolled)
+        boundary |= boundary_outer
+
+    valid = boundary
+    if r_nodata is not None:
+        valid &= (r != r_nodata)
+    if f_nodata is not None:
+        valid &= (f != f_nodata)
+
+    if not valid.any():
+        return {"ok": False, "reason": "no_valid_boundary_pixels", "n_valid": int(valid.sum())}
+
+    diff = (f.astype("float64") - r.astype("float64"))[valid]
+    ad = np.abs(diff)
+
+    def _pct(x, p):
+        return float(np.percentile(x, p)) if x.size else float("nan")
+
+    return {
+        "ok": True,
+        "n_valid": int(diff.size),
+        "diff_mean": float(diff.mean()),
+        "diff_std": float(diff.std(ddof=0)),
+        "diff_rmse": float(np.sqrt((diff * diff).mean())),
+        "abs_p50": _pct(ad, 50),
+        "abs_p90": _pct(ad, 90),
+        "abs_p95": _pct(ad, 95),
+        "abs_p99": _pct(ad, 99),
+        "boundary_mode": boundary_mode,
+        "mask_threshold": float(mask_threshold),
+    }

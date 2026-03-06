@@ -442,11 +442,11 @@ def predict_scene_parallel(
     # Create tile specifications
     tiles = create_tile_specs(height, width, config.tile_size, config.overlap)
     n_tiles = len(tiles)
-    log.info(f"Total tiles: {n_tiles}")
+    log.info("Total tiles: %s", n_tiles)
     
     # Get number of workers
     n_workers = config.get_max_workers()
-    log.info(f"Workers: {n_workers}")
+    log.info("Workers: %s", n_workers)
     
     # Initialize output arrays
     output = np.full((height, width), NODATA_DEPTH, dtype=np.float32)
@@ -507,7 +507,7 @@ def predict_scene_parallel(
                         failed += 1
                         
                 except TimeoutError:
-                    log.warning(f"Tile {tile_id} timed out")
+                    log.warning("Tile %s timed out", tile_id)
                     failed += 1
                 except Exception as e:
                     log.warning(f"Tile {tile_id} exception: {e}")
@@ -520,7 +520,7 @@ def predict_scene_parallel(
                 pbar.close()
     
     except Exception as e:
-        log.error(f"Parallel processing failed: {e}")
+        log.error("Parallel processing failed: %s", e, exc_info=True)
         
         if config.fallback_sequential:
             log.info("Falling back to sequential processing...")
@@ -542,7 +542,7 @@ def predict_scene_parallel(
                 output[land_mask == 1] = NODATA_DEPTH
                 output_unc[land_mask == 1] = NODATA_DEPTH
         except Exception as e:
-            log.warning(f"Could not apply land mask: {e}")
+            log.warning("Could not apply land mask: %s", e)
     
     # Write output
     profile.update(
@@ -567,7 +567,7 @@ def predict_scene_parallel(
             PROCESSING="parallel_tile"
         )
     
-    log.info(f"Wrote prediction: {out_path}")
+    log.info("Wrote prediction: %s", out_path)
     
     # Write uncertainty if requested
     if uncertainty_path:
@@ -578,7 +578,7 @@ def predict_scene_parallel(
                 UNITS="m",
                 METHOD="tree_std"
             )
-        log.info(f"Wrote uncertainty: {uncertainty_path}")
+        log.info("Wrote uncertainty: %s", uncertainty_path)
     
     # Summary
     log.info("=" * 60)
@@ -637,7 +637,7 @@ def _predict_sequential_fallback(
         }
         
     except Exception as e:
-        log.error(f"Sequential fallback also failed: {e}")
+        log.error("Sequential fallback also failed: %s", e, exc_info=True)
         return {
             "success": False,
             "error": str(e),

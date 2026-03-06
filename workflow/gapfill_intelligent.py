@@ -251,7 +251,7 @@ def _is_geographic_crs(crs) -> bool:
             c = PyprojCRS.from_user_input(crs)
             return c.is_geographic
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
     
     # Fallback: check for common geographic CRS strings
     crs_str = str(crs).lower()

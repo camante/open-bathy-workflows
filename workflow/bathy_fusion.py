@@ -211,6 +211,7 @@ class FusionConfig:
     
     # Processing
     nodata: float = -9999.0
+    tile_size: int = 1024   # chunk size for tiled processing
     template_raster: Optional[Path] = None  # Use this grid if set
 
 
@@ -279,11 +280,11 @@ def _validate_crs_compatibility(src_crs, dst_crs, src_name: str = "source", dst_
     from pyproj import CRS
     
     if src_crs is None:
-        log.warning(f"[CRS] {src_name} has no CRS defined - assuming EPSG:4326")
+        log.warning("[CRS] %s has no CRS defined - assuming EPSG:4326", src_name)
         return False
     
     if dst_crs is None:
-        log.warning(f"[CRS] {dst_name} has no CRS defined - assuming EPSG:4326")
+        log.warning("[CRS] %s has no CRS defined - assuming EPSG:4326", dst_name)
         return False
     
     try:
@@ -296,9 +297,9 @@ def _validate_crs_compatibility(src_crs, dst_crs, src_name: str = "source", dst_
         
         # Warn about geographic vs projected mismatches
         if src.is_geographic and not dst.is_geographic:
-            log.info(f"[CRS] Reprojecting {src_name} from geographic to projected CRS")
+            log.info("[CRS] Reprojecting %s from geographic to projected CRS", src_name)
         elif not src.is_geographic and dst.is_geographic:
-            log.info(f"[CRS] Reprojecting {src_name} from projected to geographic CRS")
+            log.info("[CRS] Reprojecting %s from projected to geographic CRS", src_name)
         
         # Warn about different datums
         if src.datum != dst.datum:
@@ -319,7 +320,7 @@ def _validate_crs_compatibility(src_crs, dst_crs, src_name: str = "source", dst_
         return True
         
     except Exception as e:
-        log.error(f"[CRS] Failed to validate CRS compatibility: {e}")
+        log.error("[CRS] Failed to validate CRS compatibility: %s", e, exc_info=True)
         return False
 
 
@@ -422,7 +423,7 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
         bounds = tmpl.bounds
 
     # Output nodata (use numeric nodata; NaN nodata is fragile in GDAL toolchains)
-    nodata_out = float(getattr(cfg, "nodata", -9999.0) or -9999.0)
+    nodata_out = float(cfg.nodata or -9999.0)
 
     # -------------------------
     # Input sanity checks (prevents fusing optical imagery/masks as 'depth')
@@ -552,8 +553,8 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
 
     # Optional river domain mask (aligned using nearest)
     aligned_domain_mask: Path | None = None
-    if getattr(cfg, "river_domain_mask", None):
-        mp = Path(getattr(cfg, "river_domain_mask"))
+    if cfg.river_domain_mask:
+        mp = Path(cfg.river_domain_mask)
         if mp.exists():
             aligned_domain_mask = _reproject_to_template_file(mp, _aligned_path("river_domain_mask"), resampling=Resampling.nearest)
         else:
@@ -562,8 +563,8 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
 
     # Optional ocean domain mask (WAFFLES ocean-only, aligned using nearest; water==0, land==1)
     aligned_ocean_mask: Path | None = None
-    if getattr(cfg, "ocean_domain_mask", None):
-        op = Path(getattr(cfg, "ocean_domain_mask"))
+    if cfg.ocean_domain_mask:
+        op = Path(cfg.ocean_domain_mask)
         if op.exists():
             aligned_ocean_mask = _reproject_to_template_file(op, _aligned_path("ocean_domain_mask"), resampling=Resampling.nearest)
         else:
@@ -583,11 +584,11 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
         count_tiles = None
         TQDM_AVAILABLE = False
 
-    tile_size = int(getattr(cfg, "tile_size", 1024) or 1024)
-    taper_m = float(getattr(cfg, "taper_m", 0.0) or 0.0)
+    tile_size = int(cfg.tile_size or 1024)
+    taper_m = float(cfg.taper_m or 0.0)
     taper_px = int(max(0, round(taper_m / max(pixel_size_m, 1e-6))))
 
-    strat = str(getattr(cfg, "strategy", "priority") or "priority").strip().lower()
+    strat = str(cfg.strategy or "priority").strip().lower()
     overlap_px = int(taper_px + 2) if strat in ("blend", "spatial_taper") and taper_px > 0 else 0
 
     # -------------------------
@@ -722,7 +723,7 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
                 # Suppress SDB anywhere the river-domain mask is true.
                 # This avoids tile-to-tile seams caused by SDB training differences within the river corridor
                 # and ensures river (or measured) is the only contributor inside the river domain.
-                if (domain_mask is not None) and (sdb is not None) and bool(getattr(cfg, 'river_overrides_sdb_in_domain', False)) and (strat != 'seam_blend'):
+                if (domain_mask is not None) and (sdb is not None) and cfg.river_overrides_sdb_in_domain and (strat != 'seam_blend'):
                     sdb = sdb.copy()
                     sdb[domain_mask] = float('nan')
                     if sdb_u is not None:
@@ -771,8 +772,8 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
                             if meas is not None:
                                 m &= ~np.isfinite(meas)
                             if m.any():
-                                w1 = float(getattr(cfg, "primary_weight", 0.7) or 0.7)
-                                w2 = float(getattr(cfg, "secondary_weight", 0.3) or 0.3)
+                                w1 = float(cfg.primary_weight or 0.7)
+                                w2 = float(cfg.secondary_weight or 0.3)
                                 s = w1 + w2
                                 if s <= 0:
                                     w1, w2, s = 0.7, 0.3, 1.0
@@ -799,8 +800,8 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
                         if meas is not None:
                             m &= ~np.isfinite(meas)
                         if m.any():
-                            w1 = float(getattr(cfg, "primary_weight", 0.7) or 0.7)
-                            w2 = float(getattr(cfg, "secondary_weight", 0.3) or 0.3)
+                            w1 = float(cfg.primary_weight or 0.7)
+                            w2 = float(cfg.secondary_weight or 0.3)
                             s = w1 + w2
                             if s <= 0:
                                 w1, w2, s = 0.7, 0.3, 1.0
@@ -1073,7 +1074,7 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
                     raise ValueError(f"Unknown fusion strategy: {cfg.strategy}")
 
                 # River dominates inside domain mask (seam prevention)
-                if bool(getattr(cfg, "river_overrides_sdb_in_domain", False)) and domain_mask is not None and river is not None:
+                if cfg.river_overrides_sdb_in_domain and domain_mask is not None and river is not None:
                     take = domain_mask & np.isfinite(river)
                     if meas is not None:
                         take &= ~np.isfinite(meas)
@@ -1121,17 +1122,17 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
             try:
                 ds.close()
             except Exception:
-                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("Optional step failed; continuing.", exc_info=True)
         for ds in list(unc_ds.values()):
             try:
                 ds.close()
             except Exception:
-                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("Optional step failed; continuing.", exc_info=True)
         if domain_ds is not None:
             try:
                 domain_ds.close()
             except Exception:
-                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("Optional step failed; continuing.", exc_info=True)
 
     if has_unc_inputs and wrote_unc_any and uncertainty_path.exists():
         result.uncertainty_raster = uncertainty_path
@@ -1140,7 +1141,7 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
             if uncertainty_path.exists():
                 uncertainty_path.unlink()
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
         result.uncertainty_raster = None
 
     result.stats["pixel_counts"] = cnt

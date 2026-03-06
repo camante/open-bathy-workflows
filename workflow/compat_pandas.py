@@ -14,6 +14,8 @@ exist.
 from __future__ import annotations
 
 import logging
+
+log = logging.getLogger("compat_pandas")
 try:
     import pandas as pd  # type: ignore
 
@@ -23,4 +25,4 @@ try:
         pd.UInt64Index = pd.Index  # type: ignore[attr-defined]
 except Exception:
     # If pandas is not available, callers will fail elsewhere anyway.
-    logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+    log.debug("Optional step failed; continuing.", exc_info=True)

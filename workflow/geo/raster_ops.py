@@ -479,7 +479,7 @@ def _mask_raster_to_waffles(raster_path: Path, waffles_mask_path: Path, nodata: 
             raster_path.unlink()
             shutil.move(str(tmp_copy), str(raster_path))
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
 
     tmp_out = raster_path.with_suffix(".tmp_masked.tif")
 
@@ -532,7 +532,7 @@ def _mask_raster_to_waffles(raster_path: Path, waffles_mask_path: Path, nodata: 
             try:
                 out_ds.update_tags(**ds.tags())
             except Exception:
-                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("Optional step failed; continuing.", exc_info=True)
 
     # Atomic replace
     try:
@@ -593,7 +593,7 @@ def _mask_raster_to_nhdarea(
             ok = fixed.geom_type.isin(["Polygon", "MultiPolygon"])
             areas.loc[ok, "geometry"] = fixed[ok].values
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
         areas = areas[areas.geometry.notnull() & (~areas.geometry.is_empty)]
         areas = areas[areas.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
 
@@ -613,7 +613,7 @@ def _mask_raster_to_nhdarea(
             areas = areas.to_crs(r_crs)
     except Exception:
         # If CRS handling fails, try rasterizing in-place; worst case it yields empty mask and we no-op.
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
 
     try:
         geom = _union_all_geoms(areas.geometry)

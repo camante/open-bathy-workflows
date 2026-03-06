@@ -123,7 +123,7 @@ def _resolve_max_depth_sdb(
     try:
         return float(s)
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
 
     if s not in ("auto", "automatic"):
         return default
@@ -223,7 +223,7 @@ def generate_atl03_debug_plots(training_df, atl03_files, aoi_bbox, plots_dir,
 
     out_dir = plots_dir / "atl03_transects"
     out_dir.mkdir(parents=True, exist_ok=True)
-    log.info(f"[VIS] Generating ATL03 debug plots in {out_dir} ...")
+    log.info("[VIS] Generating ATL03 debug plots in %s ...", out_dir)
 
     unique_pairs = training_df[["granule", "beam"]].drop_duplicates()
     n_water = _n_water_index(float(water_temp_c), float(wavelength_nm))
@@ -372,7 +372,7 @@ def generate_atl03_debug_plots(training_df, atl03_files, aoi_bbox, plots_dir,
                             label=f"Depth support ({max_depth_val:.1f} m)",
                         )
                 except Exception:
-                    logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                    log.debug("Optional step failed; continuing.", exc_info=True)
 
             ax.set_title(f"{granule} – {beam_name} – {int(start_m)}-{int(end_m)} m")
 

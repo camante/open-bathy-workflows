@@ -131,7 +131,7 @@ def _rr_add(rr, key, value):
         if rr is not None:
             rr.add(key, value)
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
 
 def _rr_artifact(rr, kind: str, path: str):
     """Record an artifact path in the run report."""
@@ -139,7 +139,7 @@ def _rr_artifact(rr, kind: str, path: str):
         if rr is not None and hasattr(rr, "record_artifact"):
             rr.record_artifact(kind, path)
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
 
 
 def _df_depth_summary(df: pd.DataFrame, depth_col: str = "depth_m") -> Dict[str, Any]:
@@ -191,7 +191,7 @@ def _log_depth_funnel(stage: str, df: pd.DataFrame, *, rr=None, depth_col: str =
         if "hist_0_40_1m" in s:
             _rr_add(rr, f"funnel.{stage}.depth.hist_0_40_1m", s["hist_0_40_1m"])
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
 
 # NOTE: Heavy geospatial imports are intentionally *lazy*.
 #
@@ -393,7 +393,7 @@ def _write_cached_training_points(
         write_meta(meta_path, payload)
         write_meta(meta_path, payload)
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
 
 # Use centralized logging - get logger, don't configure root here
 log = logging.getLogger("sdb.atl")
@@ -568,7 +568,7 @@ def _filter_points_by_mask(
 
             dropped_count = int(len(df) - np.count_nonzero(keep))
             if dropped_count > 0:
-                log.info(f"[ATL-MASK] Dropped {dropped_count} points masked out.")
+                log.info("[ATL-MASK] Dropped %s points masked out.", dropped_count)
             _rr_add(rr, "atl.mask_filter.dropped_n", dropped_count)
             _rr_add(rr, "atl.mask_filter.output_n", int(np.count_nonzero(keep)))
 
@@ -577,7 +577,7 @@ def _filter_points_by_mask(
             return out_df
 
     except Exception as e:
-        log.warning(f"[ATL-MASK] Failed to filter points by mask: {e}. Returning original points.")
+        log.warning("[ATL-MASK] Failed to filter points by mask: %s. Returning original points.", e)
         _rr_add(rr, "atl.mask_filter.failed", True)
         return df
 
@@ -881,7 +881,7 @@ def _collect_points_from_atl24_file(h5_path, conf_min, segment_length_m=5.0):
             if "orbit_info" in f and "sc_orient_time" in f["orbit_info"]:
                 granule_start_delta_time = f["orbit_info"]["sc_orient_time"][0]
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
         for beam_key in [k for k in f.keys() if k.startswith("gt")]:
             g = f.get(beam_key)
@@ -1044,6 +1044,22 @@ def _collect_points_from_atl24_file(h5_path, conf_min, segment_length_m=5.0):
 # ICESat‑2 Main Data Collection Functions
 # -----------------------------------------------------------------------------
 
+
+def _fingerprint_path(p: Optional[str], cache_strict: bool = True) -> Optional[str]:
+    """Stable fingerprint for a file path, or a string fallback on error."""
+    if not p:
+        return None
+    try:
+        pp = Path(p)
+        if _CACHE_UTILS_AVAILABLE:
+            return fingerprint_file(pp, strict=bool(cache_strict))
+        st = pp.stat()
+        return f"{pp.resolve()}|{st.st_size}|{int(st.st_mtime)}"
+    except Exception:
+        return str(p)
+
+
+
 def collect_training_points_from_atl03(
     atl03_files: List[str], lat_res: float, height_res: float, aoi_str: str,
     atl03_conf_min: int, atl03_bottom_percentile: float, use_refraction: bool,
@@ -1088,21 +1104,10 @@ def collect_training_points_from_atl03(
         "land_mask_threshold": float(land_mask_threshold),
     }
 
-    def _fp(p: Optional[str]):
-        if not p:
-            return None
-        try:
-            pp = Path(p)
-            if _CACHE_UTILS_AVAILABLE:
-                return fingerprint_file(pp, strict=bool(cache_strict))
-            st = pp.stat()
-            return f"{pp.resolve()}|{st.st_size}|{int(st.st_mtime)}"
-        except Exception:
-            return str(p)
 
     inputs_fp = {
-        "atl03_files": [_fp(p) for p in (atl03_files or [])],
-        "land_mask": _fp(land_mask_path) if land_mask_path else None,
+        "atl03_files": [_fingerprint_path(p) for p in (atl03_files or [])],
+        "land_mask": _fingerprint_path(land_mask_path) if land_mask_path else None,
     }
 
     df_cached, cache_reason, cache_key, cache_data_path, cache_meta_path = _maybe_load_cached_training_points(
@@ -1119,7 +1124,7 @@ def collect_training_points_from_atl03(
         return df_cached.reset_index(drop=True)
     else:
         if cache_dir is not None and _CACHE_UTILS_AVAILABLE:
-            log.info(f"[ATL03_TRAINING_POINTS-CACHE] MISS: {cache_reason}")
+            log.info("[ATL03_TRAINING_POINTS-CACHE] MISS: %s", cache_reason)
 
 
     for atl03_path in atl03_files:
@@ -1169,12 +1174,12 @@ def collect_training_points_from_atl03(
                             p50 = float(np.nanpercentile(d, 50))
                             p95 = float(np.nanpercentile(d, 95))
                             if frac_near_floor >= 0.60 or (p95 - p50) <= 0.25:
-                                logging.getLogger(__name__).warning(
+                                log.warning(
                                     "[ATL03_QC] Depths cluster near shallow floor after ATL03 filtering (floor=%.2f m, p50=%.2f, p95=%.2f, near_floor<=0.20m=%.1f%%, n=%d). Check min-depth-atl03 / bottom-pick thresholds / water classification.",
                                     shallow_floor, p50, p95, 100.0 * frac_near_floor, int(d.size)
                                 )
                 except Exception:
-                    logging.getLogger(__name__).debug("ATL03 shallow-floor QC warning failed", exc_info=True)
+                    log.debug("ATL03 shallow-floor QC warning failed", exc_info=True)
                 bath_df = bath_df[(bath_df["n_bottom"] >= min_bottom_photons) & (bath_df["frac_bottom"] >= min_bottom_frac)]
 
                 bath_df["granule"] = Path(atl03_path).stem; bath_df["beam"] = f"gt{laser_num}"; bath_df["source"] = "atl03"
@@ -1261,21 +1266,10 @@ def collect_training_points_from_atl24(
         "land_mask_threshold": float(land_mask_threshold),
     }
 
-    def _fp(p: Optional[str]):
-        if not p:
-            return None
-        try:
-            pp = Path(p)
-            if _CACHE_UTILS_AVAILABLE:
-                return fingerprint_file(pp, strict=bool(cache_strict))
-            st = pp.stat()
-            return f"{pp.resolve()}|{st.st_size}|{int(st.st_mtime)}"
-        except Exception:
-            return str(p)
 
     inputs_fp = {
-        "atl24_files": [_fp(p) for p in (atl24_files or [])],
-        "land_mask": _fp(land_mask_path) if land_mask_path else None,
+        "atl24_files": [_fingerprint_path(p) for p in (atl24_files or [])],
+        "land_mask": _fingerprint_path(land_mask_path) if land_mask_path else None,
     }
 
     df_cached, cache_reason, cache_key, cache_data_path, cache_meta_path = _maybe_load_cached_training_points(
@@ -1292,7 +1286,7 @@ def collect_training_points_from_atl24(
         return df_cached.reset_index(drop=True)
     else:
         if cache_dir is not None and _CACHE_UTILS_AVAILABLE:
-            log.info(f"[ATL24_TRAINING_POINTS-CACHE] MISS: {cache_reason}")
+            log.info("[ATL24_TRAINING_POINTS-CACHE] MISS: %s", cache_reason)
 
     pts = []
     for h5 in atl24_files or []:
@@ -1432,7 +1426,7 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
 
     log.info(f"[load_extra_xyz] Loading XYZ data from {len(xyz_files)} file(s)")
     log.info(f"[load_extra_xyz] Target AOI: W={W:.4f}, E={E:.4f}, S={S:.4f}, N={N:.4f}")
-    log.info(f"[load_extra_xyz] Input CRS: {crs}")
+    log.info("[load_extra_xyz] Input CRS: %s", crs)
 
     # Setup coordinate transformation
     transformer = None
@@ -1440,9 +1434,9 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
         try:
             # Create transformer from input CRS to WGS84
             transformer = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
-            log.info(f"[load_extra_xyz] Created CRS transformer: {crs} → EPSG:4326")
+            log.info("[load_extra_xyz] Created CRS transformer: %s → EPSG:4326", crs)
         except Exception as e:
-            log.error(f"[load_extra_xyz] Failed to create CRS transformer: {e}")
+            log.error("[load_extra_xyz] Failed to create CRS transformer: %s", e, exc_info=True)
             log.error(f"[load_extra_xyz] Assuming data is already in EPSG:4326")
             transformer = None
 
@@ -1469,7 +1463,7 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
                         tmp['depth_m'] = gdf[depth_cols[0]]
                     log.info(f"[load_extra_xyz]   Loaded as vector file: {len(tmp)} points")
                 except Exception as e:
-                    log.debug(f"[load_extra_xyz]   Not a vector file: {e}")
+                    log.debug("[load_extra_xyz]   Not a vector file: %s", e)
 
             # Try CSV/TXT
             if tmp is None:

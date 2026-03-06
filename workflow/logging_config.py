@@ -37,6 +37,8 @@ import sys
 from pathlib import Path
 from typing import Optional, Union
 
+log = logging.getLogger("logging_config")
+
 
 class _RunContextFilter(logging.Filter):
     """Inject run_id/step into LogRecord (safe defaults if not configured)."""
@@ -54,7 +56,7 @@ class _RunContextFilter(logging.Filter):
             record.run_id = current_run_id()
             record.step = current_step()
         except Exception:
-            logging.getLogger(__name__).debug('Unexpected exception suppressed (was pass).', exc_info=True)
+            log.debug('Unexpected exception suppressed (was pass).', exc_info=True)
         return True
 
 
@@ -266,7 +268,7 @@ def start_flight_recorder(out_dir: Union[str, Path], run_id: str) -> Optional[Pa
 
             atexit.register(_write_summaries)
         except Exception:
-            logging.getLogger(__name__).debug('Unexpected exception suppressed (was pass).', exc_info=True)
+            log.debug('Unexpected exception suppressed (was pass).', exc_info=True)
         return fr_path
     except Exception:
         return None

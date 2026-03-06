@@ -160,7 +160,7 @@ def run_command(
         rc = proc.wait()
 
         for t in threads:
-            t.join(timeout=2.0)
+            t.join(timeout=30.0)  # wait up to 30 s for I/O threads to drain
 
     finally:
         try:

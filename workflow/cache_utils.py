@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
+log = logging.getLogger("cache_utils")
+
 # -----------------------------------------------------------------------------
 # Canonical JSON
 # -----------------------------------------------------------------------------
@@ -55,7 +57,7 @@ def _normalize_for_json(obj: Any) -> _JSONABLE:
         if isinstance(obj, np.ndarray):
             return _normalize_for_json(obj.tolist())
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
     return str(obj)
 
 def canonical_json(obj: Any) -> str:

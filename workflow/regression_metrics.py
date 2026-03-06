@@ -217,7 +217,7 @@ def _skeleton_max_slope(
                 gdf2 = gdf.to_crs(ds.crs)
                 lines = [geom for geom in gdf2.geometry if geom is not None and geom.geom_type in ("LineString", "MultiLineString")]
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
         max_slope = 0.0
         for geom in lines:
@@ -389,7 +389,7 @@ def main() -> int:
         out_dir.mkdir(parents=True, exist_ok=True)
         out_json = out_dir / "metrics.json"
         out_json.write_text(json.dumps(m, indent=2, sort_keys=True) + "\n")
-        log.info(f"[OK] wrote {out_json}")
+        log.info("[OK] wrote %s", out_json)
 
     if args.write_csv:
         import csv
@@ -421,7 +421,7 @@ def main() -> int:
             w = csv.DictWriter(f, fieldnames=fieldnames)
             w.writeheader()
             w.writerows(rows)
-        log.info(f"[OK] wrote {out_csv}")
+        log.info("[OK] wrote %s", out_csv)
 
     return 0
 

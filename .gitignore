@@ -25,9 +25,8 @@ Thumbs.db
 # Outputs / caches
 output/
 cache/
-seam_stability/
 downloads/
-tests/
+software/
 cudem_cache/
 *.tif
 *.tiff
@@ -42,6 +41,7 @@ cudem_cache/
 *.log
 *.bak
 *.patch
+*.zip
 
 # Large binaries
 *.pkl

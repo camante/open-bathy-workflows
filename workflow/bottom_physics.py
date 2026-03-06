@@ -399,7 +399,7 @@ def estimate_bottom_endmembers_eigenanalysis(
     
     n_samples = len(data)
     if n_samples < 10:
-        log.warning(f"[BottomEndmembers] Only {n_samples} valid samples, using defaults")
+        log.warning("[BottomEndmembers] Only %s valid samples, using defaults", n_samples)
         return DEFAULT_SAND_SPECTRUM.copy(), DEFAULT_SEAGRASS_SPECTRUM.copy(), {"n_samples": n_samples}
     
     log.info(f"[BottomEndmembers] Eigenanalysis on {n_samples} samples, {len(bands)} bands")
@@ -459,8 +459,8 @@ def estimate_bottom_endmembers_eigenanalysis(
     }
     
     log.info(f"[BottomEndmembers] PC1 explains {variance_explained*100:.1f}% of variance")
-    log.info(f"[BottomEndmembers] Sand endmember: {rho_sand}")
-    log.info(f"[BottomEndmembers] Grass endmember: {rho_grass}")
+    log.info("[BottomEndmembers] Sand endmember: %s", rho_sand)
+    log.info("[BottomEndmembers] Grass endmember: %s", rho_grass)
     
     return rho_sand, rho_grass, diagnostics
 
@@ -715,7 +715,7 @@ def physics_sdb_inversion(
         iterations_used[newly_converged] = iteration
         
         if np.all(converged):
-            log.info(f"[PhysicsSDB] All pixels converged at iteration {iteration}")
+            log.info("[PhysicsSDB] All pixels converged at iteration %s", iteration)
             break
         
         # Compute Jacobian (partial derivatives)
@@ -849,8 +849,8 @@ def physics_only_predict(
         Kd[band] = kd_corr
         Ku[band] = ku_corr
     
-    log.info(f"[PhysicsOnly] Kd: {Kd}")
-    log.info(f"[PhysicsOnly] Ku: {Ku}")
+    log.info("[PhysicsOnly] Kd: %s", Kd)
+    log.info("[PhysicsOnly] Ku: %s", Ku)
     
     # Load S2 bands
     band_paths = {
@@ -886,7 +886,7 @@ def physics_only_predict(
     else:
         rrs_deep = {b: float(np.nanmedian(rrs[b][deep_mask])) for b in ["B02", "B03", "B04"]}
     
-    log.info(f"[PhysicsOnly] Deep water Rrs: {rrs_deep}")
+    log.info("[PhysicsOnly] Deep water Rrs: %s", rrs_deep)
     
     # Create water mask (exclude land)
     water_mask = (nir < 0.1) & (brightness > 0.001) & np.isfinite(brightness)

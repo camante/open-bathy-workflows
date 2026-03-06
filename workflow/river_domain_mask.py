@@ -35,6 +35,8 @@ from rasterio.warp import reproject, Resampling
 from scipy.ndimage import distance_transform_edt, label, binary_closing, binary_fill_holes
 from shapely.ops import unary_union
 
+log = logging.getLogger("river_domain_mask")
+
 LOG = logging.getLogger("river_domain_mask")
 
 
@@ -47,7 +49,7 @@ def _union_all_geoms(geos):
         if hasattr(geos, "union_all"):
             return geos.union_all()
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
     # fallback
     try:
         return geos.unary_union
@@ -208,7 +210,7 @@ def main() -> int:
                 str(crs),
             )
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
 
     # Load rivers layer
     rivers = gpd.read_file(args.river_gpkg, layer=args.rivers_layer)

@@ -231,7 +231,7 @@ class PipelineCheckpoint:
         try:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
-            log.warning(f"[CHECKPOINT] Could not create checkpoint directory: {e}")
+            log.warning("[CHECKPOINT] Could not create checkpoint directory: %s", e)
             self.enabled = False
     
     def _load_or_create_state(self) -> None:
@@ -262,7 +262,7 @@ class PipelineCheckpoint:
                         self._save_state()
                         
                 except (json.JSONDecodeError, KeyError, TypeError) as e:
-                    log.warning(f"[CHECKPOINT] Could not load state, creating new: {e}")
+                    log.warning("[CHECKPOINT] Could not load state, creating new: %s", e)
                     self._state = self._create_new_state()
             else:
                 self._state = self._create_new_state()
@@ -298,7 +298,7 @@ class PipelineCheckpoint:
                 temp_file.rename(self.state_file)
                 
             except Exception as e:
-                log.warning(f"[CHECKPOINT] Could not save state: {e}")
+                log.warning("[CHECKPOINT] Could not save state: %s", e)
     
     def should_skip(self, stage: CheckpointStage) -> bool:
         """
@@ -330,7 +330,7 @@ class PipelineCheckpoint:
                     )
                     return False
             
-            log.info(f"[CHECKPOINT] Skipping completed stage: {stage_key}")
+            log.info("[CHECKPOINT] Skipping completed stage: %s", stage_key)
             return True
     
     def mark_complete(
@@ -515,7 +515,7 @@ class PipelineCheckpoint:
                 shutil.rmtree(self.checkpoint_dir)
                 log.info("[CHECKPOINT] Cleaned checkpoint directory")
             except Exception as e:
-                log.warning(f"[CHECKPOINT] Could not clean: {e}")
+                log.warning("[CHECKPOINT] Could not clean: %s", e)
         
         self._state = None
 
@@ -706,12 +706,12 @@ if __name__ == "__main__":
             try:
                 stage = CheckpointStage.from_string(stage_name)
                 checkpoint.invalidate([stage])
-                log.info(f"Invalidated: {stage_name}")
+                log.info("Invalidated: %s", stage_name)
             except ValueError as e:
-                log.info(f"Error: {e}")
+                log.info("Error: %s", e)
                 sys.exit(1)
         else:
-            log.info(f"Unknown command: {cmd}")
+            log.info("Unknown command: %s", cmd)
             sys.exit(1)
     else:
         # Default: show status

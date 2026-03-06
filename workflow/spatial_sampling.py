@@ -617,7 +617,7 @@ def depth_stratified_sampling(
         return df
         
     except Exception as e:
-        log.warning(f"[SAMPLING] Depth stratification failed: {e}")
+        log.warning("[SAMPLING] Depth stratification failed: %s", e)
         df['depth_bin'] = 0
         return df
 

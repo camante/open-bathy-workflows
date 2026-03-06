@@ -12,7 +12,7 @@ Usage:
     result = validate_pipeline_config(config_dict)
     if not result.is_valid:
         for error in result.errors:
-            log.info(f"ERROR: {error}")
+            log.info("ERROR: %s", error)
         sys.exit(1)
 """
 
@@ -759,7 +759,7 @@ if __name__ == "__main__":
     # Load and validate config file
     config_path = Path(sys.argv[1])
     if not config_path.exists():
-        log.info(f"ERROR: Config file not found: {config_path}")
+        log.info("ERROR: Config file not found: %s", config_path)
         sys.exit(1)
     
     with open(config_path) as f:

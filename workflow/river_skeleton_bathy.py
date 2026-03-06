@@ -29,7 +29,10 @@ Optionally (--debug-dir), writes:
 import argparse
 import logging
 import math
+import json
 from shapely.geometry import LineString, MultiLineString
+
+log = logging.getLogger("river_skeleton_bathy")
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -37,6 +40,7 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 import rasterio
+from rasterio.transform import array_bounds
 from rasterio.features import rasterize
 from rasterio.warp import reproject, Resampling
 from rasterio.transform import rowcol
@@ -139,7 +143,7 @@ def _junction_zone_mask(
                     gdf = gdf.to_crs(c2)
         except Exception:
             # Best effort; if CRS is missing or parsing fails, rasterize as-is.
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
         # Buffer and dissolve into a single geometry for efficiency
         geom = gdf.geometry.buffer(float(buffer_m))
@@ -231,7 +235,7 @@ def _junction_zone_mask_from_flowlines(
             if not c1.equals(c2):
                 gdf = gdf.to_crs(c2)
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
 
     # Collect coordinates (not just endpoints), tracking which feature each coordinate came from.
     # Confluences are often represented as shared vertices between a mainstem and tributary.
@@ -565,7 +569,7 @@ def _build_wse_longitudinal_profile(
                                         swot_ws.append(float(wsv))
                                         swot_d.append(float(d))
                         except Exception:
-                            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                            log.debug("Optional step failed; continuing.", exc_info=True)
 
             if len(ws) < int(min_samples):
                 continue
@@ -678,7 +682,7 @@ def _build_wse_longitudinal_profile(
                         else:
                             wgrid = wfit.astype(float)
                 except Exception:
-                    logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                    log.debug("Optional step failed; continuing.", exc_info=True)
 
             # map smoothed profile back to sample points and store for KDTree
             w_s = np.interp(d_kept, dgrid, wgrid)
@@ -833,7 +837,7 @@ def _read_swot_riversp_points(paths, template_crs=None, wse_field=None, qual_fie
                             wcol = c
                             break
                     except Exception:
-                        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                        log.debug("Optional step failed; continuing.", exc_info=True)
         if wcol is None:
             LOG.warning("SWOT RiverSP: could not find a WSE column in %s (provide --swot-wse-field)", p)
             continue
@@ -871,7 +875,7 @@ def _read_swot_riversp_points(paths, template_crs=None, wse_field=None, qual_fie
                     good = qv.isna() | (qv <= 0.0)
                 gdf = gdf[good].copy()
             except Exception:
-                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("Optional step failed; continuing.", exc_info=True)
 
 # Iterate rows
         for geom, wv in zip(gdf.geometry, gdf[wcol]):
@@ -992,7 +996,7 @@ def _estimate_swot_vertical_offset(
         try:
             inside = inside & channel[rows.clip(0, h-1), cols.clip(0, w-1)].astype(bool)
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
     if not np.any(inside):
         return 0.0, 0, {}
 
@@ -1076,7 +1080,7 @@ def _read_soundings_file(path: Path):
                         zcol = c
                         break
                 except Exception:
-                    logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                    log.debug("Optional step failed; continuing.", exc_info=True)
         if zcol is None:
             raise ValueError(f"Could not find a numeric Z/depth/elev column in {path}")
         x = gdf.geometry.x.to_numpy(dtype='float64')
@@ -1156,6 +1160,7 @@ def _soundings_to_grids(
     sample_seed: int = 0,
     cell_percentile: float | None = None,
     wse_map: np.ndarray | None = None,
+    diag_json_path: "Path | str | None" = None,
 ):
     """Rasterize external soundings onto the template grid.
 
@@ -1184,6 +1189,26 @@ def _soundings_to_grids(
     if not sounding_files:
         return depth_grid, dmax_grid, bed_grid
 
+    # If soundings_crs is not provided, attempt to infer it from parquet metadata
+    # produced by xs_infer_bathy_raster.py (it stores a 'crs' column).
+    if (not soundings_crs) and sounding_files:
+        for fp in sounding_files:
+            try:
+                pth = Path(fp)
+                if pth.suffix.lower() == '.parquet' and pth.exists():
+                    import pandas as _pd
+                    cols = _pd.read_parquet(pth, nrows=0).columns
+                    if 'crs' in cols:
+                        dfc = _pd.read_parquet(pth, columns=['crs'])
+                        vals = dfc['crs'].dropna().astype(str).str.strip()
+                        vals = vals[vals != '']
+                        if len(vals) > 0:
+                            soundings_crs = vals.iloc[0]
+                            LOG.info('Inferred soundings_crs from parquet: %s', soundings_crs)
+                            break
+            except Exception:
+                continue
+
     # Optional CRS transform into template CRS
     xform = None
     if soundings_crs:
@@ -1191,6 +1216,36 @@ def _soundings_to_grids(
         dst = CRS.from_user_input(template_crs)
         if src != dst:
             xform = Transformer.from_crs(src, dst, always_xy=True)
+
+    def _template_bbox_xy() -> Optional[Tuple[float, float, float, float]]:
+        """Return template bbox as (xmin, xmax, ymin, ymax) in template CRS."""
+        try:
+            # rasterio.transform.array_bounds returns (xmin, ymin, xmax, ymax) in the raster CRS
+            xmin, ymin, xmax, ymax = array_bounds(H, W, transform)
+            return float(xmin), float(xmax), float(ymin), float(ymax)
+        except Exception:
+            return None
+
+    def _in_bbox_ratio(xv: np.ndarray, yv: np.ndarray) -> float:
+        """Fraction of finite points that fall inside template bbox."""
+        bb = _template_bbox_xy()
+        if bb is None:
+            return float("nan")
+        xmin, xmax, ymin, ymax = bb
+        m = np.isfinite(xv) & np.isfinite(yv)
+        if int(np.count_nonzero(m)) == 0:
+            return float("nan")
+        xv2, yv2 = xv[m], yv[m]
+        inside = (xv2 >= xmin) & (xv2 <= xmax) & (yv2 >= ymin) & (yv2 <= ymax)
+        return float(np.count_nonzero(inside)) / float(len(xv2))
+
+    try:
+        bb = _template_bbox_xy()
+        if bb is not None:
+            xmin, xmax, ymin, ymax = bb
+            LOG.info('Template bounds (crs=%s): x=[%.3f, %.3f] y=[%.3f, %.3f]', str(template_crs), xmin, xmax, ymin, ymax)
+    except Exception:
+        pass
 
     xs_all, ys_all, zs_all = [], [], []
     sizes = []
@@ -1239,6 +1294,16 @@ def _soundings_to_grids(
     y = np.concatenate(ys_all)
     z = np.concatenate(zs_all)
 
+    try:
+        sx0, sx1 = float(np.nanmin(x)), float(np.nanmax(x))
+        sy0, sy1 = float(np.nanmin(y)), float(np.nanmax(y))
+        LOG.info('Soundings bounds (raw): x=[%.3f, %.3f] y=[%.3f, %.3f] n=%d', sx0, sx1, sy0, sy1, int(len(x)))
+        r0 = _in_bbox_ratio(x, y)
+        if np.isfinite(r0):
+            LOG.info('Soundings inside template bbox (raw): %.3f', float(r0))
+    except Exception:
+        pass
+
     n_loaded = int(x.size)
     m = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
     x, y, z = x[m], y[m], z[m]
@@ -1246,23 +1311,205 @@ def _soundings_to_grids(
     if x.size == 0:
         return depth_grid, dmax_grid, bed_grid
 
+    # Apply declared CRS transform (if any)
     if xform is not None:
         x2, y2 = xform.transform(x.tolist(), y.tolist())
         x = np.asarray(x2, dtype="float64")
         y = np.asarray(y2, dtype="float64")
+
+    # Deterministic CRS/axis-order self-check:
+    # If the declared CRS yields almost no points inside the template bbox, try alternative
+    # geographic interpretations (NAD83/WGS84 + optional axis swap) and pick the one that
+    # maximizes in-bbox ratio. Only apply when improvement is overwhelming.
+    try:
+        r_after = _in_bbox_ratio(x, y)
+        if np.isfinite(r_after):
+            LOG.info('Soundings inside template bbox (post-declared-crs): %.3f', float(r_after))
+        best_ratio = r_after
+        best_tr = None
+        best_swap = False
+        if np.isfinite(r_after) and float(r_after) < 0.01:
+            for s in ('EPSG:4269', 'EPSG:4326'):
+                try:
+                    tr = Transformer.from_crs(s, template_crs, always_xy=True)
+                    # as-is
+                    xx, yy = tr.transform(x.tolist(), y.tolist())
+                    rr0 = _in_bbox_ratio(np.asarray(xx, dtype='float64'), np.asarray(yy, dtype='float64'))
+                    if np.isfinite(rr0) and (best_ratio is None or float(rr0) > float(best_ratio)):
+                        best_ratio, best_tr, best_swap = rr0, tr, False
+                    # swapped
+                    xx, yy = tr.transform(y.tolist(), x.tolist())
+                    rr1 = _in_bbox_ratio(np.asarray(xx, dtype='float64'), np.asarray(yy, dtype='float64'))
+                    if np.isfinite(rr1) and (best_ratio is None or float(rr1) > float(best_ratio)):
+                        best_ratio, best_tr, best_swap = rr1, tr, True
+                except Exception:
+                    continue
+
+            if best_tr is not None and np.isfinite(best_ratio) and float(best_ratio) >= 0.50:
+                LOG.warning(
+                    'Soundings CRS/axis mismatch detected: in_bbox=%.3f after declared CRS; using %s with swap_xy=%s (in_bbox=%.3f).',
+                    float(r_after), str(getattr(best_tr, 'source_crs', 'geo')), str(best_swap), float(best_ratio)
+                )
+                if best_swap:
+                    x_in, y_in = y.tolist(), x.tolist()
+                else:
+                    x_in, y_in = x.tolist(), y.tolist()
+                xx, yy = best_tr.transform(x_in, y_in)
+                x = np.asarray(xx, dtype='float64')
+                y = np.asarray(yy, dtype='float64')
+    except Exception:
+        LOG.debug('Soundings CRS self-check failed; continuing.', exc_info=True)
 
     rr, cc = rowcol(transform, x, y)
     rr = np.asarray(rr, dtype="int64")
     cc = np.asarray(cc, dtype="int64")
 
     inb = (rr >= 0) & (rr < channel.shape[0]) & (cc >= 0) & (cc < channel.shape[1])
-    LOG.info("Soundings: in_template_bbox=%d", int(np.count_nonzero(inb)))
+    n_inb = int(np.count_nonzero(inb))
+    LOG.info(
+        "Soundings: in_template_bbox=%d (grid=%dx%d channel_true_pixels=%d)",
+        n_inb,
+        int(channel.shape[1]),
+        int(channel.shape[0]),
+        int(np.count_nonzero(channel)),
+    )
     rr, cc, z = rr[inb], cc[inb], z[inb]
     if rr.size == 0:
         return depth_grid, dmax_grid, bed_grid
 
+    # Row/col range diagnostics for in-bounds points (helps catch axis swaps / transform mismatch)
+    try:
+        LOG.info(
+            "Soundings row/col range (in-bounds): row=[%d..%d] col=[%d..%d]",
+            int(rr.min()),
+            int(rr.max()),
+            int(cc.min()),
+            int(cc.max()),
+        )
+    except Exception:
+        pass
+
     in_ch = channel[rr, cc]
-    LOG.info("Soundings: in_channel_mask=%d", int(np.count_nonzero(in_ch)))
+    n_in_ch = int(np.count_nonzero(in_ch))
+    LOG.info("Soundings: in_channel_mask=%d", n_in_ch)
+    if n_in_ch == 0:
+        # Provide a small spread sample so we can see whether points are systematically off.
+        try:
+            samp_n = min(12, int(rr.size))
+            if samp_n > 0:
+                idx = np.linspace(0, int(rr.size) - 1, num=samp_n, dtype=int)
+                LOG.info(
+                    "Soundings sample (row,col,mask): %s",
+                    ", ".join([f"({int(rr[i])},{int(cc[i])},{bool(in_ch[i])})" for i in idx]),
+                )
+        except Exception:
+            pass
+
+        # Distance-to-channel diagnostic (pixels). Helps distinguish "mask too narrow" vs "CRS/transform mismatch".
+        # Prefer scipy's distance transform when available, but fall back to a deterministic bounded brute-force
+        # so the diagnostic still works in minimal environments.
+        d = None
+        try:
+            from scipy.ndimage import distance_transform_edt
+
+            dist_px = distance_transform_edt(~channel)
+            d = dist_px[rr, cc]
+        except Exception:
+            d = None
+
+        if d is None:
+            try:
+                ch_rc = np.column_stack(np.nonzero(channel))
+                if ch_rc.size and rr.size:
+                    rs = np.random.RandomState(0)
+                    max_ch = 5000
+                    if ch_rc.shape[0] > max_ch:
+                        ch_rc = ch_rc[rs.choice(ch_rc.shape[0], size=max_ch, replace=False)]
+                    max_snd = 2000
+                    if rr.size > max_snd:
+                        idx2 = rs.choice(rr.size, size=max_snd, replace=False)
+                        rc_s = np.column_stack([rr[idx2], cc[idx2]]).astype(np.float64)
+                    else:
+                        rc_s = np.column_stack([rr, cc]).astype(np.float64)
+                    ch_rc_f = ch_rc.astype(np.float64)
+                    diff = rc_s[:, None, :] - ch_rc_f[None, :, :]
+                    d = np.sqrt((diff * diff).sum(axis=2)).min(axis=1)
+            except Exception as e:
+                LOG.debug("Soundings distance_to_channel_px fallback failed: %s", str(e))
+                d = None
+
+        if d is not None and np.size(d):
+            try:
+                LOG.info(
+                    "Soundings distance_to_channel_px: min=%.2f p50=%.2f p95=%.2f max=%.2f",
+                    float(np.min(d)),
+                    float(np.percentile(d, 50)),
+                    float(np.percentile(d, 95)),
+                    float(np.max(d)),
+                )
+            except Exception:
+                pass
+
+    # Write a diagnostic receipt so CRS/rowcol/mask overlap is provable from artifacts.
+    # This is intentionally written even when 0 points fall in the channel mask.
+    if diag_json_path is not None:
+        try:
+            diag_path = Path(diag_json_path)
+
+            # Swapped-axis diagnostic: if any upstream bug swapped (x,y)->(y,x),
+            # this may show non-zero overlaps.
+            rr_sw, cc_sw = rasterio.transform.rowcol(transform, y, x)
+            rr_sw = np.asarray(rr_sw)
+            cc_sw = np.asarray(cc_sw)
+            inb_sw = (rr_sw >= 0) & (rr_sw < H) & (cc_sw >= 0) & (cc_sw < W)
+            n_inb_sw = int(np.count_nonzero(inb_sw))
+            n_inch_sw = (
+                int(np.count_nonzero(channel[rr_sw[inb_sw], cc_sw[inb_sw]]))
+                if n_inb_sw
+                else 0
+            )
+
+            receipt = {
+                "soundings": {
+                    "n_total": int(len(x)),
+                    "x_min": float(np.min(x)) if len(x) else None,
+                    "x_max": float(np.max(x)) if len(x) else None,
+                    "y_min": float(np.min(y)) if len(y) else None,
+                    "y_max": float(np.max(y)) if len(y) else None,
+                    "z_min": float(np.min(z)) if len(z) else None,
+                    "z_max": float(np.max(z)) if len(z) else None,
+                },
+                "grid": {
+                    "crs": str(template_crs) if template_crs is not None else None,
+                    "shape": [int(H), int(W)],
+                    "transform_gdal": [float(v) for v in transform.to_gdal()],
+                    "bounds": {
+                        "left": float(bounds.left),
+                        "bottom": float(bounds.bottom),
+                        "right": float(bounds.right),
+                        "top": float(bounds.top),
+                    },
+                },
+                "channel": {
+                    "true_count": int(np.count_nonzero(channel)),
+                    "false_count": int(channel.size - np.count_nonzero(channel)),
+                },
+                "rowcol": {
+                    "n_in_bounds": int(np.count_nonzero(inb)),
+                    "n_in_channel": int(np.count_nonzero(in_ch)),
+                    "row_min": int(np.min(rr)) if rr.size else None,
+                    "row_max": int(np.max(rr)) if rr.size else None,
+                    "col_min": int(np.min(cc)) if cc.size else None,
+                    "col_max": int(np.max(cc)) if cc.size else None,
+                    "n_in_bounds_swapped": n_inb_sw,
+                    "n_in_channel_swapped": n_inch_sw,
+                },
+            }
+            diag_path.parent.mkdir(parents=True, exist_ok=True)
+            diag_path.write_text(json.dumps(receipt, indent=2) + "\n")
+            LOG.info("Soundings/channel receipt written: %s", str(diag_path))
+        except Exception as e:
+            LOG.warning("Failed to write soundings/channel receipt: %s", str(e))
     rr, cc, z = rr[in_ch], cc[in_ch], z[in_ch]
     if rr.size == 0:
         return depth_grid, dmax_grid, bed_grid
@@ -1583,8 +1830,8 @@ def _rasterize_tangent_and_curvature(
 
 
 
-def _densify_linestring(ls, step_m):
-    """Yield points along a LineString at approximately step_m spacing (including endpoints)."""
+def _densify_linestring_to_points(ls, step_m):
+    """Return a list of Points along a LineString at approximately step_m spacing (including endpoints)."""
     try:
         import numpy as np
         from shapely.geometry import Point
@@ -1602,7 +1849,7 @@ def _densify_linestring(ls, step_m):
         try:
             pts.append(ls.interpolate(d))
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
     return pts
 
 
@@ -1719,7 +1966,7 @@ def _apply_bed_profile_constraints(
                     line_layer = name
                     break
             except Exception:
-                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("Optional step failed; continuing.", exc_info=True)
     if line_layer is None:
         for name in layers:
             try:
@@ -1747,7 +1994,7 @@ def _apply_bed_profile_constraints(
     try:
         gdf = gdf.to_crs(crs)
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
 
     transform = template_profile['transform']
     nodata = template_profile.get('nodata', -9999.0)
@@ -1780,7 +2027,7 @@ def _apply_bed_profile_constraints(
         else:
             continue
         for ls in geoms:
-            pts = _densify_linestring(ls, step)
+            pts = _densify_linestring_to_points(ls, step)
             if len(pts) < 3:
                 continue
             # sample bed at points
@@ -2477,7 +2724,8 @@ def main(
                 max_points=int(getattr(args, 'soundings_max_points', 2_000_000) or 0),
                 sample_seed=int(getattr(args, 'soundings_sample_seed', 0) or 0),
                 cell_percentile=args.soundings_cell_percentile,
-            wse_map=wse_map,
+                wse_map=wse_map,
+                diag_json_path=Path(args.out_bed).with_name("soundings_channel_receipt.json"),
             )
             snd_mask = np.isfinite(snd_dmax_grid)
             snd_dmax_field = None
@@ -2597,7 +2845,7 @@ def main(
                             if template_crs is not None and getattr(g_edges, 'crs', None) is not None and str(g_edges.crs) != str(template_crs):
                                 g_edges = g_edges.to_crs(template_crs)
                         except Exception:
-                            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                            log.debug("Optional step failed; continuing.", exc_info=True)
                         if (g_edges is not None) and (not g_edges.empty):
                             geoms = list(g_edges.geometry)
 
@@ -2737,7 +2985,7 @@ def main(
                                 )
                                 ms_sum = int(ms_line.sum())
                             except Exception:
-                                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                                log.debug("Optional step failed; continuing.", exc_info=True)
                         if ms_sum > 0:
                                         # Distance to mainstem line (meters)
                                         dist_line = _edt(ms_line == 0) * float(pix)
@@ -2774,7 +3022,7 @@ def main(
                                                                                             keep = int(np.argmax(counts))
                                                                                             mainstem_wide = (lab == keep)
                                                                                     except Exception:
-                                                                                        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                                                                                        log.debug("Optional step failed; continuing.", exc_info=True)
                                                                                     
                                                                                     # In junction zones, expand protection slightly so tributary smoothing cannot imprint into the mainstem.
                                                                                     mainstem_corridor = mainstem_wide | (jm & channel & (w_proxy_m >= 0.8 * thr))
@@ -2805,7 +3053,7 @@ def main(
                                             if debug_corr_path is not None:
                                                 _save_f32(debug_corr_path, corridor.astype("float32"), template_profile, nodata=255.0)
                                         except Exception:
-                                            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                                            log.debug("Optional step failed; continuing.", exc_info=True)
                                         mainstem_corridor = corridor
                                         # preserve_mainstem already set by width-proxy selection
                                         preserve_mainstem = preserve_mainstem
@@ -2819,7 +3067,7 @@ def main(
                                             if (debug_ms_path is not None) and (preserve_mainstem is not None):
                                                 _save_f32(debug_ms_path, preserve_mainstem.astype("uint8"), template_profile, nodata=255.0)
                                         except Exception:
-                                            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                                            log.debug("Optional step failed; continuing.", exc_info=True)
                 except Exception:
                     preserve_mainstem = None
                     mainstem_corridor = None
@@ -2835,9 +3083,7 @@ def main(
                 elif jmode == "smooth":
                     sig_m = float(getattr(args, "junction_smooth_sigma_m", 80.0) or 0.0)
                     if sig_m > 0.0:
-                        sigma_px = sig_m / max(pix, 1e-9)
-
-                        def _smooth_in_zone(arr: np.ndarray) -> np.ndarray:
+                        def _smooth_in_zone(arr: np.ndarray, zone: np.ndarray, sigma_px: float) -> np.ndarray:
                             out = arr.astype("float32", copy=True)
                             # Normalized (mask-aware) Gaussian smoothing to avoid leaking values
                             # from outside-channel/nodata areas into the junction zone.
@@ -2855,26 +3101,82 @@ def main(
                             np.divide(num, den, out=sm, where=(den > 1e-6))
                             sm = sm.astype("float32")
 
-                            out[jm] = sm[jm]
+                            out[zone] = sm[zone]
                             return out
 
+                        # Width-scaled junction smoothing
+                        # Goal: reduce over-smoothing at small tributary confluences while still
+                        # damping junction artifacts where geometry supports it.
+                        #
+                        # We approximate a spatially-varying sigma by applying two passes:
+                        # (1) a "large-width" pass (sigma=sig_m)
+                        # (2) a "small-width" pass with sigma scaled by width ratio.
+                        #
+                        # This remains deterministic and avoids introducing new external deps.
+                        jm_w = None
+                        try:
+                            jm_w = width[jm] if width is not None else None
+                        except Exception:
+                            jm_w = None
+
+                        sigma_px_large = sig_m / max(pix, 1e-9)
+                        sigma_px_small = sigma_px_large
+                        jm_small = jm
+                        jm_large = jm
+                        if (jm_w is not None) and np.any(np.isfinite(jm_w)):
+                            # Percentile-derived scaling: avoids hard-coded width thresholds and
+                            # remains stable across AOIs with different channel sizes.
+                            w_all = jm_w[np.isfinite(jm_w)].astype("float32")
+                            w_med = float(np.nanmedian(w_all)) if w_all.size else 0.0
+
+                            if w_all.size:
+                                p25, p50, p75 = np.nanpercentile(w_all, [25.0, 50.0, 75.0])
+                                p25 = float(max(p25, 0.0))
+                                p50 = float(max(p50, p25))
+                                p75 = float(max(p75, p50))
+                            else:
+                                p25, p50, p75 = 0.0, w_med, 0.0
+
+                            # Split covers the full junction zone.
+                            jm_small = jm & (width <= p50)
+                            jm_large = jm & (width > p50)
+
+                            # Scale small-sigma using (narrow/typical) width ratio.
+                            if p75 > 0.0:
+                                scale = float(p25 / p75)
+                                scale = float(np.clip(scale, 0.25, 1.0))
+                                sigma_px_small = sigma_px_large * scale
+
+                            LOG.info(
+                                "Junction smoothing width-scaled: p25=%.2fm p50=%.2fm p75=%.2fm sigma_small=%.1fm sigma_large=%.1fm",
+                                p25,
+                                p50,
+                                p75,
+                                float(sigma_px_small * pix),
+                                float(sigma_px_large * pix),
+                            )
+
                         # Smooth WSE only (avoid circular 'bullseye' depth artifacts at tributary mouths)
-                        wse_map = _smooth_in_zone(wse_map)
+                        # Apply large-width pass first, then refine small-width pixels with a smaller sigma.
+                        if np.any(jm_large):
+                            wse_map = _smooth_in_zone(wse_map, jm_large, sigma_px_large)
+                        if np.any(jm_small):
+                            wse_map = _smooth_in_zone(wse_map, jm_small, sigma_px_small)
                         # Recompute depth from (smoothed) WSE and current bed to keep mainstem continuity
                         try:
                             depth = (wse_map - bed).astype('float32')
                             # Depth cannot be negative
                             depth = np.where(depth >= 0.0, depth, 0.0).astype('float32')
                         except Exception:
-                            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                            log.debug("Optional step failed; continuing.", exc_info=True)
                         try:
                             if preserve_mainstem is not None and np.any(preserve_mainstem):
                                 depth[preserve_mainstem] = depth_pre_smooth[preserve_mainstem]
                                 wse_map[preserve_mainstem] = wse_pre_smooth[preserve_mainstem]
                                 LOG.info("Preserved mainstem corridor during junction smoothing (cells=%d).", int(np.count_nonzero(preserve_mainstem)))
                         except Exception:
-                            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
-                        LOG.info("Junction mode=smooth: locally smoothed WSE (depth recomputed from WSE-bed) in %d junction-zone cells (sigma=%.1fm).", n_jm, sig_m)
+                            log.debug("Optional step failed; continuing.", exc_info=True)
+                        LOG.info("Junction mode=smooth: locally smoothed WSE (depth recomputed from WSE-bed) in %d junction-zone cells (sigma_base=%.1fm).", n_jm, sig_m)
                     else:
                         LOG.info("Junction mode=smooth requested but sigma<=0; no smoothing applied.")
                 else:

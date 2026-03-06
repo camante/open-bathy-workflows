@@ -76,7 +76,7 @@ def _log_funnel(stage: str, df: Optional[pd.DataFrame], rr: Optional[Any] = None
             elif hasattr(rr, "data") and isinstance(rr.data, dict):
                 rr.data[f"funnel.{stage}"] = stats
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
 # -----------------------------------------------------------------------------
 # Helper: local metric projection
@@ -114,10 +114,10 @@ def _build_local_transformer(latitudes: np.ndarray, longitudes: np.ndarray) -> T
             epsg_code = f"EPSG:{32600 + utm_zone}"
         else:
             epsg_code = f"EPSG:{32700 + utm_zone}"
-        log.info(f"[Fusion] Using local metric CRS {epsg_code} for KDTree distances.")
+        log.info("[Fusion] Using local metric CRS %s for KDTree distances.", epsg_code)
         return Transformer.from_crs("EPSG:4326", epsg_code, always_xy=True)
     except Exception as exc:
-        log.warning(f"[Fusion] Failed to build UTM CRS ({exc}); using EPSG:3857.")
+        log.warning("[Fusion] Failed to build UTM CRS (%s); using EPSG:3857.", exc)
         return Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 
 
@@ -424,9 +424,9 @@ def _ensure_training_schema(
     # Logging weight distribution for verification (mean weight by source)
     try:
         stats = df.groupby("source")["sample_weight"].mean().to_dict()
-        log.info(f"[Fusion] Weight distribution (mean by source): {stats}")
+        log.info("[Fusion] Weight distribution (mean by source): %s", stats)
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
 
     # Enforce column order
     col_order = [
@@ -529,7 +529,7 @@ def build_fused_training_dataframe(
                     )
         
     except Exception:
-        logging.getLogger(__name__).debug("Optional ATL03 QC warning failed", exc_info=True)
+        log.debug("Optional ATL03 QC warning failed", exc_info=True)
     _log_funnel('fusion.input.atl24', atl24_df, rr)
     _log_funnel('fusion.input.xyz', xyz_df, rr)
 
@@ -553,7 +553,7 @@ def build_fused_training_dataframe(
                     atl03_df = atl03_df.iloc[0:0].copy()
                     _log_funnel('fusion.input.atl03.quarantined', atl03_df, rr)
     except Exception:
-        logging.getLogger(__name__).debug("Optional ATL03 quarantine QC failed", exc_info=True)
+        log.debug("Optional ATL03 quarantine QC failed", exc_info=True)
 
     log.info(
         f"[Fusion] Starting build_fused_training_dataframe with "
@@ -681,7 +681,7 @@ def build_fused_training_dataframe(
                         elif hasattr(rr, "data") and isinstance(rr.data, dict):
                             rr.data["fusion.adaptive_sampling"] = sampling_stats
                     except Exception:
-                        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                        log.debug("Optional step failed; continuing.", exc_info=True)
                 
                 _log_funnel('fusion.sampled.final', sampled_df, rr)
                 return sampled_df
@@ -690,11 +690,11 @@ def build_fused_training_dataframe(
                 return final_df
                 
         except ImportError as e:
-            log.warning(f"[Fusion] Adaptive sampling module not available: {e}")
+            log.warning("[Fusion] Adaptive sampling module not available: %s", e)
             log.warning(f"[Fusion] Proceeding with unsampled data ({len(final_df):,} points)")
             return final_df
         except Exception as e:
-            log.error(f"[Fusion] Adaptive sampling failed: {e}")
+            log.error("[Fusion] Adaptive sampling failed: %s", e, exc_info=True)
             log.error(f"[Fusion] Proceeding with unsampled data ({len(final_df):,} points)")
             import traceback
             traceback.print_exc()
@@ -712,7 +712,7 @@ def _read_optional_csv(path: Optional[str]) -> pd.DataFrame:
         return pd.DataFrame()
     p = Path(path)
     if (not p.exists()) or p.stat().st_size == 0:
-        log.warning(f"[CLI] CSV not found or empty: {p}")
+        log.warning("[CLI] CSV not found or empty: %s", p)
         return pd.DataFrame()
     df = pd.read_csv(p)
     log.info(f"[CLI] Loaded {len(df)} rows from {p}")

@@ -128,9 +128,9 @@ def estimate_scene_bottom_endmembers(
             
             if np.sum(deep_mask) > 100:
                 rrs_deep = {b: float(np.nanmedian(rrs[b][deep_mask])) for b in ["B02", "B03", "B04"]}
-                log.info(f"[PhysicsIntegration] Deep water Rrs: {rrs_deep}")
+                log.info("[PhysicsIntegration] Deep water Rrs: %s", rrs_deep)
     except Exception as e:
-        log.warning(f"[PhysicsIntegration] Could not estimate deep water Rrs: {e}")
+        log.warning("[PhysicsIntegration] Could not estimate deep water Rrs: %s", e)
     
     # Run endmember estimation
     try:
@@ -162,12 +162,12 @@ def estimate_scene_bottom_endmembers(
                     "rho_grass": rho_grass,
                     "diagnostics": diag_json,
                 }, f, indent=2)
-            log.info(f"[PhysicsIntegration] Saved endmember diagnostics to {diag_path}")
+            log.info("[PhysicsIntegration] Saved endmember diagnostics to %s", diag_path)
         
         return rho_sand, rho_grass, diag
         
     except Exception as e:
-        log.error(f"[PhysicsIntegration] Endmember estimation failed: {e}")
+        log.error("[PhysicsIntegration] Endmember estimation failed: %s", e, exc_info=True)
         return DEFAULT_SAND_SPECTRUM.copy(), DEFAULT_SEAGRASS_SPECTRUM.copy(), {"error": str(e)}
 
 
@@ -417,7 +417,7 @@ def get_sun_view_angles_from_s2_metadata(s2_dir: Union[str, Path]) -> Tuple[floa
                 log.info(f"[PhysicsIntegration] Found angles from S2_DATE_QC.json: SZA={sza_deg:.1f}°, VZA={vza_deg:.1f}°")
                 return float(sza_deg), float(min(abs(vza_deg), 12.0))
         except Exception as e:
-            log.debug(f"[PhysicsIntegration] Could not read S2_DATE_QC.json: {e}")
+            log.debug("[PhysicsIntegration] Could not read S2_DATE_QC.json: %s", e)
     
     # Source 2: Try other metadata JSON files
     meta_paths = (
@@ -459,7 +459,7 @@ def get_sun_view_angles_from_s2_metadata(s2_dir: Union[str, Path]) -> Tuple[floa
                 log.info(f"[PhysicsIntegration] Found angles from {meta_path.name}: SZA={sza_deg:.1f}°, VZA={vza_deg:.1f}°")
                 break
                 
-        except Exception as e:
+        except Exception:
             continue
     
     # Source 2: Try to compute from raster metadata (date + location)
@@ -505,7 +505,7 @@ def get_sun_view_angles_from_s2_metadata(s2_dir: Union[str, Path]) -> Tuple[floa
                             log.info(f"[PhysicsIntegration] Computed SZA={sza_deg:.1f}° from location ({center_lat:.2f}, {center_lon:.2f}) and date")
                             
         except Exception as e:
-            log.debug(f"[PhysicsIntegration] Could not compute SZA from raster: {e}")
+            log.debug("[PhysicsIntegration] Could not compute SZA from raster: %s", e)
     
     # Source 3: Default based on typical tropical/subtropical conditions
     if sza_deg is None:
@@ -579,7 +579,7 @@ def compute_solar_zenith(lat: float, lon: float, date_str: str, hour_utc: float 
         return sza
         
     except Exception as e:
-        log.debug(f"[PhysicsIntegration] Solar zenith calculation failed: {e}")
+        log.debug("[PhysicsIntegration] Solar zenith calculation failed: %s", e)
         return None
 
 

@@ -128,7 +128,7 @@ def compute_xs_diagnostics(
     
     xs_gpkg = Path(xs_gpkg)
     if not xs_gpkg.exists():
-        log.warning(f"[DIAG] XS GPKG not found: {xs_gpkg}")
+        log.warning("[DIAG] XS GPKG not found: %s", xs_gpkg)
         return RiverDiagnostics()
     
     try:
@@ -280,7 +280,7 @@ def summarize_river_run(
         try:
             report.add("diagnostics", summary)
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
     
     return summary
 

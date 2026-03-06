@@ -324,8 +324,9 @@ def _detect_bimodal(residuals: np.ndarray, min_samples: int = 50) -> Dict[str, A
     """
     Detect if residual distribution is bimodal using kernel density estimation.
     
-    Per Palaseanu-Lovejoy et al. (2026), SDB errors tend to be bimodal regardless
-    of method, which makes RMSE potentially misleading.
+    In practice, residual distributions can be multi-modal (e.g., mixed bottom types,
+    mask edge effects, or datum/quality heterogeneity). In those cases RMSE can be
+    misleading and robust summaries (MAD/quantiles) are often more informative.
     
     Returns dict with:
         - is_bimodal: bool
@@ -365,8 +366,7 @@ def _detect_bimodal(residuals: np.ndarray, min_samples: int = 50) -> Dict[str, A
         if n_modes >= 2:
             result["warning"] = (
                 "Bimodal error distribution detected. RMSE may be misleading. "
-                "Consider using MAD (median absolute deviation) instead. "
-                "See Palaseanu-Lovejoy et al. (2026) for details."
+                "Consider using MAD (median absolute deviation) and quantiles instead."
             )
         
         return result
@@ -394,7 +394,7 @@ def _residual_summary(res: np.ndarray) -> Dict[str, Any]:
         "p99_abs_m": float(np.nanpercentile(absr, 99)),
     }
     
-    # Add bimodal detection (per Palaseanu-Lovejoy et al. 2026)
+    # Add bimodal detection (helps flag when RMSE is not representative)
     bimodal_info = _detect_bimodal(r[m])
     summary["bimodal"] = bimodal_info
     
@@ -782,7 +782,7 @@ def align_raster_to_tie_points(
             plot_path = str(Path(plots_dir) / plot_name)
             _plot_residuals(res, np.asarray(post.get("residuals_m", np.array([]))), ref_pd, plot_path, title=title)
         except Exception as exc:
-            log.warning(f"[ALIGN] Plot generation failed: {exc}")
+            log.warning("[ALIGN] Plot generation failed: %s", exc)
             plot_path = None
 
     out = {

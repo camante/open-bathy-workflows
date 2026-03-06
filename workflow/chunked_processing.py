@@ -528,7 +528,7 @@ def chunked_apply_raster(
             result = func(data)
             proc.write_tile(tile, result)
     
-    log.info(f"Chunked processing complete: {dst_path}")
+    log.info("Chunked processing complete: %s", dst_path)
 
 
 

@@ -25,8 +25,7 @@ import logging
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Optional, List
-
+from typing import Optional, List, Tuple, Dict, Any
 import pandas as pd
 
 log = logging.getLogger("river.usgs_nwis")
@@ -43,7 +42,7 @@ def _read_text_cached(url: str, cache_path: Optional[Path], timeout_s: int = 45)
         try:
             return cache_path.read_text(encoding="utf-8", errors="replace")
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
     req = urllib.request.Request(
         url,
@@ -61,7 +60,7 @@ def _read_text_cached(url: str, cache_path: Optional[Path], timeout_s: int = 45)
             _ensure_dir(cache_path.parent)
             cache_path.write_text(text, encoding="utf-8")
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
     # be a polite client
     time.sleep(0.1)
@@ -232,65 +231,100 @@ def normalize_units_us_to_si(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _compute_slope_proxy(xs_param: pd.DataFrame, cfg: Optional[InferConfig] = None) -> pd.Series:
-    """Estimate water-surface slope proxy per XS using d(WSE)/d(s) within each river_id.
 
-    This is a *fallback* when no slope attribute is available. Because WSE is a proxy
-    derived from DEM sampling, it can be noisy or biased. We therefore:
-      - require a minimum number of XS per river_id
-      - smooth WSE along stationing (rolling median)
-      - require |corr(s, WSE)| >= threshold (else return NaN for that group)
+def compute_site_a_from_measurements(
+    meas_si: pd.DataFrame,
+    b: float,
+    mean_to_dmax: float = 1.0,
+    stat: str = "median",
+    q_quantile_range: Optional[Tuple[float, float]] = None,
+) -> Tuple[Optional[float], int, Dict[str, Any]]:
+    """Estimate a site-specific coefficient *a* in: Dmax ≈ a * W^b.
 
-    Returns slope (unitless, m/m).
+    This is used as a *soft* prior when the workflow is anchored to USGS discharge
+    *measurement* records (width + area -> mean depth).
+
+    Args:
+        meas_si: Output of normalize_units_us_to_si(); expects width_m and mean_depth_m.
+        b: Width exponent used elsewhere in the workflow.
+        mean_to_dmax: Conversion factor from mean depth to an approximate Dmax.
+        stat: Aggregation over per-measurement a-values ('median' or 'mean').
+        q_quantile_range: Optional (lo, hi) quantiles to filter measurements by discharge.
+
+    Returns:
+        (a_site or None, n_used, meta)
     """
-    if xs_param is None or xs_param.empty:
-        return pd.Series([], dtype="float64")
+    if meas_si is None or meas_si.empty:
+        return (None, 0, {"reason": "empty"})
 
-    out = pd.Series(np.nan, index=xs_param.index, dtype="float64")
-    if "river_id" not in xs_param.columns or "s_center_m" not in xs_param.columns or "wse_m" not in xs_param.columns:
-        return out
+    df = meas_si.copy()
 
-    min_n = int(getattr(cfg, "slope_proxy_min_n", 10)) if cfg is not None else 10
-    min_r = float(getattr(cfg, "slope_proxy_min_r", 0.70)) if cfg is not None else 0.70
-    wwin = int(max(3, int(getattr(cfg, "smooth_window", 7)))) if cfg is not None else 7
-    if wwin % 2 == 0:
-        wwin += 1
+    w = pd.to_numeric(df.get("width_m", pd.Series([], dtype="float64")), errors="coerce")
+    dmean = pd.to_numeric(df.get("mean_depth_m", pd.Series([], dtype="float64")), errors="coerce")
 
-    for _, g in xs_param.groupby("river_id", dropna=False):
-        gg = g.copy()
-        gg["s_center_m"] = pd.to_numeric(gg["s_center_m"], errors="coerce")
-        gg["wse_m"] = pd.to_numeric(gg["wse_m"], errors="coerce")
-        gg = gg.sort_values("s_center_m")
-        gg = gg.loc[gg["s_center_m"].notna() & gg["wse_m"].notna()]
-        if len(gg) < max(3, min_n):
-            continue
+    mask = w.notna() & dmean.notna() & (w > 0) & (dmean > 0)
 
-        s = gg["s_center_m"].to_numpy(dtype=float)
-        w = gg["wse_m"].to_numpy(dtype=float)
-
-        # Require meaningful monotonic stationing
-        if not np.all(np.isfinite(s)) or not np.all(np.isfinite(w)):
-            continue
-        if np.nanmax(np.diff(s)) <= 0:
-            continue
-
-        # Smooth WSE to reduce DEM artifacts (rolling median)
-        w_s = pd.Series(w).rolling(window=wwin, center=True, min_periods=max(3, wwin // 3)).median().to_numpy()
-
-        # Require correlation between stationing and WSE (river should generally slope)
+    q_lo_v = None
+    q_hi_v = None
+    if q_quantile_range is not None and "discharge_cms" in df.columns:
+        q = pd.to_numeric(df.get("discharge_cms"), errors="coerce")
+        q = q.where(q.notna() & (q > 0))
         try:
-            r = np.corrcoef(s, w_s)[0, 1]
+            lo, hi = float(q_quantile_range[0]), float(q_quantile_range[1])
+            if 0.0 <= lo < hi <= 1.0 and q.notna().any():
+                q_lo_v = float(q.quantile(lo))
+                q_hi_v = float(q.quantile(hi))
+                mask &= q.notna() & (q >= q_lo_v) & (q <= q_hi_v)
         except Exception:
-            r = np.nan
-        if (not np.isfinite(r)) or (abs(float(r)) < float(min_r)):
-            continue
+            q_lo_v = None
+            q_hi_v = None
 
-        # Gradient-based slope
-        with np.errstate(divide="ignore", invalid="ignore"):
-            slope = np.abs(np.gradient(w_s, s))
-        # Clip to a sane range
-        slope = np.clip(slope, 0.0, 0.05)
+    w2 = w.loc[mask].astype("float64")
+    d2 = dmean.loc[mask].astype("float64")
+    if len(w2) == 0:
+        return (None, 0, {"reason": "no_valid"})
 
-        out.loc[gg.index] = slope
+    # Convert mean depth -> approximate max depth under the workflow's trapezoid model.
+    try:
+        mt = float(mean_to_dmax)
+    except Exception:
+        mt = 1.0
+    if not (pd.notna(mt) and mt > 0):
+        mt = 1.0
+    dmax = d2 * mt
 
-    return out
+    # a_i = Dmax / W^b
+    try:
+        bb = float(b)
+    except Exception:
+        bb = 0.0
+
+    a = dmax / (w2 ** bb)
+    a = pd.to_numeric(a, errors="coerce")
+    a = a.where(a.notna() & (a > 0)).dropna()
+
+    n_used = int(len(a))
+    if n_used == 0:
+        return (None, 0, {"reason": "no_a"})
+
+    s = str(stat or "median").strip().lower()
+    if s == "mean":
+        a_site = float(a.mean())
+    else:
+        a_site = float(a.median())
+
+    a_mean = float(a.mean())
+    a_std = float(a.std(ddof=1)) if n_used >= 2 else 0.0
+    a_cv = float(a_std / a_mean) if (a_mean > 0 and pd.notna(a_mean)) else float("nan")
+
+    meta: Dict[str, Any] = {
+        "n_total": int(len(df)),
+        "n_used": n_used,
+        "width_med_m": float(w2.median()) if len(w2) else float("nan"),
+        "a_cv": a_cv,
+        "q_lo": q_lo_v,
+        "q_hi": q_hi_v,
+        "stat": s,
+        "mean_to_dmax": float(mt),
+    }
+    return (a_site, n_used, meta)

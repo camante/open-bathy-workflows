@@ -294,6 +294,10 @@ def try_arcgis_nhd_flowlines(
     aoi: Tuple[float, float, float, float],
     out_crs: Optional[str],
     timeout_s: int = 120,
+    *,
+    da_raster: Optional[str] = None,
+    da_raster_band: int = 1,
+    da_raster_units: str = "km2",
 ) -> gpd.GeoDataFrame:
     """
     Try to fetch flowlines via ArcGIS REST as a fallback when TNMAccess download returns 0.
@@ -307,15 +311,116 @@ def try_arcgis_nhd_flowlines(
     # 1) NHDPlus HR
     try:
         log.info("[ARCGIS] Querying NHDPlus_HR NetworkNHDFlowline (layer 3) ...")
-        gdf_ll = arcgis_query_layer_geojson(NHDPLUS_HR_MAPSERVER, 3, aoi, timeout_s=timeout_s)
+        # NOTE: do not rely on ArcGIS defaults for outFields. Request the specific
+        # attributes we need for deterministic physics priors (e.g., drainage area).
+        # Field names are case-insensitive on the server side, but GeoJSON property
+        # keys may arrive with varying case across drivers. We normalize to lowercase.
+        out_fields = ",".join([
+            "COMID",
+            "NHDPlusID",
+            "FTYPE",
+            "StreamOrde",
+            "TotDASqKm",
+            "TotDASqMI",
+            # Slope fields — NHDPlus HR: Slope in cm/km (divide by 1e5 → m/m).
+            # MinElevSmo / MaxElevSmo in cm; LengthKm for independent cross-check.
+            "Slope",
+            "LengthKm",
+            "MinElevSmo",
+            "MaxElevSmo",
+        ])
+        try:
+            gdf_ll = arcgis_query_layer_geojson(NHDPLUS_HR_MAPSERVER, 3, aoi, timeout_s=timeout_s, out_fields=out_fields)
+        except Exception as e_fields:
+            # Some ArcGIS instances are strict about outFields; retry with '*' to avoid hard failure.
+            log.warning("[ARCGIS] NHDPlus_HR query with explicit fields failed (%s); retrying with outFields='*'", str(e_fields))
+            gdf_ll = arcgis_query_layer_geojson(NHDPLUS_HR_MAPSERVER, 3, aoi, timeout_s=timeout_s, out_fields="*")
         if gdf_ll is not None and not gdf_ll.empty:
+            # Normalize columns to lowercase for deterministic downstream access.
+            gdf_ll = gdf_ll.rename(columns={c: c.lower() for c in gdf_ll.columns if c != "geometry"})
+
             # Normalize id
-            if "COMID" in gdf_ll.columns:
-                gdf_ll["river_id"] = gdf_ll["COMID"].astype(str)
-            elif "NHDPlusID" in gdf_ll.columns:
-                gdf_ll["river_id"] = gdf_ll["NHDPlusID"].astype(str)
+            if "comid" in gdf_ll.columns:
+                gdf_ll["river_id"] = gdf_ll["comid"].astype(str)
+            elif "nhdplusid" in gdf_ll.columns:
+                gdf_ll["river_id"] = gdf_ll["nhdplusid"].astype(str)
             else:
                 gdf_ll["river_id"] = [f"reach_{i}" for i in range(len(gdf_ll))]
+
+            # Deterministic DA availability report (km^2)
+            da_field = "totdasqkm"
+            if da_field in gdf_ll.columns:
+                da = pd.to_numeric(gdf_ll[da_field], errors="coerce")
+                n_valid = int(np.isfinite(da).sum())
+                if n_valid > 0:
+                    log.info("[ARCGIS][ATTR] Drainage area available: field=%s valid=%d/%d", da_field, n_valid, int(len(da)))
+                else:
+                    log.warning("[ARCGIS][ATTR] Drainage area field present but all null: field=%s", da_field)
+            else:
+                log.warning("[ARCGIS][ATTR] Drainage area field not returned by service (expected %s)", da_field)
+            # Standardized schema for downstream XS code
+            # - drain_area_km2: used for DA/Q priors (energy solver)
+            # - slope_mpm: placeholder; may be filled later from WSE fit or proxies
+            if "drain_area_km2" not in gdf_ll.columns:
+                if da_field in gdf_ll.columns:
+                    gdf_ll["drain_area_km2"] = pd.to_numeric(gdf_ll[da_field], errors="coerce")
+                else:
+                    gdf_ll["drain_area_km2"] = np.nan
+            # ── Slope normalisation ────────────────────────────────────────────
+            # NHDPlus HR NetworkNHDFlowline carries Slope in cm/km (confirmed in
+            # NHDPlus HR User Guide v2.1 Table 21).  Convert to m/m.
+            # We also attempt an independent cross-check from smoothed elevation
+            # endpoints (MaxElevSmo − MinElevSmo in cm, LengthKm in km).
+            slope_mpm_ok = False
+            if "slope" in gdf_ll.columns:
+                sl = pd.to_numeric(gdf_ll["slope"], errors="coerce")
+                sl_mpm = sl * 1e-5           # cm/km → m/m
+                valid = np.isfinite(sl_mpm) & (sl_mpm > 0)
+                if valid.any():
+                    gdf_ll["slope_mpm"] = np.where(valid, sl_mpm, np.nan)
+                    n_valid = int(valid.sum())
+                    log.info(
+                        "[ARCGIS][ATTR] Slope available from NHDPlus HR (Slope field): "
+                        "n_valid=%d/%d  range=[%.2e, %.2e] m/m",
+                        n_valid, len(gdf_ll),
+                        float(sl_mpm[valid].min()), float(sl_mpm[valid].max()),
+                    )
+                    slope_mpm_ok = True
+            if not slope_mpm_ok:
+                # Derive from smoothed endpoint elevations when the Slope field is absent or all-null.
+                if "minelevsmo" in gdf_ll.columns and "maxelevsmo" in gdf_ll.columns and "lengthkm" in gdf_ll.columns:
+                    dz_m  = (pd.to_numeric(gdf_ll["maxelevsmo"], errors="coerce") -
+                              pd.to_numeric(gdf_ll["minelevsmo"], errors="coerce")) * 0.01  # cm → m
+                    len_m = pd.to_numeric(gdf_ll["lengthkm"], errors="coerce") * 1e3
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        sl_derived = np.abs(dz_m / len_m)
+                    valid = np.isfinite(sl_derived) & (sl_derived > 0)
+                    if valid.any():
+                        gdf_ll["slope_mpm"] = np.where(valid, sl_derived, np.nan)
+                        log.info(
+                            "[ARCGIS][ATTR] Slope derived from MinElevSmo/MaxElevSmo: "
+                            "n_valid=%d/%d",
+                            int(valid.sum()), len(gdf_ll),
+                        )
+                        slope_mpm_ok = True
+            if not slope_mpm_ok:
+                if "slope_mpm" not in gdf_ll.columns:
+                    gdf_ll["slope_mpm"] = np.nan
+                log.warning(
+                    "[ARCGIS][ATTR] No slope information available from NHDPlus HR "
+                    "(fields: %s). Will fall back to WSE-profile slope proxy.",
+                    list(gdf_ll.columns),
+                )
+
+            # If drainage area is still missing, optionally sample a drainage-area raster (e.g., MERIT Hydro UPA).
+            gdf_ll = _attach_drainage_area_from_raster(
+                gdf_ll,
+                da_raster=str(da_raster or ""),
+                da_raster_band=int(da_raster_band or 1),
+                da_raster_units=str(da_raster_units or "km2"),
+                logger=log,
+            )
+
             # Project
             lonc, latc = _aoi_center(aoi)
             crs_out = CRS.from_user_input(out_crs) if out_crs else CRS.from_epsg(_auto_utm_epsg_from_lonlat(lonc, latc))
@@ -338,6 +443,22 @@ def try_arcgis_nhd_flowlines(
                 gdf_ll["river_id"] = gdf_ll["ReachCode"].astype(str)
             else:
                 gdf_ll["river_id"] = [f"reach_{i}" for i in range(len(gdf_ll))]
+            # Standardized schema for downstream XS code
+            if "drain_area_km2" not in gdf_ll.columns:
+                gdf_ll["drain_area_km2"] = np.nan
+            if "slope_mpm" not in gdf_ll.columns:
+                gdf_ll["slope_mpm"] = np.nan
+
+            # Optional drainage-area raster fallback for classic NHD flowlines.
+            gdf_ll = _attach_drainage_area_from_raster(
+                gdf_ll,
+                da_raster=str(da_raster or ""),
+                da_raster_band=int(da_raster_band or 1),
+                da_raster_units=str(da_raster_units or "km2"),
+                logger=log,
+            )
+
+
             lonc, latc = _aoi_center(aoi)
             crs_out = CRS.from_user_input(out_crs) if out_crs else CRS.from_epsg(_auto_utm_epsg_from_lonlat(lonc, latc))
             gdfp = gdf_ll.to_crs(crs_out)
@@ -718,7 +839,7 @@ def tnm_download_products(items: List[Dict[str, Any]], out_dir: Path, timeout_s:
                 if part.exists():
                     part.unlink()
             except Exception:
-                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("Optional step failed; continuing.", exc_info=True)
 
     return downloaded
 
@@ -840,7 +961,7 @@ def find_best_flowline_source(extract_roots: List[Path]) -> Tuple[Optional[Path]
             sc = score(c, chosen)
             scored.append((sc, str(c), c, chosen))
         except Exception:
-            logging.getLogger(__name__).debug("Flowline candidate inspect failed: %s", str(c), exc_info=True)
+            log.debug("Flowline candidate inspect failed: %s", str(c), exc_info=True)
             continue
 
     if not scored:
@@ -902,7 +1023,7 @@ def download_hydrorivers_zip(region: str, out_dir: Path, timeout_s: int = 600) -
             if part.exists():
                 part.unlink()
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
         raise
 
     return dst
@@ -1198,6 +1319,27 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--tnm-timeout", type=int, default=120, help="HTTP timeout seconds for TNM search/download.")
     p.add_argument("--arcgis-timeout", type=int, default=120, help="HTTP timeout seconds for ArcGIS REST flowline fallback.")
 
+    # Optional drainage-area raster fallback (e.g., MERIT Hydro upstream area grid).
+    # This is only used when NHDPlus drainage-area attributes are unavailable.
+    p.add_argument(
+    "--da-raster",
+    default=None,
+    help=(
+        "Optional drainage-area raster to sample when NHDPlus drainage area is unavailable. "
+        "Example: MERIT Hydro upstream area (UPA)."
+    ),
+    )
+    p.add_argument("--da-raster-band", type=int, default=1, help="Band index for --da-raster (1-based).")
+    p.add_argument(
+    "--da-raster-units",
+    default="km2",
+    choices=["km2", "m2"],
+    help=(
+        "Units of values stored in --da-raster. 'km2' is typical for MERIT UPA; "
+        "set explicitly to avoid ambiguity."
+    ),
+    )
+    
     p.add_argument("--hydrography-source", default="arcgis", choices=["arcgis","arcgis_tnm","tnm"],
                    help="Hydrography acquisition strategy: arcgis (default) queries ArcGIS REST first; arcgis_tnm uses TNM as a fallback; tnm prefers TNM.")
 
@@ -1231,6 +1373,114 @@ def _parse_args() -> argparse.Namespace:
         help="Comma-separated output layers to write.",
     )
     return p.parse_args()
+
+
+def _attach_drainage_area_from_raster(
+    gdf_ll: "gpd.GeoDataFrame",
+    *,
+    da_raster: str,
+    da_raster_band: int = 1,
+    da_raster_units: str = "km2",
+    logger: Optional[logging.Logger] = None,
+) -> "gpd.GeoDataFrame":
+    """Fill drain_area_km2 by sampling a drainage-area raster at reach midpoints.
+
+    Intended as a deterministic fallback when NHDPlus_HR attributes are unavailable.
+    - gdf_ll is expected in EPSG:4326.
+    - Only fills rows where drain_area_km2 is NaN.
+    """
+    log_ = logger or logging.getLogger(__name__)
+    if gdf_ll is None or gdf_ll.empty:
+        return gdf_ll
+    if not da_raster:
+        return gdf_ll
+
+    try:
+        import rasterio
+        from pyproj import Transformer
+    except Exception as e:
+        log_.warning("[DA_RASTER] raster sampling unavailable (missing deps): %s", e)
+        return gdf_ll
+
+    if "drain_area_km2" not in gdf_ll.columns:
+        gdf_ll["drain_area_km2"] = np.nan
+
+    need = pd.to_numeric(gdf_ll["drain_area_km2"], errors="coerce").isna()
+    n_need = int(need.sum())
+    if n_need == 0:
+        return gdf_ll
+
+    try:
+        with rasterio.open(da_raster) as ds:
+            if ds.crs is None:
+                log_.warning("[DA_RASTER] Raster has no CRS; cannot sample: %s", da_raster)
+                return gdf_ll
+            band = int(da_raster_band)
+            if band < 1 or band > ds.count:
+                log_.warning("[DA_RASTER] Invalid band %s for raster with %d band(s): %s", band, ds.count, da_raster)
+                return gdf_ll
+
+            # Midpoints in EPSG:4326
+            try:
+                mids = gdf_ll.loc[need, "geometry"].apply(
+                    lambda g: g.interpolate(0.5, normalized=True) if g is not None else None
+                )
+            except Exception:
+                mids = gdf_ll.loc[need, "geometry"].apply(
+                    lambda g: g.representative_point() if g is not None else None
+                )
+
+            xs: List[float] = []
+            ys: List[float] = []
+            idxs: List[int] = []
+            for idx, pt in mids.items():
+                if pt is None or pt.is_empty:
+                    continue
+                idxs.append(int(idx))
+                xs.append(float(pt.x))
+                ys.append(float(pt.y))
+
+            if not idxs:
+                log_.warning("[DA_RASTER] No valid midpoint geometries to sample.")
+                return gdf_ll
+
+            tr = Transformer.from_crs("EPSG:4326", ds.crs, always_xy=True)
+            rx, ry = tr.transform(xs, ys)
+            coords = list(zip(rx, ry))
+            vals = list(ds.sample(coords, indexes=band))
+            sampled = np.array([v[0] if v is not None and len(v) else np.nan for v in vals], dtype=float)
+
+            nodata = ds.nodata
+            if nodata is not None and np.isfinite(nodata):
+                sampled = np.where(sampled == float(nodata), np.nan, sampled)
+
+            units = str(da_raster_units).strip().lower()
+            if units == "km2":
+                da_km2 = sampled
+            elif units == "m2":
+                da_km2 = sampled / 1e6
+            else:
+                log_.warning("[DA_RASTER] Unknown units '%s'; assuming km2.", units)
+                da_km2 = sampled
+
+            filled = 0
+            for i, idx in enumerate(idxs):
+                if np.isfinite(da_km2[i]) and da_km2[i] > 0:
+                    gdf_ll.at[idx, "drain_area_km2"] = float(da_km2[i])
+                    filled += 1
+
+            log_.info(
+                "[DA_RASTER] Filled drain_area_km2 from raster for %d/%d reach(es): %s (band=%d units=%s)",
+                filled,
+                n_need,
+                da_raster,
+                int(da_raster_band),
+                units,
+            )
+    except Exception as e:
+        log_.warning("[DA_RASTER] Failed to sample drainage-area raster '%s': %s", da_raster, e)
+
+    return gdf_ll
 
 
 def main() -> None:
@@ -1277,6 +1527,9 @@ def main() -> None:
             aoi=aoi,
             out_crs=args.out_crs,
             timeout_s=int(getattr(args, "arcgis_timeout", 120)),
+            da_raster=getattr(args, "da_raster", None),
+            da_raster_band=int(getattr(args, "da_raster_band", 1) or 1),
+            da_raster_units=str(getattr(args, "da_raster_units", "km2") or "km2"),
         )
         if gdf_arc is not None and not gdf_arc.empty:
             gdf = gdf_arc
@@ -1348,6 +1601,9 @@ def main() -> None:
             aoi=aoi,
             out_crs=args.out_crs,
             timeout_s=int(getattr(args, "arcgis_timeout", 120)),
+            da_raster=getattr(args, "da_raster", None),
+            da_raster_band=int(getattr(args, "da_raster_band", 1) or 1),
+            da_raster_units=str(getattr(args, "da_raster_units", "km2") or "km2"),
         )
         if gdf_arc is not None and not gdf_arc.empty:
             gdf = gdf_arc
@@ -1444,7 +1700,7 @@ def main() -> None:
         len(rivers_clip),
         len(nodes_gdf),
         len(edges_gdf),
-        len(nhdarea_clip) if 'nhdarea_clip' in locals() else 0,
+        len(nhdarea_clip) if nhdarea_clip is not None else 0,
         str(gdf.crs),
         str(rivers_aoi["source"].iloc[0]) if "source" in rivers_aoi.columns and len(rivers_aoi) else "unknown",
     )

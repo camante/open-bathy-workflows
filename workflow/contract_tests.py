@@ -401,7 +401,7 @@ class ContractTestSuite:
         log.info("=" * 70)
         log.info(f"Contract Tests: {passed}/{total} passed")
         if critical_failed > 0:
-            log.error(f"CRITICAL FAILURES: {critical_failed}")
+            log.error("CRITICAL FAILURES: %s", critical_failed, exc_info=True)
         log.info("=" * 70)
         
         return total, passed, critical_failed
@@ -433,7 +433,7 @@ class ContractTestSuite:
         with open(output_path, 'w') as f:
             json.dump(summary, f, indent=2)
         
-        log.info(f"[CONTRACT TESTS] Report saved to {output_path}")
+        log.info("[CONTRACT TESTS] Report saved to %s", output_path)
 
 
 def load_test_context_from_run(output_dir: Path) -> Dict[str, Any]:
@@ -454,7 +454,7 @@ def load_test_context_from_run(output_dir: Path) -> Dict[str, Any]:
         try:
             context["fused_df"] = pd.read_csv(fused_csv)
         except Exception as e:
-            log.warning(f"Failed to load fused CSV: {e}")
+            log.warning("Failed to load fused CSV: %s", e)
             pass
     
     # Load run report
@@ -464,7 +464,7 @@ def load_test_context_from_run(output_dir: Path) -> Dict[str, Any]:
             with open(run_report_path) as f:
                 context["run_report"] = json.load(f)
         except Exception as e:
-            log.warning(f"Failed to load run report: {e}")
+            log.warning("Failed to load run report: %s", e)
             pass
     
     # Check if XYZ was provided (look for extra_xyz in inputs)
@@ -518,7 +518,7 @@ if __name__ == "__main__":
     output_dir = Path(sys.argv[1])
     
     if not output_dir.exists():
-        log.info(f"Error: Directory not found: {output_dir}")
+        log.info("Error: Directory not found: %s", output_dir)
         sys.exit(1)
     
     exit_code = run_contract_tests_cli(output_dir)

@@ -142,22 +142,29 @@ class ValidationError(SDBError):
     pass
 
 
-class MemoryError(SDBError):
+class PipelineMemoryError(SDBError):
     """
     Memory-related errors.
-    
+
     Raised when:
     - Insufficient memory for operation
     - Array size exceeds limits
     - Chunked processing required
-    
+
+    Named PipelineMemoryError (not MemoryError) to avoid shadowing the Python builtin.
+
     Example:
-        raise MemoryError(
+        raise PipelineMemoryError(
             "AOI too large for memory",
             details={"size_gb": 16.5, "available_gb": 8.0}
         )
     """
     pass
+
+
+# Backwards-compatibility alias — do not use for new code.
+# Kept so existing imports of `from errors import MemoryError` continue to work.
+MemoryError = PipelineMemoryError  # type: ignore[assignment]
 
 
 class InterpolationError(ProcessingError):

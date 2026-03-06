@@ -489,7 +489,7 @@ def buffered_spatial_cv(
         log.info(f"[SpatialCV] Fold {fold_id}: {n_buffered} points in buffer zone excluded from training")
         
         if np.sum(train_mask) < min_test_samples:
-            log.warning(f"[SpatialCV] Fold {fold_id}: insufficient training samples after buffer")
+            log.warning("[SpatialCV] Fold %s: insufficient training samples after buffer", fold_id)
             continue
         
         test_idx = indices[test_mask]
@@ -700,7 +700,7 @@ def compare_cv_strategies(
     
     results = {}
     for strategy in strategies:
-        log.info(f"\n[SpatialCV] === Running {strategy} ===")
+        log.info("\n[SpatialCV] === Running %s ===", strategy)
         try:
             results[strategy] = run_spatial_cv(
                 df, feature_cols, target_col,
@@ -937,7 +937,7 @@ def plot_spatial_cv_results(
     fig.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     
-    log.info(f"[SpatialCV] Saved CV results plot: {output_path}")
+    log.info("[SpatialCV] Saved CV results plot: %s", output_path)
 
 
 # -----------------------------------------------------------------------------

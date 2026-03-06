@@ -286,6 +286,15 @@ def build_xs_line(center_pt: Point, tan: Tuple[float, float], half_width_m: floa
     return LineString([(x0, y0), (x1, y1)])
 
 
+def _trim_line_at_intersection(line_geom: LineString, intersect_pt: Point) -> LineString:
+    """Trim a XS line at its intersection point, keeping the half containing the line midpoint."""
+    d_int = line_geom.project(intersect_pt)
+    d_center = line_geom.length * 0.5
+    if d_int < d_center:
+        return LineString([intersect_pt, line_geom.coords[-1]])
+    return LineString([line_geom.coords[0], intersect_pt])
+
+
 def _trim_overlapping_xs(xs_list: List[Dict]) -> List[Dict]:
     """
     Check adjacent cross-sections for intersection. If they cross, clip them at the intersection point.
@@ -316,42 +325,22 @@ def _trim_overlapping_xs(xs_list: List[Dict]) -> List[Dict]:
         # Strategy: The intersection usually happens on the "inside" of the bend.
         # We want to keep the segment of the line that connects to the centerline.
         # Since we construct lines as [Left, Right] centered on the centerline,
-        # checking the distance from the centerline point to the intersection vs the endpoints
-        # tells us which side to trim.
-        
-        # Helper to trim a line to the intersection point, keeping the side with the centerline
-        def _trim_line(line_geom, intersect_pt, center_dist_along):
-            # Project intersection onto line to find distance along line
-            d_int = line_geom.project(intersect_pt)
-            d_center = line_geom.project(line_geom.interpolate(0.5, normalized=True))
-            
-            # Reconstruct
-            if d_int < d_center:
-                # Intersection is on the "left" (start) side -> cut the start
-                # New line is [Intersection, End]
-                return LineString([intersect_pt, line_geom.coords[-1]])
-            else:
-                # Intersection is on the "right" (end) side -> cut the end
-                # New line is [Start, Intersection]
-                return LineString([line_geom.coords[0], intersect_pt])
-
-        # Apply trimming
+        # Apply trimming using the module-level helper (no inner def, no unused param).
         try:
-            new_g1 = _trim_line(g1, pt, curr['s_center_m'])
-            new_g2 = _trim_line(g2, pt, next_xs['s_center_m'])
-            
-            # Update geometries in place if valid
+            new_g1 = _trim_line_at_intersection(g1, pt)
+            new_g2 = _trim_line_at_intersection(g2, pt)
+
             if not new_g1.is_empty and new_g1.length > 1.0:
-                curr['geometry'] = new_g1
+                curr["geometry"] = new_g1
             if not new_g2.is_empty and new_g2.length > 1.0:
-                next_xs['geometry'] = new_g2
-            
+                next_xs["geometry"] = new_g2
+
             modified += 1
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True) # Geometry error, skip trimming this pair
+            log.debug("XS trim failed for pair %s/%s; skipping.", curr.get("xs_id"), next_xs.get("xs_id"), exc_info=True)
 
     if modified > 0:
-        log.info(f"[XS] Trimmed {modified} intersecting cross-section pairs.")
+        log.info("[XS] Trimmed %d intersecting cross-section pairs.", modified)
         
     return xs_list
 
@@ -540,7 +529,7 @@ def _global_deconflict_xs_all(xs_lines_records: List[Dict], tol_m: float) -> Lis
             kept.add(rec_i)
 
     if dropped:
-        log.info(f"[XS] Global deconflict (all) dropped {len(dropped)} intersecting XS across AOI.")
+        log.info("[XS] Global deconflict (all) dropped %d intersecting XS across AOI.", len(dropped))
 
     # Return records in original order for stability
     out: List[Dict] = []
@@ -579,7 +568,7 @@ def _global_deconflict_xs(xs_list: List[Dict], tol_m: float) -> List[Dict]:
 
     dropped = len(xs_list) - len(kept)
     if dropped > 0:
-        log.info(f"[XS] Global deconflict dropped {dropped} intersecting XS within reach.")
+        log.info("[XS] Global deconflict dropped %d intersecting XS within reach.", dropped)
     return kept
 
 
@@ -730,7 +719,7 @@ def build_xs_for_river(
             raise RuntimeError(f"DEM has no CRS: {dem_path}")
         dem_crs = CRS.from_user_input(dem_ds.crs)
 
-        topo_ds = rasterio.open(topo_path) if topo_path else None
+        topo_ds = topo_ds_ctx = rasterio.open(topo_path) if topo_path else None
         topo_crs = CRS.from_user_input(topo_ds.crs) if topo_ds is not None else None
 
         xform_to_dem = None if rivers_crs == dem_crs else Transformer.from_crs(rivers_crs, dem_crs, always_xy=True)
@@ -750,19 +739,19 @@ def build_xs_for_river(
         # Pre-compute junction nodes from snapped reach endpoints (fast proxy for confluences).
         junction_pts: List[Point] = []
         junction_tree = None
-        if bool(getattr(cfg, "skip_junctions", True)) and float(getattr(cfg, "junction_buffer_m", 0.0)) > 0:
+        if bool(cfg.skip_junctions) and float(cfg.junction_buffer_m) > 0:
             try:
                 lines: List[LineString] = []
                 for _, r in rivers_clip.iterrows():
                     g = _ensure_single_linestring(r.geometry)
                     if g is None or g.is_empty:
                         continue
-                    g = _densify_linestring(g, float(getattr(cfg, "densify_step_m", 0.0)))
+                    g = _densify_linestring(g, float(cfg.densify_step_m))
                     lines.append(g)
-                junction_pts = _compute_junction_points(lines, snap_m=float(getattr(cfg, "junction_snap_m", 30.0)), min_degree=3)
+                junction_pts = _compute_junction_points(lines, snap_m=float(cfg.junction_snap_m), min_degree=3)
                 if junction_pts:
                     junction_tree = STRtree(junction_pts)
-                    log.info(f"[XS] Detected {len(junction_pts)} junction node(s) from reach endpoints.")
+                    log.info("[XS] Detected %d junction node(s) from reach endpoints.", len(junction_pts))
             except Exception as e:
                 log.debug("[XS] Junction detection failed: %s", e)
                 junction_tree = None
@@ -776,7 +765,7 @@ def build_xs_for_river(
                 continue
 
             # Densify to stabilize tangents and reduce spurious XS crossings on coarse centerlines
-            geom = _densify_linestring(geom, float(getattr(cfg, 'densify_step_m', 0.0)))
+            geom = _densify_linestring(geom, float(cfg.densify_step_m))
 
             L = float(geom.length)
             if L < cfg.min_centerline_len_m:
@@ -798,18 +787,18 @@ def build_xs_for_river(
                 # Skip XS too close to a junction/confluence (reduces self-intersection artifacts)
                 if junction_tree is not None:
                     try:
-                        buf = center_pt.buffer(float(getattr(cfg, 'junction_buffer_m', 0.0)))
+                        buf = center_pt.buffer(float(cfg.junction_buffer_m))
                         hits = junction_tree.query(buf)
                         # Shapely 2 returns indices; Shapely 1 may return geometries
                         if len(hits) > 0:
                             if isinstance(hits[0], (int, np.integer)):
-                                geoms = [junction_pts[int(i)] for i in hits]
+                                _hit_jpts = [junction_pts[int(h)] for h in hits]
                             else:
-                                geoms = list(hits)
-                            if any(center_pt.distance(pt) <= float(getattr(cfg, 'junction_buffer_m', 0.0)) for pt in geoms):
+                                _hit_jpts = list(hits)
+                            if any(center_pt.distance(pt) <= float(cfg.junction_buffer_m) for pt in _hit_jpts):
                                 continue
                     except Exception:
-                        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                        log.debug("[XS] Junction proximity check failed; skipping.", exc_info=True)
 
                 # Use smoothed tangent for orientation
                 tan = _line_tangent(geom, s_center, eps=smoothing_eps)
@@ -835,8 +824,8 @@ def build_xs_for_river(
                 xs_batch = _trim_overlapping_xs(xs_batch)
 
             # 2b. Global deconflict within reach: drop XS that still intersect after trimming
-            if bool(getattr(cfg, 'global_deconflict', True)) and len(xs_batch) > 1:
-                xs_batch = _global_deconflict_xs(xs_batch, tol_m=float(getattr(cfg, 'deconflict_tol_m', 2.0)))
+            if bool(cfg.global_deconflict) and len(xs_batch) > 1:
+                xs_batch = _global_deconflict_xs(xs_batch, tol_m=float(cfg.deconflict_tol_m))
             
             # 3. Sample Rasters along final geometries
             for rec in xs_batch:
@@ -914,14 +903,12 @@ def build_xs_for_river(
 
         # Conservative: drop intersecting XS across the entire AOI to reduce artifacts at tight meanders
         # and reach boundaries (at the cost of fewer XS).
-        if getattr(cfg, 'global_deconflict_all', True) and len(xs_lines_records) > 1:
+        if cfg.global_deconflict_all and len(xs_lines_records) > 1:
             before = len(xs_lines_records)
             xs_lines_records = _global_deconflict_xs_all(xs_lines_records, tol_m=float(cfg.deconflict_tol_m))
             kept_ids = {r.get('xs_id') for r in xs_lines_records}
             xs_points_records = [r for r in xs_points_records if r.get('xs_id') in kept_ids]
             dropped = before - len(xs_lines_records)
-            if dropped > 0:
-                log.info(f"[XS] Global deconflict (all) dropped {dropped} intersecting XS across AOI.")
 
         xs_lines_gdf = gpd.GeoDataFrame(xs_lines_records, crs=rivers_clip.crs)
         xs_pts_gdf = gpd.GeoDataFrame(xs_points_records, crs=rivers_clip.crs)
@@ -937,8 +924,11 @@ def build_xs_for_river(
             df_csv.to_csv(out_csv, index=False)
             log.info("[WRITE] %s", out_csv)
 
-        if topo_ds is not None:
-            topo_ds.close()
+        if topo_ds_ctx is not None:
+            try:
+                topo_ds_ctx.close()
+            except Exception:
+                pass
 
 
 # --------------------------------------------------------------------------------------
@@ -1051,7 +1041,7 @@ def main() -> None:
         try:
             ftype_allow.append(int(float(s)))
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("[CLI] Could not parse ftype value %r; skipping.", s, exc_info=True)
     if not ftype_allow:
         ftype_allow = [460, 558]
 

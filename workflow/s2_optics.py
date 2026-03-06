@@ -145,7 +145,24 @@ def _write_composite_meta(out_dir: Path, meta: dict) -> None:
     try:
         meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True))
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
+
+
+
+def _sample_band_masked(path, *, mask, np_mod, rio_mod, max_samples=750000):
+    """Read a single-band raster, apply a finite mask, and return a flat float32 sample array."""
+    with rio_mod.open(str(path)) as ds:
+        a = ds.read(1).astype(np_mod.float32)
+        if ds.nodata is not None:
+            a = np_mod.where(a == ds.nodata, np_mod.nan, a)
+    if mask is not None:
+        a = np_mod.where(mask, a, np_mod.nan)
+    v = a[np_mod.isfinite(a)]
+    if v.size > max_samples:
+        idx = np_mod.random.choice(v.size, size=max_samples, replace=False)
+        v = v[idx]
+    return v
+
 
 
 def _build_s2_params_fingerprint_dict(
@@ -203,7 +220,7 @@ def _purge_expected_outputs(expected: Dict[str, Path]) -> None:
             if p.exists():
                 p.unlink()
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
 
 def acquire_run_lock(lock_path: Path, stale_hours: float = 6.0) -> None:
@@ -246,7 +263,7 @@ def acquire_run_lock(lock_path: Path, stale_hours: float = 6.0) -> None:
         try:
             lock_path.unlink()
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
     meta = {
         "pid": os.getpid(),
@@ -265,7 +282,7 @@ def acquire_run_lock(lock_path: Path, stale_hours: float = 6.0) -> None:
             if lock_path.exists():
                 lock_path.unlink()
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
     atexit.register(_cleanup)
 
@@ -338,7 +355,7 @@ def extract_orbit(item: dict) -> str:
         try:
             return f"{int(v):03d}"
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
     iid = item.get("id", "") or ""
     m = re.search(r"_R(\d{3})_", iid)
     if m:
@@ -1163,7 +1180,7 @@ def _hedley_glint_correct(
             vmask = scl_valid_mask(scl_int, dilate=0, scl_bad=set(scl_bad))
             mask0 &= vmask
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
     mask = mask0
     mask_mode = "strict"
@@ -1184,7 +1201,7 @@ def _hedley_glint_correct(
                 vmask = scl_valid_mask(scl_int, dilate=0, scl_bad=set(scl_bad))
                 mask1 &= vmask
             except Exception:
-                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("Optional step failed; continuing.", exc_info=True)
         n1 = int(np.count_nonzero(mask1))
         if n1 > n0:
             mask = mask1
@@ -1595,7 +1612,7 @@ def build_weighted_shared_date_composite(
             if Path(coastline_mask_path).exists():
                 inputs_fp["coastline_mask"] = fingerprint_file(Path(coastline_mask_path), strict=bool(cache_strict))
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
     want_key = _s2_exact_cache_key(
         bbox_wesn=bbox_wesn,
@@ -1609,7 +1626,7 @@ def build_weighted_shared_date_composite(
     have_key = str(meta.get("cache_key", ""))
 
     if outputs_exist and have_key == want_key:
-        log.info(f"[S2] CACHE HIT (exact params): {out_dir}")
+        log.info("[S2] CACHE HIT (exact params): %s", out_dir)
         ret = {k: str(v) for k, v in expected.items()}
         try:
             from log_report import raster_quickstats, mask_fraction
@@ -1649,29 +1666,17 @@ def build_weighted_shared_date_composite(
                     else:
                         _mask = _np.isfinite(_m) & (_m != 0)
 
-                def _sample_band(_p):
-                    with _rio.open(str(_p)) as _ds:
-                        _a = _ds.read(1).astype(_np.float32)
-                        if _ds.nodata is not None:
-                            _a = _np.where(_a == _ds.nodata, _np.nan, _a)
-                    if _mask is not None:
-                        _a = _np.where(_mask, _a, _np.nan)
-                    _v = _a[_np.isfinite(_a)]
-                    if _v.size > 750000:
-                        _idx = _np.random.choice(_v.size, size=750000, replace=False)
-                        _v = _v[_idx]
-                    return _v
 
                 od = {}
                 if expected.get("B02") and Path(expected["B02"]).exists():
-                    _v02 = _sample_band(expected["B02"])
+                    _v02 = _sample_band_masked(expected["B02"], mask=_mask, np_mod=_np, rio_mod=_rio)
                     od["n_sample_b02"] = int(_v02.size)
                     if _v02.size:
                         od["L_inf_proxy_b02_p01"] = float(_np.percentile(_v02, 1))
                         _vlog = _np.log(_np.maximum(_v02, _eps))
                         od["EDR_log_b02_p95_p05"] = float(_np.percentile(_vlog, 95) - _np.percentile(_vlog, 5))
                 if expected.get("B03") and Path(expected["B03"]).exists():
-                    _v03 = _sample_band(expected["B03"])
+                    _v03 = _sample_band_masked(expected["B03"], mask=_mask, np_mod=_np, rio_mod=_rio)
                     od["n_sample_b03"] = int(_v03.size)
                     if _v03.size:
                         od["L_inf_proxy_b03_p01"] = float(_np.percentile(_v03, 1))
@@ -1687,11 +1692,11 @@ def build_weighted_shared_date_composite(
                     od["signal_feasibility"] = "unknown"
                 rep["optical_diagnostics"] = od
             except Exception:
-                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("Optional step failed; continuing.", exc_info=True)
 
             ret["_report"] = rep
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
         return ret
 
     # If outputs exist but key differs, purge and rebuild
@@ -1895,7 +1900,7 @@ def build_weighted_shared_date_composite(
 
         ranked.sort(key=lambda x: x[0])
 
-        log.info(f"[S2] Final Filter: Dropped {final_dropped_month} dates due to preferred_months setting.")
+        log.info("[S2] Final Filter: Dropped %s dates due to preferred_months setting.", final_dropped_month)
         if not ranked:
             raise RuntimeError("[S2] No usable dates remain after applying all filters (cloud, shared-date, preferred-months).")
 
@@ -1912,7 +1917,7 @@ def build_weighted_shared_date_composite(
         cache_subdir_name = f"S2_{_norm_bbox_key(bbox_wesn, ndp=3)}_{start_date}_{end_date}"
         sentinel_cache_dir = base_cache_dir / "sentinel2" / cache_subdir_name
         sentinel_cache_dir.mkdir(parents=True, exist_ok=True)
-        log.info(f"[S2] Sentinel-2 downloads will be cached in: {sentinel_cache_dir}")
+        log.info("[S2] Sentinel-2 downloads will be cached in: %s", sentinel_cache_dir)
 
         # Pre-flight: if user provided coastline_mask_path, it must exist (no silent fallback)
         if date_qc_enable and coastline_mask_path:
@@ -2058,7 +2063,7 @@ def build_weighted_shared_date_composite(
                     )
                     # --- NEW: log stats so it's undeniable it's being used ---
                     cnt = int(np.count_nonzero(water_mask))
-                    log.info(f"[S2] [QC] Loaded coastline mask: {coastline_mask_path}")
+                    log.info("[S2] [QC] Loaded coastline mask: %s", coastline_mask_path)
                     log.info("[S2] [QC] Coast mask semantics: water_value=%s invert=%s erode_px=%d",
                              coastline_mask_water_value, coastline_mask_invert, int(coastline_erode_px))
                     log.info("[S2] [QC] Target-water pixels: %d (%.2f%% of grid)",
@@ -2146,7 +2151,7 @@ def build_weighted_shared_date_composite(
         # Phase 2: download 2x(outliers) additional candidates and score them
         extra_n = 2 * len(outliers)
         if date_qc_enable and extra_n > 0:
-            log.info(f"[S2] Phase 2: downloading {extra_n} additional candidate dates for outlier replacement...")
+            log.info("[S2] Phase 2: downloading %s additional candidate dates for outlier replacement...", extra_n)
             extras = []
             for cloud_score, date_key, present_tiles in ranked[N:]:
                 if date_key in date_mosaics:
@@ -2277,7 +2282,7 @@ def build_weighted_shared_date_composite(
             }
             (out_dir / "S2_DATE_QC.json").write_text(json.dumps(qc_report, indent=2))
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
         if used == 0:
             raise RuntimeError("[S2] Could not build any mosaics with publicly downloadable assets. Try a different --stac-url or relax filters.")
@@ -2324,7 +2329,7 @@ def build_weighted_shared_date_composite(
                         log.info(f"[S2][GLINT] Skipped glint correction: {meta_g.get('reason')}")
             except Exception as exc:
                 glint_meta_comp = {"enabled": True, "status": "skipped", "reason": f"exception: {exc}"}
-                log.warning(f"[S2][GLINT] Glint correction failed; continuing without it: {exc}")
+                log.warning("[S2][GLINT] Glint correction failed; continuing without it: %s", exc)
 
         brightness = compute_brightness(final["B02"], final["B03"], final["B04"]).astype(np.float32)
         clear = compute_clear_water_mask(final["B08"], brightness).astype(np.uint8)
@@ -2393,7 +2398,7 @@ def build_weighted_shared_date_composite(
                                 log.info(f"[S2][GLINT] Best-date glint correction skipped: {meta_b.get('reason')}")
                     except Exception as exc3:
                         glint_meta_best = {"enabled": True, "status": "skipped", "reason": f"exception: {exc3}"}
-                        log.warning(f"[S2][GLINT] Best-date glint correction failed; continuing without it: {exc3}")
+                        log.warning("[S2][GLINT] Best-date glint correction failed; continuing without it: %s", exc3)
                 # Write best-date full band stack + masks so downstream can compare
                 # (best-date vs temporal composite) in training/validation.
                 try:
@@ -2408,7 +2413,7 @@ def build_weighted_shared_date_composite(
                     write_geotiff(expected["BRIGHTNESS_BEST_DATE"], bright_best, dst_crs, dst_transform, nodata=np.nan, dtype="float32")
                     write_geotiff(expected["CLEAR_WATER_BEST_DATE"], clear_best.astype(np.uint8), dst_crs, dst_transform, nodata=255, dtype="uint8")
                 except Exception as exc2:
-                    log.warning(f"[S2] Failed writing best-date band stack/masks: {exc2}")
+                    log.warning("[S2] Failed writing best-date band stack/masks: %s", exc2)
 
                 rgb_best = np.stack([mos_best["B04"], mos_best["B03"], mos_best["B02"]], axis=0).astype(np.float32)
                 out_best = expected.get("RGB_BEST_DATE")
@@ -2431,13 +2436,13 @@ def build_weighted_shared_date_composite(
                         dst2.write(rgb_best)
                     log.info(f"[S2] Wrote single-best-date products: {out_best} (best_date={best_date})")
         except Exception as exc:
-            log.warning(f"[S2] Failed writing RGB_10m_best_date.tif: {exc}")
+            log.warning("[S2] Failed writing RGB_10m_best_date.tif: %s", exc)
 
         log.info(f"[S2] Wrote composite to {out_dir} (used {used} dates)")
         _write_composite_meta(out_dir, {
-            "cache_key": str(want_key) if "want_key" in locals() else _composite_cache_key(bbox_wesn, start_date, end_date),
-            "params_fp": params_fp if "params_fp" in locals() else {},
-            "inputs_fp": inputs_fp if "inputs_fp" in locals() else {},
+            "cache_key": str(want_key) if want_key is not None else _composite_cache_key(bbox_wesn, start_date, end_date),
+            "params_fp": params_fp if params_fp is not None else {},
+            "inputs_fp": inputs_fp if inputs_fp is not None else {},
             "bbox_wesn": list(map(float, bbox_wesn)),
             "start_date": str(start_date),
             "end_date": str(end_date),
@@ -2452,7 +2457,7 @@ def build_weighted_shared_date_composite(
         if clean_cache:
             try:
                 if sentinel_cache_dir.exists():
-                    log.info(f"[S2] Cleanup requested. Deleting raw scene cache: {sentinel_cache_dir}")
+                    log.info("[S2] Cleanup requested. Deleting raw scene cache: %s", sentinel_cache_dir)
                     shutil.rmtree(sentinel_cache_dir, ignore_errors=True)
             except Exception as e:
                 log.warning(f"[S2] Cleanup requested but failed to delete raw cache ({sentinel_cache_dir}): {e}")
@@ -2509,29 +2514,17 @@ def build_weighted_shared_date_composite(
                     else:
                         _mask = _np.isfinite(_m) & (_m != 0)
 
-                def _sample_band(_p):
-                    with _rio.open(str(_p)) as _ds:
-                        _a = _ds.read(1).astype(_np.float32)
-                        if _ds.nodata is not None:
-                            _a = _np.where(_a == _ds.nodata, _np.nan, _a)
-                    if _mask is not None:
-                        _a = _np.where(_mask, _a, _np.nan)
-                    _v = _a[_np.isfinite(_a)]
-                    if _v.size > 750000:
-                        _idx = _np.random.choice(_v.size, size=750000, replace=False)
-                        _v = _v[_idx]
-                    return _v
 
                 od = {}
                 if expected.get("B02") and Path(expected["B02"]).exists():
-                    _v02 = _sample_band(expected["B02"])
+                    _v02 = _sample_band_masked(expected["B02"], mask=_mask, np_mod=_np, rio_mod=_rio)
                     od["n_sample_b02"] = int(_v02.size)
                     if _v02.size:
                         od["L_inf_proxy_b02_p01"] = float(_np.percentile(_v02, 1))
                         _vlog = _np.log(_np.maximum(_v02, _eps))
                         od["EDR_log_b02_p95_p05"] = float(_np.percentile(_vlog, 95) - _np.percentile(_vlog, 5))
                 if expected.get("B03") and Path(expected["B03"]).exists():
-                    _v03 = _sample_band(expected["B03"])
+                    _v03 = _sample_band_masked(expected["B03"], mask=_mask, np_mod=_np, rio_mod=_rio)
                     od["n_sample_b03"] = int(_v03.size)
                     if _v03.size:
                         od["L_inf_proxy_b03_p01"] = float(_np.percentile(_v03, 1))
@@ -2547,11 +2540,11 @@ def build_weighted_shared_date_composite(
                     od["signal_feasibility"] = "unknown"
                 rep["optical_diagnostics"] = od
             except Exception:
-                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("Optional step failed; continuing.", exc_info=True)
 
             ret["_report"] = rep
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
         return ret
 
     finally:
@@ -2561,7 +2554,7 @@ def build_weighted_shared_date_composite(
             if lock.exists():
                 lock.unlink()
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
 def main():
     p = argparse.ArgumentParser(description="Sentinel-2 composite via weighted shared-date selection + feather mosaic.")

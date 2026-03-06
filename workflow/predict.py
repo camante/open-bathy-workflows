@@ -4,7 +4,7 @@
 predict.py – SDB inference engine (Scene-wide prediction)
 
 UPDATES:
-- POST-PREDICTION ALIGNMENT: ICP alignment to ICESat-2 tie points (Palaseanu-Lovejoy et al. 2026)
+- POST-PREDICTION ALIGNMENT: optional ICP alignment to independent tie points (e.g., ICESat-2)
 - HYBRID MODE: RF + Stumpf fallback for extrapolation beyond training depth
 - INTEGRATED: Full uncertainty quantification from sdb_uncertainty module
 - FIXED: Smart L_inf warning ignores harmless zero-filled dicts when linf_enabled=False
@@ -80,7 +80,7 @@ def _fmt_phys_scalar(value) -> str:
 # Optional modules
 # -----------------------------------------------------------------------------
 
-# Post-prediction alignment (Palaseanu-Lovejoy et al. 2026)
+# Post-prediction alignment (optional; keep conservative and report deltas)
 ALIGNMENT_AVAILABLE: bool = False
 _alignment_import_error: Optional[str] = None
 try:
@@ -90,7 +90,7 @@ except ImportError as e:
     _alignment_import_error = f"ImportError: {e}"
 except Exception as e:
     _alignment_import_error = f"{type(e).__name__}: {e}"
-    log.error(f"[predict] Alignment module failed to load: {_alignment_import_error}")
+    log.error("[predict] Alignment module failed to load: %s", _alignment_import_error, exc_info=True)
 
 # Physics-based SDB (Kim et al. 2024)
 PHYSICS_MODULE_AVAILABLE: bool = False
@@ -103,7 +103,7 @@ except ImportError as e:
     _physics_import_error = f"ImportError: {e}"
 except Exception as e:
     _physics_import_error = f"{type(e).__name__}: {e}"
-    log.error(f"[predict] Physics module failed to load: {_physics_import_error}")
+    log.error("[predict] Physics module failed to load: %s", _physics_import_error, exc_info=True)
 
 # Import standardized constants
 try:
@@ -376,7 +376,7 @@ def _normalize_linf_constants(d):
             try:
                 out[ku] = float(v)
             except Exception:
-                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("Optional step failed; continuing.", exc_info=True)
 
     for k, v in defaults.items():
         out.setdefault(k, v)
@@ -483,7 +483,7 @@ def predict_scene(
     # Log optional module status once per run (avoid import-time logging).
     if UNCERTAINTY_STATUS_MSG:
         log.info("[PREDICT] %s", UNCERTAINTY_STATUS_MSG)
-    log.info(f"[PREDICT] Loading RF model: {rf_model_path}")
+    log.info("[PREDICT] Loading RF model: %s", rf_model_path)
     rf_model = joblib.load(rf_model_path)
     stumpf_lr = joblib.load(stumpf_lr_path) if stumpf_lr_path and os.path.exists(stumpf_lr_path) else None
 
@@ -495,7 +495,7 @@ def predict_scene(
             stumpf_lr_intercept = float(stumpf_lr.intercept_)
             log.info(f"[PREDICT] Stumpf LR: depth = {stumpf_lr_intercept:.3f} + {stumpf_lr_coef:.3f} * stumpf_idx")
         except Exception as e:
-            log.warning(f"[PREDICT] Could not extract Stumpf LR coefficients: {e}")
+            log.warning("[PREDICT] Could not extract Stumpf LR coefficients: %s", e)
 
     with open(meta_json_path, "r") as f:
         meta = json.load(f)
@@ -569,7 +569,7 @@ def predict_scene(
                 if any(float(v) != 0 for v in linf_raw.values()):
                     log.warning("[PREDICT] linf_enabled=False but NON-ZERO L∞ constants are present in metadata; ignoring.")
             except Exception:
-                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("Optional step failed; continuing.", exc_info=True)
         log.info("[PREDICT] L_inf disabled; using zeros.")
 
     training_bounds = meta.get("training_bounds", {})
@@ -948,14 +948,14 @@ def predict_scene(
             with open(report_dir / "predict_report.json", "w") as f:
                 json.dump(rep, f, indent=2)
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
     finally:
         for s in srcs.values():
             try:
                 s.close()
             except Exception:
-                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("Optional step failed; continuing.", exc_info=True)
 
     log.info("[PREDICT] Finished. Depth: %s", out_path)
     return {"status": "ok"}

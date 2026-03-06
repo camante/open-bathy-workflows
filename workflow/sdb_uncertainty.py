@@ -768,7 +768,7 @@ def predict_sdb_with_uncertainty(
     # Log dominant uncertainty sources
     sorted_var = sorted(var_summary.items(), key=lambda x: x[1]["variance_fraction"], reverse=True)
     top_sources = ", ".join([f"{k}:{v['variance_fraction']*100:.0f}%" for k, v in sorted_var[:3]])
-    log.info(f"[SDB] Dominant uncertainty sources: {top_sources}")
+    log.info("[SDB] Dominant uncertainty sources: %s", top_sources)
     
     return SDBPrediction(
         depth=depth.astype(np.float32),
@@ -920,7 +920,7 @@ def write_uncertainty_rasters(
         dst.set_band_description(3, "confidence_0_1")
     outputs["combined"] = combined_path
     
-    log.info(f"[SDB] Wrote uncertainty-aware outputs to {output_dir}")
+    log.info("[SDB] Wrote uncertainty-aware outputs to %s", output_dir)
     
     return outputs
 
@@ -986,7 +986,7 @@ def predict_physics_only(
         center_lon = (bounds.left + bounds.right) / 2
         center_lat = (bounds.bottom + bounds.top) / 2
         region = estimate_region_from_location(center_lon, center_lat)
-        log.info(f"[SDB] Auto-detected region: {region}")
+        log.info("[SDB] Auto-detected region: %s", region)
     
     # Estimate Kd
     kd_map = None

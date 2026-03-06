@@ -463,7 +463,7 @@ class RunReport:
             if artifacts:
                 out_path.write_text(json.dumps(self.data, indent=2))
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
         return out_path
 

@@ -54,7 +54,7 @@ def print_human_run_summary(stats: Dict[str, Any], log_fn: Optional[Callable[[st
                 return
             except Exception:
                 # Fall back to stdout if logger fails for any reason.
-                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("Optional step failed; continuing.", exc_info=True)
         log.info(line)
 
     def get(d: Dict[str, Any], *keys: str, default=None):
@@ -162,12 +162,38 @@ def print_human_run_summary(stats: Dict[str, Any], log_fn: Optional[Callable[[st
     lines.append("Outputs written")
     lines.append("-" * 72)
 
-    # Show combined first, then method-specific
-    for k in ["combined_warped", "combined_root_copy", "sdb_warped", "river_warped", "river_bottom_warped", "combined", "sdb", "river"]:
-        if k in outputs:
-            lines.append(f"• {k}: {outputs[k]}")
-    if not outputs:
-        lines.append("• (No output paths recorded in stats.)")
+    # Show combined first, then method-specific.
+    # IMPORTANT: never claim a path exists unless we confirm it on disk.
+    from pathlib import Path as _Path
+
+    shown_any = False
+    for k in [
+        "combined_warped",
+        "combined_root_copy",
+        "sdb_warped",
+        "river_warped",
+        "river_bottom_warped",
+        "combined",
+        "sdb",
+        "river",
+    ]:
+        if k not in outputs:
+            continue
+        v = outputs.get(k)
+        if isinstance(v, str) and v.strip():
+            if _Path(v).exists():
+                lines.append(f"• {k}: {v}")
+                shown_any = True
+            else:
+                lines.append(f"• {k}: (missing) {v}")
+                shown_any = True
+        else:
+            # Unknown / non-string value; don't pretend we know.
+            lines.append(f"• {k}: (unverified) {v}")
+            shown_any = True
+
+    if not outputs or not shown_any:
+        lines.append("• (No verified output paths recorded in stats.)")
 
     lines.append("")
     lines.append("What to sanity-check in GIS")
@@ -290,7 +316,7 @@ def summarize_flight_recorder(fr_path: Path) -> Dict[str, Any]:
                     "rc": obj.get("rc"),
                 })
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
 
     # Sort steps by elapsed desc if available
     try:

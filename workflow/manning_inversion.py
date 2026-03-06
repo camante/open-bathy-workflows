@@ -582,7 +582,7 @@ def estimate_q2_from_drainage_area(
                 equation_id=str(ent.get('source','registry'))
             )
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
     # 2) Fallback: coarse built-in regressions (intended only as a last resort).
     
@@ -712,18 +712,19 @@ def main():
     )
     
     if args.json:
-        log.info(json.dumps(result.to_dict(), indent=2))
+        print(json.dumps(result.to_dict(), indent=2))
     else:
-        log.info(f"\n{'='*50}")
-        log.info("MANNING INVERSION DEPTH ESTIMATE")
-        log.info(f"{'='*50}")
-        log.info(f"Depth:        {result.depth_m:.2f} m")
-        log.info(f"Uncertainty:  ±{result.uncertainty_m:.2f} m")
-        log.info(f"Confidence:   {result.confidence:.0%}")
-        log.info(f"Backwater:    {'YES' if result.backwater_flag else 'No'}")
-        log.info(f"Tidal:        {'YES' if result.tidal_flag else 'No'}")
-        log.info(f"Guard Factor: {result.guard_factor:.2f}")
-        log.info(f"{'='*50}\n")
+        sep = "=" * 50
+        print(f"\n{sep}")
+        print("MANNING INVERSION DEPTH ESTIMATE")
+        print(sep)
+        print(f"Depth:        {result.depth_m:.2f} m")
+        print(f"Uncertainty:  \xb1{result.uncertainty_m:.2f} m")
+        print(f"Confidence:   {result.confidence:.0%}")
+        print(f"Backwater:    {'YES' if result.backwater_flag else 'No'}")
+        print(f"Tidal:        {'YES' if result.tidal_flag else 'No'}")
+        print(f"Guard Factor: {result.guard_factor:.2f}")
+        print(f"{sep}\n")
 
 
 if __name__ == "__main__":

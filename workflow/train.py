@@ -45,7 +45,7 @@ except Exception as e:
     # Catch any other errors (syntax, missing dependencies, etc.)
     _physics_import_error = f"{type(e).__name__}: {e}"
     import logging
-    logging.getLogger(__name__).error(
+    log.error(
         f"[train] Physics module failed to load: {_physics_import_error}"
     )
 
@@ -85,7 +85,7 @@ def stratified_train_test_split(df, target_col='depth_m', test_size=0.2, seed=42
         return train_df.index.to_numpy(), test_df.index.to_numpy()
 
     except Exception as e:
-        logging.getLogger(__name__).warning(f"Stratification failed ({e}). Falling back to random split.")
+        log.warning("Stratification failed (%s). Falling back to random split.", e)
         tr, te = train_test_split(df.index.to_numpy(), test_size=test_size, random_state=seed)
         return tr, te
 
@@ -396,7 +396,7 @@ def apply_stumpf_residual_filter(
                 f"dropped p50/p95={np.nanpercentile(d_drop,50):.2f}/{np.nanpercentile(d_drop,95):.2f} m."
             )
         except Exception:
-            log.info(f"[QC] Stumpf residual filter dropped {dropped_total} outliers.")
+            log.info("[QC] Stumpf residual filter dropped %s outliers.", dropped_total)
         return df.loc[keep].reset_index(drop=True)
 
     return df
@@ -409,7 +409,7 @@ def _resolve_s2_optics_module():
     try:
         return importlib.import_module("s2_optics")
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
     for k, v in list(sys.modules.items()):
         if k.startswith("s2_optics_dyn_"):
             return v
@@ -588,7 +588,7 @@ def _make_depth_bin_edges(
         try:
             max_ref = min(max_ref, float(max_depth_cap_m))
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
     if (not np.isfinite(max_ref)) or max_ref <= 0:
         return np.array([], dtype="float64")
 
@@ -658,7 +658,7 @@ max_depth_bins: int = 30,
         try:
             max_ref = min(max_ref, float(max_depth_cap_m))
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
     if not np.isfinite(max_ref) or max_ref <= 0:
         return None, {"reason": "invalid_depth_range", "max_ref": max_ref}
@@ -730,14 +730,14 @@ max_depth_bins: int = 30,
     log.info("-" * 85)
 
     if first_fail_msg:
-        log.info(f"[TRAIN][VAL] {first_fail_msg}")
+        log.info("[TRAIN][VAL] %s", first_fail_msg)
 
     max_supported = float(max(supported_upper_edges)) if supported_upper_edges else None
     if max_supported is not None and max_depth_cap_m is not None:
         try:
             max_supported = min(max_supported, float(max_depth_cap_m))
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
     diag = {
         "rmse_target_m": float(rmse_target_m),
@@ -809,7 +809,7 @@ def estimate_max_depth_from_spatial_validation_dual(
     )
     if str(depth_binning).lower() == "quantile":
         edges_list = [round(float(e), 3) for e in np.asarray(edges).ravel().tolist()]
-        log.info(f"[TRAIN][VAL] Quantile depth bin edges (m): {edges_list}")
+        log.info("[TRAIN][VAL] Quantile depth bin edges (m): %s", edges_list)
 
 
     strict_max: Optional[float] = None
@@ -1029,7 +1029,7 @@ def scatter_plot(
         path_out.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(path_out, dpi=150)
         plt.close(fig)
-        log.info(f"[PLOT] Saved: {path_out}")
+        log.info("[PLOT] Saved: %s", path_out)
 
     lim_all = _lims_percentile(np.concatenate([yt, yp]), p=all_pctl)
     
@@ -1120,7 +1120,7 @@ def plot_depth_binning_sanity(
         try:
             plt.close()
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
 
 def plot_feature_importance(rf_model, feature_names, out_png):
@@ -1143,14 +1143,14 @@ def plot_feature_importance(rf_model, feature_names, out_png):
     plt.tight_layout()
     fig.savefig(out_png, dpi=150)
     plt.close(fig)
-    log.info(f"[PLOT] Feature importance saved: {out_png}")
+    log.info("[PLOT] Feature importance saved: %s", out_png)
 
 def _count(df: pd.DataFrame, label: str):
     log.info(f"[TRAIN][COUNT] {label}: n={len(df)}")
 
 def _nonfinite_report(df: pd.DataFrame, cols: List[str], label: str, max_lines: int = 30):
     if df.empty:
-        log.warning(f"[TRAIN][DIAG] {label}: df is empty; cannot compute non-finite fractions.")
+        log.warning("[TRAIN][DIAG] %s: df is empty; cannot compute non-finite fractions.", label)
         return
     lines = []
     n = len(df)
@@ -1162,7 +1162,7 @@ def _nonfinite_report(df: pd.DataFrame, cols: List[str], label: str, max_lines: 
         if bad > 0:
             lines.append((bad / n, c, int(bad)))
     if not lines:
-        log.info(f"[TRAIN][DIAG] {label}: all requested cols are finite.")
+        log.info("[TRAIN][DIAG] %s: all requested cols are finite.", label)
         return
     lines.sort(reverse=True)
     log.warning(f"[TRAIN][DIAG] {label}: non-finite values detected (showing up to {max_lines}).")
@@ -1177,12 +1177,12 @@ def _funnel_df_stats(df: pd.DataFrame, stage: str, *, rr: Optional[Any] = None, 
     except Exception:
         n = 0
     if df is None or n == 0:
-        log.info(f"[Funnel][TRAIN] {stage}: n=0")
+        log.info("[Funnel][TRAIN] %s: n=0", stage)
         if rr is not None:
             try:
                 rr.add(f"funnel.train.{stage}.n", 0)
             except Exception:
-                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("Optional step failed; continuing.", exc_info=True)
         return
 
     d = None
@@ -1198,7 +1198,7 @@ def _funnel_df_stats(df: pd.DataFrame, stage: str, *, rr: Optional[Any] = None, 
             try:
                 rr.add(f"funnel.train.{stage}.n", n)
             except Exception:
-                logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("Optional step failed; continuing.", exc_info=True)
         return
 
     mfin = np.isfinite(d)
@@ -1232,7 +1232,7 @@ def _funnel_df_stats(df: pd.DataFrame, stage: str, *, rr: Optional[Any] = None, 
                 rr.add_dict(f"funnel.train.{stage}.depth_hist_0_{int(hist_max_m)}_{int(hist_bin_m)}m",
                             {"bins": edges.tolist(), "counts": hist.tolist()})
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
 def sample_s2_bands_at_points(train_df: pd.DataFrame,
                              s2_paths: Dict[str, str],
@@ -1436,7 +1436,7 @@ def train_sdb_model(
         n_xyz_before = int(m_is_xyz.sum())
         m_env |= m_is_xyz
         if n_xyz_before > 0:
-            log.info(f"[TRAIN][ENV] Bypassed env filter for {n_xyz_before} extra_xyz points (high-quality survey data)")
+            log.info("[TRAIN][ENV] Bypassed env filter for %s extra_xyz points (high-quality survey data)", n_xyz_before)
 
     df = df[m_env].reset_index(drop=True)
     _count(df, f"after env filter (LAND<= {land_max}, CLEAR_WATER>= {cw_min})")
@@ -1459,9 +1459,9 @@ def train_sdb_model(
                         percentile=linf_percentile,
                     )
                     if est:
-                        log.info(f"[TRAIN] Estimated L_inf constants from rasters: {est}")
+                        log.info("[TRAIN] Estimated L_inf constants from rasters: %s", est)
             except Exception as e:
-                log.warning(f"[TRAIN] Raster-based L_inf estimation failed; falling back to DF method. Reason: {e}")
+                log.warning("[TRAIN] Raster-based L_inf estimation failed; falling back to DF method. Reason: %s", e)
 
             if not est:
                 est = estimate_linf_from_df(
@@ -1472,7 +1472,7 @@ def train_sdb_model(
                     cw_col="CLEAR_WATER" if "CLEAR_WATER" in df.columns else None,
                 )
                 if est:
-                    log.info(f"[TRAIN] Estimated L_inf constants from deepwater (DF fallback): {est}")
+                    log.info("[TRAIN] Estimated L_inf constants from deepwater (DF fallback): %s", est)
 
             if est:
                 l_inf_constants = est
@@ -1533,7 +1533,7 @@ def train_sdb_model(
                 feat_cols.append("stumpf_depth")
                 log.info("[TRAIN] Fitted auxiliary stumpf_depth LR model (positive magnitudes).")
             except Exception as e:
-                log.warning(f"[TRAIN] Stumpf LR failed: {e}")
+                log.warning("[TRAIN] Stumpf LR failed: %s", e)
 
     df = _sanitize_feature_columns(df, feat_cols + ["depth_m", "sample_weight"])
     _count(df, "after sanitize (inf->nan, coercion)")
@@ -1544,7 +1544,7 @@ def train_sdb_model(
     req_cols = feat_cols + ["depth_m", "sample_weight"]
     missing_cols = [c for c in req_cols if c not in df.columns]
     if missing_cols:
-        log.error(f"[TRAIN] Missing required columns: {missing_cols}. Training aborted.")
+        log.error("[TRAIN] Missing required columns: %s. Training aborted.", missing_cols, exc_info=True)
         return RandomForestRegressor(), stumpf_lr, pd.DataFrame(), pd.DataFrame(), {}
 
     _nonfinite_report(df, req_cols, "pre finite-row drop")
@@ -1651,7 +1651,7 @@ def train_sdb_model(
                 'last_replaced': int(bank_meta.get('last_replaced', 0)) if bank_meta else 0,
             }
         except Exception as ex:
-            log.warning(f"[MODEL_BANK] Update failed; continuing without bank: {ex}")
+            log.warning("[MODEL_BANK] Update failed; continuing without bank: %s", ex)
             metadata['model_bank'] = {'enabled': False, 'error': str(ex)}
     else:
         metadata['model_bank'] = {'enabled': False}
@@ -2042,7 +2042,7 @@ def train_sdb_model(
 
     missing = [c for c in feat_cols if (c not in df_tr_fit.columns) or (c not in df_te.columns)]
     if missing:
-        log.warning(f"[TRAIN] Dropping missing feature columns: {missing}")
+        log.warning("[TRAIN] Dropping missing feature columns: %s", missing)
         feat_cols = [c for c in feat_cols if c not in missing]
 
     X_train = df_tr_fit[feat_cols].to_numpy()
@@ -2127,7 +2127,7 @@ def train_sdb_model(
                         metadata['training_qc']['dominant_source_rebalanced'] = True
                         metadata['training_qc']['dominant_source_rebalanced_target_frac'] = float(max_dom_frac)
         except Exception as _ex:
-            log.error(f"[TRAIN][QC] Dominance guardrail failed: {_ex}")
+            log.error("[TRAIN][QC] Dominance guardrail failed: %s", _ex, exc_info=True)
 
     # === NEW: Log training data composition by source ===
     if 'source' in df_tr_fit.columns or 'source_norm' in df_tr_fit.columns:
@@ -2177,7 +2177,7 @@ def train_sdb_model(
                     metadata.setdefault('training_qc', {})
                     metadata['training_qc']['max_effective_source_influence_frac'] = float(max(eff_fracs))
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
         log.info("=" * 60)
 
     rf.fit(X_train, y_train, sample_weight=w_train)
@@ -2213,7 +2213,7 @@ def train_sdb_model(
         except ImportError:
             log.debug("[TRAIN] spatial_cv module not available")
         except Exception as e:
-            log.warning(f"[TRAIN] Spatial CV failed: {e}")
+            log.warning("[TRAIN] Spatial CV failed: %s", e)
 
     # --- Training Data Diversity Analysis ---
     diversity_report = None
@@ -2224,11 +2224,11 @@ def train_sdb_model(
             log.info(f"[TRAIN] Data diversity score: {diversity_report['overall_score']*100:.0f}%")
             if diversity_report.get("recommendations"):
                 for rec in diversity_report["recommendations"][:3]:
-                    log.info(f"[TRAIN] → {rec}")
+                    log.info("[TRAIN] → %s", rec)
     except ImportError:
         log.debug("[TRAIN] training_diversity module not available")
     except Exception as e:
-        log.warning(f"[TRAIN] Diversity analysis failed: {e}")
+        log.warning("[TRAIN] Diversity analysis failed: %s", e)
 
     if plots_dir:
         plots_dir.mkdir(parents=True, exist_ok=True)
@@ -2299,7 +2299,7 @@ def train_sdb_model(
                     elif hasattr(rr, "data") and isinstance(rr.data, dict):
                         rr.data["validation.by_source"] = source_validation
                 except Exception:
-                    logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+                    log.debug("Optional step failed; continuing.", exc_info=True)
 
         max_depth_sdb_auto = None
         max_depth_diag = {}
@@ -2330,7 +2330,7 @@ def train_sdb_model(
                 if plots_dir and isinstance(max_depth_diag, dict) and max_depth_diag.get("bin_edges_m"):
                     plot_depth_binning_sanity(
                         df_te["depth_m"].to_numpy(),
-                        y_true_tr=(df_tr["depth_m"].to_numpy() if ("df_tr" in locals() and df_tr is not None and not df_tr.empty) else None),
+                        y_true_tr=(df_tr["depth_m"].to_numpy() if (df_tr is not None and not df_tr.empty) else None),
                         bin_edges=max_depth_diag.get("bin_edges_m"),
                         out_png=plots_dir / "Depth_Binning_Sanity.png",
                         title=f"Depth binning sanity ({depth_binning})",
@@ -2339,7 +2339,7 @@ def train_sdb_model(
                         relaxed_max=max_depth_sdb_auto_relaxed,
                     )
 
-            except Exception as e:
+            except Exception:
                 log.exception("[TRAIN] Auto max-depth estimation failed")
 
         metadata["rmse_target_sdb"] = float(rmse_target_sdb)
@@ -2394,7 +2394,7 @@ def train_sdb_model(
             except ImportError:
                 log.debug("[TRAIN] kd_estimation module not available, skipping physics-based depth")
             except Exception as e:
-                log.warning(f"[TRAIN] Physics-based depth estimation failed: {e}")
+                log.warning("[TRAIN] Physics-based depth estimation failed: %s", e)
 
         # --- Physics-based enhancements (Kim et al. 2024) ---
         # Estimate scene-specific bottom endmembers and geometry-corrected attenuation
@@ -2471,10 +2471,10 @@ def train_sdb_model(
                         log.debug(f"[TRAIN][PHYSICS] Endmember estimation skipped: {endmember_result.get('reason', 'unknown')}")
                         
                 except Exception as e:
-                    log.debug(f"[TRAIN][PHYSICS] Endmember estimation failed: {e}")
+                    log.debug("[TRAIN][PHYSICS] Endmember estimation failed: %s", e)
                     
             except Exception as e:
-                log.warning(f"[TRAIN][PHYSICS] Physics integration failed: {e}")
+                log.warning("[TRAIN][PHYSICS] Physics integration failed: %s", e)
         elif not PHYSICS_AVAILABLE:
             log.debug("[TRAIN] physics_integration module not available")
 
@@ -2635,7 +2635,7 @@ def train_sdb_model(
             rep["train"]["max_depth_sdb_auto_physics"] = metadata.get("max_depth_sdb_auto_physics")
             rep["train"]["max_depth_options"] = metadata.get("max_depth_options", {})
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
         try:
             if df_te is not None and (not df_te.empty) and ("depth_pred_m" in df_te.columns) and ("depth_m" in df_te.columns):
                 _bins = _np.array([0, 5, 10, 15, 20, 30, 50], dtype=float)
@@ -2658,7 +2658,7 @@ def train_sdb_model(
                 rep["train"]["rmse_per_depth_bin_m"] = _rmse
                 rep["train"]["n_per_depth_bin"] = _counts
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
         if "depth_m" in df.columns and len(df) > 0:
             d = df["depth_m"].to_numpy(dtype=float)
@@ -2688,7 +2688,7 @@ def train_sdb_model(
                     }
                 rep["train"]["source_breakdown"] = _src_stats
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
         try:
             imps = rf.feature_importances_
@@ -2696,7 +2696,7 @@ def train_sdb_model(
             pairs.sort(key=lambda x: x[1], reverse=True)
             rep["train"]["feature_importance"] = [{"feature": k, "importance": v} for k, v in pairs[:15]]
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
         try:
             top_feats = [p["feature"] for p in rep["train"].get("feature_importance", [])[:8]]
             fstats = {}
@@ -2712,7 +2712,7 @@ def train_sdb_model(
                         }
             rep["train"]["feature_stats_top"] = fstats
         except Exception:
-            logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Optional step failed; continuing.", exc_info=True)
 
         metadata["train_report"] = rep["train"]
         # Write to diagnostics dir if provided, otherwise fallback to plots_dir parent
@@ -2725,7 +2725,7 @@ def train_sdb_model(
             import json as _json
             _json.dump(rep, f, indent=2)
     except Exception:
-        logging.getLogger(__name__).debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Optional step failed; continuing.", exc_info=True)
 
     return rf, stumpf_lr, df_tr, df_te, metadata
 
@@ -2820,7 +2820,7 @@ def main():
         has_best = _s2_paths_exist(best_paths)
 
         if not has_comp:
-            log.warning(f"[S2-AB] Composite rasters not found/complete in: {s2_d}. Proceeding without raster sampling.")
+            log.warning("[S2-AB] Composite rasters not found/complete in: %s. Proceeding without raster sampling.", s2_d)
         else:
             if args.s2_choice == "composite" or (args.s2_choice == "auto" and not has_best):
                 if args.s2_choice == "auto" and not has_best:
