@@ -1,105 +1,124 @@
-########################################################################
+# Open Bathy Workflows — General Workflow Guide
 
-> **Authoritative file list:** Each run writes `io_manifest.json` and `io_manifest.md` into your `--out-dir`.
-> Use those manifests (and `unified_bathy_report.json`) as the *only* source of truth for exact input/output filenames and paths.
-> Do **not** rely on any “canonical” filenames in docs; outputs can vary by enabled methods and configuration.
+> **Authoritative file list:** every run writes `io_manifest.json` and `io_manifest.md` into `--out-dir`.
+> Use those manifests, together with `bathy_report.json` and `unified_bathy_report.json`, as the source of truth for exact inputs, outputs, and paths.
 
-# Open Bathy Workflows (v2.0.42)
-########################################################################
+This repository produces coastal and river bathymetry from a single orchestration layer.
+The code is centered on `bathy_main.py`, which can run three families of work:
 
-A Python workflow that generates bathymetry by combining:
-- **Satellite‑Derived Bathymetry (SDB)** from Sentinel‑2 + ICESat‑2 / in‑situ training points
-- **River bathymetry** from DEM + NHD river network cross‑sections / skeleton methods
-- **Fusion** to produce a single combined depth product
+- **SDB** from Sentinel-2, ICESat-2, and optional external XYZ soundings
+- **River bathymetry** from hydrography, DEMs, masks, cross-sections, skeleton interpolation, and optional hydraulic constraints
+- **Fusion** into a combined deliverable raster
 
-> This repo version keeps scripts in `workflow/`. Most runs are executed from that directory.
+## What is current in this snapshot
 
-## Quickstart
+The current workflow is no longer best described as separate experimental pieces.
+It behaves as an integrated production-style pipeline with these important defaults and guardrails:
 
-From the repo root:
+- `--methods=sdb,river,fuse` by default
+- `--river-method=hybrid` by default, meaning XS inference is focused on the mainstem while the skeleton method fills the broader river domain
+- explicit artifact tracking through `bathy_report.json`, `unified_bathy_report.json`, and `io_manifest.json`
+- bounded SDB model-bank support for cross-tile consistency
+- deterministic final domain clipping so deliverables do not persist outside the intended coastal and/or river water mask
+- optional seam comparison against neighboring `io_manifest.json` files
+- default output retention that keeps final deliverables plus run metadata while removing or relocating non-deliverable intermediates
+
+## Core products
+
+### 1) SDB
+
+The SDB path uses `sdb_main.py` and related modules to:
+
+- build or reuse optical composites
+- assemble land/water masks
+- ingest ATL03, ATL24, and optional external XYZ
+- train or refresh the SDB model
+- predict raster depth products
+- write an SDB artifact manifest (`artifacts_sdb.json`) for downstream discovery
+
+### 2) River bathymetry
+
+The river path begins with hydrography preparation and domain masking, then runs one of three modes:
+
+- `hybrid` — current default; uses mainstem XS inference plus skeleton fill elsewhere
+- `skeleton` — channel-skeleton distance-transform method without XS generation
+- `xs` — cross-sections everywhere; most flexible, but generally more artifact-prone at junctions
+
+River products are constrained to the river/channel domain and can incorporate:
+
+- external soundings
+- optional authoritative bed blending
+- optional 1D energy-solver priors
+- optional SWOT RiverSP water-surface elevation anchoring
+- optional drainage-area and Manning-based priors
+
+### 3) Fusion
+
+Fusion combines SDB and river results onto a common grid and records the decision path in the run report.
+The workflow can sanitize problematic SDB zeros before fusion, enforce river-domain separation, and then clip final deliverables to the intended domain as a final safety step.
+
+## Run template
+
 ```bash
-cd workflow
 python bathy_main.py \
-  --aoi="-74.52/-74.23/40.23/40.52" \
-  --start 2024-01-01 \
-  --end   2026-01-01 \
-  --out-dir output/nyc \
+  --aoi="-71.14/-71.10/42.75/42.78" \
+  --start=2025-01-01 \
+  --end=2026-01-01 \
+  --methods=sdb,river,fuse \
+  --river-method=hybrid \
+  --out-dir=output/merrimack_example \
+  --cache-root=cache \
   --extra-xyz-cudem=hydronos,ehydro
 ```
 
-### External dependencies
-The workflow assumes you have:
-- A working Python environment (often the `cudem` conda env)
-- **CUDEM** CLIs available on PATH (e.g., `fetches`, `dlim`)
-- **waffles** available on PATH (used for coastline / land‑water masks)
-- GDAL/PROJ set up (vertical CRS transforms are optional but supported)
+## External dependencies
 
-## What the pipeline does
+A typical working environment includes:
 
-### 1) Orchestration (`bathy_main.py`)
-Parses arguments, validates configuration, sets up cache + output directories, and runs:
-- **SDB pipeline** via `sdb_main.py`
-- **River pipeline** via `river_network.py`, plus either:
-  - **Cross‑sections**: `xs_builder.py` → `xs_infer_bathy_raster.py`
-  - **Skeleton**: `river_skeleton_bathy.py`
-- **Fusion** via `bathy_fusion.py` / `fusion.py`
-It also writes a JSON run report (e.g., `output/<name>/bathy_report.json`).
+- Python with the scientific/geospatial stack used by the repo
+- GDAL / rasterio / PROJ support
+- GeoPandas / Shapely / PyProj
+- scikit-learn, NumPy, pandas, SciPy
+- CUDEM command-line tools where relevant to your run
+- network-enabled dependencies when fetching remote data products
 
-### 2) SDB (`sdb_main.py`)
-High‑level flow:
-1. Builds/loads a land‑water mask (typically **waffles coastline**)
-2. Acquires Sentinel‑2 scenes (STAC), applies date/cloud QC, and builds composites
-3. Loads ICESat‑2 (ATL03/ATL24) + optional **extra XYZ** points, aligns depths if needed
-4. Samples training points (spatial sampling + optional spatial CV)
-5. Trains the model (Random Forest + uncertainty helpers)
-6. Predicts SDB depth tiles and writes outputs to `output/<name>/sdb/`
+Some CLIs support `--help` without all heavy runtime dependencies, but real pipeline execution still requires the full environment.
 
-**Cross‑tile consistency (default behavior):** SDB uses a bounded **model bank** (reservoir sample) stored under `cache/model_bank/sdb_global_v1` (or your `--cache-root`). Training points from each AOI update this bounded reservoir (max samples configurable), and the Random Forest is **only retrained periodically** once enough new samples accumulate. This improves seam consistency across adjacent tiles without storing unbounded training data.
+## Reports and metadata written by the workflow
 
-### 3) River bathymetry
-There are two main river approaches in this codebase:
-- **Cross‑section approach**: build XS lines, infer depths/beds from DEM + optional WSE/Manning constraints.
-- **Skeleton approach**: a lighter‑weight, morphology‑driven estimator (`river_skeleton_bathy.py`).
-Outputs land in `output/<name>/river/`.
+At the end of a successful run, the most important metadata artifacts are:
 
-**Important safety guarantee:** the final river rasters are **hard‑clipped** to the computed river/channel domain mask, so river outputs contain values **only inside river/channel pixels**.
+- `bathy_report.json` — main orchestrator report with step status and explicit outputs
+- `unified_bathy_report.json` and `unified_bathy_report.md` — compact whole-run summary
+- `io_manifest.json` and `io_manifest.md` — explicit input/output path manifest
+- `run_logs/flight_recorder_*.jsonl` — structured execution trace
+- `run_logs/run_summary_*` — machine, technical, scientific, and human summaries
 
-**Confluence artifact fix:** at tributary junctions, the interpolation enforces **main‑stem priority** (by stream order when available) so small stems cannot imprint circular “bullseye” artifacts into the main channel.
+Additional receipts may be written when those components run, including input receipts, soundings/channel receipts, reprojection receipts, and energy-solver receipts.
 
-**Optional SWOT WSE constraint:** SWOT RiverSP WSE (when provided) is used only to stabilize/anchor the **water‑surface elevation profile** (stage/slope). SWOT is not used as a direct bathymetry predictor.
+## Sign conventions and datums
 
-### 4) Fusion (`bathy_fusion.py` / `fusion.py`)
-Combines SDB and river rasters into a single product, optionally patching gaps and enforcing masks.
-Final merged outputs are written to `output/<name>/combined/`.
+Use the actual product metadata and report context when interpreting a raster.
+The current repo documentation assumes:
 
-## Outputs
+- final depth rasters are generally **negative-down**
+- bed rasters are elevations in the working DEM vertical reference unless an explicit conversion step is requested
+- optional SDB vertical-datum conversion is explicit and recorded in reports and manifests
 
-- `output/<name>/sdb/` – SDB depth rasters, masks, QC plots, run_report JSON
-- `output/<name>/river/` – river depth/bed rasters, GPKGs (network + XS) and diagnostics
-- `output/<name>/combined/` – fused products (see `io_manifest.json` for exact filenames).
-- `output/<name>/bathy_report.json` – top‑level pipeline report
+## Troubleshooting priorities
 
-## Troubleshooting
+When a run looks wrong, inspect in this order:
 
-- **S2 acquisition keeps failing**: try widening the date range, lowering `--cloud`, or clearing the S2 cache.
-- **CRS / vertical datum errors**: make sure PROJ grid files are available; consider running without vertical transforms first.
-- **Mask surprises (land vs water)**: waffles coastline masks typically use **water=0, land=1**; the workflow expects that convention.
-- **Cross‑section artifacts**: intersecting cross‑sections can cause interpolation artifacts. This repo includes:
-  - XS deconfliction controls in `xs_builder.py`
-  - a confluence guard (main‑stem priority) in `xs_infer_bathy_raster.py`
-  If you still see artifacts, focus first on XS generation spacing/overlap trimming.
+1. `bathy_report.json` for step failures or missing outputs
+2. `io_manifest.json` to confirm what files were actually used and written
+3. `run_logs/` for flight-recorder and run-summary context
+4. river or SDB subdirectories for component-specific receipts and diagnostics
 
-## Where the scripts live
-
-All scripts in this zip are intended to live under `workflow/`. The detailed per‑script reference is in `README_SCRIPTS_DETAILED.md`.
-
-For a full “how it works” walkthrough (inputs → caches → outputs → failure modes), see `README_WORKFLOW_DETAILED.md`.
-
-
-## Verification (offline)
-
-Run the repo's offline verification (syntax/compile + smoke tests):
+## Verification before packaging changes
 
 ```bash
 ./verify_repo.sh
+./ci_smoke.sh
 ```
+
+The second script is stricter and is intended to catch committed cache/slop artifacts in addition to compile and unit-test failures.

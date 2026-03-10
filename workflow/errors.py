@@ -296,12 +296,12 @@ def handle_exception(exc: Exception, context: str = "") -> None:
     
     if isinstance(exc, SDBError):
         # Our custom errors - log with context
-        log.error(f"{context}: {exc}")
+        log.error("%s: %s", context, exc)
         if exc.details:
-            log.debug(f"Error details: {exc.details}")
+            log.debug("Error details: %s", exc.details)
     else:
         # Unexpected errors - log with full traceback
-        log.exception(f"{context}: Unexpected error: {exc}")
+        log.exception("%s: Unexpected error: %s", context, exc)
 
 
 # Convenience function for wrapping operations

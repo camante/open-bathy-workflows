@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-physics_integration.py - Integration of Kim et al. (2024) Physics Improvements
+physics_integration.py - Integrates bottom_physics.py (Kim et al. 2024) into the SDB pipeline.
 
-This module provides the glue code to integrate the bottom_physics.py improvements
-into the existing SDB pipeline. It handles:
-
-1. Scene-derived bottom endmember estimation during training
-2. Enhanced Kd/Ku computation with sun/view geometry
-3. Physics-only prediction mode when training data is limited
-4. Enhanced hybrid prediction for extrapolation
+Handles scene-derived bottom endmember estimation, geometry-corrected Kd/Ku computation,
+physics-only prediction, and hybrid RF+physics prediction.
 
 Usage in sdb_main.py:
 ---------------------
@@ -43,7 +38,7 @@ try:
     PHYSICS_MODULE_AVAILABLE = True
 except ImportError:
     PHYSICS_MODULE_AVAILABLE = False
-    log.warning("[PhysicsIntegration] bottom_physics module not available")
+    log.warning("bottom_physics module not available")
 
 
 def estimate_scene_bottom_endmembers(
@@ -87,7 +82,7 @@ def estimate_scene_bottom_endmembers(
         Analysis diagnostics including eigenvalues, variance explained, etc.
     """
     if not PHYSICS_MODULE_AVAILABLE:
-        log.warning("[PhysicsIntegration] Physics module unavailable, using default endmembers")
+        log.warning("Physics module unavailable, using default endmembers")
         return DEFAULT_SAND_SPECTRUM.copy(), DEFAULT_SEAGRASS_SPECTRUM.copy(), {"error": "module_unavailable"}
     
     # Compute Kd and Ku for each band
@@ -103,7 +98,7 @@ def estimate_scene_bottom_endmembers(
         Kd[band] = kd_corr
         Ku[band] = ku_corr
     
-    log.info(f"[PhysicsIntegration] Computing bottom endmembers with Kd={Kd}, Ku={Ku}")
+    log.info("Computing bottom endmembers with Kd=%s, Ku=%s", Kd, Ku)
     
     # Estimate deep water reflectance from rasters
     import rasterio
@@ -128,9 +123,9 @@ def estimate_scene_bottom_endmembers(
             
             if np.sum(deep_mask) > 100:
                 rrs_deep = {b: float(np.nanmedian(rrs[b][deep_mask])) for b in ["B02", "B03", "B04"]}
-                log.info("[PhysicsIntegration] Deep water Rrs: %s", rrs_deep)
+                log.info("Deep water Rrs: %s", rrs_deep)
     except Exception as e:
-        log.warning("[PhysicsIntegration] Could not estimate deep water Rrs: %s", e)
+        log.warning("Could not estimate deep water Rrs: %s", e)
     
     # Run endmember estimation
     try:
@@ -154,7 +149,7 @@ def estimate_scene_bottom_endmembers(
             output_dir = Path(output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
             diag_path = output_dir / "bottom_endmembers.json"
-            with open(diag_path, "w") as f:
+            with open(diag_path, "w", encoding="utf-8") as f:
                 # Convert numpy types
                 diag_json = json.loads(json.dumps(diag, default=lambda x: float(x) if hasattr(x, 'item') else str(x)))
                 json.dump({
@@ -162,12 +157,12 @@ def estimate_scene_bottom_endmembers(
                     "rho_grass": rho_grass,
                     "diagnostics": diag_json,
                 }, f, indent=2)
-            log.info("[PhysicsIntegration] Saved endmember diagnostics to %s", diag_path)
+            log.info("Saved endmember diagnostics to %s", diag_path)
         
         return rho_sand, rho_grass, diag
         
     except Exception as e:
-        log.error("[PhysicsIntegration] Endmember estimation failed: %s", e, exc_info=True)
+        log.error("Endmember estimation failed: %s", e, exc_info=True)
         return DEFAULT_SAND_SPECTRUM.copy(), DEFAULT_SEAGRASS_SPECTRUM.copy(), {"error": str(e)}
 
 
@@ -268,7 +263,7 @@ def run_physics_only_prediction(
         Output paths and statistics
     """
     if not PHYSICS_MODULE_AVAILABLE:
-        log.error("[PhysicsIntegration] Cannot run physics-only: module unavailable")
+        log.error("Cannot run physics-only: module unavailable")
         return {"error": "module_unavailable"}
     
     return physics_only_predict(
@@ -330,7 +325,7 @@ def enhance_prediction_with_physics(
         Blending statistics
     """
     if not PHYSICS_MODULE_AVAILABLE:
-        log.warning("[PhysicsIntegration] Physics module unavailable, returning RF predictions")
+        log.warning("Physics module unavailable, returning RF predictions")
         return rf_pred, rf_std, {"error": "module_unavailable"}
     
     import rasterio
@@ -414,10 +409,10 @@ def get_sun_view_angles_from_s2_metadata(s2_dir: Union[str, Path]) -> Tuple[floa
                 vza_deg = float(qc["mean_view_zenith"])
             
             if sza_deg is not None:
-                log.info(f"[PhysicsIntegration] Found angles from S2_DATE_QC.json: SZA={sza_deg:.1f}°, VZA={vza_deg:.1f}°")
+                log.info("Found angles from S2_DATE_QC.json: SZA=%.1f°, VZA=%.1f°", sza_deg, vza_deg)
                 return float(sza_deg), float(min(abs(vza_deg), 12.0))
         except Exception as e:
-            log.debug("[PhysicsIntegration] Could not read S2_DATE_QC.json: %s", e)
+            log.debug("Could not read S2_DATE_QC.json: %s", e)
     
     # Source 2: Try other metadata JSON files
     meta_paths = (
@@ -456,7 +451,7 @@ def get_sun_view_angles_from_s2_metadata(s2_dir: Union[str, Path]) -> Tuple[floa
                     break
             
             if sza_deg is not None:
-                log.info(f"[PhysicsIntegration] Found angles from {meta_path.name}: SZA={sza_deg:.1f}°, VZA={vza_deg:.1f}°")
+                log.info("Found angles from %s: SZA=%.1f°, VZA=%.1f°", meta_path.name, sza_deg, vza_deg)
                 break
                 
         except Exception:
@@ -502,15 +497,15 @@ def get_sun_view_angles_from_s2_metadata(s2_dir: Union[str, Path]) -> Tuple[floa
                     if date_str and center_lat:
                         sza_deg = compute_solar_zenith(center_lat, center_lon, date_str)
                         if sza_deg is not None:
-                            log.info(f"[PhysicsIntegration] Computed SZA={sza_deg:.1f}° from location ({center_lat:.2f}, {center_lon:.2f}) and date")
+                            log.info("Computed SZA=%.1f° from location (%.2f, %.2f) and date", sza_deg, center_lat, center_lon)
                             
         except Exception as e:
-            log.debug("[PhysicsIntegration] Could not compute SZA from raster: %s", e)
+            log.debug("Could not compute SZA from raster: %s", e)
     
     # Source 3: Default based on typical tropical/subtropical conditions
     if sza_deg is None:
         sza_deg = 45.0  # Reasonable default for most SDB applications
-        log.info(f"[PhysicsIntegration] Using default angles: SZA={sza_deg:.1f}°, VZA={vza_deg:.1f}°")
+        log.info("Using default angles: SZA=%.1f°, VZA=%.1f°", sza_deg, vza_deg)
     
     # Sanity check VZA (Sentinel-2 is typically < 10°)
     vza_deg = min(abs(vza_deg), 12.0)
@@ -579,7 +574,7 @@ def compute_solar_zenith(lat: float, lon: float, date_str: str, hour_utc: float 
         return sza
         
     except Exception as e:
-        log.debug("[PhysicsIntegration] Solar zenith calculation failed: %s", e)
+        log.debug("Solar zenith calculation failed: %s", e)
         return None
 
 

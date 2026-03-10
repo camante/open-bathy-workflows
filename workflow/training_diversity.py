@@ -362,7 +362,7 @@ def analyze_training_diversity(
     DiversityReport
         Comprehensive diversity metrics and recommendations
     """
-    log.info(f"[Diversity] Analyzing training data diversity ({len(df)} points)...")
+    log.info("Analyzing training data diversity (%s points)...", len(df))
     
     # Spatial analysis
     spatial_score, spatial_gaps = analyze_spatial_coverage(df)
@@ -422,13 +422,13 @@ def analyze_training_diversity(
     )
     
     # Log summary
-    log.info(f"[Diversity] Spatial coverage: {spatial_score*100:.0f}%")
-    log.info(f"[Diversity] Depth coverage: {depth_score*100:.0f}%")
-    log.info(f"[Diversity] Spectral diversity: {spectral_score*100:.0f}%")
-    log.info("[Diversity] Unique tracks: %s", n_tracks)
-    log.info(f"[Diversity] Overall score: {overall*100:.0f}%")
+    log.info("Spatial coverage: %.0f%%", spatial_score*100)
+    log.info("Depth coverage: %.0f%%", depth_score*100)
+    log.info("Spectral diversity: %.0f%%", spectral_score*100)
+    log.info("Unique tracks: %s", n_tracks)
+    log.info("Overall score: %.0f%%", overall*100)
     for rec in recommendations:
-        log.info("[Diversity] → %s", rec)
+        log.info("→ %s", rec)
     
     return report
 
@@ -520,7 +520,7 @@ def plot_diversity_analysis(
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     
-    log.info("[Diversity] Saved analysis plot: %s", output_path)
+    log.info("Saved analysis plot: %s", output_path)
 
 
 def suggest_additional_tracks(
@@ -603,7 +603,7 @@ def add_diversity_analysis_to_training(
         }
         
     except Exception as e:
-        log.warning("[Diversity] Analysis failed: %s", e)
+        log.warning("Analysis failed: %s", e)
         return {"error": str(e)}
 
 
@@ -643,9 +643,9 @@ if __name__ == "__main__":
         "overall_score": report.overall_score,
         "recommendations": report.recommendations,
     }
-    with open(output_dir / "diversity_report.json", "w") as f:
+    with open(output_dir / "diversity_report.json", "w", encoding="utf-8") as f:
         json.dump(report_dict, f, indent=2)
     
-    log.info("\nRecommendations:")
+    log.info("Recommendations:")
     for rec in report.recommendations:
         log.info("  • %s", rec)

@@ -463,7 +463,7 @@ class RunReport:
             if artifacts:
                 out_path.write_text(json.dumps(self.data, indent=2))
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
         return out_path
 
@@ -487,9 +487,9 @@ def _cli():
         data.setdefault("artifacts", {})
         data["artifacts"].update(artifacts)
         rr_path.write_text(json.dumps(data, indent=2))
-        log.info("Wrote:", ", ".join(str(Path(v)) for v in artifacts.values()))
+        log.info("Wrote: %s", ", ".join(str(Path(v)) for v in artifacts.values()))
     else:
-        log.info("No funnels written (matplotlib missing or no output dir).")
+        log.debug("No funnels written (matplotlib missing or no output dir).")
 
 if __name__ == "__main__":
     _cli()

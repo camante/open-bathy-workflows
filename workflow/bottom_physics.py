@@ -59,7 +59,7 @@ try:
     G2 = GORDON_G2
 except ImportError:
     # Fallback to local definitions if constants module unavailable
-    log.warning("[bottom_physics] constants module not found, using local definitions")
+    log.warning("constants module not found, using local definitions")
     
     # Refractive index of seawater (typical)
     # Source: Mobley, C.D. (1994). "Light and Water: Radiative Transfer in 
@@ -379,7 +379,7 @@ def estimate_bottom_endmembers_eigenanalysis(
     """
     bands = [b for b in ["B02", "B03", "B04"] if b in rho_b]
     if len(bands) < 2:
-        log.warning("[BottomEndmembers] Need at least 2 bands for eigenanalysis")
+        log.warning("Need at least 2 bands for eigenanalysis")
         return DEFAULT_SAND_SPECTRUM.copy(), DEFAULT_SEAGRASS_SPECTRUM.copy(), {}
     
     # Stack bands into N×M matrix (N samples, M bands)
@@ -399,10 +399,10 @@ def estimate_bottom_endmembers_eigenanalysis(
     
     n_samples = len(data)
     if n_samples < 10:
-        log.warning("[BottomEndmembers] Only %s valid samples, using defaults", n_samples)
+        log.warning("Only %s valid samples, using defaults", n_samples)
         return DEFAULT_SAND_SPECTRUM.copy(), DEFAULT_SEAGRASS_SPECTRUM.copy(), {"n_samples": n_samples}
     
-    log.info(f"[BottomEndmembers] Eigenanalysis on {n_samples} samples, {len(bands)} bands")
+    log.info("Eigenanalysis on %s samples, %s bands", n_samples, len(bands))
     
     # Compute mean and covariance
     mean_rho = np.mean(data, axis=0)
@@ -458,9 +458,9 @@ def estimate_bottom_endmembers_eigenanalysis(
         "projection_range": (float(projections.min()), float(projections.max())),
     }
     
-    log.info(f"[BottomEndmembers] PC1 explains {variance_explained*100:.1f}% of variance")
-    log.info("[BottomEndmembers] Sand endmember: %s", rho_sand)
-    log.info("[BottomEndmembers] Grass endmember: %s", rho_grass)
+    log.info("PC1 explains %.1f%% of variance", variance_explained*100)
+    log.info("Sand endmember: %s", rho_sand)
+    log.info("Grass endmember: %s", rho_grass)
     
     return rho_sand, rho_grass, diagnostics
 
@@ -515,24 +515,24 @@ def estimate_bottom_endmembers_from_training(
     # Check files exist
     for band, path in band_paths.items():
         if not path.exists():
-            log.warning(f"[BottomEndmembers] Missing {band}: {path}")
+            log.warning("Missing %s: %s", band, path)
             return DEFAULT_SAND_SPECTRUM.copy(), DEFAULT_SEAGRASS_SPECTRUM.copy(), {"error": "missing_bands"}
     
     # Filter to shallow points
     df = training_df.copy()
     depth_col = "depth_m" if "depth_m" in df.columns else "depth"
     if depth_col not in df.columns:
-        log.warning("[BottomEndmembers] No depth column found")
+        log.warning("No depth column found")
         return DEFAULT_SAND_SPECTRUM.copy(), DEFAULT_SEAGRASS_SPECTRUM.copy(), {"error": "no_depth"}
     
     shallow_mask = df[depth_col] <= max_depth_for_endmembers
     df_shallow = df[shallow_mask].copy()
     
     if len(df_shallow) < 10:
-        log.warning(f"[BottomEndmembers] Only {len(df_shallow)} shallow points, using defaults")
+        log.warning("Only %s shallow points, using defaults", len(df_shallow))
         return DEFAULT_SAND_SPECTRUM.copy(), DEFAULT_SEAGRASS_SPECTRUM.copy(), {"n_shallow": len(df_shallow)}
     
-    log.info(f"[BottomEndmembers] Using {len(df_shallow)} points with depth <= {max_depth_for_endmembers}m")
+    log.info("Using %s points with depth <= %sm", len(df_shallow), max_depth_for_endmembers)
     
     # Get coordinates
     lon_col = "longitude" if "longitude" in df_shallow.columns else "lon"
@@ -581,7 +581,7 @@ def estimate_bottom_endmembers_from_training(
     valid = np.all([np.isfinite(rrs[b]) for b in ["B02", "B03", "B04"]], axis=0)
     
     if np.sum(valid) < 10:
-        log.warning(f"[BottomEndmembers] Only {np.sum(valid)} valid samples after filtering")
+        log.warning("Only %s valid samples after filtering", np.sum(valid))
         return DEFAULT_SAND_SPECTRUM.copy(), DEFAULT_SEAGRASS_SPECTRUM.copy(), {"n_valid": int(np.sum(valid))}
     
     # Filter to valid
@@ -687,7 +687,7 @@ def physics_sdb_inversion(
     iterations_used = np.zeros(n_pixels, dtype=np.int32)
     final_residual = np.zeros(n_pixels, dtype=np.float64)
     
-    log.info(f"[PhysicsSDB] Starting inversion on {n_pixels} pixels, {len(bands)} bands")
+    log.info("Inverting %d pixels, %d bands", n_pixels, len(bands))
     
     # Levenberg-Marquardt optimization (simplified pixel-by-pixel)
     damping = 0.01
@@ -715,7 +715,7 @@ def physics_sdb_inversion(
         iterations_used[newly_converged] = iteration
         
         if np.all(converged):
-            log.info("[PhysicsSDB] All pixels converged at iteration %s", iteration)
+            log.info("All pixels converged at iteration %s", iteration)
             break
         
         # Compute Jacobian (partial derivatives)
@@ -778,7 +778,7 @@ def physics_sdb_inversion(
         "bands_used": bands,
     }
     
-    log.info(f"[PhysicsSDB] Converged: {diagnostics['n_converged']}/{n_pixels} "
+    log.info(f"Converged: {diagnostics['n_converged']}/{n_pixels} "
              f"({diagnostics['convergence_rate']*100:.1f}%)")
     
     return depth.astype(np.float32), sand_frac.astype(np.float32), uncertainty.astype(np.float32), diagnostics
@@ -849,8 +849,8 @@ def physics_only_predict(
         Kd[band] = kd_corr
         Ku[band] = ku_corr
     
-    log.info("[PhysicsOnly] Kd: %s", Kd)
-    log.info("[PhysicsOnly] Ku: %s", Ku)
+    log.info("Kd: %s", Kd)
+    log.info("Ku: %s", Ku)
     
     # Load S2 bands
     band_paths = {
@@ -881,12 +881,12 @@ def physics_only_predict(
     deep_mask = (nir < 0.02) & (brightness < 0.02) & np.isfinite(brightness)
     
     if np.sum(deep_mask) < 100:
-        log.warning("[PhysicsOnly] Few deep water pixels, using defaults")
+        log.warning("Few deep water pixels, using defaults")
         rrs_deep = {"B02": 0.005, "B03": 0.003, "B04": 0.001}
     else:
         rrs_deep = {b: float(np.nanmedian(rrs[b][deep_mask])) for b in ["B02", "B03", "B04"]}
     
-    log.info("[PhysicsOnly] Deep water Rrs: %s", rrs_deep)
+    log.info("Deep water Rrs: %s", rrs_deep)
     
     # Create water mask (exclude land)
     water_mask = (nir < 0.1) & (brightness > 0.001) & np.isfinite(brightness)
@@ -933,8 +933,8 @@ def physics_only_predict(
         "mean_uncertainty": float(np.nanmean(uncertainty)) if len(valid_depths) > 0 else None,
     }
     
-    log.info(f"[PhysicsOnly] Valid pixels: {stats['n_valid_pixels']}")
-    log.info(f"[PhysicsOnly] Depth range: {stats['depth_min']:.1f} - {stats['depth_max']:.1f} m")
+    log.info("Valid pixels: %s", stats['n_valid_pixels'])
+    log.info("Depth range: %.1f - %.1f m", stats['depth_min'], stats['depth_max'])
     
     return {
         "depth_path": str(depth_path),

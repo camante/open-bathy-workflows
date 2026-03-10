@@ -1,0 +1,55 @@
+# Python bytecode / caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build artifacts
+*.so
+*.egg-info/
+dist/
+build/
+
+# Environments
+.venv/
+venv/
+.env
+*.conda
+*.mamba
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Run outputs / caches
+output/
+cache/
+downloads/
+cudem_cache/
+run_logs/
+*.jsonl
+
+# Geospatial outputs and scratch artifacts
+*.tif
+*.tiff
+*.gpkg
+*.geojson
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.aux.xml
+*.log
+*.bak
+*.patch
+
+# Large model/data artifacts
+*.pkl
+*.joblib

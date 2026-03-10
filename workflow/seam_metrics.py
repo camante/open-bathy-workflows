@@ -14,7 +14,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+import logging
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -178,7 +181,7 @@ def compute_seam_metrics(
                     if gv.size:
                         out["mean_abs_normal_gradient_mismatch"] = float(np.mean(np.abs(gv)))
             except Exception:
-                pass
+                log.debug("ignored", exc_info=True)  # gradient mismatch metric optional
         return out
 
 

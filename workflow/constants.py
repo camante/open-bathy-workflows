@@ -15,7 +15,7 @@ from typing import Dict, FrozenSet
 import numpy as np
 
 __version__ = "0.8.0"
-PIPELINE_VERSION = 'open-bathy-workflows_v2.0.17_river_domain_mask_v2'
+PIPELINE_VERSION = __version__
 
 # =============================================================================
 # NODATA VALUES - Standardized across all modules
@@ -242,7 +242,7 @@ MAX_VALID_SDB_DEPTH_M: float = 50.0
 MAX_VALID_RIVER_DEPTH_M: float = 30.0
 
 # Depth Convention
-# NOTE: The pipeline uses NEGATIVE values for positions below the reference surface.
+# The pipeline uses NEGATIVE values for positions below the reference surface.
 # A value of -5.0m means the seabed is 5m below the reference (MSL or NAVD88).
 DEPTH_CONVENTION: str = "negative_below_datum"
 """

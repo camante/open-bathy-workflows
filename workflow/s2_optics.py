@@ -145,7 +145,7 @@ def _write_composite_meta(out_dir: Path, meta: dict) -> None:
     try:
         meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True))
     except Exception:
-        log.debug("Optional step failed; continuing.", exc_info=True)
+        log.warning("Failed to write composite meta to %s", meta_path, exc_info=True)
 
 
 
@@ -220,7 +220,7 @@ def _purge_expected_outputs(expected: Dict[str, Path]) -> None:
             if p.exists():
                 p.unlink()
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
 
 def acquire_run_lock(lock_path: Path, stale_hours: float = 6.0) -> None:
@@ -259,11 +259,11 @@ def acquire_run_lock(lock_path: Path, stale_hours: float = 6.0) -> None:
                 f"(remove only if you're sure it's stale)"
             )
 
-        log.warning(f"[S2] Removing stale lock ({age_hours:.1f}h old): {lock_path}")
+        log.warning("Removing stale lock (%.1fh old): %s", age_hours, lock_path)
         try:
             lock_path.unlink()
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
     meta = {
         "pid": os.getpid(),
@@ -282,7 +282,7 @@ def acquire_run_lock(lock_path: Path, stale_hours: float = 6.0) -> None:
             if lock_path.exists():
                 lock_path.unlink()
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
     atexit.register(_cleanup)
 
@@ -355,7 +355,7 @@ def extract_orbit(item: dict) -> str:
         try:
             return f"{int(v):03d}"
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
     iid = item.get("id", "") or ""
     m = re.search(r"_R(\d{3})_", iid)
     if m:
@@ -526,7 +526,7 @@ def _request_with_backoff(
 
             if resp.status_code == 429 and attempt < max_retries:
                 delay = base_delay * (2 ** (attempt - 1))
-                log.warning(f"[STAC] 429 rate-limit. Retry in {delay:.1f}s (attempt {attempt}/{max_retries})")
+                log.warning("429 rate-limit. Retry in %.1fs (attempt %s/%s)", delay, attempt, max_retries)
                 time.sleep(delay)
                 continue
 
@@ -536,7 +536,7 @@ def _request_with_backoff(
         except (HTTPError, RequestException) as e:
             if attempt < max_retries:
                 delay = base_delay * (2 ** (attempt - 1))
-                log.warning(f"[STAC] Request error: {e}. Retry in {delay:.1f}s (attempt {attempt}/{max_retries})")
+                log.warning("Request error: %s. Retry in %.1fs (attempt %s/%s)", e, delay, attempt, max_retries)
                 time.sleep(delay)
                 continue
             raise
@@ -585,7 +585,7 @@ def stac_search_window(
                 new += 1
 
         dt = time.time() - t0
-        log.info(f"[STAC] Page {page}: got {len(feats)} feats ({new} new), total={len(items)} in {dt:.1f}s")
+        log.info("Page %s: got %s feats (%s new), total=%s in %.1fs", page, len(feats), new, len(items), dt)
 
         next_url = None
         next_method = "GET"
@@ -620,7 +620,7 @@ def stac_search(
     union: Dict[str, dict] = {}
     windows = list(_iter_date_windows(start_date, end_date, chunk_months))
     for i, (ws, we) in enumerate(windows, 1):
-        log.info(f"[STAC] Searching window {i}/{len(windows)}: {ws} to {we}")
+        log.info("Searching window %s/%s: %s to %s", i, len(windows), ws, we)
         feats = stac_search_window(
             stac_url, collection, bbox_wesn, ws, we,
             limit=limit, max_items=max_items, timeout=timeout
@@ -629,11 +629,11 @@ def stac_search(
             fid = f.get("id")
             if fid and fid not in union:
                 union[fid] = f
-        log.info(f"[STAC] Window {i}/{len(windows)} done: got {len(feats)} items, union_total={len(union)}")
+        log.info("Window %s/%s done: got %s items, union_total=%s", i, len(windows), len(feats), len(union))
         if len(union) >= max_items:
             break
 
-    log.info(f"[STAC] Retrieved {len(union)} unique items total (chunk_months={chunk_months}; max={max_items}).")
+    log.info("Retrieved %s unique items total (chunk_months=%s; max=%s).", len(union), chunk_months, max_items)
     return list(union.values())
 
 # -------------------------
@@ -762,7 +762,7 @@ def download_file(url: str, out_path: Path, timeout: int = 180) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if out_path.exists() and out_path.stat().st_size > 0:
         return
-    log.info(f"[DL] Downloading {out_path.name} from {url}")
+    log.info("Downloading %s from %s", out_path.name, url)
     try:
         with requests.get(url, stream=True, timeout=timeout) as r:
             r.raise_for_status()
@@ -772,9 +772,9 @@ def download_file(url: str, out_path: Path, timeout: int = 180) -> None:
                     if chunk:
                         f.write(chunk)
             tmp.replace(out_path)
-        log.info(f"[DL] Finished {out_path.name}")
+        log.debug("downloaded %s", out_path.name)
     except Exception as e:
-        log.error(f"[DL] Failed {out_path.name}: {e}")
+        log.error("Failed %s: %s", out_path.name, e)
         raise RuntimeError(f"Failed downloading {url} -> {out_path}: {e}") from e
 
 def resolve_and_download_scene(scene: Scene, cache_dir: Path, max_workers: int = 8) -> Optional[Dict[str, Path]]:
@@ -790,13 +790,13 @@ def resolve_and_download_scene(scene: Scene, cache_dir: Path, max_workers: int =
     for b in BANDS:
         picked = pick_asset_href(scene.assets, b)
         if not picked:
-            log.warning(f"[S2] Scene skipped (no public href) band={b} scene={scene.id}")
+            log.warning("Scene skipped (no public href) band=%s scene=%s", b, scene.id)
             return None
         href, sfx = picked
         out = scene_dir / f"{scene.id}_{b}{sfx}"
         urls[b] = (href, out)
 
-    log.info(f"[DL] Starting parallel download of {len(urls)} assets for scene: {scene.id}")
+    log.info("Downloading %d assets for scene %s", len(urls), scene.id)
 
     futures = []
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -811,10 +811,10 @@ def resolve_and_download_scene(scene: Scene, cache_dir: Path, max_workers: int =
                 all_ok = False
 
     if not all_ok:
-        log.warning(f"[DL] Failed to download all required assets for scene {scene.id}. Skipping scene.")
+        log.warning("Failed to download all required assets for scene %s. Skipping scene.", scene.id)
         return None
 
-    log.info(f"[DL] Successfully downloaded all assets for scene: {scene.id}")
+    log.info("Successfully downloaded all assets for scene: %s", scene.id)
     return {b: p for b, (_, p) in urls.items()}
 
 # -------------------------
@@ -1180,7 +1180,7 @@ def _hedley_glint_correct(
             vmask = scl_valid_mask(scl_int, dilate=0, scl_bad=set(scl_bad))
             mask0 &= vmask
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.warning("SCL masking failed; proceeding without SCL quality filter", exc_info=True)
 
     mask = mask0
     mask_mode = "strict"
@@ -1201,7 +1201,7 @@ def _hedley_glint_correct(
                 vmask = scl_valid_mask(scl_int, dilate=0, scl_bad=set(scl_bad))
                 mask1 &= vmask
             except Exception:
-                log.debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("ignored", exc_info=True)
         n1 = int(np.count_nonzero(mask1))
         if n1 > n0:
             mask = mask1
@@ -1531,7 +1531,7 @@ def build_weighted_shared_date_composite(
     # -----------------------------------------------------------
     # Glint-correction parameters (optional; passed via **kwargs)
     # -----------------------------------------------------------
-    # NOTE: These are used by the optional Hedley-style glint correction block.
+    # These are used by the optional Hedley-style glint correction block.
     # They are *also* included in the cache fingerprint so changing them invalidates cache.
     glint_correct = bool(kwargs.get("glint_correct", False))
     glint_clip_min = float(kwargs.get("glint_clip_min", 1e-6))
@@ -1612,7 +1612,7 @@ def build_weighted_shared_date_composite(
             if Path(coastline_mask_path).exists():
                 inputs_fp["coastline_mask"] = fingerprint_file(Path(coastline_mask_path), strict=bool(cache_strict))
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
     want_key = _s2_exact_cache_key(
         bbox_wesn=bbox_wesn,
@@ -1626,7 +1626,7 @@ def build_weighted_shared_date_composite(
     have_key = str(meta.get("cache_key", ""))
 
     if outputs_exist and have_key == want_key:
-        log.info("[S2] CACHE HIT (exact params): %s", out_dir)
+        log.info("CACHE HIT (exact params): %s", out_dir)
         ret = {k: str(v) for k, v in expected.items()}
         try:
             from log_report import raster_quickstats, mask_fraction
@@ -1692,11 +1692,11 @@ def build_weighted_shared_date_composite(
                     od["signal_feasibility"] = "unknown"
                 rep["optical_diagnostics"] = od
             except Exception:
-                log.debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("ignored", exc_info=True)
 
             ret["_report"] = rep
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
         return ret
 
     # If outputs exist but key differs, purge and rebuild
@@ -1739,7 +1739,7 @@ def build_weighted_shared_date_composite(
             f"(full keys in meta). Rebuilding (purging old outputs)."
         )
         if diff_info:
-            log.warning("[S2] Cache key differences:\n" + "\n".join(diff_info[:15]))  # Limit to first 15
+            log.warning("Cache key differences:\n" + "\n".join(diff_info[:15]))  # Limit to first 15
         
         _purge_expected_outputs(expected)
 
@@ -1831,9 +1831,9 @@ def build_weighted_shared_date_composite(
         # stable tile weights
         weights = compute_tile_weights(items_by_tile, aoi_poly_ll)
         log.info("")
-        log.info("[S2] Tile weights (AOI intersection fraction):")
+        log.info("Tile weights (AOI intersection fraction):")
         for t in sorted(weights.keys()):
-            log.info(f"  - {t}: {weights[t]*100:.1f}%")
+            log.info("  - %s: %.1f%%", t, weights[t]*100)
         log.info("")
 
         
@@ -1875,9 +1875,9 @@ def build_weighted_shared_date_composite(
         final_dropped_month = 0
 
         if pref:
-            log.info(f"[S2] Filtering candidates by preferred months: {sorted(list(pref))}")
+            log.info("Filtering candidates by preferred months: %s", sorted(list(pref)))
         else:
-            log.info("[S2] No preferred month filtering active (all months accepted).")
+            log.info("No preferred month filtering active (all months accepted).")
 
         for date_key in sorted(shared):
             if pref and month_from_iso(date_key) not in pref:
@@ -1900,11 +1900,11 @@ def build_weighted_shared_date_composite(
 
         ranked.sort(key=lambda x: x[0])
 
-        log.info("[S2] Final Filter: Dropped %s dates due to preferred_months setting.", final_dropped_month)
+        log.info("Final Filter: Dropped %s dates due to preferred_months setting.", final_dropped_month)
         if not ranked:
             raise RuntimeError("[S2] No usable dates remain after applying all filters (cloud, shared-date, preferred-months).")
 
-        log.info("[S2] Top DATES ranked by WEIGHTED cloud (shared-date-mode=%s)", mode)
+        log.info("Top DATES ranked by WEIGHTED cloud (shared-date-mode=%s)", mode)
         log.info("")
         log.info(" idx  w_cloud%%  tiles_present  DATE_KEY")
         log.info(" ---  --------  -------------  ------------------------")
@@ -1917,7 +1917,7 @@ def build_weighted_shared_date_composite(
         cache_subdir_name = f"S2_{_norm_bbox_key(bbox_wesn, ndp=3)}_{start_date}_{end_date}"
         sentinel_cache_dir = base_cache_dir / "sentinel2" / cache_subdir_name
         sentinel_cache_dir.mkdir(parents=True, exist_ok=True)
-        log.info("[S2] Sentinel-2 downloads will be cached in: %s", sentinel_cache_dir)
+        log.info("Sentinel-2 downloads will be cached in: %s", sentinel_cache_dir)
 
         # Pre-flight: if user provided coastline_mask_path, it must exist (no silent fallback)
         if date_qc_enable and coastline_mask_path:
@@ -1939,7 +1939,7 @@ def build_weighted_shared_date_composite(
                 sc = per_tile_dt_best[t][date_key]
                 local = resolve_and_download_scene(sc, cache_dir=sentinel_cache_dir, max_workers=download_workers)
                 if local is None:
-                    log.warning(f"[S2] Date {date_key} skipped: missing assets for tile {t}.")
+                    log.warning("Date %s skipped: missing assets for tile %s.", date_key, t)
                     return None
 
                 if not grid_ready and ref_path_for_grid is None:
@@ -1971,8 +1971,7 @@ def build_weighted_shared_date_composite(
                             arr = arr / 10000.0
                     raw[b] = arr.astype(np.float32)
 
-                # Per-tile pixel gating
-                # IMPORTANT: keep non-water pixels (land) for visualization products (RGB),
+                # Per-tile pixel gating: keep non-water pixels (land) for visualization products (RGB),
                 # while applying aggressive bright/turbidity gates only over SCL=Water pixels.
                 base_valid = vmask & np.isfinite(raw["B02"]) & np.isfinite(raw["B03"]) & np.isfinite(raw["B04"]) & np.isfinite(raw["B08"])
 
@@ -2040,11 +2039,11 @@ def build_weighted_shared_date_composite(
 
         # Phase 1: build initial pool and score
         initial = ranked[:N]
-        log.info(f"[S2] Phase 1: building QC metrics for initial {len(initial)} lowest-cloud dates...")
+        log.info("Phase 1: building QC metrics for initial %s lowest-cloud dates...", len(initial))
 
         water_mask = None  # True where "target water" pixels are
         for cloud_score, date_key, present_tiles in initial:
-            log.info(f"[S2] [QC] Building date mosaic for {date_key} (cloud={cloud_score:.2f}%) ...")
+            log.info("Building date mosaic for %s (cloud=%.2f%%) ...", date_key, cloud_score)
             mos = _build_date_mosaic(date_key, present_tiles)
             if mos is None:
                 continue
@@ -2063,14 +2062,14 @@ def build_weighted_shared_date_composite(
                     )
                     # --- NEW: log stats so it's undeniable it's being used ---
                     cnt = int(np.count_nonzero(water_mask))
-                    log.info("[S2] [QC] Loaded coastline mask: %s", coastline_mask_path)
-                    log.info("[S2] [QC] Coast mask semantics: water_value=%s invert=%s erode_px=%d",
+                    log.info("Loaded coastline mask: %s", coastline_mask_path)
+                    log.info("Coast mask semantics: water_value=%s invert=%s erode_px=%d",
                              coastline_mask_water_value, coastline_mask_invert, int(coastline_erode_px))
-                    log.info("[S2] [QC] Target-water pixels: %d (%.2f%% of grid)",
+                    log.info("Target-water pixels: %d (%.2f%% of grid)",
                              cnt, 100.0 * float(cnt) / float(water_mask.size))
                 else:
                     water_mask = np.ones(mos["B02"].shape, dtype=bool)
-                    log.info("[S2] [QC] Coastline masking disabled; using AOI-only QC footprint.")
+                    log.info("Coastline masking disabled; using AOI-only QC footprint.")
 
             # Score quality (uses water_mask)
             if date_qc_enable:
@@ -2142,16 +2141,16 @@ def build_weighted_shared_date_composite(
 
             outliers = [k for k in keys0 if triggers_map.get(k)]
             if outliers:
-                log.info(f"[S2] [QC] Initial outliers detected ({len(outliers)}): {', '.join(outliers)}")
+                log.info(f"Initial outliers detected ({len(outliers)}): {', '.join(outliers)}")
                 for k in outliers:
-                    log.info("[S2] [QC]   - %s triggers: %s", k, "; ".join(triggers_map[k]))
+                    log.info("- %s triggers: %s", k, "; ".join(triggers_map[k]))
             else:
-                log.info("[S2] [QC] No outliers detected in initial pool.")
+                log.info("No outliers detected in initial pool.")
 
         # Phase 2: download 2x(outliers) additional candidates and score them
         extra_n = 2 * len(outliers)
         if date_qc_enable and extra_n > 0:
-            log.info("[S2] Phase 2: downloading %s additional candidate dates for outlier replacement...", extra_n)
+            log.info("Phase 2: downloading %s additional candidate dates for outlier replacement...", extra_n)
             extras = []
             for cloud_score, date_key, present_tiles in ranked[N:]:
                 if date_key in date_mosaics:
@@ -2161,7 +2160,7 @@ def build_weighted_shared_date_composite(
                     break
 
             for cloud_score, date_key, present_tiles in extras:
-                log.info(f"[S2] [QC] Building extra date mosaic for {date_key} (cloud={cloud_score:.2f}%) ...")
+                log.info("Building extra date mosaic for %s (cloud=%.2f%%) ...", date_key, cloud_score)
                 mos = _build_date_mosaic(date_key, present_tiles)
                 if mos is None:
                     continue
@@ -2205,7 +2204,7 @@ def build_weighted_shared_date_composite(
         used = len(selected_dates)
 
         if used:
-            log.info("[S2] Selected %d dates after coastline-aware QC:", used)
+            log.info("Selected %d dates after coastline-aware QC:", used)
             for i, k in enumerate(selected_dates, 1):
                 met = date_metrics.get(k, {})
                 log.info(
@@ -2222,15 +2221,15 @@ def build_weighted_shared_date_composite(
                     float(met.get("cloud_w", np.nan)),
                 )
         else:
-            log.warning("[S2] No dates were successfully mosaicked/scored.")
+            log.warning("No dates were successfully mosaicked/scored.")
 
         stack_dates = list(selected_dates)
         if single_best_date and selected_dates:
             stack_dates = [selected_dates[0]]
-            log.info(f"[S2] SINGLE BEST DATE MODE: Using only {selected_dates[0]} (score={date_metrics.get(selected_dates[0], {}).get('score', 'N/A'):.3f})")
+            log.info(f"SINGLE BEST DATE MODE: Using only {selected_dates[0]} (score={date_metrics.get(selected_dates[0], {}).get('score', 'N/A'):.3f})")
         elif int(temporal_median_k) > 0:
             stack_dates = stack_dates[: int(temporal_median_k)]
-            log.info(f"[S2] Temporal median using best K dates: K={int(temporal_median_k)} of {len(selected_dates)}")
+            log.info("Temporal median using best K dates: K=%s of %s", int(temporal_median_k), len(selected_dates))
         for k in stack_dates:
             mos = date_mosaics[k]
             for b in ["B02", "B03", "B04", "B08", "SCL"]:
@@ -2282,7 +2281,7 @@ def build_weighted_shared_date_composite(
             }
             (out_dir / "S2_DATE_QC.json").write_text(json.dumps(qc_report, indent=2))
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
         if used == 0:
             raise RuntimeError("[S2] Could not build any mosaics with publicly downloadable assets. Try a different --stac-url or relax filters.")
@@ -2324,12 +2323,12 @@ def build_weighted_shared_date_composite(
                         final[b] = v
                     glint_meta_comp = meta_g
                     if meta_g.get("status") == "applied":
-                        log.info(f"[S2][GLINT] Applied Hedley correction to {vis_bands} using {meta_g.get('n_samples')} samples (nir_min={meta_g.get('nir_min')})")
+                        log.info(f"Applied Hedley correction to {vis_bands} using {meta_g.get('n_samples')} samples (nir_min={meta_g.get('nir_min')})")
                     else:
-                        log.info(f"[S2][GLINT] Skipped glint correction: {meta_g.get('reason')}")
+                        log.info(f"Skipped glint correction: {meta_g.get('reason')}")
             except Exception as exc:
                 glint_meta_comp = {"enabled": True, "status": "skipped", "reason": f"exception: {exc}"}
-                log.warning("[S2][GLINT] Glint correction failed; continuing without it: %s", exc)
+                log.warning("Glint correction failed; continuing without it: %s", exc)
 
         brightness = compute_brightness(final["B02"], final["B03"], final["B04"]).astype(np.float32)
         clear = compute_clear_water_mask(final["B08"], brightness).astype(np.uint8)
@@ -2393,12 +2392,12 @@ def build_weighted_shared_date_composite(
                                 mos_best[b] = v
                             glint_meta_best = meta_b
                             if meta_b.get("status") == "applied":
-                                log.info(f"[S2][GLINT] Best-date glint correction applied to {vis_bands} using {meta_b.get('n_samples')} samples")
+                                log.info(f"Best-date glint correction applied to {vis_bands} using {meta_b.get('n_samples')} samples")
                             else:
-                                log.info(f"[S2][GLINT] Best-date glint correction skipped: {meta_b.get('reason')}")
+                                log.info(f"Best-date glint correction skipped: {meta_b.get('reason')}")
                     except Exception as exc3:
                         glint_meta_best = {"enabled": True, "status": "skipped", "reason": f"exception: {exc3}"}
-                        log.warning("[S2][GLINT] Best-date glint correction failed; continuing without it: %s", exc3)
+                        log.warning("Best-date glint correction failed; continuing without it: %s", exc3)
                 # Write best-date full band stack + masks so downstream can compare
                 # (best-date vs temporal composite) in training/validation.
                 try:
@@ -2413,7 +2412,7 @@ def build_weighted_shared_date_composite(
                     write_geotiff(expected["BRIGHTNESS_BEST_DATE"], bright_best, dst_crs, dst_transform, nodata=np.nan, dtype="float32")
                     write_geotiff(expected["CLEAR_WATER_BEST_DATE"], clear_best.astype(np.uint8), dst_crs, dst_transform, nodata=255, dtype="uint8")
                 except Exception as exc2:
-                    log.warning("[S2] Failed writing best-date band stack/masks: %s", exc2)
+                    log.warning("Failed writing best-date band stack/masks: %s", exc2)
 
                 rgb_best = np.stack([mos_best["B04"], mos_best["B03"], mos_best["B02"]], axis=0).astype(np.float32)
                 out_best = expected.get("RGB_BEST_DATE")
@@ -2434,11 +2433,11 @@ def build_weighted_shared_date_composite(
                         nodata=np.nan,
                     ) as dst2:
                         dst2.write(rgb_best)
-                    log.info(f"[S2] Wrote single-best-date products: {out_best} (best_date={best_date})")
+                    log.info("Wrote single-best-date products: %s (best_date=%s)", out_best, best_date)
         except Exception as exc:
-            log.warning("[S2] Failed writing RGB_10m_best_date.tif: %s", exc)
+            log.warning("Failed writing RGB_10m_best_date.tif: %s", exc)
 
-        log.info(f"[S2] Wrote composite to {out_dir} (used {used} dates)")
+        log.info("Wrote composite to %s (used %s dates)", out_dir, used)
         _write_composite_meta(out_dir, {
             "cache_key": str(want_key) if want_key is not None else _composite_cache_key(bbox_wesn, start_date, end_date),
             "params_fp": params_fp if params_fp is not None else {},
@@ -2457,10 +2456,10 @@ def build_weighted_shared_date_composite(
         if clean_cache:
             try:
                 if sentinel_cache_dir.exists():
-                    log.info("[S2] Cleanup requested. Deleting raw scene cache: %s", sentinel_cache_dir)
+                    log.info("Cleanup requested. Deleting raw scene cache: %s", sentinel_cache_dir)
                     shutil.rmtree(sentinel_cache_dir, ignore_errors=True)
             except Exception as e:
-                log.warning(f"[S2] Cleanup requested but failed to delete raw cache ({sentinel_cache_dir}): {e}")
+                log.warning("Cleanup requested but failed to delete raw cache (%s): %s", sentinel_cache_dir, e)
         # ------------------------------------------------------------------------------
 
         ret = {k: str(v) for k, v in expected.items()}
@@ -2540,11 +2539,11 @@ def build_weighted_shared_date_composite(
                     od["signal_feasibility"] = "unknown"
                 rep["optical_diagnostics"] = od
             except Exception:
-                log.debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("ignored", exc_info=True)
 
             ret["_report"] = rep
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
         return ret
 
     finally:
@@ -2554,7 +2553,7 @@ def build_weighted_shared_date_composite(
             if lock.exists():
                 lock.unlink()
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
 def main():
     p = argparse.ArgumentParser(description="Sentinel-2 composite via weighted shared-date selection + feather mosaic.")

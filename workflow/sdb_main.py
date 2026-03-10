@@ -1,20 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sdb_main.py – The Master Orchestrator for the Modular SDB Pipeline.
+sdb_main.py – Orchestrator for the modular SDB pipeline.
 
-This script ties together the 6 core modules:
-  1. sdb.atl       -> Fetch & Process ICESat-2 (Now with Land Masking)
-  2. sdb.s2_optics -> Fetch Sentinel-2 & Build Masks
-  3. sdb.fusion    -> Hierarchical Data Fusion (XYZ > ATL03 > ATL24)
-  4. sdb.train     -> Feature Sampling & RF Training
-  5. sdb.vis       -> Visual Debugging (Photon Transects)
-  6. sdb.predict   -> Full-scene Inference
-
-UPDATES:
-- **FIXED: Hard-coded Override Removed**: `train_sdb_model` call now respects `validate_spatial` flag.
-- **FIXED: Auto-Depth Logic**: Allows "interpolation limit" calc via Stratified Random Split.
-- **FIXED: Config Override**: Regional config applies correctly without forcing spatial validation.
+Coordinates the core modules: atl (ICESat-2), s2_optics (Sentinel-2),
+fusion (multi-source training data), train (RF model), predict (scene inference),
+and vis (diagnostics).
 """
 
 import os as _os
@@ -27,7 +18,7 @@ import sys
 import re
 import os
 
-# IMPORTANT: Configure logging FIRST, before importing other pipeline modules
+# Configure logging before importing other pipeline modules
 try:
     from logging_config import setup_logging
     setup_logging()
@@ -75,23 +66,39 @@ from pyproj import Transformer
 from plot_utils import lazy_pyplot
 plt = None  # lazy-loaded when plots are enabled
 
-def _mask_has_ocean_pixels(mask_tif: str, *, water_max: float = 0.5, max_dim: int = 1024) -> bool:
+def _mask_has_ocean_pixels(mask_tif: str, *, water_max: float = 0.5, max_stride: int = 8) -> bool:
     """Fast check: does a waffles-style land mask contain ANY water/ocean pixels?
 
-    Assumes mask values where water is ~0 and land is ~1. We downsample read for speed.
-    Returns False if the file can't be read (fail-open to avoid skipping unexpectedly).
+    Assumes WAFFLES convention: water=0, land=1.
+
+    nodata=0 collision: WAFFLES GTiffs frequently set nodata=0, the same value as
+    water.  rasterio honours the stored nodata tag internally during resampling, so
+    using ds.read(out_shape=...) with any Resampling mode causes rasterio to treat
+    every water pixel as invalid and exclude it from the aggregation.  The result is
+    that all-water blocks collapse to the nodata fill and coastal strips disappear,
+    making this function return False even when the mask is perfectly correct.
+
+    Fix: read the raw integer array with masked=False (bypasses rasterio nodata
+    masking entirely), then subsample with numpy striding — no resampling library
+    involved.  We then apply our own nodata guard only for sentinels that cannot
+    collide with the water (0) or land (1) encoding.
+
+    Returns True on any read error (fail-open: never skip SDB due to a read failure).
     """
     try:
         import numpy as np
         import rasterio
-        from rasterio.enums import Resampling
         with rasterio.open(mask_tif) as ds:
-            h, w = ds.height, ds.width
-            out_h = min(max_dim, h)
-            out_w = min(max_dim, w)
-            data = ds.read(1, out_shape=(out_h, out_w), resampling=Resampling.nearest)
             nodata = ds.nodata
-        if nodata is not None:
+            # Read raw values — masked=False so rasterio never hides water pixels.
+            data = ds.read(1, masked=False)
+        # Stride-subsample to keep memory bounded (stride=8 => 64x reduction max)
+        h, w = data.shape
+        stride = max(1, min(max_stride, h // 128, w // 128))
+        data = data[::stride, ::stride]
+        # Only exclude nodata when it is a distinct sentinel that cannot collide
+        # with water (0) or land (1).
+        if nodata is not None and np.isfinite(float(nodata)) and abs(float(nodata)) > 0.5:
             data = data[data != nodata]
         if data.size == 0:
             return False
@@ -133,7 +140,7 @@ def detect_active_config_profile(aoi_bbox: list, config_path: str = "sdb_config.
     - Else: return 'defaults' if present, otherwise 'default'
     """
     try:
-        with open(config_path, "r") as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         w, s, e, n = aoi_bbox
         c_lon = (w + e) / 2.0
@@ -189,15 +196,13 @@ try:
     import vis
 except (ImportError, IndentationError, SyntaxError) as exc:
     import traceback
-    log.info("CRITICAL ERROR: Could not import one or more SDB modules.")
-    log.info(f"  {type(exc).__name__}: {exc}")
+    log.error("Failed to import SDB modules: %s: %s", type(exc).__name__, exc)
+    log.error("Tip: if this is an IndentationError/SyntaxError in predict.py, replace it with the fixed version.")
     traceback.print_exc()
-    log.info("\nTip: If this is an IndentationError/SyntaxError in predict.py, replace predict.py with the fixed version from sdb_river_fixed (v0.5.0+).")
     sys.exit(1)
 except Exception as exc:
     import traceback
-    log.info("CRITICAL ERROR: Unexpected exception while importing SDB modules.")
-    log.info(f"  {type(exc).__name__}: {exc}")
+    log.error("Unexpected error importing SDB modules: %s: %s", type(exc).__name__, exc)
     traceback.print_exc()
     sys.exit(1)
 
@@ -228,7 +233,7 @@ def _load_s2_module(s2_module_path: str):
 
     mod = importlib.util.module_from_spec(spec)
 
-    # CRITICAL: register in sys.modules *before* executing (needed by dataclasses in py3.13)
+    # Register in sys.modules before executing: required by dataclasses in py3.13
     sys.modules[mod_name] = mod
 
     spec.loader.exec_module(mod)
@@ -252,7 +257,7 @@ def _run(cmd: str):
     It attempts to safely parse the command string into argv and then delegates to _run_safe().
     """
     import shlex
-    log.warning("[SECURITY] _run() is deprecated. Prefer _run_safe(list_args).")
+    log.warning("_run() is deprecated. Prefer _run_safe(list_args).")
     try:
         cmd_list = shlex.split(cmd)
     except Exception as e:
@@ -328,17 +333,16 @@ def generate_coastline_mask(target_raster_path, aoi, cache_masks, out_mask_tif, 
     if target_raster_path and out_mask_tif:
         out_mask_tif = Path(out_mask_tif)
         if out_mask_tif.exists() and out_mask_tif.stat().st_size > 0:
-            # FIX: Check if the existing mask has the 'nodata=0' bug. If so, delete it.
             try:
                 import rasterio
                 with rasterio.open(out_mask_tif) as ds:
                     if ds.nodata == 0:
-                        log.warning("[MASK] Found cached mask with nodata=0 (BUG). Deleting to regenerate: %s", out_mask_tif)
+                        log.warning("Found cached mask with nodata=0 (BUG). Deleting to regenerate: %s", out_mask_tif)
                         out_mask_tif.unlink()
                     else:
                         return str(out_mask_tif)
             except Exception:
-                log.debug("Optional step failed; continuing.", exc_info=True) # Re-generate if check fails
+                log.debug("mask cache check failed; will regenerate", exc_info=True)
 
     # 2. Setup Cache and Params
     aoi_buf = _buffer_aoi(aoi, pct=0.05)
@@ -378,12 +382,12 @@ def generate_coastline_mask(target_raster_path, aoi, cache_masks, out_mask_tif, 
             "-O",
             str(base_prefix),
         ]
-        log.info(f"[WAFFLES] Running: {' '.join(cmd_list)}")
+        log.info(f"Running: {' '.join(cmd_list)}")
         try:
             _run_safe(cmd_list)
         except Exception:
             # Fallback check for glob if name varied slightly
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
         if not base_tif.exists():
             existing = sorted([p.name for p in cache_masks.glob('*.tif')])
             raise RuntimeError(
@@ -433,7 +437,7 @@ def _write_report(out_dir: Path, status: str, **kwargs):
                 log.debug("Optional emit failed: %s", e)
             return
     except Exception:
-        log.debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("ignored", exc_info=True)
 
     report = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -442,7 +446,7 @@ def _write_report(out_dir: Path, status: str, **kwargs):
         **kwargs
     }
     report_path = out_dir / "run_report.json"
-    with open(report_path, "w") as f:
+    with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
     try:
         from flight_recorder import emit_artifact_written
@@ -481,14 +485,14 @@ def _rr_add(rr, key: str, value):
         if rr is not None:
             rr.add(key, value)
     except Exception:
-        log.debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("ignored", exc_info=True)
 
 def _rr_artifact(rr, name: str, path: str):
     try:
         if rr is not None and hasattr(rr, "record_artifact"):
             rr.record_artifact(name, str(path))
     except Exception:
-        log.debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("ignored", exc_info=True)
 
 def _rr_merge_json(rr, key: str, path: Path):
     try:
@@ -496,12 +500,12 @@ def _rr_merge_json(rr, key: str, path: Path):
             return
         p = Path(path)
         if p.exists() and p.stat().st_size > 0:
-            with open(p, "r") as f:
+            with open(p, "r", encoding="utf-8") as f:
                 d = json.load(f)
             rr.add_dict(key, d if isinstance(d, dict) else {"value": d})
             _rr_artifact(rr, key.replace(".", "_") + "_json", str(p))
     except Exception:
-        log.debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("ignored", exc_info=True)
 
 def shift_start_back_one_month(start_str: str) -> str:
     """Backoff utility for retry loop."""
@@ -514,7 +518,7 @@ def shift_start_back_one_month(start_str: str) -> str:
 
 def _save_training_gpkg(out_path: Path, df_all, df_train, df_test):
     """Saves training data artifacts to a multi-layer GeoPackage."""
-    log.info("[GPKG] Saving training data to %s...", out_path)
+    log.info("Saving training data to %s...", out_path)
 
     def _to_gdf(df):
         if df is None or df.empty: return None
@@ -543,9 +547,9 @@ def _save_training_gpkg(out_path: Path, df_all, df_train, df_test):
         if gdf_test is not None:
             gdf_test.to_file(out_path, layer="test_depths", driver="GPKG")
 
-        log.info("[GPKG] Export complete.")
+        log.info("Export complete.")
     except Exception as exc:
-        log.warning("[GPKG] Failed to save GeoPackage: %s", exc)
+        log.warning("Failed to save GeoPackage: %s", exc)
 
 # -----------------------------------------------------------------------------
 # Config Loading Helper
@@ -562,7 +566,7 @@ def load_config_overrides(aoi_bbox: list, config_path: str = "sdb_config.json") 
         return {}
 
     try:
-        with open(config_path, "r") as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
         # 1. Start with global defaults
@@ -577,18 +581,18 @@ def load_config_overrides(aoi_bbox: list, config_path: str = "sdb_config.json") 
         for region in data.get("regions", []):
             rw, rs, re, rn = region["bbox"]
             if (rw <= c_lon <= re) and (rs <= c_lat <= rn):
-                log.info(f"[Config] AOI center ({c_lon:.2f}, {c_lat:.2f}) matches region: {region['name']}")
-                log.info(f"[Config] Description: {region['description']}")
+                log.info(f"AOI center ({c_lon:.2f}, {c_lat:.2f}) matches region: {region['name']}")
+                log.info(f"Description: {region['description']}")
 
                 # Merge region settings ON TOP of defaults
                 config.update(region["settings"])
                 return config
 
-        log.info("[Config] No specific region matched. Using global defaults.")
+        log.info("No specific region matched. Using global defaults.")
         return config
 
     except Exception as e:
-        log.warning("[Config] Failed to load config: %s", e)
+        log.warning("Failed to load config: %s", e)
         return {}
 
 # -----------------------------------------------------------------------------
@@ -652,20 +656,20 @@ def evaluate_raster_against_points(
     max_depth: float = None,
 ) -> dict:
     if df_points is None or df_points.empty:
-        log.warning("[EVAL] No points provided for raster evaluation.")
+        log.warning("No points provided for raster evaluation.")
         return {}
 
     required_cols = {"longitude", "latitude", "depth_m"}
     if not required_cols.issubset(df_points.columns):
-        log.warning("[EVAL] Points DataFrame missing required columns for evaluation.")
+        log.warning("Points DataFrame missing required columns for evaluation.")
         return {}
 
     raster_path = str(raster_path)
     if not os.path.exists(raster_path):
-        log.warning("[EVAL] Raster not found: %s", raster_path)
+        log.warning("Raster not found: %s", raster_path)
         return {}
 
-    log.info(f"[EVAL] Evaluating raster '{raster_path}' against {len(df_points)} points.")
+    log.info("Evaluating raster %s against %s points.", raster_path, len(df_points))
 
     lons = df_points["longitude"].to_numpy(np.float64)
     lats = df_points["latitude"].to_numpy(np.float64)
@@ -687,17 +691,16 @@ def evaluate_raster_against_points(
     m = np.isfinite(z_pred_raw) & np.isfinite(z_true) & (z_pred_raw != nodata)
 
     if not np.any(m):
-        log.warning("[EVAL] No valid overlapping samples between raster and points.")
+        log.warning("No valid overlapping samples between raster and points.")
         return {}
 
     z_true_m = z_true[m]
     z_pred_m = z_pred_raw[m]
 
-    # FIX: Robust Sign Alignment to prevent massive negative R2
     z_true_m, z_pred_m = _normalize_depth_pair(z_true_m, z_pred_m)
 
     if z_true_m.size == 0:
-        log.warning("[EVAL] No valid overlapping samples between raster and points.")
+        log.warning("No valid overlapping samples between raster and points.")
         return {}
 
     # Metrics on ALL overlap samples
@@ -707,7 +710,7 @@ def evaluate_raster_against_points(
     r2_all = _r2(z_true_m, z_pred_m)
     n_all = int(len(z_true_m))
 
-    log.info(f"[EVAL] Raster vs points (ALL) – RMSE={rmse_all:.2f} m, MAE={mae_all:.2f} m, R²={r2_all:.2f}, N={n_all}")
+    log.info("Raster vs points (ALL) – RMSE=%.2f m, MAE=%.2f m, R²=%.2f, N=%s", rmse_all, mae_all, r2_all, n_all)
 
     out_png = plot_dir / f"{prefix}.png"
 
@@ -724,8 +727,7 @@ def evaluate_raster_against_points(
             bias_val = float(np.nanmean(zp - zt))
             r2_val = _r2(zt, zp)
             n_val = int(len(zt))
-            log.info(f"[EVAL] Raster vs points (|depth|≤{md:g}m) – RMSE={rmse_val:.2f} m, MAE={mae_val:.2f} m, R²={r2_val:.2f}, N={n_val}")
-            out_png = plot_dir / f"{prefix}.png"
+            log.info("Raster vs points (|depth|≤%gm) – RMSE=%.2f m, MAE=%.2f m, R²=%.2f, N=%s", md, rmse_val, mae_val, r2_val, n_val)
 
     train.scatter_plot(
         y_true=z_true_m,
@@ -738,7 +740,7 @@ def evaluate_raster_against_points(
     )
 
     metrics = {"all": {"rmse_m": rmse_all, "mae_m": mae_all, "bias_m": bias_all, "r2": r2_all, "n": n_all}, "limited": {"rmse_m": rmse_val, "mae_m": mae_val, "bias_m": bias_val, "r2": r2_val, "n": n_val}, "max_depth_m": (None if max_depth is None else float(max_depth))}
-    with open(log_dir / "eval_metrics_raster_vs_icesat_test.json", "w") as f:
+    with open(log_dir / "eval_metrics_raster_vs_icesat_test.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
     return metrics
 
@@ -897,311 +899,421 @@ def overlap_consistency_diagnostic(
 # Main Execution
 # -----------------------------------------------------------------------------
 
-def main():
-    import rasterio
-    args = parse_args()
 
-    # ---------------------------------------------------------------------
-    # Run-scoped logging + flight recorder
-    # ---------------------------------------------------------------------
-    run_id = None
-    try:
-        from datetime import datetime, timezone
-        from logging_config import add_file_handler, start_flight_recorder
 
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        run_id = f"sdb_{ts}_{os.getpid()}"
-        out_dir = Path(getattr(args, "out_dir", "output"))
-        (out_dir / "run_logs").mkdir(parents=True, exist_ok=True)
-        add_file_handler(out_dir / "run_logs" / f"run_{run_id}.log", level=logging.INFO)
-        fr_path = start_flight_recorder(out_dir, run_id=run_id)
-        if fr_path is not None:
-            log.info("[RUN] Flight recorder: %s", fr_path)
-        log.info("[RUN] run_id=%s", run_id)
-    except Exception as e:
-        log.debug("[RUN] Unable to initialize run logs/flight recorder: %s", e)
+def _run_sdb_prediction(
+    args, out_tif, dir_model, dir_rast, run_id, s2_paths, land_mask_out,
+    stumpf_lr, land_mask_type_for_train, land_mask_water_val_for_train,
+    land_mask_invert, land_mask_threshold, chosen_max_depth, rr,
+    dir_data, predict,
+):
+    """Dispatch SDB prediction: chunked or standard path."""
+    # 9. Prediction
+    log.info("Prediction")
 
-    try:
-        w, e, s, n = [float(x) for x in args.aoi.split("/")]
-        bbox_list = [w, s, e, n]
-        bbox_wesn = (w, e, s, n)
-    except Exception:
-        log.error("Invalid AOI format. Use W/E/S/N")
-        sys.exit(1)
-
-    # ------------------------------------------------------------------
-    # NEW: Validate configuration before processing
-    # ------------------------------------------------------------------
-    # Build config dict for validation and checkpointing
-    config_dict = {
-        "aoi": args.aoi,
-        "start_date": getattr(args, "start", None),
-        "end_date": getattr(args, "end", None),
-        "max_depth_sdb": getattr(args, "max_depth_sdb", None),
-        "rmse_target_sdb": getattr(args, "rmse_target_sdb", None),
-        "depth_bin_m": getattr(args, "depth_bin_m", None),
-        "out_dir": getattr(args, "out_dir", None),
-        "cache_root": getattr(args, "cache_root", None),
-    }
-    
-    if VALIDATION_AVAILABLE:
-        validation_result = validate_pipeline_config(config_dict)
-        if not validation_result.is_valid:
-            log.error("Configuration validation failed. Exiting.")
-            for err in validation_result.errors:
-                log.error("  - %s", err, exc_info=True)
-            sys.exit(1)
-        elif validation_result.warnings:
-            for warn in validation_result.warnings:
-                log.warning("  - %s", warn)
-    
-    # ------------------------------------------------------------------
-    # NEW: Initialize checkpoint manager if available
-    # ------------------------------------------------------------------
-    checkpoint = None
-    if CHECKPOINTS_AVAILABLE and not getattr(args, "no_checkpoints", False):
+    use_chunked = False
+    if args.chunked_prediction == "on":
+        use_chunked = True
+        log.info("Chunked processing: enabled (forced)")
+    elif args.chunked_prediction == "off":
+        use_chunked = False
+        log.info("Chunked processing: disabled (forced)")
+    elif args.chunked_prediction == "auto":
+        # Auto-detect based on memory requirement
         try:
-            out_dir = Path(getattr(args, "out_dir", "output"))
-            checkpoint = PipelineCheckpoint(
-                output_dir=out_dir,
-                config=config_dict,
-                enabled=True
-            )
-            progress = checkpoint.get_progress_summary()
-            if progress.get("completed_stages"):
-                log.info(f"[CHECKPOINT] Resuming from checkpoint: {progress['completed_stages']}")
+            from predict_chunked import estimate_memory_requirement_gb
+            
+            # Get raster dimensions from first band
+            import rasterio
+            with rasterio.open(s2_paths[list(s2_paths.keys())[0]]) as src:
+                width, height = src.width, src.height
+            
+            estimated_gb = estimate_memory_requirement_gb(width, height)
+            use_chunked = estimated_gb > args.max_memory_gb
+            
+            log.info("Memory estimation: %.1f GB (threshold: %s GB)", estimated_gb, args.max_memory_gb)
+            log.info(f"Chunked processing: {'enabled (auto)' if use_chunked else 'disabled (auto)'}")
         except Exception as e:
-            log.warning("[CHECKPOINT] Could not initialize: %s", e)
-            checkpoint = None
+            log.warning("Failed to estimate memory: %s. Using standard prediction.", e)
+            use_chunked = False
+    
+    if use_chunked:
+        # Use chunked processing
+        try:
+            from predict_chunked import predict_scene_chunked
+            
+            log.info("Using chunked processing: tile_size=%s, overlap=%s", args.tile_size, args.tile_overlap)
+            
+            result = predict_scene_chunked(
+                model_dir=dir_model,
+                band_paths=s2_paths,
+                out_dir=dir_rast,
+                final_out_path=str(out_tif),
+                land_mask_path=str(land_mask_out),
+                max_memory_gb=args.max_memory_gb,
+                tile_size=args.tile_size,
+                overlap=args.tile_overlap,
+                sdb_mode=args.sdb_mode,
+                s2_smooth_kernel=args.s2_smooth_kernel,
+                enable_doa=(not args.no_doa),
+                cw_min=args.cw_min,
+                land_max=args.land_max,
+                land_mask_type=land_mask_type_for_train,
+                land_mask_water_val=land_mask_water_val_for_train,
+                land_mask_invert=land_mask_invert,
+                land_mask_threshold=land_mask_threshold,
+                linf_estimate_deepwater=args.linf_estimate_deepwater,
+                linf_deepwater_nir_max=args.linf_deepwater_nir_max,
+                linf_deepwater_bright_max=args.linf_deepwater_bright_max,
+                linf_percentile=args.linf_percentile,
+                write_confidence=True,
+                write_provenance=True,
+                min_confidence_threshold=args.min_confidence_threshold,
+            )
+
+            # Copy depth raster and any sibling outputs to their final locations
+            tmp_raster = result['output_raster']
+            if not tmp_raster.exists():
+                raise FileNotFoundError(f"Chunked output not found: {tmp_raster}")
+            shutil.copy2(tmp_raster, out_tif)
+            for suffix in ("_confidence.tif", "_provenance.tif", "_uncertainty.tif", "_doa.tif"):
+                src_sib = tmp_raster.with_name(tmp_raster.stem + suffix)
+                if src_sib.exists():
+                    shutil.copy2(src_sib, out_tif.with_name(out_tif.stem + suffix))
+            log.info("Chunked prediction complete: %s", out_tif)
+
+        except ImportError:
+            log.error("predict_chunked module not available. Falling back to standard prediction.")
+            use_chunked = False
+        except Exception as e:
+            log.error("Chunked processing failed: %s. Falling back to standard prediction.", e, exc_info=True)
+            use_chunked = False
+    
+    if not use_chunked:
+        # Standard prediction
+        predict.predict_scene(
+            s2_paths=s2_paths,
+            land_mask_path=str(land_mask_out),
+            rf_model_path=str(dir_model / "rf_model.pkl"),
+            meta_json_path=str(dir_model / "model_meta.json"),
+            out_path=str(out_tif),
+            stumpf_lr_path=str(dir_model / "stumpf_lr.pkl") if stumpf_lr else None,
+            sdb_mode=args.sdb_mode, tile_size=args.tile, s2_smooth_kernel=args.s2_smooth_kernel,
+            enable_doa=(not args.no_doa),
+            cw_min=args.cw_min, land_max=args.land_max,
+            land_mask_type=land_mask_type_for_train,
+            land_mask_water_val=land_mask_water_val_for_train,
+            land_mask_invert=land_mask_invert,
+            land_mask_threshold=land_mask_threshold,
+            linf_estimate_deepwater=args.linf_estimate_deepwater,
+            linf_deepwater_nir_max=args.linf_deepwater_nir_max,
+            linf_deepwater_bright_max=args.linf_deepwater_bright_max,
+            linf_percentile=args.linf_percentile,
+            align_mode=args.align_mode,
+            align_tie_points_gpkg=str(dir_data / "icesat_depths.gpkg") if (dir_data / "icesat_depths.gpkg").exists() else None,
+            align_min_points=args.align_min_points,
+            align_depth_bins=args.align_depth_bins,
+            align_source_priority=args.align_source_priority,
+            align_extra_points=args.align_extra_points,
+            align_max_abs_residual_m_for_fit=args.align_max_abs_residual_for_fit if args.align_max_abs_residual_for_fit > 0 else None,
+            write_confidence=True,
+            write_provenance=True,
+            min_confidence_threshold=args.min_confidence_threshold,
+        )
 
 
-    # ------------------------------------------------------------------
-    # Resolve max_depth_sdb (supports numeric or 'auto')
-    # ------------------------------------------------------------------
-    max_depth_arg_raw = getattr(args, "max_depth_sdb", "20.0")
-    auto_max_depth = False
-    max_depth_sdb_product = 20.0
+
+def _run_sdb_post_processing(
+    args, out_tif, s2_paths, dir_rast, rr, out_root,
+    bbox_wesn, df_test_final, predict,
+):
+    """Post-prediction steps: NAVD88 conversion, overlap diagnostic,
+    brightness masking, masked RGB, and NAD83 reprojection.
+    """
+    import rasterio
+    # 9a. Optional conversion to bed elevation in NAVD88
+    # This converts SDB depth (relative to ~MSL) to bed elevation in NAVD88
+    # for consistency with river bathymetry and coastal DEMs.
+    #
+    # SDB depth is relative to MSL (negative = below surface). This converts
+    # to bed elevation in NAVD88: bed_elev = MSL_height_in_NAVD88 + depth_below_MSL.
+    #
+    out_tif_navd88 = None
+    if getattr(args, "convert_sdb_to_navd88", False):
+        log.info("Converting SDB from MSL to NAVD88")
+        out_tif_navd88 = dir_rast / f"{out_tif.stem}_bed_navd88.tif"
+        
+        # Apply MSL metadata to original raster
+        apply_sdb_metadata(out_tif, vertical_datum="MSL", vertical_datum_epsg=5714)
+        
+        # Convert from MSL to NAVD88
+        success, msg = convert_sdb_msl_to_navd88(
+            input_tif=out_tif,
+            output_tif=out_tif_navd88,
+            source_vdatum=args.sdb_source_vdatum,
+            target_vdatum=args.sdb_target_vdatum,
+            logger=log,
+        )
+        
+        if success:
+            # Apply NAVD88 metadata to the converted output
+            apply_sdb_metadata(out_tif_navd88, vertical_datum="NAVD88", vertical_datum_epsg=5703)
+            
+            # Also convert uncertainty raster if it exists
+            unc_tif = out_tif.with_name(f"{out_tif.stem}_uncertainty.tif")
+            if unc_tif.exists():
+                unc_tif_navd88 = dir_rast / f"{out_tif.stem}_uncertainty_bed_navd88.tif"
+                convert_sdb_msl_to_navd88(
+                    input_tif=unc_tif,
+                    output_tif=unc_tif_navd88,
+                    source_vdatum=args.sdb_source_vdatum,
+                    target_vdatum=args.sdb_target_vdatum,
+                    logger=log,
+                )
+            
+            if rr is not None:
+                rr.add("vdatum_conversion.status", "success")
+                rr.add("vdatum_conversion.source", args.sdb_source_vdatum)
+                rr.add("vdatum_conversion.target", args.sdb_target_vdatum)
+                rr.add("vdatum_conversion.output", str(out_tif_navd88))
+        else:
+            log.warning("Conversion failed: %s", msg)
+            if rr is not None:
+                rr.add("vdatum_conversion.status", "failed")
+                rr.add("vdatum_conversion.error", msg)
+
+    # 9b. Optional adjacent-tile overlap consistency diagnostic
+    if getattr(args, "overlap_neighbor", None):
+        try:
+            neighbor_in = Path(str(args.overlap_neighbor))
+            neighbor_rr = neighbor_in / "run_report.json" if neighbor_in.is_dir() else neighbor_in
+            if not neighbor_rr.exists():
+                log.warning("Neighbor run_report not found: %s", neighbor_rr)
+            else:
+                with open(neighbor_rr, "r", encoding="utf-8") as f:
+                    nb = json.load(f)
+                nb_wesn = None
+                if isinstance(nb.get("aoi", None), dict):
+                    nb_wesn = nb["aoi"].get("wesn") or nb["aoi"].get("bbox")
+                if nb_wesn is None and isinstance(nb.get("run", None), dict):
+                    nb_wesn = nb["run"].get("aoi_wesn")
+                if nb_wesn is None:
+                    log.warning("Could not determine neighbor AOI WESN from run_report.json")
+                else:
+                    nb_w, nb_e, nb_s, nb_n = [float(x) for x in nb_wesn]
+                    nb_pred = None
+                    try:
+                        nb_pred = nb.get("outputs", {}).get("sdb_prediction", {}).get("path", None)
+                    except Exception:
+                        nb_pred = None
+                    # No fallback filename guessing for neighbor outputs.
+                    # Neighbor must explicitly record its prediction path in run_report.json.
+                    if not nb_pred or not Path(nb_pred).exists():
+                        log.warning("Neighbor prediction raster not found: %s", nb_pred)
+                    else:
+                        w, e, s, n = [float(x) for x in args.aoi.split("/")[:4]] if isinstance(args.aoi, str) else bbox_wesn
+                        cur_aoi = {"w": float(w), "e": float(e), "s": float(s), "n": float(n)}
+                        nb_aoi = {"w": nb_w, "e": nb_e, "s": nb_s, "n": nb_n}
+                        res = overlap_consistency_diagnostic(
+                            current_run_aoi=cur_aoi,
+                            neighbor_run_aoi=nb_aoi,
+                            current_pred_tif=str(out_tif),
+                            neighbor_pred_tif=str(nb_pred),
+                            buffer_m=float(getattr(args, "overlap_buffer_m", 500.0)),
+                            sample_spacing_m=float(getattr(args, "overlap_sample_spacing_m", 30.0)),
+                            max_samples=int(getattr(args, "overlap_max_samples", 200000)),
+                            df_ref_points=df_test_final,
+                            ref_depth_col="depth_m",
+                        )
+                        rr.add_dict("qa.overlap_consistency", res)
+                        log.info(f"{res.get('status')} n_valid={res.get('n_samples_valid')} median_diff={res.get('median_diff_m')} m p90_abs={res.get('p90_abs_diff_m')} m")
+        except Exception as e:
+            log.warning("Failed to compute overlap consistency diagnostic: %s", e)
+
+    if args.mask_bright_pixels is not None and s2_paths and "B02" in s2_paths:
+        log.info("[Post-Process] Brightness masking: B02 thresh=%s, allow_bright_shallow=%s", args.mask_bright_pixels, bool(args.allow_bright_shallow_pixels))
+        try:
+            with rasterio.open(str(out_tif), "r+") as dst:
+                sdb_data = dst.read(1)
+                nodata = dst.nodata if dst.nodata is not None else -9999.0
+
+                with rasterio.open(s2_paths["B02"]) as src_b2:
+                    b2_data = src_b2.read(1, out_shape=dst.shape, resampling=rasterio.enums.Resampling.nearest)
+
+                scale_factor = 10000.0 if np.nanmax(b2_data) > 100 else 1.0
+                b2_norm = b2_data / scale_factor
+
+                bad_mask = (b2_norm > args.mask_bright_pixels)
+
+                if bool(args.allow_bright_shallow_pixels) and ("B08" in s2_paths) and (s2_paths.get("B08") is not None):
+                    nir_thr = float(args.bright_shallow_nir_max) if args.bright_shallow_nir_max is not None else 0.03
+                    log.info("[Post-Process] Bright-shallow escape hatch enabled (B08 < %s)", nir_thr)
+                    with rasterio.open(s2_paths["B08"]) as src_b8:
+                        b8_data = src_b8.read(1, out_shape=dst.shape, resampling=rasterio.enums.Resampling.nearest)
+                    b8_norm = b8_data / scale_factor
+
+                    is_shallow_sand = (b2_norm > args.mask_bright_pixels) & (b8_norm < nir_thr)
+                    bad_mask = bad_mask & (~is_shallow_sand)
+
+                mask_count = int(np.sum(bad_mask))
+                if mask_count > 0:
+                    sdb_data[bad_mask] = nodata
+                    dst.write(sdb_data, 1)
+                    log.info("[Post-Process] Masked %s pixels (cloud/glint).", mask_count)
+                else:
+                    log.info("[Post-Process] No pixels masked by brightness gate.")
+        except Exception as exc:
+            log.warning("[Post-Process] Brightness masking failed: %s", exc)
+
+    # --- NEW: Create Masked RGB (Prediction Only) ---
+    rgb_full = dir_rast / "RGB_10m.tif"
+    if rgb_full.exists():
+        rgb_masked_out = dir_rast / "RGB_10m_predict.tif"
+        log.info("[Post-Process] Creating Masked RGB: %s", rgb_masked_out)
+        try:
+            with rasterio.open(str(out_tif)) as src_sdb:
+                sdb_arr = src_sdb.read(1)
+                sdb_nodata = src_sdb.nodata if src_sdb.nodata is not None else -9999.0
+                valid_mask = (sdb_arr != sdb_nodata) & np.isfinite(sdb_arr)
+
+            with rasterio.open(rgb_full) as src_rgb:
+                prof = src_rgb.profile.copy()
+                if prof.get('nodata') is None:
+                    prof.update(nodata=0)
+
+                r = src_rgb.read(1)
+                g = src_rgb.read(2)
+                b = src_rgb.read(3)
+
+                fill_val = prof['nodata']
+                if r.shape != valid_mask.shape:
+                    log.warning("[Post-Process] RGB and SDB shapes mismatch. skipping RGB mask.")
+                else:
+                    r[~valid_mask] = fill_val
+                    g[~valid_mask] = fill_val
+                    b[~valid_mask] = fill_val
+
+                    with rasterio.open(rgb_masked_out, 'w', **prof) as dst_rgb:
+                        dst_rgb.write(r, 1)
+                        dst_rgb.write(g, 2)
+                        dst_rgb.write(b, 3)
+
+        except Exception as exc:
+            log.warning("[Post-Process] Failed to create masked RGB: %s", exc)
+
+    if not args.skip_nad83:
+        # Derive NAD83 output names from the actual primary output, not guessed filenames.
+        out_path = Path(out_tif)
+        nad83_depth = out_path.with_name(out_path.stem + "_epsg4269" + out_path.suffix)
+        predict.reproject_to_nad83(str(out_tif), str(nad83_depth))
+        unc_src = str(out_path.with_name(out_path.stem + "_uncertainty" + out_path.suffix))
+        if os.path.exists(unc_src):
+            nad83_unc = Path(unc_src).with_name(Path(unc_src).stem + "_epsg4269" + Path(unc_src).suffix)
+            predict.reproject_to_nad83(unc_src, str(nad83_unc))
+
+
+
+def _write_sdb_manifest(
+    args, out_tif, dir_rast, dir_model, dir_logs, dir_plot, run_id,
+    out_root, rr, df_test_final, df_train_final, chosen_max_depth,
+    raster_quickstats,
+):
+    """Write the SDB artifact manifest and final reporting."""
+    # -------------------------------------------------------------------------
+    # Artifact manifest paths are derived from run_id, not guessed
+    # -------------------------------------------------------------------------
+    # Primary depth output (EPSG:4269 if NAD83 reprojection is enabled)
+    try:
+        # Prefer the NAD83-reprojected depth if it was created, otherwise use the native output.
+        out_path = Path(out_tif)
+        depth_primary = out_path.with_name(out_path.stem + "_epsg4269" + out_path.suffix)
+        if not depth_primary.exists():
+            depth_primary = out_path
+
+        # Write manifest (relative paths, rooted at out_root)
+        artifacts = {
+            "run_id": run_id if run_id is not None else None,
+            "depth_raster": str(depth_primary.relative_to(out_root)) if str(depth_primary).startswith(str(out_root)) else str(depth_primary),
+        }
+
+        # Optional artifacts (only if present)
+        unc = Path(str(out_tif)).with_name(Path(str(out_tif)).stem + "_uncertainty.tif")
+        if unc.exists():
+            artifacts["uncertainty_raster"] = str(unc.relative_to(out_root))
+        # If NAD83 uncertainty exists, record it (derived from the actual uncertainty filename).
+        if unc.exists():
+            unc_nad83 = unc.with_name(unc.stem + "_epsg4269" + unc.suffix)
+            if unc_nad83.exists():
+                artifacts["uncertainty_raster_epsg4269"] = str(unc_nad83.relative_to(out_root))
+
+        land_mask = dir_rast / "LAND_MASK_aligned.tif"
+        if land_mask.exists():
+            artifacts["land_mask"] = str(land_mask.relative_to(out_root))
+
+        # Guidance rasters (confidence + provenance)
+        conf_tif = Path(str(out_tif)).with_name(Path(str(out_tif)).stem + "_confidence.tif")
+        if conf_tif.exists():
+            artifacts["confidence_raster"] = str(conf_tif.relative_to(out_root)) if str(conf_tif).startswith(str(out_root)) else str(conf_tif)
+        prov_tif = Path(str(out_tif)).with_name(Path(str(out_tif)).stem + "_provenance.tif")
+        if prov_tif.exists():
+            artifacts["provenance_raster"] = str(prov_tif.relative_to(out_root)) if str(prov_tif).startswith(str(out_root)) else str(prov_tif)
+
+        rgb = dir_rast / "RGB_10m.tif"
+        if rgb.exists():
+            artifacts["rgb"] = str(rgb.relative_to(out_root))
+        rgb_pred = dir_rast / "RGB_10m_predict.tif"
+        if rgb_pred.exists():
+            artifacts["rgb_predict"] = str(rgb_pred.relative_to(out_root))
+
+        (out_root / "artifacts_sdb.json").write_text(json.dumps(artifacts, indent=2), encoding="utf-8")
+        log.info(f"Wrote SDB manifest: {out_root / 'artifacts_sdb.json'}")
+    except Exception as exc:
+        log.warning("Failed to write outputs/manifest: %s", exc)
+
+    if df_test_final is not None and not df_test_final.empty:
+        try:
+            if df_train_final is not None and not df_train_final.empty:
+                df_points_all = pd.concat([df_train_final, df_test_final], ignore_index=True)
+            else:
+                df_points_all = df_test_final
+        except Exception:
+            df_points_all = df_test_final
+
+        evaluate_raster_against_points(str(out_tif), df_points_all, dir_logs, dir_plot, max_depth=chosen_max_depth)
+
 
     try:
-        if isinstance(max_depth_arg_raw, str) and max_depth_arg_raw.strip().lower() == "auto":
-            auto_max_depth = True
-            max_depth_sdb_product = 20.0
-        else:
-            max_depth_sdb_product = float(max_depth_arg_raw)
+        if rr is not None:
+            _rr_merge_json(rr, "train", out_root / "train_report.json")
+            _rr_merge_json(rr, "predict", dir_rast / "predict_report.json")
+
+            if raster_quickstats is not None:
+                if out_tif is not None and Path(out_tif).exists():
+                    rr.add_dict("outputs.sdb_prediction", raster_quickstats(str(out_tif)))
+                unc = Path(str(out_tif)).with_name(Path(str(out_tif)).stem + "_uncertainty.tif")
+                if unc.exists():
+                    rr.add_dict("outputs.sdb_uncertainty", raster_quickstats(str(unc)))
+
+            _rr_artifact(rr, "rf_model_pkl", str(dir_model / "rf_model.pkl"))
+            if (dir_model / "stumpf_lr.pkl").exists():
+                _rr_artifact(rr, "stumpf_lr_pkl", str(dir_model / "stumpf_lr.pkl"))
+
+            rr.write(status="ok")
+            log.info("SDB pipeline done")
     except Exception:
-        log.warning(f"[Config] Invalid --max-depth-sdb value '{max_depth_arg_raw}'. Falling back to 20.0 m.")
-        max_depth_sdb_product = 20.0
-
-    MAX_DEPTH_TRAIN_FETCH = max(30.0, max_depth_sdb_product)
-
-    # --- UPDATED LOGIC: Allow auto-depth without forced spatial validation ---
-    if auto_max_depth and not getattr(args, "validate_spatial", True):
-        log.info("[Config] --max-depth-sdb auto requested with --no-validate-spatial. "
-                 "Using STRATIFIED RANDOM SPLIT to estimate depth-of-support (interpolation limit).")
-        # Do NOT force validate_spatial = True
-
-    # --- AUTO-CONFIGURATION OVERRIDE ---
-    config_settings = load_config_overrides(bbox_list)
-    active_profile = detect_active_config_profile(bbox_list)
-    overrides_applied = list(config_settings.keys()) if isinstance(config_settings, dict) else []
-
-    if config_settings:
-        log.info("--- Applying Regional Configuration ---")
-
-        for key, value in config_settings.items():
-            if key == "preferred_months":
-                setattr(args, "preferred_months", value)
-                log.info("   [Auto-Config] Set preferred_months: %s", value)
-                continue
-
-            if not hasattr(args, key):
-                # We log this but still set it on args so it appears in the final dump
-                # (useful for custom flags like 'gl_red_max' not in argparse)
-                setattr(args, key, value)
-                log.info(f"   [Auto-Config] Set {key} (custom): {value}")
-                continue
-
-            cli_flag = "--" + key.replace("_", "-")
-            if key == "min_depth_atl03_val": cli_flag = "--min-depth-atl03"
-            elif key == "refraction":
-                if not value: cli_flag = "--no-refraction"
-
-            if cli_flag in sys.argv:
-                log.info(f"   [Override Skipped] User explicitly set {cli_flag}. Keeping value: {getattr(args, key)}")
-            else:
-                old_val = getattr(args, key)
-                setattr(args, key, value)
-                if old_val != value:
-                    log.info(f"   [Auto-Config] Set {key}: {old_val} -> {value}")
-
-        log.info("---------------------------------------")
-
-    # --- UPDATED: Comprehensive Grouped Argument Printer ---
-    log.info("\n=== Final Effective Arguments ===")
-
-    # Defined Groups matching sdb_config.json + argparse keys
-    arg_groups = {
-        "Core": [
-            "aoi", "start", "end", "out_dir", "sdb_mode", "s2_module"
-        ],
-        "Caching": [
-            "cache_root", "cache_strict", "cache_code_strict"
-        ],
-        "Sentinel-2 / Cloud": [
-            "cloud", "s2_scene_limit", "s2_only", "min_scene_valid_frac",
-            "stac_max_items", "stac_page_limit", "cloud_report_only", "preferred_months",
-            "edge_weight_power", "edge_weight_min", "temporal_median_k"
-        ],
-        "Bright Pixel / Turbidity Handling": [
-            "mask_bright_pixels",
-            "allow_bright_shallow_pixels", "bright_shallow_nir_max",
-            "apply_gl_turbidity_reject", "gl_nir_max", "gl_nir_green_ratio_max", "gl_red_max"
-        ],
-        "Optical / Masks": [
-            "land_mask_user", "cw_min", "land_max",
-            "land_mask_water_val", "land_mask_invert", "land_mask_type", "land_mask_threshold"
-        ],
-        "ICESat-2": [
-            "icesat", "atl_only", "water_class", "atl03_conf_min", "min_depth_atl03_val",
-            "max_depth_atl03", "refraction", "water_temp_c", "debug_atl03_qc",
-            "atl24_conf_min", "force_redl_atl24", "write_atl03_tracks_shp",
-            "min_bottom_photons", "min_bottom_frac"
-        ],
-        "Training / Validation": [
-            "max_depth_sdb", "min_training_points_for_sdb", "use_stumpf_depth", "seed",
-            "validate_spatial", "rmse_target_sdb", "depth_bin_m", "min_samples_per_bin",
-            "depth_binning",
-            "linf_enabled", "linf_estimate_deepwater", "linf_percentile",
-            "linf_deepwater_nir_max", "linf_deepwater_bright_max"
-        ],
-        "Prediction": [
-            "tile", "s2_smooth_kernel", "no_doa", "skip_nad83"
-        ]
-    }
-
-    printed_keys = set()
-
-    for group_name, keys in arg_groups.items():
-        log.info("--- %s ---", group_name)
-        for k in keys:
-            if hasattr(args, k):
-                val = getattr(args, k)
-                log.info(f"  {k}: {val}")
-                printed_keys.add(k)
-            # Handle config keys that might not be in argparse definition (dynamically added)
-            elif k in vars(args):
-                 val = getattr(args, k)
-                 log.info(f"  {k}: {val}")
-                 printed_keys.add(k)
-
-    # Catch-all for anything else not in groups
-    all_keys = set(vars(args).keys())
-    remaining = sorted(list(all_keys - printed_keys))
-    if remaining:
-        log.info("--- Other / Uncategorized ---")
-        for k in remaining:
-            # Skip hidden private attrs
-            if not k.startswith("_"):
-                log.info(f"  {k}: {getattr(args, k)}")
-
-    log.info("=================================\n")
+        log.debug("ignored", exc_info=True)
 
 
-    # ------------------------------------------------------------
-    # Enforce lake-mode defaults & constraints
-    # ------------------------------------------------------------
-    if getattr(args, "sdb_mode", None) == "lakes":
-        log.info("[MODE] Lake mode enabled")
-        if getattr(args, "icesat", None) in ("atl24", "all_atl"):
-            log.info("[MODE] ATL24 disabled in lake mode (not defined over lakes)")
-            args.icesat = "atl03"
-        if getattr(args, "cw_min", None) is None:
-            args.cw_min = 0.8
-            log.info("[MODE] Setting default cw_min=0.8 for lakes")
-        if getattr(args, "land_max", None) is None:
-            args.land_max = 0.1
-            log.info("[MODE] Setting default land_max=0.1 for lakes")
+def _acquire_s2_and_atl_data(
+    args, s2_cache, atl_cache, mask_cache, bbox_wesn, out_root, rr,
+    dir_data, dir_rast, w, e, s, n,
+    s2_optics, atl, bbox_list,
+):
+    """Acquire Sentinel-2 composite and ICESat-2 data with retry logic.
 
-    # Load requested s2_optics implementation
-    s2_optics = _load_s2_module(getattr(args, "s2_module", "s2_optics.py"))
-
-    # 1. Setup Organized Output Structure
-    if args.out_dir:
-        out_root = Path(args.out_dir)
-        # Ensure a stable run directory name for logs/reports/titles even when user supplies --out-dir
-        dir_name = out_root.name
-    else:
-        dir_name = f"sdb_{w:.3f}_{e:.3f}_{s:.3f}_{n:.3f}_{args.start}_{args.end}"
-        out_root = Path("output") / dir_name
-    dir_data = out_root / "data"
-    dir_model = out_root / "model"
-    dir_rast = out_root / "rasters"
-    dir_plot = out_root / "plots"
-    dir_logs = out_root / "logs"
-
-    for d in [dir_data, dir_model, dir_rast, dir_plot, dir_logs]:
-        d.mkdir(parents=True, exist_ok=True)
-
-    _setup_file_logging(dir_logs)
-
-    # ------------------------------------------------------------------
-    # RunReport (structured run_report.json)
-    # ------------------------------------------------------------------
-    rr = RunReport(out_root) if RunReport is not None else None
-    _rr_add(rr, "run.version", VERSION)
-    _rr_add(rr, "run.args", vars(args))
-    _rr_add(rr, "sdb.max_depth.auto.rmse_target_m", float(getattr(args,'rmse_target_sdb',0.5)))
-    _rr_add(rr, "run.aoi", {"w": w, "e": e, "s": s, "n": n})
-    _rr_add(rr, "config.active_profile", active_profile if active_profile is not None else "unknown")
-    _rr_add(rr, "config.overrides_applied", overrides_applied if overrides_applied is not None else [])
-
-    _rr_artifact(rr, "out_root", str(out_root))
-    _rr_artifact(rr, "dir_data", str(dir_data))
-    _rr_artifact(rr, "dir_model", str(dir_model))
-    _rr_artifact(rr, "dir_rasters", str(dir_rast))
-    _rr_artifact(rr, "dir_plots", str(dir_plot))
-    _rr_artifact(rr, "dir_logs", str(dir_logs))
-
-
-    cache_root = Path(getattr(args, "cache_root", "cache"))
-    atl_cache = cache_root / "icesat2"
-    s2_cache = cache_root / "sentinel2"
-    mask_cache = cache_root / "masks"
-
-    for _d in (atl_cache, s2_cache, mask_cache):
-        try:
-            Path(_d).mkdir(parents=True, exist_ok=True)
-        except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
-
-    # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
-    # Model bank (bounded reservoir): accumulate training across AOIs
-    # ------------------------------------------------------------------
-    model_bank_dir = None
-    if bool(getattr(args, 'model_bank_enabled', True)):
-        mb = str(getattr(args, 'model_bank', 'auto'))
-        if mb.strip().lower() == 'auto':
-            model_bank_dir = cache_root / 'model_bank' / 'sdb_global_v1'
-        else:
-            model_bank_dir = Path(mb).expanduser().resolve()
-        model_bank_dir.mkdir(parents=True, exist_ok=True)
-        log.info(f"[MODEL_BANK] enabled dir={model_bank_dir} max_samples={int(getattr(args,'bank_max_samples',100000))}")
-        if rr is not None:
-            rr.add('model_bank.enabled', True)
-            rr.add('model_bank.dir', str(model_bank_dir))
-            rr.add('model_bank.max_samples', int(getattr(args,'bank_max_samples',100000)))
-    else:
-        log.info('[MODEL_BANK] disabled')
-        if rr is not None:
-            rr.add('model_bank.enabled', False)
-
-    # Deprecated model cache is disabled by default in this workflow.
-    model_bank_dir_run = model_bank_dir  # may be partitioned later by source mix/depth regime
-    model_cache_dir = None
-    log.info(f"--- Starting SDB Run [{args.sdb_mode}] ---")
-    log.info("Output Directory: %s", out_root)
-
+    Returns (s2_paths, atl_files_map) on success, or calls sys.exit / returns
+    on failure depending on mode.
+    """
     # 3. Data Acquisition
     current_start = args.start
     end_date = args.end
@@ -1217,7 +1329,7 @@ def main():
 
 
     for attempt in range(6):
-        log.info(f"\n[Acquisition] Attempt {attempt+1}: {current_start} to {end_date}")
+        log.info("Attempt %s: %s to %s", attempt+1, current_start, end_date)
 
         if (not args.atl_only) and (s2_paths is None):
             try:
@@ -1231,15 +1343,15 @@ def main():
                     try:
                         waffles_cache = Path(os.environ.get("WAFFLES_CACHE_ROOT", str(mask_cache)))
                         coast_mask_raw = generate_coastline_mask(None, args.aoi, waffles_cache, None, args.sdb_mode)
-                        log.info("[MASK] Using waffles coastline mask for S2 date QC: %s", coast_mask_raw)
+                        log.info("Using waffles coastline mask for S2 date QC: %s", coast_mask_raw)
                         # If the coastline mask indicates *no* water/ocean pixels in this AOI, skip SDB early.
                         # This avoids wasting time downloading S2/ATL data when the AOI is fully inland (or otherwise non-ocean).
                         if coast_mask_raw and (not _mask_has_ocean_pixels(str(coast_mask_raw))):
-                            log.warning("[SDB] No ocean/water pixels found in coastline mask for this AOI; skipping SDB.")
+                            log.warning("No ocean/water pixels found in coastline mask for this AOI; skipping SDB.")
                             return None
 
                     except Exception as exc:
-                        log.warning("[MASK] Waffles generation failed (%s). S2 date QC will be AOI-only.", exc)
+                        log.warning("Waffles generation failed (%s). S2 date QC will be AOI-only.", exc)
                         coast_mask_raw = None
 
 
@@ -1292,7 +1404,7 @@ def main():
                     allowed = set(sig.parameters.keys())
                     s2_kwargs = {k: v for k, v in s2_kwargs.items() if k in allowed}
                 except Exception:
-                    log.debug("Optional step failed; continuing.", exc_info=True)
+                    log.debug("ignored", exc_info=True)
 
                 s2_paths = s2_optics.build_weighted_shared_date_composite(**s2_kwargs)
 
@@ -1307,11 +1419,11 @@ def main():
                                 _rr_artifact(rr, f"s2_{k}".lower(), v)
                         _rr_merge_json(rr, "s2.date_qc", s2_out / "S2_DATE_QC.json")
                 except Exception:
-                    log.debug("Optional step failed; continuing.", exc_info=True)
-                log.info("[S2] Composite acquired.")
+                    log.debug("ignored", exc_info=True)
+                log.info("Composite acquired.")
 
-                if getattr(args, 'cloud_report_only', False):
-                    log.info('[S2] Cloud report only requested; exiting after STAC scan.')
+                if args.cloud_report_only:
+                    log.info('Cloud report only requested; exiting after STAC scan.')
                     return
 
                 rgb_src = s2_out / "RGB_10m.tif"
@@ -1319,14 +1431,14 @@ def main():
                     rgb_dst = dir_rast / "RGB_10m.tif"
                     shutil.copy(rgb_src, rgb_dst)
                 else:
-                    log.warning("[S2] RGB_10m.tif not found in %s", s2_out)
+                    log.warning("RGB_10m.tif not found in %s", s2_out)
 
             except Exception as exc:
-                log.warning("[S2] Failed: %s", exc)
+                log.warning("Failed: %s", exc)
                 s2_paths = None
 
         if (not args.atl_only) and (s2_paths is not None):
-            log.info("[S2] Reusing existing composite from earlier attempt; skipping S2 reacquisition.")
+            log.info("Reusing existing composite from earlier attempt; skipping S2 reacquisition.")
 
         if not args.s2_only:
             atl_run_name = f"ATL_{w:.3f}_{e:.3f}_{s:.3f}_{n:.3f}_{current_start}_{end_date}"
@@ -1341,7 +1453,7 @@ def main():
                     atl_files_map["ATL03"] = f03
                 if args.icesat in ["atl24", "all_atl"]:
                     if getattr(args, "sdb_mode", None) == "lakes":
-                        log.info("[ATL] Skipping ATL24 in lake mode (not defined over lakes).")
+                        log.info("Skipping ATL24 in lake mode (not defined over lakes).")
                         atl_files_map["ATL24"] = []
                     else:
                         target_dir_24 = atl_run_dir / "ATL24"
@@ -1352,7 +1464,7 @@ def main():
                         atl_files_map["ATL24"] = f24
 
             except Exception as exc:
-                log.warning("[ATL] Failed: %s", exc)
+                log.warning("Failed: %s", exc)
 
         has_s2 = (s2_paths is not None) or args.atl_only
         has_atl = (len(atl_files_map["ATL03"]) > 0 or len(atl_files_map["ATL24"]) > 0) or args.s2_only
@@ -1368,104 +1480,20 @@ def main():
 
     if args.s2_only or args.atl_only:
         return
-
-    # 4. Mask Generation
-    log.info("\n--- Mask Generation ---")
-    land_mask_out = dir_rast / "LAND_MASK_aligned.tif"
-    waffles_cache = Path(os.environ.get("WAFFLES_CACHE_ROOT", mask_cache))
-
-    if args.land_mask_user:
-        s2_optics.prepare_user_land_mask(args.land_mask_user, s2_paths["B02"], str(land_mask_out))
-    else:
-        try:
-            generate_coastline_mask(s2_paths["B02"], args.aoi, waffles_cache, land_mask_out, args.sdb_mode)
-        except Exception as exc:
-            log.warning("Mask generation failed (%s).", exc)
+    return s2_paths, atl_files_map
 
 
-    # Ensure land mask exists even if waffles generation failed
-    if not land_mask_out.exists():
-        try:
-            import rasterio
-            with rasterio.open(s2_paths["B02"]) as src:
-                prof = src.profile.copy()
-                prof.update(count=1, dtype="uint8", nodata=None, compress="LZW")
-                data = np.zeros((src.height, src.width), dtype="uint8")  # 0 = water everywhere (no land gate)
-            with rasterio.open(land_mask_out, "w", **prof) as dst:
-                dst.write(data, 1)
-            log.warning("[MASK] LAND mask missing; created fallback all-water mask: %s", land_mask_out)
-        except Exception as _e:
-            log.error("[MASK] Failed to create fallback LAND mask (%s); cannot proceed.", _e, exc_info=True)
-            raise
+def _run_fusion(
+    args, dir_data, dir_rast, dir_logs, dir_model, dir_plot,
+    s2_paths, df_atl03, df_atl24, out_root, rr,
+    atl, fusion,
+):
+    """Fuse ATL03, ATL24, and extra-XYZ training points into a single training DataFrame.
 
-    log.info(f"[MASK] Using LAND mask as hard gate: keep pixels where LAND <= {args.land_max} (0.0 = waffles water-only).")
-
-    # 5. ATL Processing
-    log.info("\n--- Processing ICESat-2 Data ---")
-    df_atl03 = None
-    df_atl24 = None
-
-    land_mask_water_val = int(args.land_mask_water_val) if getattr(args, "land_mask_water_val", None) is not None else 0
-    land_mask_invert = bool(getattr(args, "land_mask_invert", False))
-    land_mask_type = str(getattr(args, "land_mask_type", "auto"))
-    land_mask_threshold = float(getattr(args, "land_mask_threshold", 0.5))
-
-    if rr is not None:
-        try:
-            rr.add("mask.land_mask_water_val", land_mask_water_val)
-            rr.add("mask.land_mask_invert", land_mask_invert)
-            rr.add("mask.land_mask_type", land_mask_type)
-            rr.add("mask.land_mask_threshold", land_mask_threshold)
-        except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
-
-
-    if atl_files_map["ATL03"]:
-        if args.write_atl03_tracks_shp:
-            atl.build_atl03_track_lines(atl_files_map["ATL03"], args.aoi, str(dir_data / "ATL03_tracks.shp"))
-
-        df_atl03 = atl.collect_training_points_from_atl03(
-            atl_files_map["ATL03"], lat_res=0.00005, height_res=0.25, aoi_str=args.aoi,
-            atl03_conf_min=args.atl03_conf_min, atl03_bottom_percentile=90.0,
-            use_refraction=args.refraction, default_temp_c=args.water_temp_c,
-            default_wavelength_nm=532.0, min_bottom_photons=args.min_bottom_photons,
-            min_bottom_frac=args.min_bottom_frac,
-            min_depth_m=args.min_depth_atl03_val,
-            max_depth_m=args.max_depth_atl03,
-            debug_atl03_qc=args.debug_atl03_qc,
-            land_mask_path=str(land_mask_out),
-            land_mask_water_val=land_mask_water_val,
-            land_mask_invert=land_mask_invert,
-            cache_dir=str(atl_cache_dir),
-            cache_strict=getattr(args, 'cache_strict', True),
-            cache_code_strict=getattr(args, 'cache_code_strict', False),
-        rr=rr,
-    )
-
-    if atl_files_map["ATL24"]:
-        df_atl24 = atl.collect_training_points_from_atl24(
-            atl_files_map["ATL24"], aoi_str=args.aoi,
-            max_depth_m=MAX_DEPTH_TRAIN_FETCH,
-            train_relax_buffer=0.01, limit_train_samples=None, seed=args.seed,
-            atl24_conf_min=args.atl24_conf_min,
-            land_mask_path=str(land_mask_out),
-            land_mask_water_val=land_mask_water_val,
-            land_mask_invert=land_mask_invert,
-            cache_dir=str(atl_cache_dir),
-            cache_strict=getattr(args, 'cache_strict', True),
-            cache_code_strict=getattr(args, 'cache_code_strict', False),
-        rr=rr,
-    )
-
-    # Optional: harmonize ATL horizontal CRS before fusion (e.g., WGS84 -> NAD83).
-    # NOTE: This is HORIZONTAL-ONLY. depth_m is NOT transformed because it's relative
-    # water depth, not a geodetic height. Transforming depth would corrupt values.
-    if getattr(args, "atl_transform_datum", False):
-        df_atl03 = atl.transform_xyz_dataframe_crs(df_atl03, src_srs=args.atl_src_srs, dst_srs=args.atl_dst_srs, logger=log)
-        df_atl24 = atl.transform_xyz_dataframe_crs(df_atl24, src_srs=args.atl_src_srs, dst_srs=args.atl_dst_srs, logger=log)
-
+    Returns fused_df.
+    """
     # 6. Fusion
-    log.info("\n--- Fusion & QC ---")
+    log.info("Fusion & QC")
     def _filter_extra_xyz_for_sdb(df_xyz_local):
         """Conservative guardrails for extra_xyz in SDB training.
         River/XS anchoring is handled separately in bathy_main; here we avoid poisoning SDB
@@ -1481,7 +1509,7 @@ def main():
             return df_xyz_local
         mode = str(getattr(args, "extra_xyz_sdb_mode", "auto") or "auto").lower()
         if mode == "exclude":
-            log.warning("[XYZ][SDB] extra_xyz_sdb_mode=exclude -> excluding extra_xyz from SDB training.")
+            log.warning("extra_xyz_sdb_mode=exclude -> excluding extra_xyz from SDB training.")
             return None
         if mode == "allow":
             return df_xyz_local
@@ -1499,7 +1527,7 @@ def main():
 
         try:
             if "depth_m" not in df_xyz_local.columns:
-                log.warning("[XYZ][SDB] extra_xyz missing depth_m; excluding from SDB training in auto mode.")
+                log.warning("extra_xyz missing depth_m; excluding from SDB training in auto mode.")
                 return None
 
             n_before = int(len(df_xyz_local))
@@ -1508,7 +1536,7 @@ def main():
             finite_mask = np.isfinite(d_arr)
             n_finite = int(finite_mask.sum())
             if n_finite == 0:
-                log.warning("[XYZ][SDB] extra_xyz has no finite depth_m after coercion; excluding from SDB training.")
+                log.warning("extra_xyz has no finite depth_m after coercion; excluding from SDB training.")
                 return None
 
             df_guard = df_xyz_local.loc[finite_mask].copy()
@@ -1563,17 +1591,17 @@ def main():
                 f"(finite depth + |depth_m|<={guard_max_abs_depth_m:g} m)."
             )
             if src_before or src_after:
-                log.info(f"[XYZ][SDB] Guard source breakdown before={src_before} after={src_after}")
+                log.info("Guard source breakdown before=%s after=%s", src_before, src_after)
                 hydro_before = sum(v for k, v in src_before.items() if ("hydronos" in k or "ehydro" in k))
                 hydro_after = sum(v for k, v in src_after.items() if ("hydronos" in k or "ehydro" in k))
                 if hydro_before > 0 and hydro_after < hydro_before:
-                    log.info(f"[XYZ][SDB] Hydronos/eHydro-like rows reduced by guard: {hydro_before} -> {hydro_after}")
+                    log.info("Hydronos/eHydro-like rows reduced by guard: %s -> %s", hydro_before, hydro_after)
             return df_guard
 
         except Exception as ex:
             # Fail closed: do not silently keep unguarded extra_xyz in SDB training.
-            log.error("[XYZ][SDB] Auto guard failed; excluding extra_xyz from SDB training. Reason: %s", ex, exc_info=True)
-            log.debug("[XYZ][SDB] Guard exception details", exc_info=True)
+            log.error("Auto guard failed; excluding extra_xyz from SDB training. Reason: %s", ex, exc_info=True)
+            log.debug("Guard exception details", exc_info=True)
             return None
 
     df_xyz = None
@@ -1585,25 +1613,25 @@ def main():
                 dmin = float(np.nanmin(df_xyz["depth_m"])) if "depth_m" in df_xyz.columns else float("nan")
                 dmed = float(np.nanmedian(df_xyz["depth_m"])) if "depth_m" in df_xyz.columns else float("nan")
                 dmax = float(np.nanmax(df_xyz["depth_m"])) if "depth_m" in df_xyz.columns else float("nan")
-                log.info(f"[XYZ] Loaded extra XYZ points: n={n_xyz} depth(min/med/max)={dmin:.3f}/{dmed:.3f}/{dmax:.3f} m")
+                log.info("Loaded extra XYZ points: n=%s depth(min/med/max)=%.3f/%.3f/%.3f m", n_xyz, dmin, dmed, dmax)
             else:
-                log.warning("[XYZ] Extra XYZ inputs were provided but produced 0 usable points after parsing/filtering.")
+                log.warning("Extra XYZ inputs were provided but produced 0 usable points after parsing/filtering.")
         except Exception:
-            log.warning("[XYZ] Loaded extra XYZ points (stats unavailable).", exc_info=True)
+            log.warning("Loaded extra XYZ points (stats unavailable).", exc_info=True)
         df_xyz = _filter_extra_xyz_for_sdb(df_xyz)
         if df_xyz is None or len(df_xyz) == 0:
-            log.warning("[XYZ][SDB] No extra_xyz points will be used for SDB training after guardrails.")
+            log.warning("No extra_xyz points will be used for SDB training after guardrails.")
 
     fused_df = fusion.build_fused_training_dataframe(
         atl03_df=df_atl03, atl24_df=df_atl24, xyz_df=df_xyz,
         xyz_max_dist_m=30.0, atl_max_dist_m=20.0,
         atl03_weight=args.atl03_weight_factor, atl24_weight=1.0, xyz_weight=10.0,
         rr=rr,
-        # Adaptive sampling parameters (v0.7.0)
-        enable_adaptive_sampling=getattr(args, 'enable_adaptive_sampling', False),
-        sampling_target_points=getattr(args, 'sampling_target_points', 2000),
-        sampling_min_threshold=getattr(args, 'sampling_min_threshold', 3000),
-        sampling_max_gap_m=getattr(args, 'sampling_max_gap_m', 100.0),
+        # Adaptive sampling parameters
+        enable_adaptive_sampling=args.enable_adaptive_sampling,
+        sampling_target_points=args.sampling_target_points,
+        sampling_min_threshold=args.sampling_min_threshold,
+        sampling_max_gap_m=args.sampling_max_gap_m,
     )
 
     # Helpful provenance summary (especially to confirm external XYZ participation)
@@ -1611,13 +1639,13 @@ def main():
         if fused_df is not None and len(fused_df) > 0:
             if "source" in fused_df.columns:
                 src_counts = fused_df["source"].value_counts(dropna=False).to_dict()
-                log.info("[FUSION] Point provenance after fusion: %s", src_counts)
+                log.info("Point provenance after fusion: %s", src_counts)
             else:
-                log.info(f"[FUSION] Fused training points: n={len(fused_df)} (no 'source' column present)")
+                 log.info("Fused training points: n=%s (no source column present)", len(fused_df))
         else:
-            log.warning("[FUSION] Fusion produced 0 points. Check water/land masks, AOI, and input data.")
+            log.warning("Fusion produced 0 points. Check water/land masks, AOI, and input data.")
     except Exception:
-        log.warning("[FUSION] Unable to summarize point provenance.", exc_info=True)
+        log.warning("Unable to summarize point provenance.", exc_info=True)
     # Cap per-source rows before S2 sampling to prevent one source (e.g., Hydronos/eHydro)
     # from dominating sampling cost and training provenance.
     def _cap_per_source_presampling(df_in, cap_per_source=250000, seed=1337):
@@ -1645,14 +1673,14 @@ def main():
                 f"[TRAIN][PRESAMPLE] Capped per-source rows before S2 sampling at {int(cap_per_source):,}. "
                 f"Total rows {len(df_in):,} -> {len(df_out):,}."
             )
-            log.info(f"[TRAIN][PRESAMPLE] Source counts before: {vc_before.to_dict()}")
-            log.info(f"[TRAIN][PRESAMPLE] Source counts after: {vc_after.to_dict()}")
+            log.info("Source counts before: %s", vc_before.to_dict())
+            log.info("Source counts after: %s", vc_after.to_dict())
             return df_out
         except Exception as ex:
-            log.warning("[TRAIN][PRESAMPLE] Per-source cap failed; continuing without cap: %s", ex)
+            log.warning("Per-source cap failed; continuing without cap: %s", ex)
             return df_in
 
-    fused_df = _cap_per_source_presampling(fused_df, cap_per_source=250000, seed=int(getattr(args, 'seed', 42)))
+    fused_df = _cap_per_source_presampling(fused_df, cap_per_source=250000, seed=int(args.seed))
 
     fused_df.to_csv(dir_data / "training_data_fused.csv", index=False)
 
@@ -1660,11 +1688,428 @@ def main():
     try:
         if "source" in fused_df.columns:
             src_counts = fused_df["source"].value_counts(dropna=False).to_dict()
-            log.info("[FUSION] Fused point sources: %s", src_counts)
+            log.info("Fused point sources: %s", src_counts)
         else:
-            log.info("[FUSION] Fused dataframe has no 'source' column; provenance counts unavailable.")
+            log.info("Fused dataframe has no 'source' column; provenance counts unavailable.")
     except Exception:
-        log.warning("[FUSION] Could not compute fused source counts.", exc_info=True)
+        log.warning("Could not compute fused source counts.", exc_info=True)
+
+    return fused_df
+def main():
+    import rasterio
+    args = parse_args()
+
+    # ---------------------------------------------------------------------
+    # Run-scoped logging + flight recorder
+    # ---------------------------------------------------------------------
+    run_id = None
+    try:
+        from datetime import datetime, timezone
+        from logging_config import add_file_handler, start_flight_recorder
+
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        run_id = f"sdb_{ts}_{os.getpid()}"
+        out_dir = Path(getattr(args, "out_dir", "output"))
+        (out_dir / "run_logs").mkdir(parents=True, exist_ok=True)
+        add_file_handler(out_dir / "run_logs" / f"run_{run_id}.log", level=logging.INFO)
+        fr_path = start_flight_recorder(out_dir, run_id=run_id)
+        if fr_path is not None:
+            log.info("Flight recorder: %s", fr_path)
+        log.info("run_id=%s", run_id)
+    except Exception as e:
+        log.warning("Unable to initialize run logs/flight recorder: %s", e)
+
+    try:
+        w, e, s, n = [float(x) for x in args.aoi.split("/")]
+        bbox_list = [w, s, e, n]
+        bbox_wesn = (w, e, s, n)
+    except Exception:
+        log.error("Invalid AOI format. Use W/E/S/N")
+        sys.exit(1)
+
+    # Build config dict for validation and checkpointing
+    config_dict = {
+        "aoi": args.aoi,
+        "start_date": getattr(args, "start", None),
+        "end_date": getattr(args, "end", None),
+        "max_depth_sdb": getattr(args, "max_depth_sdb", None),
+        "rmse_target_sdb": getattr(args, "rmse_target_sdb", None),
+        "depth_bin_m": getattr(args, "depth_bin_m", None),
+        "out_dir": getattr(args, "out_dir", None),
+        "cache_root": getattr(args, "cache_root", None),
+    }
+    
+    if VALIDATION_AVAILABLE:
+        validation_result = validate_pipeline_config(config_dict)
+        if not validation_result.is_valid:
+            log.error("Configuration validation failed. Exiting.")
+            for err in validation_result.errors:
+                log.error("  - %s", err)
+            sys.exit(1)
+        elif validation_result.warnings:
+            for warn in validation_result.warnings:
+                log.warning("  - %s", warn)
+    
+    checkpoint = None
+    if CHECKPOINTS_AVAILABLE and not getattr(args, "no_checkpoints", False):
+        try:
+            out_dir = Path(getattr(args, "out_dir", "output"))
+            checkpoint = PipelineCheckpoint(
+                output_dir=out_dir,
+                config=config_dict,
+                enabled=True
+            )
+            progress = checkpoint.get_progress_summary()
+            if progress.get("completed_stages"):
+                log.info(f"Resuming from checkpoint: {progress['completed_stages']}")
+        except Exception as e:
+            log.warning("Could not initialize: %s", e)
+            checkpoint = None
+
+
+    # ------------------------------------------------------------------
+    # Resolve max_depth_sdb (supports numeric or 'auto')
+    # ------------------------------------------------------------------
+    max_depth_arg_raw = getattr(args, "max_depth_sdb", "20.0")
+    auto_max_depth = False
+    max_depth_sdb_product = 20.0
+
+    try:
+        if isinstance(max_depth_arg_raw, str) and max_depth_arg_raw.strip().lower() == "auto":
+            auto_max_depth = True
+            max_depth_sdb_product = 20.0
+        else:
+            max_depth_sdb_product = float(max_depth_arg_raw)
+    except Exception:
+        log.warning("Invalid --max-depth-sdb value %r. Falling back to 20.0 m.", max_depth_arg_raw)
+        max_depth_sdb_product = 20.0
+
+    MAX_DEPTH_TRAIN_FETCH = max(30.0, max_depth_sdb_product)
+
+    # --- UPDATED LOGIC: Allow auto-depth without forced spatial validation ---
+    if auto_max_depth and not getattr(args, "validate_spatial", True):
+        log.info("--max-depth-sdb auto requested with --no-validate-spatial. "
+                 "Using STRATIFIED RANDOM SPLIT to estimate depth-of-support (interpolation limit).")
+        # Do NOT force validate_spatial = True
+
+    # --- AUTO-CONFIGURATION OVERRIDE ---
+    config_settings = load_config_overrides(bbox_list)
+    active_profile = detect_active_config_profile(bbox_list)
+    overrides_applied = list(config_settings.keys()) if isinstance(config_settings, dict) else []
+
+    if config_settings:
+        log.info("Applying regional configuration")
+
+        for key, value in config_settings.items():
+            if key == "preferred_months":
+                setattr(args, "preferred_months", value)
+                log.info("   [Auto-Config] Set preferred_months: %s", value)
+                continue
+
+            if not hasattr(args, key):
+                # We log this but still set it on args so it appears in the final dump
+                # (useful for custom flags like 'gl_red_max' not in argparse)
+                setattr(args, key, value)
+                log.info("   [Auto-Config] Set %s (custom): %s", key, value)
+                continue
+
+            cli_flag = "--" + key.replace("_", "-")
+            if key == "min_depth_atl03_val": cli_flag = "--min-depth-atl03"
+            elif key == "refraction":
+                if not value: cli_flag = "--no-refraction"
+
+            if cli_flag in sys.argv:
+                log.info("   [Override Skipped] User explicitly set %s. Keeping value: %s", cli_flag, getattr(args, key))
+            else:
+                old_val = getattr(args, key)
+                setattr(args, key, value)
+                if old_val != value:
+                    log.info("   [Auto-Config] Set %s: %s -> %s", key, old_val, value)
+
+        
+    log.info("Final effective arguments:")
+
+    # Defined Groups matching sdb_config.json + argparse keys
+    arg_groups = {
+        "Core": [
+            "aoi", "start", "end", "out_dir", "sdb_mode", "s2_module"
+        ],
+        "Caching": [
+            "cache_root", "cache_strict", "cache_code_strict"
+        ],
+        "Sentinel-2 / Cloud": [
+            "cloud", "s2_scene_limit", "s2_only", "min_scene_valid_frac",
+            "stac_max_items", "stac_page_limit", "cloud_report_only", "preferred_months",
+            "edge_weight_power", "edge_weight_min", "temporal_median_k"
+        ],
+        "Bright Pixel / Turbidity Handling": [
+            "mask_bright_pixels",
+            "allow_bright_shallow_pixels", "bright_shallow_nir_max",
+            "apply_gl_turbidity_reject", "gl_nir_max", "gl_nir_green_ratio_max", "gl_red_max"
+        ],
+        "Optical / Masks": [
+            "land_mask_user", "cw_min", "land_max",
+            "land_mask_water_val", "land_mask_invert", "land_mask_type", "land_mask_threshold"
+        ],
+        "ICESat-2": [
+            "icesat", "atl_only", "water_class", "atl03_conf_min", "min_depth_atl03_val",
+            "max_depth_atl03", "refraction", "water_temp_c", "debug_atl03_qc",
+            "atl24_conf_min", "force_redl_atl24", "write_atl03_tracks_shp",
+            "min_bottom_photons", "min_bottom_frac"
+        ],
+        "Training / Validation": [
+            "max_depth_sdb", "min_training_points_for_sdb", "use_stumpf_depth", "seed",
+            "validate_spatial", "rmse_target_sdb", "depth_bin_m", "min_samples_per_bin",
+            "depth_binning",
+            "linf_enabled", "linf_estimate_deepwater", "linf_percentile",
+            "linf_deepwater_nir_max", "linf_deepwater_bright_max"
+        ],
+        "Prediction": [
+            "tile", "s2_smooth_kernel", "no_doa", "skip_nad83"
+        ]
+    }
+
+    printed_keys = set()
+
+    for group_name, keys in arg_groups.items():
+        log.info("%s", group_name)
+        for k in keys:
+            if hasattr(args, k):
+                val = getattr(args, k)
+                log.info("  %s: %s", k, val)
+                printed_keys.add(k)
+            # Handle config keys that might not be in argparse definition (dynamically added)
+            elif k in vars(args):
+                 val = getattr(args, k)
+                 log.info("  %s: %s", k, val)
+                 printed_keys.add(k)
+
+    # Catch-all for anything else not in groups
+    all_keys = set(vars(args).keys())
+    remaining = sorted(list(all_keys - printed_keys))
+    if remaining:
+        log.info("Other / Uncategorized")
+        for k in remaining:
+            # Skip hidden private attrs
+            if not k.startswith("_"):
+                log.info("  %s: %s", k, getattr(args, k))
+
+
+
+    # ------------------------------------------------------------
+    # Enforce lake-mode defaults & constraints
+    # ------------------------------------------------------------
+    if getattr(args, "sdb_mode", None) == "lakes":
+        log.info("Lake mode enabled")
+        if getattr(args, "icesat", None) in ("atl24", "all_atl"):
+            log.info("ATL24 disabled in lake mode (not defined over lakes)")
+            args.icesat = "atl03"
+        if getattr(args, "cw_min", None) is None:
+            args.cw_min = 0.8
+            log.info("Setting default cw_min=0.8 for lakes")
+        if getattr(args, "land_max", None) is None:
+            args.land_max = 0.1
+            log.info("Setting default land_max=0.1 for lakes")
+
+    # Load requested s2_optics implementation
+    s2_optics = _load_s2_module(getattr(args, "s2_module", "s2_optics.py"))
+
+    # 1. Setup Organized Output Structure
+    if args.out_dir:
+        out_root = Path(args.out_dir)
+        # Ensure a stable run directory name for logs/reports/titles even when user supplies --out-dir
+        dir_name = out_root.name
+    else:
+        dir_name = f"sdb_{w:.3f}_{e:.3f}_{s:.3f}_{n:.3f}_{args.start}_{args.end}"
+        out_root = Path("output") / dir_name
+    dir_data = out_root / "data"
+    dir_model = out_root / "model"
+    dir_rast = out_root / "rasters"
+    dir_plot = out_root / "plots"
+    dir_logs = out_root / "logs"
+
+    for d in [dir_data, dir_model, dir_rast, dir_plot, dir_logs]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    _setup_file_logging(dir_logs)
+
+    # ------------------------------------------------------------------
+    # RunReport (structured run_report.json)
+    # ------------------------------------------------------------------
+    rr = RunReport(out_root) if RunReport is not None else None
+    _rr_add(rr, "run.version", VERSION)
+    _rr_add(rr, "run.args", vars(args))
+    _rr_add(rr, "sdb.max_depth.auto.rmse_target_m", float(args.rmse_target_sdb))
+    _rr_add(rr, "run.aoi", {"w": w, "e": e, "s": s, "n": n})
+    _rr_add(rr, "config.active_profile", active_profile if active_profile is not None else "unknown")
+    _rr_add(rr, "config.overrides_applied", overrides_applied if overrides_applied is not None else [])
+
+    _rr_artifact(rr, "out_root", str(out_root))
+    _rr_artifact(rr, "dir_data", str(dir_data))
+    _rr_artifact(rr, "dir_model", str(dir_model))
+    _rr_artifact(rr, "dir_rasters", str(dir_rast))
+    _rr_artifact(rr, "dir_plots", str(dir_plot))
+    _rr_artifact(rr, "dir_logs", str(dir_logs))
+
+
+    cache_root = Path(getattr(args, "cache_root", "cache"))
+    atl_cache = cache_root / "icesat2"
+    s2_cache = cache_root / "sentinel2"
+    mask_cache = cache_root / "masks"
+
+    for _d in (atl_cache, s2_cache, mask_cache):
+        try:
+            Path(_d).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            log.debug("ignored", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Model bank (bounded reservoir): accumulate training across AOIs
+    # ------------------------------------------------------------------
+    model_bank_dir = None
+    if bool(args.model_bank_enabled):
+        mb = str(args.model_bank)
+        if mb.strip().lower() == 'auto':
+            model_bank_dir = cache_root / 'model_bank' / 'sdb_global_v1'
+        else:
+            model_bank_dir = Path(mb).expanduser().resolve()
+        model_bank_dir.mkdir(parents=True, exist_ok=True)
+        log.info("enabled dir=%s max_samples=%s", model_bank_dir, int(args.bank_max_samples))
+        if rr is not None:
+            rr.add('model_bank.enabled', True)
+            rr.add('model_bank.dir', str(model_bank_dir))
+            rr.add('model_bank.max_samples', int(args.bank_max_samples))
+    else:
+        log.info('disabled')
+        if rr is not None:
+            rr.add('model_bank.enabled', False)
+
+    # Deprecated model cache is disabled by default in this workflow.
+    model_bank_dir_run = model_bank_dir  # may be partitioned later by source mix/depth regime
+    model_cache_dir = None
+    log.info("Starting SDB run (mode=%s)", args.sdb_mode)
+    log.info("Output Directory: %s", out_root)
+
+    _acq_result = _acquire_s2_and_atl_data(
+        args, s2_cache, atl_cache, mask_cache, bbox_wesn, out_root, rr,
+        dir_data, dir_rast, w, e, s, n,
+        s2_optics, atl, bbox_list,
+    )
+    if _acq_result is None:
+        return 0
+    s2_paths, atl_files_map = _acq_result
+
+
+    # 4. Mask Generation
+    log.info("Mask generation")
+    land_mask_out = dir_rast / "LAND_MASK_aligned.tif"
+    waffles_cache = Path(os.environ.get("WAFFLES_CACHE_ROOT", mask_cache))
+
+    if args.land_mask_user:
+        s2_optics.prepare_user_land_mask(args.land_mask_user, s2_paths["B02"], str(land_mask_out))
+    else:
+        try:
+            generate_coastline_mask(s2_paths["B02"], args.aoi, waffles_cache, land_mask_out, args.sdb_mode)
+        except Exception as exc:
+            log.warning("Mask generation failed (%s).", exc)
+
+
+    # Ensure land mask exists even if waffles generation failed
+    if not land_mask_out.exists():
+        try:
+            import rasterio
+            with rasterio.open(s2_paths["B02"]) as src:
+                prof = src.profile.copy()
+                prof.update(count=1, dtype="uint8", nodata=None, compress="LZW")
+                data = np.zeros((src.height, src.width), dtype="uint8")  # 0 = water everywhere (no land gate)
+            with rasterio.open(land_mask_out, "w", **prof) as dst:
+                dst.write(data, 1)
+            log.warning("LAND mask missing; created fallback all-water mask: %s", land_mask_out)
+        except Exception as _e:
+            log.error("Failed to create fallback LAND mask (%s); cannot proceed.", _e, exc_info=True)
+            raise
+
+    log.info("Using LAND mask as hard gate: keep pixels where LAND <= %s (0.0 = waffles water-only).", args.land_max)
+
+    # 5. ATL Processing
+    log.info("Processing ICESat-2 data")
+    df_atl03 = None
+    df_atl24 = None
+
+    # Cache directory for ATL processing (mirrors the logic in _acquire_s2_and_atl_data)
+    atl_cache_dir = atl_cache if args.out_dir is None else out_root / "cache_icesat2"
+
+    land_mask_water_val = int(args.land_mask_water_val) if getattr(args, "land_mask_water_val", None) is not None else 0
+    land_mask_invert = bool(getattr(args, "land_mask_invert", False))
+    land_mask_type = str(getattr(args, "land_mask_type", "auto"))
+    land_mask_threshold = float(getattr(args, "land_mask_threshold", 0.5))
+
+    if rr is not None:
+        try:
+            rr.add("mask.land_mask_water_val", land_mask_water_val)
+            rr.add("mask.land_mask_invert", land_mask_invert)
+            rr.add("mask.land_mask_type", land_mask_type)
+            rr.add("mask.land_mask_threshold", land_mask_threshold)
+        except Exception:
+            log.debug("ignored", exc_info=True)
+
+
+    if atl_files_map["ATL03"]:
+        if args.write_atl03_tracks_shp:
+            atl.build_atl03_track_lines(atl_files_map["ATL03"], args.aoi, str(dir_data / "ATL03_tracks.shp"))
+
+        df_atl03 = atl.collect_training_points_from_atl03(
+            atl_files_map["ATL03"], lat_res=0.00005, height_res=0.25, aoi_str=args.aoi,
+            atl03_conf_min=args.atl03_conf_min, atl03_bottom_percentile=90.0,
+            use_refraction=args.refraction, default_temp_c=args.water_temp_c,
+            default_wavelength_nm=532.0, min_bottom_photons=args.min_bottom_photons,
+            min_bottom_frac=args.min_bottom_frac,
+            min_depth_m=args.min_depth_atl03_val,
+            max_depth_m=args.max_depth_atl03,
+            debug_atl03_qc=args.debug_atl03_qc,
+            land_mask_path=str(land_mask_out),
+            land_mask_water_val=land_mask_water_val,
+            land_mask_invert=land_mask_invert,
+            land_mask_type=land_mask_type,
+            land_mask_threshold=land_mask_threshold,
+            cache_dir=str(atl_cache_dir),
+            cache_strict=args.cache_strict,
+            cache_code_strict=args.cache_code_strict,
+            cache_ignore_code=args.cache_ignore_code,
+            rr=rr,
+        )
+
+    if atl_files_map["ATL24"]:
+        df_atl24 = atl.collect_training_points_from_atl24(
+            atl_files_map["ATL24"], aoi_str=args.aoi,
+            max_depth_m=MAX_DEPTH_TRAIN_FETCH,
+            train_relax_buffer=0.01, limit_train_samples=None, seed=args.seed,
+            atl24_conf_min=args.atl24_conf_min,
+            land_mask_path=str(land_mask_out),
+            land_mask_water_val=land_mask_water_val,
+            land_mask_invert=land_mask_invert,
+            land_mask_type=land_mask_type,
+            land_mask_threshold=land_mask_threshold,
+            cache_dir=str(atl_cache_dir),
+            cache_strict=args.cache_strict,
+            cache_code_strict=args.cache_code_strict,
+            cache_ignore_code=args.cache_ignore_code,
+            rr=rr,
+        )
+
+    # Optional: harmonize ATL horizontal CRS before fusion (e.g., WGS84 -> NAD83).
+    # HORIZONTAL-ONLY: depth_m is relative water depth, not geodetic height.
+    # Transforming it would corrupt values.
+    if getattr(args, "atl_transform_datum", False):
+        df_atl03 = atl.transform_xyz_dataframe_crs(df_atl03, src_srs=args.atl_src_srs, dst_srs=args.atl_dst_srs, logger=log)
+        df_atl24 = atl.transform_xyz_dataframe_crs(df_atl24, src_srs=args.atl_src_srs, dst_srs=args.atl_dst_srs, logger=log)
+
+    fused_df = _run_fusion(
+        args, dir_data, dir_rast, dir_logs, dir_model, dir_plot,
+        s2_paths, df_atl03, df_atl24, out_root, rr,
+        atl, fusion,
+    )
 
     # ------------------------------------------------------------------
     # Model reuse (regional cache): if a cached model exists, prefer it over retraining.
@@ -1688,7 +2133,7 @@ def main():
                     stumpf_lr = True  # truthy sentinel for downstream arg
                 cached_model = True
                 try:
-                    with open(meta_p, "r") as f:
+                    with open(meta_p, "r", encoding="utf-8") as f:
                         model_meta = json.load(f)
                 except Exception:
                     model_meta = None
@@ -1698,14 +2143,14 @@ def main():
                 except Exception:
                     df_train_final = None
                     df_test_final = None
-                log.info("[MODEL_CACHE] HIT: using cached model from %s", model_cache_dir)
+                log.info("HIT: using cached model from %s", model_cache_dir)
                 if rr is not None:
                     rr.add("model_cache.hit", True)
             else:
                 if rr is not None:
                     rr.add("model_cache.hit", False)
     except Exception as e:
-        log.warning("[MODEL_CACHE] Could not use cached model: %s", e)
+        log.warning("Could not use cached model: %s", e)
         if rr is not None:
             rr.add("model_cache.hit", False)
             rr.add("model_cache.error", str(e))
@@ -1726,11 +2171,11 @@ def main():
                         stumpf_lr = True  # sentinel (file exists)
                     cached_model = True
                     try:
-                        with open(meta_p, 'r') as f:
+                        with open(meta_p, 'r', encoding='utf-8') as f:
                             model_meta = json.load(f)
                     except Exception:
                         model_meta = None
-                    log.warning('[FUSION] 0 training points; using existing model bank for prediction-only.')
+                    log.warning('0 training points; using existing model bank for prediction-only.')
                     if rr is not None:
                         rr.add('model_bank.prediction_only', True)
                         _rr_artifact(rr, 'rf_model_pkl', str(dir_model / 'rf_model.pkl'))
@@ -1738,9 +2183,9 @@ def main():
                         if (dir_model / 'stumpf_lr.pkl').exists():
                             _rr_artifact(rr, 'stumpf_lr_pkl', str(dir_model / 'stumpf_lr.pkl'))
                 else:
-                    log.error('[FUSION] 0 training points and model bank has no trained model yet.')
+                    log.error('0 training points and model bank has no trained model yet.')
             except Exception as ex:
-                log.error("[FUSION] 0 training points and failed to load model bank model: %s", ex, exc_info=True)
+                log.error("0 training points and failed to load model bank model: %s", ex, exc_info=True)
         if not cached_model:
             # No valid training points for this AOI and no cached model available.
             # This is common for inland AOIs when the water/land mask gates out all pixels.
@@ -1749,7 +2194,7 @@ def main():
             try:
                 (out_root / 'SDB_SKIPPED.txt').write_text('SDB skipped: no training points after fusion and no cached model available.\n', encoding='utf-8')
             except Exception:
-                pass
+                log.debug("ignored", exc_info=True)
             if rr is not None:
                 rr.add('sdb.skipped', True)
                 rr.add('sdb.skip_reason', 'no_training_points_no_model')
@@ -1765,16 +2210,16 @@ def main():
         land_mask_water_val_for_train = int(land_mask_water_val_for_train)
 
     if not cached_model:
-        log.info("\n--- Model Training & Validation ---")
+        log.info("Model training & validation")
         df_with_s2 = train.sample_s2_bands_at_points(fused_df, s2_paths, str(land_mask_out))
 
         # After S2 sampling/masking, re-log provenance to confirm XYZ is still present.
         try:
             if "source" in df_with_s2.columns:
                 src_counts2 = df_with_s2["source"].value_counts(dropna=False).to_dict()
-                log.info("[TRAIN][PROVENANCE] After S2 sampling/masking: %s", src_counts2)
+                log.info("After S2 sampling/masking: %s", src_counts2)
         except Exception:
-            log.warning("[TRAIN][PROVENANCE] Could not compute source counts after S2 sampling.", exc_info=True)
+            log.warning("Could not compute source counts after S2 sampling.", exc_info=True)
 
         # Partition model bank by source mix and depth regime to avoid cross-regime contamination.
         if model_bank_dir is not None:
@@ -1828,15 +2273,15 @@ def main():
                 model_bank_dir_run, mb_part = _partition_model_bank_dir(model_bank_dir, df_with_s2)
                 if model_bank_dir_run is not None and mb_part is not None:
                     model_bank_dir_run.mkdir(parents=True, exist_ok=True)
-                    log.info(f"[MODEL_BANK] partitioned dir={model_bank_dir_run} meta={mb_part}")
+                    log.info("partitioned dir=%s meta=%s", model_bank_dir_run, mb_part)
                     if rr is not None:
                         rr.add('model_bank.partition_dir', str(model_bank_dir_run))
                         rr.add('model_bank.partition', mb_part)
             except Exception as ex:
                 model_bank_dir_run = model_bank_dir
-                log.warning("[MODEL_BANK] Partitioning failed; falling back to base bank dir. Reason: %s", ex)
+                log.warning("Partitioning failed; falling back to base bank dir. Reason: %s", ex)
 
-        log.info("[TRAIN] Running Standard Training (Random Split)...")
+        log.info("Running Standard Training (Random Split)...")
 
         linf_est_mode = "deepwater" if args.linf_estimate_deepwater else "none"
 
@@ -1846,8 +2291,6 @@ def main():
             land_mask_water_val_for_train = int(land_mask_water_val_for_train)
 
 
-        # UPDATED: We directly respect 'validate_spatial' flag now.
-        # If auto_max_depth is True, train.py handles the calculation regardless of split type.
         rf, stumpf_lr, df_train_final, df_test_final, model_meta = train.train_sdb_model(
             train_df=df_with_s2,
             max_depth_sdb=max_depth_sdb_product,
@@ -1866,16 +2309,16 @@ def main():
             linf_deepwater_nir_max=args.linf_deepwater_nir_max,
             linf_deepwater_bright_max=args.linf_deepwater_bright_max,
             linf_percentile=args.linf_percentile,
-            rmse_target_sdb=getattr(args,'rmse_target_sdb',1.0),
+            rmse_target_sdb=args.rmse_target_sdb,
             raster_paths=s2_paths,
-            depth_bin_m=float(getattr(args, 'depth_bin_m', 1.0)),
-            depth_binning=str(getattr(args, 'depth_binning', 'quantile')),
-            min_samples_per_bin=int(getattr(args, 'min_samples_per_bin', 10)),
+            depth_bin_m=float(args.depth_bin_m),
+            depth_binning=str(args.depth_binning),
+            min_samples_per_bin=int(args.min_samples_per_bin),
             model_bank_dir=model_bank_dir_run,
-            model_bank_enabled=bool(getattr(args,'model_bank_enabled', True)),
-            model_bank_max_samples=int(getattr(args,'bank_max_samples', 100000)),
-            model_bank_seed=int(getattr(args,'bank_seed', 1337)),
-            model_bank_retrain_min_new=int(getattr(args,'bank_retrain_min_new', 2000)),
+            model_bank_enabled=bool(args.model_bank_enabled),
+            model_bank_max_samples=int(args.bank_max_samples),
+            model_bank_seed=int(args.bank_seed),
+            model_bank_retrain_min_new=int(args.bank_retrain_min_new),
         )
 
         # Model bank periodic retrain policy may intentionally reuse the last trained model,
@@ -1909,13 +2352,13 @@ def main():
             _rr_artifact(rr, "stumpf_lr_pkl", str(dir_model / "stumpf_lr.pkl"))
 
         if args.no_doa:
-            log.info("[Config] Domain of Applicability (DoA) enforcement DISABLED by user.")
+            log.info("Domain of Applicability (DoA) enforcement disabled by user.")
             if "training_bounds" in model_meta:
                 del model_meta["training_bounds"]
 
         model_meta["max_depth_sdb"] = max_depth_sdb_product
         model_meta["water_class"] = args.water_class
-        with open(dir_model / "model_meta.json", "w") as f:
+        with open(dir_model / "model_meta.json", "w", encoding="utf-8") as f:
             json.dump(model_meta, f, indent=2)
 
         # Compute production (random split) validation metrics once for logging and model-bank gating.
@@ -1925,7 +2368,7 @@ def main():
 
         # B. Optional Spatial Validation
         if args.validate_spatial:
-            log.info("\n[TRAIN] Running Secondary Spatial Validation (Spatial Split)...")
+            log.info("Running secondary spatial validation (spatial split)")
 
             _, _, _, df_test_spatial, model_meta_spatial = train.train_sdb_model(
                 train_df=df_with_s2,
@@ -1945,16 +2388,16 @@ def main():
                 linf_deepwater_nir_max=args.linf_deepwater_nir_max,
                 linf_deepwater_bright_max=args.linf_deepwater_bright_max,
                 linf_percentile=args.linf_percentile,
-                rmse_target_sdb=getattr(args,'rmse_target_sdb',1.0),
+                rmse_target_sdb=args.rmse_target_sdb,
                 raster_paths=s2_paths,
-                depth_bin_m=float(getattr(args, 'depth_bin_m', 1.0)),
-                depth_binning=str(getattr(args, 'depth_binning', 'quantile')),
-                min_samples_per_bin=int(getattr(args, 'min_samples_per_bin', 10)),
+                depth_bin_m=float(args.depth_bin_m),
+                depth_binning=str(args.depth_binning),
+                min_samples_per_bin=int(args.min_samples_per_bin),
                 model_bank_enabled=False,
                 model_bank_dir=model_bank_dir_run,
-                model_bank_max_samples=int(getattr(args,'bank_max_samples', 100000)),
-                model_bank_seed=int(getattr(args,'bank_seed', 1337)),
-                model_bank_retrain_min_new=int(getattr(args,'bank_retrain_min_new', 2000)),
+                model_bank_max_samples=int(args.bank_max_samples),
+                model_bank_seed=int(args.bank_seed),
+                model_bank_retrain_min_new=int(args.bank_retrain_min_new),
             )
 
             src_spat_base = dir_plot / "SDB_Accuracy_Assessment_SpatialSplit.png"
@@ -2000,7 +2443,7 @@ def main():
                 for tp in cand_paths:
                     try:
                         if tp.exists() and tp.stat().st_size > 0:
-                            with open(tp, "r") as f:
+                            with open(tp, "r", encoding="utf-8") as f:
                                 trj = json.load(f)
                             tr = trj.get("train", {}) if isinstance(trj, dict) else {}
                             v = tr.get("max_depth_sdb_auto_m", None)
@@ -2033,7 +2476,7 @@ def main():
                     chosen_max_depth = min(float(fv), float(max_depth_sdb_product))
                     log.info(
                         f"[AUTO-DEPTH] Final product cap max_depth_sdb={chosen_max_depth:.2f} m "
-                        f"(from {src_key}; rmse_target={float(getattr(args,'rmse_target_sdb',0.5)):.2f} m; hard_cap={float(max_depth_sdb_product):.2f} m)."
+                        f"(from {src_key}; rmse_target={float(args.rmse_target_sdb):.2f} m; hard_cap={float(max_depth_sdb_product):.2f} m)."
                     )
             else:
                 src_key = "cli"
@@ -2045,16 +2488,16 @@ def main():
             model_meta["max_depth_sdb_final"] = chosen_max_depth
             if auto_max_depth:
                 model_meta["max_depth_sdb_source"] = src_key
-                model_meta["rmse_target_sdb"] = float(getattr(args,'rmse_target_sdb',0.5))
+                model_meta["rmse_target_sdb"] = float(args.rmse_target_sdb)
             else:
                 model_meta["max_depth_sdb_source"] = "cli"
 
 
             try:
-                with open(dir_model / "model_meta.json", "w") as f:
+                with open(dir_model / "model_meta.json", "w", encoding="utf-8") as f:
                     json.dump(model_meta, f, indent=2)
             except Exception:
-                log.debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("ignored", exc_info=True)
 
 
             report_lines = [
@@ -2094,7 +2537,7 @@ def main():
             report_text = "\n".join(report_lines)
             log.info(report_text)
 
-            with open(dir_logs / "validation_comparison.txt", "w") as f:
+            with open(dir_logs / "validation_comparison.txt", "w", encoding="utf-8") as f:
                 f.write(report_text)
 
         # Persist model to the model bank for cross-tile consistency, but gate saves on validation quality.
@@ -2134,18 +2577,18 @@ def main():
                     shutil.copy2(dir_model / 'model_meta.json', model_bank_dir_run / 'model_meta.json')
                     if (dir_model / 'stumpf_lr.pkl').exists():
                         shutil.copy2(dir_model / 'stumpf_lr.pkl', model_bank_dir_run / 'stumpf_lr.pkl')
-                    log.info("[MODEL_BANK] SAVED model artifacts to %s", model_bank_dir_run)
+                    log.info("SAVED model artifacts to %s", model_bank_dir_run)
                     try:
                         meta_p = model_bank_dir_run / 'bank_meta.json'
                         if meta_p.exists():
-                            with open(meta_p, 'r') as _f:
+                            with open(meta_p, 'r', encoding='utf-8') as _f:
                                 _bm = json.load(_f)
                             _bm['last_trained_n_seen'] = int(_bm.get('n_seen', 0))
-                            _bm['last_trained_utc'] = datetime.utcnow().isoformat() + 'Z'
-                            with open(meta_p, 'w') as _f:
+                            _bm['last_trained_utc'] = datetime.now(timezone.utc).isoformat()
+                            with open(meta_p, 'w', encoding='utf-8') as _f:
                                 json.dump(_bm, _f, indent=2)
                     except Exception:
-                        log.debug('[MODEL_BANK] Failed to update last_trained checkpoint.', exc_info=True)
+                        log.debug('Failed to update last_trained checkpoint.', exc_info=True)
                     if rr is not None:
                         rr.add('model_bank.model_saved', True)
                         rr.add('model_bank.model_dir', str(model_bank_dir_run))
@@ -2164,7 +2607,7 @@ def main():
                             'r2': model_bank_gate_r2,
                         })
         except Exception as e:
-            log.warning("[MODEL_BANK] Failed to save model artifacts: %s", e)
+            log.warning("Failed to save model artifacts: %s", e)
             if rr is not None:
                 rr.add('model_bank.model_saved', False)
                 rr.add('model_bank.model_save_error', str(e))
@@ -2173,7 +2616,7 @@ def main():
         _save_training_gpkg(dir_data / "icesat_depths.gpkg", df_with_s2, df_train_final, df_test_final)
 
     else:
-        log.info("[MODEL_CACHE] Skipping training/validation; using cached model artifacts in model/")
+        log.info("Skipping training/validation; using cached model artifacts in model/")
         # Ensure downstream references exist
         try:
             if df_test_final is None:
@@ -2181,7 +2624,7 @@ def main():
             if df_train_final is None:
                 df_train_final = pd.DataFrame()
         except Exception:
-            log.debug('[SDB] Optional pandas DataFrame normalization failed; continuing.', exc_info=True)
+            log.debug('Optional pandas DataFrame normalization failed; continuing.', exc_info=True)
 
     # 8. Visual Debugging
     if not df_train_final.empty:
@@ -2205,366 +2648,29 @@ def main():
                     depth_mode="n_multiplier"
                 )
             except Exception as exc:
-                log.warning("[VIS] Plot generation failed: %s", exc)
+                log.warning("Plot generation failed: %s", exc)
 
-    # 9. Prediction
-    log.info("\n--- Prediction ---")
-        # IMPORTANT: do not rely on canonical/guessed filenames. Tie outputs to this run_id.
-    # The authoritative paths are written to artifacts_sdb.json and io_manifest.json.
+    # Prediction output path (used by prediction, post-processing, and manifest)
     out_tif = dir_rast / f"{run_id}_sdb_depth.tif"
 
-    # === NEW: Chunked processing integration (v0.6.2) ===
-    use_chunked = False
-    if args.chunked_prediction == "on":
-        use_chunked = True
-        log.info("[PREDICT] Chunked processing: ENABLED (forced)")
-    elif args.chunked_prediction == "off":
-        use_chunked = False
-        log.info("[PREDICT] Chunked processing: DISABLED (forced)")
-    elif args.chunked_prediction == "auto":
-        # Auto-detect based on memory requirement
-        try:
-            from predict_chunked import estimate_memory_requirement_gb
-            
-            # Get raster dimensions from first band
-            import rasterio
-            with rasterio.open(s2_paths[list(s2_paths.keys())[0]]) as src:
-                width, height = src.width, src.height
-            
-            estimated_gb = estimate_memory_requirement_gb(width, height)
-            use_chunked = estimated_gb > args.max_memory_gb
-            
-            log.info(f"[PREDICT] Memory estimation: {estimated_gb:.1f} GB (threshold: {args.max_memory_gb} GB)")
-            log.info(f"[PREDICT] Chunked processing: {'ENABLED (auto)' if use_chunked else 'DISABLED (auto)'}")
-        except Exception as e:
-            log.warning("[PREDICT] Failed to estimate memory: %s. Using standard prediction.", e)
-            use_chunked = False
-    
-    if use_chunked:
-        # Use chunked processing
-        try:
-            from predict_chunked import predict_scene_chunked
-            
-            log.info(f"[PREDICT] Using chunked processing: tile_size={args.tile_size}, overlap={args.tile_overlap}")
-            
-            result = predict_scene_chunked(
-                model_dir=dir_model,
-                band_paths=s2_paths,
-                out_dir=dir_rast,
-                final_out_path=str(out_tif),
-                land_mask_path=str(land_mask_out),
-                max_memory_gb=args.max_memory_gb,
-                tile_size=args.tile_size,
-                overlap=args.tile_overlap,
-                sdb_mode=args.sdb_mode,
-                enable_doa=(not args.no_doa),
-                cw_min=args.cw_min,
-                land_max=args.land_max
-            )
-            
-            # Copy output to expected location
-            if result['output_raster'].exists():
-                shutil.copy2(result['output_raster'], out_tif)
-                log.info("[PREDICT] Chunked prediction complete: %s", out_tif)
-            else:
-                raise FileNotFoundError(f"Chunked output not found: {result['output_raster']}")
-                
-        except ImportError:
-            log.error("[PREDICT] predict_chunked module not available. Falling back to standard prediction.")
-            use_chunked = False
-        except Exception as e:
-            log.error("[PREDICT] Chunked processing failed: %s. Falling back to standard prediction.", e, exc_info=True)
-            use_chunked = False
-    
-    if not use_chunked:
-        # Standard prediction
-        predict_result_meta = predict.predict_scene(
-            s2_paths=s2_paths,
-            land_mask_path=str(land_mask_out),
-            rf_model_path=str(dir_model / "rf_model.pkl"),
-            meta_json_path=str(dir_model / "model_meta.json"),
-            out_path=str(out_tif),
-            stumpf_lr_path=str(dir_model / "stumpf_lr.pkl") if stumpf_lr else None,
-            sdb_mode=args.sdb_mode, tile_size=args.tile, s2_smooth_kernel=args.s2_smooth_kernel,
-            enable_doa=(not args.no_doa),
-            cw_min=args.cw_min, land_max=args.land_max,
-            land_mask_type=land_mask_type_for_train,
-            land_mask_water_val=land_mask_water_val_for_train,
-            land_mask_invert=land_mask_invert,
-            land_mask_threshold=land_mask_threshold,
-            linf_estimate_deepwater=args.linf_estimate_deepwater,
-            linf_deepwater_nir_max=args.linf_deepwater_nir_max,
-            linf_deepwater_bright_max=args.linf_deepwater_bright_max,
-            linf_percentile=args.linf_percentile,
-            # Post-prediction alignment (optional; keep conservative and report deltas)
-            align_mode=args.align_mode,
-            align_tie_points_gpkg=str(dir_data / "icesat_depths.gpkg") if (dir_data / "icesat_depths.gpkg").exists() else None,
-            align_min_points=args.align_min_points,
-            align_depth_bins=args.align_depth_bins,
-            align_source_priority=args.align_source_priority,
-            align_extra_points=args.align_extra_points,
-            align_max_abs_residual_m_for_fit=args.align_max_abs_residual_for_fit if args.align_max_abs_residual_for_fit > 0 else None,
-        )
+    _run_sdb_prediction(
+        args, out_tif, dir_model, dir_rast, run_id, s2_paths, land_mask_out,
+        stumpf_lr, land_mask_type_for_train, land_mask_water_val_for_train,
+        land_mask_invert, land_mask_threshold, chosen_max_depth, rr,
+        dir_data, predict,
+    )
 
-    # 9a. Optional conversion to bed elevation in NAVD88
-    # This converts SDB depth (relative to ~MSL) to bed elevation in NAVD88
-    # for consistency with river bathymetry and coastal DEMs.
-    #
-    # IMPORTANT SCIENTIFIC NOTE:
-    # - SDB output = DEPTH below water surface (negative values = below surface)
-    # - Water surface ≈ MSL (due to temporal compositing)
-    # - This conversion produces BED ELEVATION in NAVD88 (not depth in NAVD88)
-    # - Bed elevation = MSL_height_in_NAVD88 + depth_below_MSL
-    #
-    out_tif_navd88 = None
-    if getattr(args, "convert_sdb_to_navd88", False):
-        log.info("\n--- Convert SDB from MSL to NAVD88 ---")
-        out_tif_navd88 = dir_rast / f"{out_tif.stem}_bed_navd88.tif"
-        
-        # Apply MSL metadata to original raster
-        apply_sdb_metadata(out_tif, vertical_datum="MSL", vertical_datum_epsg=5714)
-        
-        # Convert from MSL to NAVD88
-        success, msg = convert_sdb_msl_to_navd88(
-            input_tif=out_tif,
-            output_tif=out_tif_navd88,
-            source_vdatum=args.sdb_source_vdatum,
-            target_vdatum=args.sdb_target_vdatum,
-            logger=log,
-        )
-        
-        if success:
-            # Apply NAVD88 metadata to the converted output
-            apply_sdb_metadata(out_tif_navd88, vertical_datum="NAVD88", vertical_datum_epsg=5703)
-            
-            # Also convert uncertainty raster if it exists
-            unc_tif = out_tif.with_name(f"{out_tif.stem}_uncertainty.tif")
-            if unc_tif.exists():
-                unc_tif_navd88 = dir_rast / f"{out_tif.stem}_uncertainty_bed_navd88.tif"
-                convert_sdb_msl_to_navd88(
-                    input_tif=unc_tif,
-                    output_tif=unc_tif_navd88,
-                    source_vdatum=args.sdb_source_vdatum,
-                    target_vdatum=args.sdb_target_vdatum,
-                    logger=log,
-                )
-            
-            if rr is not None:
-                rr.add("vdatum_conversion.status", "success")
-                rr.add("vdatum_conversion.source", args.sdb_source_vdatum)
-                rr.add("vdatum_conversion.target", args.sdb_target_vdatum)
-                rr.add("vdatum_conversion.output", str(out_tif_navd88))
-        else:
-            log.warning("[VDATUM] Conversion failed: %s", msg)
-            if rr is not None:
-                rr.add("vdatum_conversion.status", "failed")
-                rr.add("vdatum_conversion.error", msg)
+    _run_sdb_post_processing(
+        args, out_tif, s2_paths, dir_rast, rr, out_root,
+        bbox_wesn, df_test_final, predict,
+    )
 
-    # 9b. Optional adjacent-tile overlap consistency diagnostic
-    if getattr(args, "overlap_neighbor", None):
-        try:
-            neighbor_in = Path(str(args.overlap_neighbor))
-            neighbor_rr = neighbor_in / "run_report.json" if neighbor_in.is_dir() else neighbor_in
-            if not neighbor_rr.exists():
-                log.warning("[QA][OVERLAP] Neighbor run_report not found: %s", neighbor_rr)
-            else:
-                with open(neighbor_rr, "r") as f:
-                    nb = json.load(f)
-                nb_wesn = None
-                if isinstance(nb.get("aoi", None), dict):
-                    nb_wesn = nb["aoi"].get("wesn") or nb["aoi"].get("bbox")
-                if nb_wesn is None and isinstance(nb.get("run", None), dict):
-                    nb_wesn = nb["run"].get("aoi_wesn")
-                if nb_wesn is None:
-                    log.warning("[QA][OVERLAP] Could not determine neighbor AOI WESN from run_report.json")
-                else:
-                    nb_w, nb_e, nb_s, nb_n = [float(x) for x in nb_wesn]
-                    nb_pred = None
-                    try:
-                        nb_pred = nb.get("outputs", {}).get("sdb_prediction", {}).get("path", None)
-                    except Exception:
-                        nb_pred = None
-                    # No fallback filename guessing for neighbor outputs.
-                    # Neighbor must explicitly record its prediction path in run_report.json.
-                    if not nb_pred or not Path(nb_pred).exists():
-                        log.warning("[QA][OVERLAP] Neighbor prediction raster not found: %s", nb_pred)
-                    else:
-                        w, e, s, n = [float(x) for x in args.aoi.split("/")[:4]] if isinstance(args.aoi, str) else aoi_wesn
-                        cur_aoi = {"w": float(w), "e": float(e), "s": float(s), "n": float(n)}
-                        nb_aoi = {"w": nb_w, "e": nb_e, "s": nb_s, "n": nb_n}
-                        res = overlap_consistency_diagnostic(
-                            current_run_aoi=cur_aoi,
-                            neighbor_run_aoi=nb_aoi,
-                            current_pred_tif=str(out_tif),
-                            neighbor_pred_tif=str(nb_pred),
-                            buffer_m=float(getattr(args, "overlap_buffer_m", 500.0)),
-                            sample_spacing_m=float(getattr(args, "overlap_sample_spacing_m", 30.0)),
-                            max_samples=int(getattr(args, "overlap_max_samples", 200000)),
-                            df_ref_points=df_test_final,
-                            ref_depth_col="depth_m",
-                        )
-                        rr.add_dict("qa.overlap_consistency", res)
-                        log.info(f"[QA][OVERLAP] {res.get('status')} n_valid={res.get('n_samples_valid')} median_diff={res.get('median_diff_m')} m p90_abs={res.get('p90_abs_diff_m')} m")
-        except Exception as e:
-            log.warning("[QA][OVERLAP] Failed to compute overlap consistency diagnostic: %s", e)
+    _write_sdb_manifest(
+        args, out_tif, dir_rast, dir_model, dir_logs, dir_plot, run_id,
+        out_root, rr, df_test_final, df_train_final, chosen_max_depth,
+        raster_quickstats,
+    )
 
-    # --- Post-Process Brightness Masking (Smart) ---
-    if args.mask_bright_pixels is not None and s2_paths and "B02" in s2_paths:
-        log.info(f"[Post-Process] Brightness masking using B02 thresh={args.mask_bright_pixels} (smart={bool(args.allow_bright_shallow_pixels)})")
-    try:
-        with rasterio.open(str(out_tif), "r+") as dst:
-            sdb_data = dst.read(1)
-            nodata = dst.nodata if dst.nodata is not None else -9999.0
-
-            with rasterio.open(s2_paths["B02"]) as src_b2:
-                b2_data = src_b2.read(1, out_shape=dst.shape, resampling=rasterio.enums.Resampling.nearest)
-
-            scale_factor = 10000.0 if np.nanmax(b2_data) > 100 else 1.0
-            b2_norm = b2_data / scale_factor
-
-            bad_mask = (b2_norm > args.mask_bright_pixels)
-
-            if bool(args.allow_bright_shallow_pixels) and ("B08" in s2_paths) and (s2_paths.get("B08") is not None):
-                nir_thr = float(args.bright_shallow_nir_max) if args.bright_shallow_nir_max is not None else 0.03
-                log.info("[Post-Process] Bright-shallow escape hatch enabled (B08 < %s)", nir_thr)
-                with rasterio.open(s2_paths["B08"]) as src_b8:
-                    b8_data = src_b8.read(1, out_shape=dst.shape, resampling=rasterio.enums.Resampling.nearest)
-                b8_norm = b8_data / scale_factor
-
-                is_shallow_sand = (b2_norm > args.mask_bright_pixels) & (b8_norm < nir_thr)
-                bad_mask = bad_mask & (~is_shallow_sand)
-
-            mask_count = int(np.sum(bad_mask))
-            if mask_count > 0:
-                sdb_data[bad_mask] = nodata
-                dst.write(sdb_data, 1)
-                log.info("[Post-Process] Masked %s pixels (cloud/glint).", mask_count)
-            else:
-                log.info("[Post-Process] No pixels masked by brightness gate.")
-    except Exception as exc:
-        log.warning("[Post-Process] Brightness masking failed: %s", exc)
-
-    # --- NEW: Create Masked RGB (Prediction Only) ---
-    rgb_full = dir_rast / "RGB_10m.tif"
-    if rgb_full.exists():
-        rgb_masked_out = dir_rast / "RGB_10m_predict.tif"
-        log.info("[Post-Process] Creating Masked RGB: %s", rgb_masked_out)
-        try:
-            with rasterio.open(str(out_tif)) as src_sdb:
-                sdb_arr = src_sdb.read(1)
-                sdb_nodata = src_sdb.nodata if src_sdb.nodata is not None else -9999.0
-                valid_mask = (sdb_arr != sdb_nodata) & np.isfinite(sdb_arr)
-
-            with rasterio.open(rgb_full) as src_rgb:
-                prof = src_rgb.profile.copy()
-                if prof.get('nodata') is None:
-                    prof.update(nodata=0)
-
-                r = src_rgb.read(1)
-                g = src_rgb.read(2)
-                b = src_rgb.read(3)
-
-                fill_val = prof['nodata']
-                if r.shape != valid_mask.shape:
-                    log.warning("[Post-Process] RGB and SDB shapes mismatch. skipping RGB mask.")
-                else:
-                    r[~valid_mask] = fill_val
-                    g[~valid_mask] = fill_val
-                    b[~valid_mask] = fill_val
-
-                    with rasterio.open(rgb_masked_out, 'w', **prof) as dst_rgb:
-                        dst_rgb.write(r, 1)
-                        dst_rgb.write(g, 2)
-                        dst_rgb.write(b, 3)
-
-        except Exception as exc:
-            log.warning("[Post-Process] Failed to create masked RGB: %s", exc)
-
-    if not args.skip_nad83:
-        # Do not impose canonical filenames. Derive NAD83 outputs from the actual primary output name.
-        out_path = Path(out_tif)
-        nad83_depth = out_path.with_name(out_path.stem + "_epsg4269" + out_path.suffix)
-        predict.reproject_to_nad83(str(out_tif), str(nad83_depth))
-        unc_src = str(out_path.with_name(out_path.stem + "_uncertainty" + out_path.suffix))
-        if os.path.exists(unc_src):
-            nad83_unc = Path(unc_src).with_name(Path(unc_src).stem + "_epsg4269" + Path(unc_src).suffix)
-            predict.reproject_to_nad83(unc_src, str(nad83_unc))
-
-    # -------------------------------------------------------------------------
-    # Deterministic outputs: artifact manifest (no canonical filename guessing)
-    # -------------------------------------------------------------------------
-    # Primary depth output (EPSG:4269 if NAD83 reprojection is enabled)
-    try:
-        # Prefer the NAD83-reprojected depth if it was created, otherwise use the native output.
-        out_path = Path(out_tif)
-        depth_primary = out_path.with_name(out_path.stem + "_epsg4269" + out_path.suffix)
-        if not depth_primary.exists():
-            depth_primary = out_path
-
-        # Write manifest (relative paths, rooted at out_root)
-        artifacts = {
-            "run_id": run_id if run_id is not None else None,
-            "depth_raster": str(depth_primary.relative_to(out_root)) if str(depth_primary).startswith(str(out_root)) else str(depth_primary),
-        }
-
-        # Optional artifacts (only if present)
-        unc = Path(str(out_tif)).with_name(Path(str(out_tif)).stem + "_uncertainty.tif")
-        if unc.exists():
-            artifacts["uncertainty_raster"] = str(unc.relative_to(out_root))
-        # If NAD83 uncertainty exists, record it (derived from the actual uncertainty filename).
-        if unc.exists():
-            unc_nad83 = unc.with_name(unc.stem + "_epsg4269" + unc.suffix)
-            if unc_nad83.exists():
-                artifacts["uncertainty_raster_epsg4269"] = str(unc_nad83.relative_to(out_root))
-
-        land_mask = dir_rast / "LAND_MASK_aligned.tif"
-        if land_mask.exists():
-            artifacts["land_mask"] = str(land_mask.relative_to(out_root))
-
-        rgb = dir_rast / "RGB_10m.tif"
-        if rgb.exists():
-            artifacts["rgb"] = str(rgb.relative_to(out_root))
-        rgb_pred = dir_rast / "RGB_10m_predict.tif"
-        if rgb_pred.exists():
-            artifacts["rgb_predict"] = str(rgb_pred.relative_to(out_root))
-
-        (out_root / "artifacts_sdb.json").write_text(json.dumps(artifacts, indent=2), encoding="utf-8")
-        log.info(f"[ARTIFACTS] Wrote SDB manifest: {out_root / 'artifacts_sdb.json'}")
-    except Exception as exc:
-        log.warning("[ARTIFACTS] Failed to write canonical outputs/manifest: %s", exc)
-
-    if df_test_final is not None and not df_test_final.empty:
-        try:
-            if df_train_final is not None and not df_train_final.empty:
-                df_points_all = pd.concat([df_train_final, df_test_final], ignore_index=True)
-            else:
-                df_points_all = df_test_final
-        except Exception:
-            df_points_all = df_test_final
-
-        evaluate_raster_against_points(str(out_tif), df_points_all, dir_logs, dir_plot, max_depth=chosen_max_depth)
-
-
-    try:
-        if rr is not None:
-            _rr_merge_json(rr, "train", out_root / "train_report.json")
-            _rr_merge_json(rr, "predict", dir_rast / "predict_report.json")
-
-            if raster_quickstats is not None:
-                if out_tif is not None and Path(out_tif).exists():
-                    rr.add_dict("outputs.sdb_prediction", raster_quickstats(str(out_tif)))
-                unc = Path(str(out_tif)).with_name(Path(str(out_tif)).stem + "_uncertainty.tif")
-                if unc.exists():
-                    rr.add_dict("outputs.sdb_uncertainty", raster_quickstats(str(unc)))
-
-            _rr_artifact(rr, "rf_model_pkl", str(dir_model / "rf_model.pkl"))
-            if (dir_model / "stumpf_lr.pkl").exists():
-                _rr_artifact(rr, "stumpf_lr_pkl", str(dir_model / "stumpf_lr.pkl"))
-
-            rr.write(status="ok")
-            log.info("\n=== SDB Pipeline Completed Successfully ===")
-    except Exception:
-        log.debug("Optional step failed; continuing.", exc_info=True)
 
 
 def parse_args():
@@ -2659,7 +2765,7 @@ def parse_args():
     # Sentinel-2 selection / STAC pagination (metadata-first)
     p.add_argument("--s2-scene-limit", type=int, default=10,
                    help="Number of Sentinel-2 scenes to download per tile (selected by lowest cloud percentage).")
-    p.add_argument("--min-scene-valid_frac", type=float, default=0.90,
+    p.add_argument("--min-scene-valid-frac", type=float, default=0.90,
                    help="Drop any candidate scene whose valid-pixel fraction is below this (artifact rejection).")
     p.add_argument("--edge-weight-power", type=float, default=2.0,
                    help="Edge downweight power (higher = stronger penalty near tile edges).")
@@ -2732,8 +2838,7 @@ def parse_args():
                    help="Target compound EPSG (default: epsg:4269+5703 = NAD83+NAVD88).")
 
     # ATL horizontal CRS transformation (PROJ/pyproj).
-    # NOTE: This is HORIZONTAL-ONLY (lon/lat). depth_m is NOT transformed because
-    # it's relative water depth, not a geodetic height.
+    # HORIZONTAL-ONLY: depth_m is relative water depth and must not be transformed.
     p.add_argument("--atl-src-srs", default="EPSG:4326",
                    help="Source horizontal CRS for ATL lon/lat (default EPSG:4326 = WGS84).")
     p.add_argument("--atl-dst-srs", default="EPSG:4269",
@@ -2769,7 +2874,7 @@ def parse_args():
     p.add_argument("--tile", type=int, default=1024, help="Inference tile size")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
 
-    # v0.6.1: Memory management and performance options
+    # Memory management and performance options
     p.add_argument("--chunked-prediction", choices=["auto", "on", "off"], default="auto",
                    help="Use chunked processing for large AOIs (auto=decide based on memory)")
     p.add_argument("--max-memory-gb", type=float, default=8.0,
@@ -2779,7 +2884,7 @@ def parse_args():
     p.add_argument("--tile-overlap", type=int, default=256,
                    help="Tile overlap (pixels) for seamless mosaicking")
     
-    # v0.6.1: ML enhancement options
+    # ML enhancement options
     p.add_argument("--tune-hyperparameters", action="store_true",
                    help="Enable automated hyperparameter tuning for RF model")
     p.add_argument("--n-tuning-iter", type=int, default=30,
@@ -2787,7 +2892,7 @@ def parse_args():
     p.add_argument("--use-adaptive-spatial-cv", action="store_true",
                    help="Use adaptive spatial cross-validation with density-based clustering")
     
-    # Adaptive Spatial Sampling (NEW in v0.7.0, ENABLED BY DEFAULT in v0.7.1)
+    # Adaptive Spatial Sampling (enabled by default)
     p.add_argument("--disable-adaptive-sampling", dest="enable_adaptive_sampling",
                    action="store_false", default=True,
                    help="Disable adaptive spatial sampling (sampling is ON by default)")
@@ -2867,9 +2972,14 @@ def parse_args():
     p.add_argument("--mask-bright-pixels", type=float, default=0.25,
                    help="Mask pixels with reflectance > this value (Default: 0.25) to remove bright bridges")
 
-    # NEW: Domain of Applicability
     p.add_argument("--no-doa", action="store_true",
                    help="Disable Domain of Applicability (DoA) enforcement during prediction.")
+
+    # Guidance raster output control
+    p.add_argument("--min-confidence-threshold", type=float, default=0.0, dest="min_confidence_threshold",
+                   help="Per-pixel confidence threshold (0–1). Depth cells below this are set to nodata in the "
+                        "output raster, producing a sparser but higher-quality guidance surface. "
+                        "Default 0.0 (emit all predicted cells). Suggested starting value: 0.2.")
 
     # Flow control
     p.add_argument("--s2-only", action="store_true", help="Run only Sentinel-2 acquisition")
@@ -2886,13 +2996,11 @@ def parse_args():
     p.add_argument("--overlap-max-samples", type=int, default=200000,
                    help="Maximum number of raster samples used for overlap comparison (default: 200k).")
 
-    # NEW v0.7.6: Checkpoint and Resume
     p.add_argument("--no-checkpoints", action="store_true",
                    help="Disable checkpoint saving (no resume capability)")
     p.add_argument("--clean-checkpoints", action="store_true",
                    help="Clear existing checkpoints before running")
     
-    # NEW v0.7.6: Parallel Processing
     p.add_argument("--parallel-predict", action="store_true",
                    help="Enable parallel tile processing for prediction (2-4x speedup)")
     p.add_argument("--parallel-workers", type=int, default=None,

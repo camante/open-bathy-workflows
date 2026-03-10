@@ -45,7 +45,7 @@ try:
     import predict
 except Exception as e:
     predict = None
-    log.warning("[predict_chunked] predict import failed: %s", e)
+    log.warning("predict import failed: %s", e)
 
 
 def predict_scene_chunked(
@@ -84,6 +84,7 @@ def predict_scene_chunked(
 
     rf_model_path = model_dir / "rf_model.pkl"
     meta_json_path = model_dir / "model_meta.json"
+    stumpf_lr_path = model_dir / "stumpf_lr.pkl"
 
     if not rf_model_path.exists():
         raise FileNotFoundError(f"RF model not found: {rf_model_path}")
@@ -93,28 +94,29 @@ def predict_scene_chunked(
     if land_mask_path is None:
         raise ValueError("land_mask_path is required")
 
-    # Delegate to the main predictor (already windowed).
     log.info(
         "[predict_chunked] Delegating to predict.predict_scene (windowed). tile_size=%s overlap=%s max_memory_gb=%s",
         tile_size, overlap, max_memory_gb
     )
 
+    _known = {
+        "sdb_mode", "s2_smooth_kernel", "enable_doa",
+        "cw_min", "land_max", "land_mask_type", "land_mask_water_val",
+        "land_mask_invert", "land_mask_threshold",
+        "linf_estimate_deepwater", "linf_deepwater_nir_max", "linf_deepwater_bright_max", "linf_percentile",
+        "align_mode", "align_tie_points_gpkg", "align_min_points", "align_depth_bins", "align_source_priority",
+        "align_extra_points", "align_max_abs_residual_m_for_fit",
+        "write_confidence", "write_provenance", "min_confidence_threshold",
+    }
     predict.predict_scene(
         s2_paths={k: str(v) for k, v in band_paths.items()},
         land_mask_path=str(land_mask_path),
         rf_model_path=str(rf_model_path),
         meta_json_path=str(meta_json_path),
+        stumpf_lr_path=str(stumpf_lr_path) if stumpf_lr_path.exists() else None,
         out_path=str(out_raster),
         tile_size=int(tile_size),
-        # pass through extra kwargs that predict_scene understands (safe to ignore unknown in caller)
-        **{k: v for k, v in kwargs.items() if k in {
-            "sdb_mode", "s2_smooth_kernel", "enable_doa",
-            "cw_min", "land_max", "land_mask_type", "land_mask_water_val",
-            "land_mask_invert", "land_mask_threshold",
-            "linf_estimate_deepwater", "linf_deepwater_nir_max", "linf_deepwater_bright_max", "linf_percentile",
-            "align_mode", "align_tie_points_gpkg", "align_min_points", "align_depth_bins", "align_source_priority",
-            "align_extra_points", "align_max_abs_residual_m_for_fit",
-        }},
+        **{k: v for k, v in kwargs.items() if k in _known},
     )
 
     return {"output_raster": out_raster}

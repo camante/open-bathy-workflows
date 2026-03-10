@@ -3,7 +3,7 @@
 """
 validation.py - Centralized Input Validation for SDB Pipeline
 
-This module provides comprehensive validation of all pipeline inputs BEFORE
+This module validates all pipeline inputs BEFORE
 processing begins. Fail fast with clear error messages.
 
 Usage:
@@ -12,7 +12,7 @@ Usage:
     result = validate_pipeline_config(config_dict)
     if not result.is_valid:
         for error in result.errors:
-            log.info("ERROR: %s", error)
+            log.error("%s", error)
         sys.exit(1)
 """
 
@@ -87,20 +87,12 @@ class ValidationResult:
     def log_results(self, logger: logging.Logger = None) -> None:
         """Log all validation results."""
         _log = logger or log
-        
-        if self.errors:
-            _log.error("=" * 60)
-            _log.error("VALIDATION ERRORS:")
-            for err in self.errors:
-                _log.error(f"  ✗ {err}")
-            _log.error("=" * 60)
-        
-        if self.warnings:
-            _log.warning("-" * 60)
-            _log.warning("VALIDATION WARNINGS:")
-            for warn in self.warnings:
-                _log.warning(f"  ⚠ {warn}")
-            _log.warning("-" * 60)
+
+        for err in self.errors:
+            _log.error("Validation error: %s", err)
+
+        for warn in self.warnings:
+            _log.warning("Validation warning: %s", warn)
 
 
 # =============================================================================
@@ -566,9 +558,7 @@ def validate_pipeline_config(config: Dict[str, Any]) -> ValidationResult:
     """
     result = ValidationResult()
     
-    log.info("=" * 60)
-    log.info("VALIDATING PIPELINE CONFIGURATION")
-    log.info("=" * 60)
+    log.info("Validating pipeline configuration")
     
     # Required: AOI
     if "aoi" not in config:
@@ -645,11 +635,9 @@ def validate_pipeline_config(config: Dict[str, Any]) -> ValidationResult:
     result.log_results()
     
     if result.is_valid:
-        log.info("✓ Configuration validation PASSED")
+        log.info("Configuration validation passed")
     else:
-        log.error("✗ Configuration validation FAILED")
-    
-    log.info("=" * 60)
+        log.error("Configuration validation failed")
     
     return result
 
@@ -750,7 +738,7 @@ if __name__ == "__main__":
         # Quick AOI validation
         aoi = sys.argv[2] if len(sys.argv) > 2 else None
         if not aoi:
-            log.info("ERROR: --aoi requires an argument")
+            log.error("--aoi requires an argument")
             sys.exit(1)
         result = validate_aoi(aoi)
         result.log_results()
@@ -759,7 +747,7 @@ if __name__ == "__main__":
     # Load and validate config file
     config_path = Path(sys.argv[1])
     if not config_path.exists():
-        log.info("ERROR: Config file not found: %s", config_path)
+        log.error("Config file not found: %s", config_path)
         sys.exit(1)
     
     with open(config_path) as f:

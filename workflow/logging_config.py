@@ -56,7 +56,7 @@ class _RunContextFilter(logging.Filter):
             record.run_id = current_run_id()
             record.step = current_step()
         except Exception:
-            log.debug('Unexpected exception suppressed (was pass).', exc_info=True)
+            log.debug("ignored", exc_info=True)  # flight_recorder not available
         return True
 
 
@@ -268,7 +268,7 @@ def start_flight_recorder(out_dir: Union[str, Path], run_id: str) -> Optional[Pa
 
             atexit.register(_write_summaries)
         except Exception:
-            log.debug('Unexpected exception suppressed (was pass).', exc_info=True)
+            log.debug("atexit summary registration failed", exc_info=True)
         return fr_path
     except Exception:
         return None

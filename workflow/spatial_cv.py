@@ -158,7 +158,7 @@ def create_spatial_clusters(
     # Handle NaN coordinates
     valid_mask = np.all(np.isfinite(coords), axis=1)
     if not np.all(valid_mask):
-        log.warning(f"[SpatialCV] {np.sum(~valid_mask)} points with invalid coordinates")
+        log.warning("%s points with invalid coordinates", np.sum(~valid_mask))
         # Assign invalid points to cluster 0
         clusters = np.zeros(len(df), dtype=int)
         if np.sum(valid_mask) >= n_clusters:
@@ -193,7 +193,7 @@ def create_icesat_track_groups(
         group_ids = df["source"].astype(str)
     else:
         # Fall back to spatial clusters
-        log.warning("[SpatialCV] No track column found, falling back to spatial clusters")
+        log.warning("No track column found, falling back to spatial clusters")
         return create_spatial_clusters(df, n_clusters=5)
     
     # Convert to numeric labels
@@ -259,7 +259,7 @@ def spatial_block_cv(
         
         # Check minimum samples
         if np.sum(test_mask) < min_test_samples:
-            log.warning(f"[SpatialCV] Fold {fold_id}: insufficient test samples ({np.sum(test_mask)}), skipping")
+            log.warning("Fold %s: insufficient test samples (%s), skipping", fold_id, np.sum(test_mask))
             continue
         
         test_idx = indices[test_mask]
@@ -332,16 +332,16 @@ def spatial_cluster_cv(
         
         # Sort by score (best representation first) for reporting
         cluster_stats.sort(key=lambda x: x[4])
-        log.info(f"[SpatialCV] Cluster depth stats (global p50={global_p50:.2f}m, p95={global_p95:.2f}m):")
+        log.info("Cluster depth stats (global p50=%.2fm, p95=%.2fm):", global_p50, global_p95)
         for k, n, p50, p95, score in cluster_stats[:5]:
-            log.info(f"  Cluster {k}: n={n}, p50={p50:.2f}m, p95={p95:.2f}m, score={score:.2f}")
+            log.info("  Cluster %s: n=%s, p50=%.2fm, p95=%.2fm, score=%.2f", k, n, p50, p95, score)
     
     for fold_id in range(n_folds):
         test_mask = clusters == fold_id
         train_mask = ~test_mask
         
         if np.sum(test_mask) < min_test_samples:
-            log.warning(f"[SpatialCV] Fold {fold_id}: insufficient test samples ({np.sum(test_mask)}), skipping")
+            log.warning("Fold %s: insufficient test samples (%s), skipping", fold_id, np.sum(test_mask))
             continue
         
         test_idx = indices[test_mask]
@@ -486,10 +486,10 @@ def buffered_spatial_cv(
         
         # Log buffer impact
         n_buffered = len(buffer_indices) - np.sum(test_mask)
-        log.info(f"[SpatialCV] Fold {fold_id}: {n_buffered} points in buffer zone excluded from training")
+        log.info("Fold %s: %s points in buffer zone excluded from training", fold_id, n_buffered)
         
         if np.sum(train_mask) < min_test_samples:
-            log.warning("[SpatialCV] Fold %s: insufficient training samples after buffer", fold_id)
+            log.warning("Fold %s: insufficient training samples after buffer", fold_id)
             continue
         
         test_idx = indices[test_mask]
@@ -587,7 +587,7 @@ def run_spatial_cv(
     all_predictions = [] if return_predictions else None
     all_actuals = [] if return_predictions else None
     
-    log.info(f"[SpatialCV] Running {cv_strategy} with {n_folds} folds...")
+    log.info("Running %s with %s folds...", cv_strategy, n_folds)
     
     for fold in cv_gen(df, n_folds=n_folds, seed=seed, **cv_kwargs):
         # Prepare data
@@ -604,7 +604,7 @@ def run_spatial_cv(
         X_test, y_test = X_test[test_mask], y_test[test_mask]
         
         if len(X_train) < 50 or len(X_test) < 20:
-            log.warning(f"[SpatialCV] Fold {fold.fold_id}: insufficient samples after filtering")
+            log.warning("Fold %s: insufficient samples after filtering", fold.fold_id)
             continue
         
         # Train model
@@ -648,7 +648,7 @@ def run_spatial_cv(
         )
     
     if not fold_results:
-        log.error("[SpatialCV] No valid folds completed")
+        log.error("No valid folds completed")
         return SpatialCVSummary(
             n_folds=0, rmse_mean=np.nan, rmse_std=np.nan, rmse_per_fold=[],
             r2_mean=np.nan, r2_std=np.nan, r2_per_fold=[],
@@ -700,21 +700,21 @@ def compare_cv_strategies(
     
     results = {}
     for strategy in strategies:
-        log.info("\n[SpatialCV] === Running %s ===", strategy)
+        log.info("Running %s", strategy)
         try:
             results[strategy] = run_spatial_cv(
                 df, feature_cols, target_col,
                 cv_strategy=strategy, n_folds=n_folds, seed=seed
             )
         except Exception as e:
-            log.error(f"[SpatialCV] {strategy} failed: {e}")
+            log.error("%s failed: %s", strategy, e)
             results[strategy] = None
     
     # Compare results
-    log.info("\n[SpatialCV] === Strategy Comparison ===")
+    log.info("Strategy Comparison")
     for name, summary in results.items():
         if summary is not None:
-            log.info(f"  {name}: RMSE={summary.rmse_mean:.3f}±{summary.rmse_std:.3f}m, R²={summary.r2_mean:.3f}")
+            log.info("  %s: RMSE=%.3f±%.3fm, R²=%.3f", name, summary.rmse_mean, summary.rmse_std, summary.r2_mean)
     
     return results
 
@@ -783,7 +783,7 @@ def train_with_spatial_cv(
         }
     
     # Step 1: Run spatial CV for unbiased evaluation
-    log.info("[SpatialCV] Step 1: Running spatial cross-validation...")
+    log.info("Step 1: Running spatial cross-validation...")
     cv_summary = run_spatial_cv(
         df, feature_cols, target_col,
         cv_strategy=cv_strategy, n_folds=n_folds,
@@ -791,7 +791,7 @@ def train_with_spatial_cv(
     )
     
     # Step 2: Create final train/test split (spatial)
-    log.info("[SpatialCV] Step 2: Creating final train/test split...")
+    log.info("Step 2: Creating final train/test split...")
     clusters = create_spatial_clusters(df, n_clusters=n_folds, seed=seed)
     
     # Use one cluster as holdout, rest for training
@@ -816,10 +816,10 @@ def train_with_spatial_cv(
     df_train = df[train_mask].copy()
     df_test = df[test_mask].copy()
     
-    log.info(f"[SpatialCV] Final split: {len(df_train)} train, {len(df_test)} test (cluster {best_test_cluster})")
+    log.info("Final split: %s train, %s test (cluster %s)", len(df_train), len(df_test), best_test_cluster)
     
     # Step 3: Train final model
-    log.info("[SpatialCV] Step 3: Training final model...")
+    log.info("Step 3: Training final model...")
     X_train = df_train[feature_cols].to_numpy()
     y_train = df_train[target_col].to_numpy()
     
@@ -842,8 +842,8 @@ def train_with_spatial_cv(
     final_rmse = float(np.sqrt(mean_squared_error(y_test_clean, y_pred)))
     final_r2 = float(r2_score(y_test_clean, y_pred))
     
-    log.info(f"[SpatialCV] Final model: RMSE={final_rmse:.3f}m, R²={final_r2:.3f}")
-    log.info(f"[SpatialCV] CV estimate: RMSE={cv_summary.rmse_mean:.3f}±{cv_summary.rmse_std:.3f}m")
+    log.info("Final model: RMSE=%.3fm, R²=%.3f", final_rmse, final_r2)
+    log.info("CV estimate: RMSE=%.3f±%.3fm", cv_summary.rmse_mean, cv_summary.rmse_std)
     
     # Add predictions to test df
     df_test = df_test.copy()
@@ -869,7 +869,7 @@ def train_with_spatial_cv(
     # Estimate recommended max depth based on CV variance
     # If RMSE varies a lot between folds, be more conservative
     if cv_summary.rmse_std > 0.3 * cv_summary.rmse_mean:
-        log.warning("[SpatialCV] High CV variance detected - model may not generalize well")
+        log.warning("High CV variance detected - model may not generalize well")
         metadata["cv_stability"] = "low"
     else:
         metadata["cv_stability"] = "good"
@@ -937,7 +937,7 @@ def plot_spatial_cv_results(
     fig.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     
-    log.info("[SpatialCV] Saved CV results plot: %s", output_path)
+    log.info("Saved CV results plot: %s", output_path)
 
 
 # -----------------------------------------------------------------------------
@@ -981,7 +981,7 @@ if __name__ == "__main__":
     
     # Save summary
     import json
-    with open(output_dir / "spatial_cv_summary.json", "w") as f:
+    with open(output_dir / "spatial_cv_summary.json", "w", encoding="utf-8") as f:
         json.dump({
             "n_folds": summary.n_folds,
             "rmse_mean": summary.rmse_mean,

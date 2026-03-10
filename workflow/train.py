@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-train.py – SDB model training with Feature Importance & Robust Metadata
-
-Updates:
-- **PHYSICS INTEGRATION: Bottom endmembers & geometry-corrected Kd (Kim et al. 2024)**
-- **FIXED: Auto-Depth on Random Split**: Allows depth-of-support calc even if spatial_split=False.
-- **FIXED: Smart Spatial Split**: Now selects a test cluster that actually covers the depth range.
-- **FIXED: Stratified Random Split**: Uses quantile binning to ensure deep points appear in Test.
-"""
+"""train.py – SDB model training: feature engineering, RF training, spatial CV, and model bank."""
 
 import sys
 import os
@@ -43,13 +35,9 @@ except ImportError as e:
     _physics_import_error = f"ImportError: {e}"
 except Exception as e:
     # Catch any other errors (syntax, missing dependencies, etc.)
+    # log is not defined yet at import time; store error and emit it later
     _physics_import_error = f"{type(e).__name__}: {e}"
-    import logging
-    log.error(
-        f"[train] Physics module failed to load: {_physics_import_error}"
-    )
 
-# --- Robust Import Strategy for s2_optics (lazy + dynamic-module aware) ---
 S2_OPTICS_AVAILABLE = False
 
 
@@ -242,9 +230,7 @@ def add_s2_optical_features(df, l_inf: dict = None, eps: float = 1e-6):
         0.0
     )
 
-    # FIX: Stumpf index with division-by-zero protection
-    # stumpf_idx = log(B02) / log(B03)
-    # When log(B03) is near zero, this ratio becomes undefined
+    # stumpf_idx = log(B02) / log(B03); guard against log(B03) near zero
     log_b03_safe = _np.where(
         _np.abs(out["log_B03"]) > NUMERICAL_EPS,
         out["log_B03"],
@@ -396,7 +382,7 @@ def apply_stumpf_residual_filter(
                 f"dropped p50/p95={np.nanpercentile(d_drop,50):.2f}/{np.nanpercentile(d_drop,95):.2f} m."
             )
         except Exception:
-            log.info("[QC] Stumpf residual filter dropped %s outliers.", dropped_total)
+            log.info("Stumpf residual filter dropped %s outliers.", dropped_total)
         return df.loc[keep].reset_index(drop=True)
 
     return df
@@ -409,7 +395,7 @@ def _resolve_s2_optics_module():
     try:
         return importlib.import_module("s2_optics")
     except Exception:
-        log.debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("ignored", exc_info=True)
     for k, v in list(sys.modules.items()):
         if k.startswith("s2_optics_dyn_"):
             return v
@@ -588,7 +574,7 @@ def _make_depth_bin_edges(
         try:
             max_ref = min(max_ref, float(max_depth_cap_m))
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
     if (not np.isfinite(max_ref)) or max_ref <= 0:
         return np.array([], dtype="float64")
 
@@ -658,7 +644,7 @@ max_depth_bins: int = 30,
         try:
             max_ref = min(max_ref, float(max_depth_cap_m))
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
     if not np.isfinite(max_ref) or max_ref <= 0:
         return None, {"reason": "invalid_depth_range", "max_ref": max_ref}
@@ -687,9 +673,8 @@ max_depth_bins: int = 30,
     mids = []
     supported_upper_edges = []
 
-    log.info(f"[TRAIN][VAL] --- Depth-of-Support Analysis (Target RMSE <= {rmse_target_m:.2f} m) ---")
-    log.info(f"[TRAIN][VAL] {'Bin Range (m)':<15} | {'RMSE (m)':<10} | {'Bias (m)':<10} | {'MAE (m)':<10} | {'Count':<8} | {'Status'}")
-    log.info("-" * 85)
+    log.info("Depth-of-support analysis (target RMSE <= %.2f m)", rmse_target_m)
+    log.info("%-15s | %-10s | %-10s | %-10s | %-8s | %s", 'Bin Range (m)', 'RMSE (m)', 'Bias (m)', 'MAE (m)', 'Count', 'Status')
 
     first_fail_msg = None
 
@@ -725,19 +710,18 @@ max_depth_bins: int = 30,
         else:
             rmse_by.append(np.nan); mae_by.append(np.nan); bias_by.append(np.nan)
 
-        log.info(f"[TRAIN][VAL] {lo:5.1f} - {hi:5.1f}   | {r_val:10.3f} | {b_val:10.3f} | {m_val:10.3f} | {n:8d} | {status}")
+        log.info("%5.1f - %5.1f   | %10.3f | %10.3f | %10.3f | %8d | %s", lo, hi, r_val, b_val, m_val, n, status)
 
-    log.info("-" * 85)
 
     if first_fail_msg:
-        log.info("[TRAIN][VAL] %s", first_fail_msg)
+        log.warning("%s", first_fail_msg)
 
     max_supported = float(max(supported_upper_edges)) if supported_upper_edges else None
     if max_supported is not None and max_depth_cap_m is not None:
         try:
             max_supported = min(max_supported, float(max_depth_cap_m))
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
     diag = {
         "rmse_target_m": float(rmse_target_m),
@@ -771,7 +755,6 @@ def estimate_max_depth_from_spatial_validation_dual(
     max_consecutive_empty_bins_relaxed: int = 4,
 ) -> Tuple[Dict[str, Optional[float]], Dict[str, Any]]:
     """Estimate depth-of-support using spatially independent validation."""
-    log = logging.getLogger("sdb.train")
 
     def _norm_pair(yt: np.ndarray, yp: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         yt = np.asarray(yt, dtype="float64")
@@ -809,7 +792,7 @@ def estimate_max_depth_from_spatial_validation_dual(
     )
     if str(depth_binning).lower() == "quantile":
         edges_list = [round(float(e), 3) for e in np.asarray(edges).ravel().tolist()]
-        log.info("[TRAIN][VAL] Quantile depth bin edges (m): %s", edges_list)
+        log.info("Quantile depth bin edges (m): %s", edges_list)
 
 
     strict_max: Optional[float] = None
@@ -952,7 +935,7 @@ def scatter_plot(
 
     m = np.isfinite(y_true) & np.isfinite(y_pred)
     if not np.any(m):
-        log.warning(f"[PLOT] {title}: no finite points; skipping {out_png}")
+        log.warning("%s: no finite points; skipping %s", title, out_png)
         return
 
     yt = np.asarray(y_true, dtype="float64")[m]
@@ -1029,7 +1012,7 @@ def scatter_plot(
         path_out.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(path_out, dpi=150)
         plt.close(fig)
-        log.info("[PLOT] Saved: %s", path_out)
+        log.info("Saved: %s", path_out)
 
     lim_all = _lims_percentile(np.concatenate([yt, yp]), p=all_pctl)
     
@@ -1120,7 +1103,7 @@ def plot_depth_binning_sanity(
         try:
             plt.close()
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
 
 def plot_feature_importance(rf_model, feature_names, out_png):
@@ -1143,14 +1126,14 @@ def plot_feature_importance(rf_model, feature_names, out_png):
     plt.tight_layout()
     fig.savefig(out_png, dpi=150)
     plt.close(fig)
-    log.info("[PLOT] Feature importance saved: %s", out_png)
+    log.info("Feature importance saved: %s", out_png)
 
 def _count(df: pd.DataFrame, label: str):
-    log.info(f"[TRAIN][COUNT] {label}: n={len(df)}")
+    log.info("%s: n=%s", label, len(df))
 
 def _nonfinite_report(df: pd.DataFrame, cols: List[str], label: str, max_lines: int = 30):
     if df.empty:
-        log.warning("[TRAIN][DIAG] %s: df is empty; cannot compute non-finite fractions.", label)
+        log.warning("%s: df is empty; cannot compute non-finite fractions.", label)
         return
     lines = []
     n = len(df)
@@ -1162,12 +1145,12 @@ def _nonfinite_report(df: pd.DataFrame, cols: List[str], label: str, max_lines: 
         if bad > 0:
             lines.append((bad / n, c, int(bad)))
     if not lines:
-        log.info("[TRAIN][DIAG] %s: all requested cols are finite.", label)
+        log.info("%s: all requested cols are finite.", label)
         return
     lines.sort(reverse=True)
-    log.warning(f"[TRAIN][DIAG] {label}: non-finite values detected (showing up to {max_lines}).")
+    log.warning("%s: non-finite values detected (showing up to %s).", label, max_lines)
     for frac, c, bad in lines[:max_lines]:
-        log.warning(f"  - {c}: {bad}/{n} non-finite ({frac*100:.1f}%)")
+        log.warning("  - %s: %s/%s non-finite (%.1f%%)", c, bad, n, frac*100)
 
 
 def _funnel_df_stats(df: pd.DataFrame, stage: str, *, rr: Optional[Any] = None, depth_col: str = "depth_m",
@@ -1177,12 +1160,12 @@ def _funnel_df_stats(df: pd.DataFrame, stage: str, *, rr: Optional[Any] = None, 
     except Exception:
         n = 0
     if df is None or n == 0:
-        log.info("[Funnel][TRAIN] %s: n=0", stage)
+        log.info("%s: n=0", stage)
         if rr is not None:
             try:
                 rr.add(f"funnel.train.{stage}.n", 0)
             except Exception:
-                log.debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("ignored", exc_info=True)
         return
 
     d = None
@@ -1193,12 +1176,12 @@ def _funnel_df_stats(df: pd.DataFrame, stage: str, *, rr: Optional[Any] = None, 
             d = None
 
     if d is None:
-        log.info(f"[Funnel][TRAIN] {stage}: n={n} (no {depth_col} column)")
+        log.info("%s: n=%s (no %s column)", stage, n, depth_col)
         if rr is not None:
             try:
                 rr.add(f"funnel.train.{stage}.n", n)
             except Exception:
-                log.debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("ignored", exc_info=True)
         return
 
     mfin = np.isfinite(d)
@@ -1210,7 +1193,7 @@ def _funnel_df_stats(df: pd.DataFrame, stage: str, *, rr: Optional[Any] = None, 
     else:
         p50 = p95 = dmax = float("nan")
 
-    log.info(f"[Funnel][TRAIN] {stage}: n={n} finite={nfin} depth_p50/p95/max={p50:.3f}/{p95:.3f}/{dmax:.3f} m")
+    log.info("%s: n=%s finite=%s depth_p50/p95/max=%.3f/%.3f/%.3f m", stage, n, nfin, p50, p95, dmax)
 
     hist = None
     edges = None
@@ -1232,7 +1215,7 @@ def _funnel_df_stats(df: pd.DataFrame, stage: str, *, rr: Optional[Any] = None, 
                 rr.add_dict(f"funnel.train.{stage}.depth_hist_0_{int(hist_max_m)}_{int(hist_bin_m)}m",
                             {"bins": edges.tolist(), "counts": hist.tolist()})
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
 def sample_s2_bands_at_points(train_df: pd.DataFrame,
                              s2_paths: Dict[str, str],
@@ -1241,7 +1224,7 @@ def sample_s2_bands_at_points(train_df: pd.DataFrame,
     if train_df.empty:
         return train_df
 
-    log.info(f"[SAMPLE] Sampling S2 features at {len(train_df)} locations...")
+    log.info("Sampling S2 features at %s locations...", len(train_df))
     lon_values = train_df["longitude"].to_numpy(np.float64)
     lat_values = train_df["latitude"].to_numpy(np.float64)
 
@@ -1257,7 +1240,7 @@ def sample_s2_bands_at_points(train_df: pd.DataFrame,
 
     for col, path in sampling_targets.items():
         if not os.path.exists(path):
-            log.warning(f"[SAMPLE] Missing raster: {path}. Filling {col} with NaNs.")
+            log.warning("Missing raster: %s. Filling %s with NaNs.", path, col)
             sampled_data[col] = np.full(len(train_df), np.nan, dtype=np.float32)
             continue
 
@@ -1283,7 +1266,7 @@ def sample_s2_bands_at_points(train_df: pd.DataFrame,
                 sampled_data[col] = arr
 
         except Exception as exc:
-            log.warning(f"[SAMPLE] Failed to sample {col}: {exc}")
+            log.warning("Failed to sample %s: %s", col, exc)
             sampled_data[col] = np.full(len(train_df), np.nan, dtype=np.float32)
 
     df_out = train_df.copy()
@@ -1303,6 +1286,58 @@ def _sanitize_feature_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame
 # -----------------------------------------------------------------------------
 # Main Training Logic
 # -----------------------------------------------------------------------------
+
+
+
+def _try_reuse_model_bank(
+    model_bank_dir, metadata, reason="periodic_retrain_skip",
+    extra_meta=None,
+):
+    """Attempt to load and return a previously-trained model from the model bank.
+
+    Returns (rf, lr, df_train, df_test, meta) if a model was found,
+    or None if no model is available.
+
+    Args:
+        model_bank_dir: Path to the model bank directory.
+        metadata: Metadata dict to update with reuse info.
+        reason: Why we are reusing (for logging/metadata).
+        extra_meta: Additional key-value pairs to add to model_bank metadata.
+    """
+    bank_dir_p = Path(model_bank_dir)
+    rf_p = bank_dir_p / "rf_model.pkl"
+    if not rf_p.exists():
+        return None
+
+    rf_reuse = joblib.load(rf_p)
+    lr_reuse = None
+    lr_p = bank_dir_p / "stumpf_lr.pkl"
+    if lr_p.exists():
+        try:
+            lr_reuse = joblib.load(lr_p)
+        except Exception:
+            lr_reuse = None
+
+    mm = None
+    mm_p = bank_dir_p / "model_meta.json"
+    if mm_p.exists():
+        try:
+            with open(mm_p, "r", encoding="utf-8") as _f:
+                mm = json.load(_f)
+        except Exception:
+            mm = None
+
+    bank_meta = {"enabled": True, "reused_model": True, "reuse_reason": reason}
+    if extra_meta:
+        bank_meta.update(extra_meta)
+    metadata.setdefault("model_bank", {}).update(bank_meta)
+
+    if isinstance(mm, dict):
+        mm.setdefault("model_bank", {}).update(bank_meta)
+        return rf_reuse, lr_reuse, pd.DataFrame(), pd.DataFrame(), mm
+
+    return rf_reuse, lr_reuse, pd.DataFrame(), pd.DataFrame(), metadata
+
 
 def train_sdb_model(
     train_df: pd.DataFrame,
@@ -1344,11 +1379,11 @@ def train_sdb_model(
     model_bank_retrain_min_new: int = 2000,
 ) -> Tuple[RandomForestRegressor, Optional[LinearRegression], pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
 
-    log.info("--- Stage 3: Feature Engineering and Model Training ---")
+    log.info("Stage 3: Feature Engineering and Model Training")
     if not S2_OPTICS_AVAILABLE:
         _bind_s2_optics_functions()
     if not S2_OPTICS_AVAILABLE:
-        log.warning(">> 's2_optics' module not found via lazy import. Using dummy generators.")
+        log.warning("'s2_optics' module not found via lazy import. Using dummy generators.")
 
     df = train_df.copy()
 
@@ -1381,7 +1416,7 @@ def train_sdb_model(
         if lt in ("land_probability", "probability") or (lt == "auto" and is_probish):
             thr = float(land_mask_threshold if land_mask_threshold is not None else land_max)
             m_land = nodata_ok | (finite & (land_v <= float(thr)))
-            log.info(f"[TRAIN][LAND] using land_probability semantics: keep LAND<= {thr} plus nodata_ok={land_mask_nodata_is_water}")
+            log.info("using land_probability semantics: keep LAND<= %s plus nodata_ok=%s", thr, land_mask_nodata_is_water)
         else:
             if lt == "auto" and is_binaryish:
                 if u.size == 1:
@@ -1392,33 +1427,33 @@ def train_sdb_model(
                         if vv.size > 0:
                             vals, counts = np.unique(vv.astype(np.int64), return_counts=True)
                             wv = float(vals[int(np.argmax(counts))])
-                            log.info(f"[TRAIN][LAND] auto-inferred water_val={wv} from training points distribution: {dict(zip(vals.tolist(), counts.tolist()))}")
+                            log.info("auto-inferred water_val=%s from training points distribution: %s", wv, dict(zip(vals.tolist(), counts.tolist())))
                         else:
                             wv = 0.0
-                            log.warning("[TRAIN][LAND] Could not infer water_val (no finite LAND samples); falling back to 0.")
+                            log.warning("Could not infer water_val (no finite LAND samples); falling back to 0.")
                     else:
                         wv = float(land_mask_water_val)
                     keep_eq = (finite & (land_v == wv))
                     m_land = nodata_ok | (~keep_eq if bool(land_mask_invert) else keep_eq)
-                    log.info(f"[TRAIN][LAND] using water_val={wv} invert={bool(land_mask_invert)} nodata_ok={land_mask_nodata_is_water}")
+                    log.info("using water_val=%s invert=%s nodata_ok=%s", wv, bool(land_mask_invert), land_mask_nodata_is_water)
             elif lt in ("water_only", "land_binary", "binary", "mask"):
                 if land_mask_water_val is None:
                     vv = land_v[finite & np.isfinite(land_v)]
                     if vv.size > 0:
                         vals, counts = np.unique(vv.astype(np.int64), return_counts=True)
                         wv = float(vals[int(np.argmax(counts))])
-                        log.info(f"[TRAIN][LAND] auto-inferred water_val={wv} from training points distribution: {dict(zip(vals.tolist(), counts.tolist()))}")
+                        log.info("auto-inferred water_val=%s from training points distribution: %s", wv, dict(zip(vals.tolist(), counts.tolist())))
                     else:
                         wv = 0.0
-                        log.warning("[TRAIN][LAND] Could not infer water_val (no finite LAND samples); falling back to 0.")
+                        log.warning("Could not infer water_val (no finite LAND samples); falling back to 0.")
                 else:
                     wv = float(land_mask_water_val)
                 keep_eq = (finite & (land_v == wv))
                 m_land = nodata_ok | (~keep_eq if bool(land_mask_invert) else keep_eq)
-                log.info(f"[TRAIN][LAND] using explicit semantics: water_val={wv} invert={bool(land_mask_invert)} nodata_ok={land_mask_nodata_is_water}")
+                log.info("using explicit semantics: water_val=%s invert=%s nodata_ok=%s", wv, bool(land_mask_invert), land_mask_nodata_is_water)
             else:
                 m_land = nodata_ok | (finite & (land_v <= float(land_max)))
-                log.info(f"[TRAIN][LAND] using threshold semantics: keep LAND<= {land_max} plus nodata_ok={land_mask_nodata_is_water}")
+                log.info("using threshold semantics: keep LAND<= %s plus nodata_ok=%s", land_max, land_mask_nodata_is_water)
 
     if cw_min is None or "CLEAR_WATER" not in df.columns:
         m_cw = np.ones(len(df), dtype=bool)
@@ -1428,22 +1463,21 @@ def train_sdb_model(
 
     m_env = m_land & m_cw
 
-    # FIX: extra_xyz points should bypass BOTH land AND clear_water filters
-    # because they are typically high-quality surveyed data (hydronos, ehydro, etc.)
-    # that may be in areas where S2-derived masks are unreliable (turbid coastal zones)
+    # extra_xyz (hydronos, ehydro, etc.) bypasses land and clear-water filters:
+    # these are high-quality soundings that may be in turbid/masked zones.
     if "source_norm" in df.columns:
         m_is_xyz = (df["source_norm"] == "extra_xyz")
         n_xyz_before = int(m_is_xyz.sum())
         m_env |= m_is_xyz
         if n_xyz_before > 0:
-            log.info("[TRAIN][ENV] Bypassed env filter for %s extra_xyz points (high-quality survey data)", n_xyz_before)
+            log.info("Bypassed env filter for %s extra_xyz points (high-quality survey data)", n_xyz_before)
 
     df = df[m_env].reset_index(drop=True)
     _count(df, f"after env filter (LAND<= {land_max}, CLEAR_WATER>= {cw_min})")
     _funnel_df_stats(df, "after_env_filter", rr=rr)
 
     if df.empty:
-        log.error("[TRAIN] No samples remain after environment filter.")
+        log.error("No samples remain after environment filter.")
         return RandomForestRegressor(), None, pd.DataFrame(), pd.DataFrame(), {}
 
     l_inf_constants = {"B02": 0.0, "B03": 0.0, "B04": 0.0, "B08": 0.0}
@@ -1459,9 +1493,9 @@ def train_sdb_model(
                         percentile=linf_percentile,
                     )
                     if est:
-                        log.info("[TRAIN] Estimated L_inf constants from rasters: %s", est)
+                        log.info("Estimated L_inf constants from rasters: %s", est)
             except Exception as e:
-                log.warning("[TRAIN] Raster-based L_inf estimation failed; falling back to DF method. Reason: %s", e)
+                log.warning("Raster-based L_inf estimation failed; falling back to DF method. Reason: %s", e)
 
             if not est:
                 est = estimate_linf_from_df(
@@ -1472,12 +1506,12 @@ def train_sdb_model(
                     cw_col="CLEAR_WATER" if "CLEAR_WATER" in df.columns else None,
                 )
                 if est:
-                    log.info("[TRAIN] Estimated L_inf constants from deepwater (DF fallback): %s", est)
+                    log.info("Estimated L_inf constants from deepwater (DF fallback): %s", est)
 
             if est:
                 l_inf_constants = est
             else:
-                log.warning("[TRAIN] L_inf estimate failed (no suitable deepwater pixels found). Using zeros.")
+                log.warning("L_inf estimate failed (no suitable deepwater pixels found). Using zeros.")
 
     df = add_s2_optical_features(df, l_inf=l_inf_constants)
     _count(df, "after add_s2_optical_features")
@@ -1531,9 +1565,9 @@ def train_sdb_model(
                 df["stumpf_depth"] = pred
 
                 feat_cols.append("stumpf_depth")
-                log.info("[TRAIN] Fitted auxiliary stumpf_depth LR model (positive magnitudes).")
+                log.info("Fitted auxiliary stumpf_depth LR model (positive magnitudes).")
             except Exception as e:
-                log.warning("[TRAIN] Stumpf LR failed: %s", e)
+                log.warning("Stumpf LR failed: %s", e)
 
     df = _sanitize_feature_columns(df, feat_cols + ["depth_m", "sample_weight"])
     _count(df, "after sanitize (inf->nan, coercion)")
@@ -1544,7 +1578,7 @@ def train_sdb_model(
     req_cols = feat_cols + ["depth_m", "sample_weight"]
     missing_cols = [c for c in req_cols if c not in df.columns]
     if missing_cols:
-        log.error("[TRAIN] Missing required columns: %s. Training aborted.", missing_cols, exc_info=True)
+        log.error("Missing required columns: %s. Training aborted.", missing_cols)
         return RandomForestRegressor(), stumpf_lr, pd.DataFrame(), pd.DataFrame(), {}
 
     _nonfinite_report(df, req_cols, "pre finite-row drop")
@@ -1565,7 +1599,7 @@ def train_sdb_model(
         else:
             training_bounds[col] = {"min": -9999.0, "max": 9999.0}
 
-    log.info(f"[TRAIN] Calculated Domain of Applicability bounds for {len(feat_cols)} features.")
+    log.info("Calculated Domain of Applicability bounds for %s features.", len(feat_cols))
 
     doa_weights: Dict[str, float] = {}
     try:
@@ -1651,7 +1685,7 @@ def train_sdb_model(
                 'last_replaced': int(bank_meta.get('last_replaced', 0)) if bank_meta else 0,
             }
         except Exception as ex:
-            log.warning("[MODEL_BANK] Update failed; continuing without bank: %s", ex)
+            log.warning("Update failed; continuing without bank: %s", ex)
             metadata['model_bank'] = {'enabled': False, 'error': str(ex)}
     else:
         metadata['model_bank'] = {'enabled': False}
@@ -1661,13 +1695,12 @@ def train_sdb_model(
     if model_bank_enabled and model_bank_dir is not None:
         try:
             bank_dir_p = Path(model_bank_dir)
-            rf_p = bank_dir_p / "rf_model.pkl"
             meta_p = bank_dir_p / "bank_meta.json"
             last_trained_n_seen = 0
             n_seen_now = 0
             if meta_p.exists():
                 try:
-                    with open(meta_p, "r") as _f:
+                    with open(meta_p, "r", encoding="utf-8") as _f:
                         _bm = json.load(_f)
                     last_trained_n_seen = int(_bm.get("last_trained_n_seen", 0))
                     n_seen_now = int(_bm.get("n_seen", 0))
@@ -1676,97 +1709,39 @@ def train_sdb_model(
                     n_seen_now = 0
             new_since_train = max(0, n_seen_now - last_trained_n_seen) if n_seen_now else 0
 
-            if rf_p.exists() and (new_since_train < int(model_bank_retrain_min_new)):
-                # Reuse the last bank model for this run.
-                rf_reuse = joblib.load(rf_p)
-                lr_reuse = None
-                lr_p = bank_dir_p / "stumpf_lr.pkl"
-                if lr_p.exists():
-                    try:
-                        lr_reuse = joblib.load(lr_p)
-                    except Exception:
-                        lr_reuse = None
-                # Try to load model meta if present; otherwise keep metadata as-is.
-                mm_p = bank_dir_p / "model_meta.json"
-                if mm_p.exists():
-                    try:
-                        with open(mm_p, "r") as _f:
-                            mm = json.load(_f)
-                        metadata.setdefault("model_bank", {})
-                        metadata["model_bank"]["reused_model"] = True
-                        metadata["model_bank"]["new_since_train"] = int(new_since_train)
-                        metadata["model_bank"]["retrain_min_new"] = int(model_bank_retrain_min_new)
-                        metadata["model_bank"]["reused_model_meta"] = True
-                        # Propagate reuse flags into the returned model_meta so callers can
-                        # distinguish "reused" from "failed training".
-                        try:
-                            if isinstance(mm, dict):
-                                mm.setdefault("model_bank", {})
-                                mm["model_bank"].update({
-                                    "enabled": True,
-                                    "reused_model": True,
-                                    "new_since_train": int(new_since_train),
-                                    "retrain_min_new": int(model_bank_retrain_min_new),
-                                })
-                        except Exception:
-                            pass
-                        return rf_reuse, lr_reuse, pd.DataFrame(), pd.DataFrame(), mm
-                    except Exception:
-                        pass
-
-                metadata.setdefault("model_bank", {})
-                metadata["model_bank"]["reused_model"] = True
-                metadata["model_bank"]["new_since_train"] = int(new_since_train)
-                metadata["model_bank"]["retrain_min_new"] = int(model_bank_retrain_min_new)
-                return rf_reuse, lr_reuse, pd.DataFrame(), pd.DataFrame(), metadata
+            if (bank_dir_p / "rf_model.pkl").exists() and (new_since_train < int(model_bank_retrain_min_new)):
+                result = _try_reuse_model_bank(
+                    model_bank_dir, metadata,
+                    reason="periodic_retrain_skip",
+                    extra_meta={
+                        "new_since_train": int(new_since_train),
+                        "retrain_min_new": int(model_bank_retrain_min_new),
+                    },
+                )
+                if result is not None:
+                    return result
         except Exception as ex:
-            log.debug(f"[MODEL_BANK] Reuse check failed; proceeding to retrain: {ex}", exc_info=True)
+            log.debug("Reuse check failed; proceeding to retrain: %s", ex, exc_info=True)
 
     if len(df) < min_training_points_for_sdb:
-        log.warning(f"[TRAIN] Insufficient samples ({len(df)} < {min_training_points_for_sdb}).")
+        log.warning("Insufficient samples (%s < %s).", len(df), min_training_points_for_sdb)
 
         # If a model bank exists, prefer reusing its last trained model rather than returning
         # an untrained RF (which can later look like a "successful" run but produce nonsense).
         if model_bank_enabled and model_bank_dir is not None:
             try:
-                bank_dir_p = Path(model_bank_dir)
-                rf_p = bank_dir_p / "rf_model.pkl"
-                if rf_p.exists():
-                    rf_reuse = joblib.load(rf_p)
-                    lr_reuse = None
-                    lr_p = bank_dir_p / "stumpf_lr.pkl"
-                    if lr_p.exists():
-                        try:
-                            lr_reuse = joblib.load(lr_p)
-                        except Exception:
-                            lr_reuse = None
-
-                    mm = None
-                    mm_p = bank_dir_p / "model_meta.json"
-                    if mm_p.exists():
-                        try:
-                            with open(mm_p, "r") as _f:
-                                mm = json.load(_f)
-                        except Exception:
-                            mm = None
-
-                    metadata.setdefault("model_bank", {})
-                    metadata["model_bank"].update({
-                        "enabled": True,
-                        "reused_model": True,
-                        "reuse_reason": "insufficient_new_samples",
+                result = _try_reuse_model_bank(
+                    model_bank_dir, metadata,
+                    reason="insufficient_new_samples",
+                    extra_meta={
                         "min_training_points_for_sdb": int(min_training_points_for_sdb),
                         "n_samples": int(len(df)),
-                    })
-
-                    if isinstance(mm, dict):
-                        mm.setdefault("model_bank", {})
-                        mm["model_bank"].update(metadata["model_bank"])
-                        return rf_reuse, lr_reuse, pd.DataFrame(), pd.DataFrame(), mm
-
-                    return rf_reuse, lr_reuse, pd.DataFrame(), pd.DataFrame(), metadata
+                    },
+                )
+                if result is not None:
+                    return result
             except Exception as ex:
-                log.debug(f"[MODEL_BANK] Insufficient-sample reuse failed; returning empty model: {ex}", exc_info=True)
+                log.debug("Insufficient-sample reuse failed; returning empty model: %s", ex, exc_info=True)
 
         metadata.setdefault("train_status", {})
         metadata["train_status"].update({
@@ -1783,13 +1758,12 @@ def train_sdb_model(
     df_atl = df[df["source_norm"].isin(atl_like)].copy()
 
     if df_atl.empty:
-        log.info("[TRAIN] No ATL-like sources found. Training solely on non-ATL data.")
+        log.info("No ATL-like sources found. Training solely on non-ATL data.")
         df_atl = df.copy()
 
     # --- TRAIN/TEST SPLIT LOGIC ---
     if not spatial_split:
-        # UPDATED: Use Quantile-Stratified Split for Random mode
-        log.info("[TRAIN] Performing Stratified Random Split (by Depth Quantile)...")
+        log.info("Performing Stratified Random Split (by Depth Quantile)...")
         idx_tr, idx_te = stratified_train_test_split(
             df_atl, 
             target_col='depth_m', 
@@ -1797,9 +1771,8 @@ def train_sdb_model(
             seed=seed
         )
     else:
-        # UPDATED: Smart Spatial Split
-        # Pick the spatial cluster that best represents the full depth range (esp. deep water).
-        log.info("[TRAIN] Performing Spatial Split (K-Means Clustering)...")
+        # Pick the spatial cluster that best represents the full depth range.
+        log.info("Performing Spatial Split (K-Means Clustering)...")
         coords = df_atl[["longitude", "latitude"]].to_numpy()
 
         # Robustness: KMeans can fail (or behave poorly) when sample counts are small.
@@ -1807,7 +1780,7 @@ def train_sdb_model(
         do_spatial = coords.shape[0] >= 200
         if not do_spatial:
             log.warning(
-                f"[TRAIN] Spatial split requested but too few samples for stable clustering (n={coords.shape[0]}). "
+                f"Spatial split requested but too few samples for stable clustering (n={coords.shape[0]}). "
                 "Falling back to stratified random split."
             )
             idx_tr, idx_te = stratified_train_test_split(
@@ -1852,7 +1825,7 @@ def train_sdb_model(
                     best_k = k
 
             p95_best = float(stats_by_k.get(best_k, {}).get('p95', float('nan')))
-            log.info(f"[TRAIN] Spatial Split: Global p95={global_p95:.2f}m. Selected Cluster {best_k} as Test (p95={p95_best:.2f}m).")
+            log.info("Spatial Split: Global p95=%.2fm. Selected Cluster %s as Test (p95=%.2fm).", global_p95, best_k, p95_best)
             
             idx_te = df_atl.index[km.labels_ == best_k].to_numpy()
             idx_tr = df_atl.index[km.labels_ != best_k].to_numpy()
@@ -1873,7 +1846,7 @@ def train_sdb_model(
         m = np.isfinite(d)
         n_drop = int((~m).sum())
         if n_drop:
-            log.warning(f"[TRAIN] Dropping {n_drop} rows with non-finite depth_m in {_label}.")
+            log.warning("Dropping %s rows with non-finite depth_m in %s.", n_drop, _label)
         _df2 = _df2.loc[m].copy()
         _df2['depth_m'] = d[m]
         return _df2
@@ -1904,7 +1877,7 @@ def train_sdb_model(
         m_depth = np.isfinite(df_tr_fit["depth_m"].to_numpy())
         _dropped = int((~m_depth).sum())
         if _dropped:
-            log.warning(f"[TRAIN][QC] Dropping {_dropped:,}/{_n0:,} rows with non-finite depth_m after coercion")
+            log.warning("Dropping %s/%s rows with non-finite depth_m after coercion", format(_dropped, ","), format(_n0, ","))
         df_tr_fit = df_tr_fit.loc[m_depth].copy()
     if max_depth_sdb is not None:
         try:
@@ -1948,11 +1921,11 @@ def train_sdb_model(
             vc1 = df_out[source_col_local].value_counts(dropna=False)
             dom1 = float(vc1.iloc[0] / max(1, len(df_out))) if len(vc1) else 0.0
             log.warning(
-                f"[TRAIN][QC] Final source quota cannot be satisfied with a single source. "
+                f"Final source quota cannot be satisfied with a single source. "
                 f"Applied target downsampling only: {n0:,} -> {len(df_out):,} rows; dominant source fraction remains {dom1:.3f}."
             )
-            log.info(f"[TRAIN][QC] Source counts before quota: {vc0.to_dict()}")
-            log.info(f"[TRAIN][QC] Source counts after quota: {vc1.to_dict()}")
+            log.info("Source counts before quota: %s", vc0.to_dict())
+            log.info("Source counts after quota: %s", vc1.to_dict())
             return df_out
 
         # Build shuffled indices per source (stable seed) so any trimming is deterministic/reproducible.
@@ -1977,11 +1950,11 @@ def train_sdb_model(
             keep_idx = np.sort(keep_idx)
             df_out = _df.loc[keep_idx].copy()
         else:
-            # IMPORTANT: Do NOT refill from leftovers. Leftovers come from groups already at quota_n.
+            # Do not refill from leftovers: those groups are already at quota.
             # Refilling would violate the source-fraction invariant.
             if total_capped < target_n:
                 log.warning(
-                    f"[TRAIN][QC] Final source quota limits available rows below target: "
+                    f"Final source quota limits available rows below target: "
                     f"target={target_n:,}, quota-limited rows={total_capped:,}. Applying strict fraction cap on actual rows."
                 )
 
@@ -2026,11 +1999,11 @@ def train_sdb_model(
         vc1 = df_out[source_col_local].value_counts(dropna=False)
         dom1 = float(vc1.iloc[0] / max(1, len(df_out))) if len(vc1) else 0.0
         log.warning(
-            f"[TRAIN][QC] Enforced final source quota (target={target_n:,}, max_source_frac={max_source_frac:.2f}, quota={quota_n:,}): "
+            f"Enforced final source quota (target={target_n:,}, max_source_frac={max_source_frac:.2f}, quota={quota_n:,}): "
             f"{n0:,} -> {len(df_out):,} rows. Dominant source fraction {dom0:.3f} -> {dom1:.3f}."
         )
-        log.info(f"[TRAIN][QC] Source counts before quota: {vc0.to_dict()}")
-        log.info(f"[TRAIN][QC] Source counts after quota: {vc1.to_dict()}")
+        log.info("Source counts before quota: %s", vc0.to_dict())
+        log.info("Source counts after quota: %s", vc1.to_dict())
         return df_out
 
 
@@ -2042,7 +2015,7 @@ def train_sdb_model(
 
     missing = [c for c in feat_cols if (c not in df_tr_fit.columns) or (c not in df_te.columns)]
     if missing:
-        log.warning("[TRAIN] Dropping missing feature columns: %s", missing)
+        log.warning("Dropping missing feature columns: %s", missing)
         feat_cols = [c for c in feat_cols if c not in missing]
 
     X_train = df_tr_fit[feat_cols].to_numpy()
@@ -2054,41 +2027,33 @@ def train_sdb_model(
     y_train_raw = df_tr_fit["depth_m"].to_numpy()
     w_train = df_tr_fit["sample_weight"].to_numpy() if "sample_weight" in df_tr_fit.columns else None
 
-    # === CRITICAL: Validate depth sign convention ===
     depths_finite = y_train_raw[np.isfinite(y_train_raw)]
     
     if len(depths_finite) == 0:
-        log.error("[TRAIN] CRITICAL: No finite depth values in training data!")
+        log.error("No finite depth values in training data")
         return RandomForestRegressor(), stumpf_lr, pd.DataFrame(), pd.DataFrame(), {}
     
     pct_negative = (depths_finite < 0).mean()
     pct_positive = (depths_finite > 0).mean()
     
-    log.info(f"[TRAIN] Depth sign distribution: {pct_negative*100:.1f}% negative, {pct_positive*100:.1f}% positive")
-    log.info(f"[TRAIN] Depth range: [{depths_finite.min():.2f}, {depths_finite.max():.2f}] m")
+    log.info("Depth sign distribution: %.1f%% negative, %.1f%% positive", pct_negative*100, pct_positive*100)
+    log.info("Depth range: [%.2f, %.2f] m", depths_finite.min(), depths_finite.max())
     
     # Error if mostly positive (wrong convention)
     if pct_positive > 0.9:
-        log.error("[TRAIN] ❌ DEPTH CONVENTION ERROR: 90%+ depths are POSITIVE")
-        log.error("[TRAIN]    Bathymetry depths should be NEGATIVE (below surface)")
-        log.error("[TRAIN]    Check your XYZ data depth column and sign convention")
-        log.error("[TRAIN]    Expected: water depth = negative value")
+        log.error("Depth sign error: >90%% of depths are positive; expected negative-down")
+        log.error("Check the depth column and sign convention in your XYZ data")
         raise ValueError("Invalid depth sign convention: depths should be negative (below surface)")
     
     # Warning if mixed or mostly positive
     if pct_negative < 0.8:
-        log.warning(f"[TRAIN] ⚠️  DEPTH CONVENTION WARNING: Only {pct_negative*100:.1f}% depths are negative")
-        log.warning(f"[TRAIN]    Expected: depths below surface should be negative")
-        log.warning(f"[TRAIN]    Verify depth sign convention in source data")
+        log.warning("Only %.1f%% of depths are negative; verify sign convention in source data", pct_negative*100)
 
-    # === CRITICAL: Convert to positive magnitude for training ===
-    # The model should predict POSITIVE depth magnitudes.
-    # Input depths are negative (below surface), we convert to positive for training.
-    # Prediction outputs will be positive, then negated in predict.py for final output.
+    # Model trains on positive depth magnitude; predict.py negates output for final raster.
     y_train = np.abs(y_train_raw)
-    log.info(f"[TRAIN] Converted depths to positive magnitudes for training: [{y_train[np.isfinite(y_train)].min():.2f}, {y_train[np.isfinite(y_train)].max():.2f}] m")
+    log.info("Converted depths to positive magnitudes for training: [%.2f, %.2f] m", y_train[np.isfinite(y_train)].min(), y_train[np.isfinite(y_train)].max())
 
-    # === Guardrail: avoid single-source domination (especially extra_xyz hydronos/ehydro) ===
+    # Guardrail: avoid single-source domination
     if 'source' in df_tr_fit.columns or 'source_norm' in df_tr_fit.columns:
         try:
             source_col = 'source_norm' if 'source_norm' in df_tr_fit.columns else 'source'
@@ -2103,7 +2068,7 @@ def train_sdb_model(
                 metadata['training_qc']['dominant_source_frac'] = float(dom_frac)
                 if dom_frac > 0.90:
                     log.warning(
-                        f"[TRAIN][QC] Dominant source '{dom_src}' contributes {dom_frac*100:.1f}% of training rows ({dom_n}/{total_n}). "
+                        f"Dominant source '{dom_src}' contributes {dom_frac*100:.1f}% of training rows ({dom_n}/{total_n}). "
                         "Expect weak generalization / source-specific bias."
                     )
                 # Conservative deterministic cap: only trim if one source dominates AND others exist.
@@ -2121,74 +2086,49 @@ def train_sdb_model(
                         y_train_raw = None
                         w_train = None
                         log.warning(
-                            f"[TRAIN][QC] Rebalanced dominant source '{dom_src}' to reduce count domination: "
+                            f"Rebalanced dominant source '{dom_src}' to reduce count domination: "
                             f"{total_n} -> {len(df_tr_fit)} rows (dominant kept={allowed_dom})."
                         )
                         metadata['training_qc']['dominant_source_rebalanced'] = True
                         metadata['training_qc']['dominant_source_rebalanced_target_frac'] = float(max_dom_frac)
         except Exception as _ex:
-            log.error("[TRAIN][QC] Dominance guardrail failed: %s", _ex, exc_info=True)
+            log.error("Dominance guardrail failed: %s", _ex, exc_info=True)
 
-    # === NEW: Log training data composition by source ===
+    # Log training data composition by source (single pass)
     if 'source' in df_tr_fit.columns or 'source_norm' in df_tr_fit.columns:
         source_col = 'source_norm' if 'source_norm' in df_tr_fit.columns else 'source'
-        log.info("=" * 60)
-        log.info("[TRAIN] TRAINING DATA COMPOSITION:")
-        log.info("=" * 60)
-        
         source_counts = df_tr_fit[source_col].value_counts()
         total_samples = len(df_tr_fit)
-        
+        total_weighted = df_tr_fit['sample_weight'].sum() if w_train is not None else 0.0
+        log.info("Training data composition (%d samples):", total_samples)
+        eff_fracs = []
         for source in source_counts.index:
-            count = source_counts[source]
+            count = int(source_counts[source])
             pct = 100.0 * count / total_samples
-            
-            # Get sample weights
-            mask = df_tr_fit[source_col] == source
-            if w_train is not None:
-                weights = df_tr_fit.loc[mask, 'sample_weight']
-                mean_weight = weights.mean()
-                total_weight = weights.sum()
-                log.info(f"  {source:20s}: n={count:6d} ({pct:5.1f}%), weight_mean={mean_weight:5.1f}, weight_total={total_weight:8.0f}")
-            else:
-                log.info(f"  {source:20s}: n={count:6d} ({pct:5.1f}%)")
-        
-        if w_train is not None:
-            total_weighted = df_tr_fit['sample_weight'].sum()
-            log.info(f"\n  Total samples: {total_samples:,}")
-            log.info(f"  Total weighted: {total_weighted:,.0f}")
-            
-            # Effective contribution
-            log.info(f"\n  Effective training influence:")
-            for source in source_counts.index:
-                mask = df_tr_fit[source_col] == source
-                weight_contrib = df_tr_fit.loc[mask, 'sample_weight'].sum()
-                effective_pct = 100.0 * weight_contrib / total_weighted
-                log.info(f"    {source:20s}: {effective_pct:5.1f}%")
-        
-        try:
             if w_train is not None and total_weighted > 0:
-                eff_fracs = []
-                for source in source_counts.index:
-                    mask = df_tr_fit[source_col] == source
-                    weight_contrib = float(df_tr_fit.loc[mask, 'sample_weight'].sum())
-                    eff_fracs.append(weight_contrib / float(total_weighted))
-                if eff_fracs:
-                    metadata.setdefault('training_qc', {})
-                    metadata['training_qc']['max_effective_source_influence_frac'] = float(max(eff_fracs))
+                weight_contrib = float(df_tr_fit.loc[df_tr_fit[source_col] == source, 'sample_weight'].sum())
+                eff_pct = 100.0 * weight_contrib / total_weighted
+                eff_fracs.append(weight_contrib / total_weighted)
+                log.info("  %-20s n=%6d (%5.1f%%)  weight_mean=%5.1f  training_influence=%5.1f%%",
+                         source, count, pct, weight_contrib / count if count else 0, eff_pct)
+            else:
+                log.info("  %-20s n=%6d (%5.1f%%)", source, count, pct)
+        try:
+            if eff_fracs:
+                metadata.setdefault('training_qc', {})
+                metadata['training_qc']['max_effective_source_influence_frac'] = float(max(eff_fracs))
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
-        log.info("=" * 60)
+            log.debug("ignored", exc_info=True)
 
     rf.fit(X_train, y_train, sample_weight=w_train)
-    log.info(f"[TRAIN] RF trained on {len(df_tr_fit)} samples. (Test set: {len(df_te)})")
+    log.info("RF trained on %s samples. (Test set: %s)", len(df_tr_fit), len(df_te))
 
     # --- Run Spatial Cross-Validation if enabled ---
     spatial_cv_summary = None
     if spatial_cv_enabled and len(df) >= 200:
         try:
             from spatial_cv import run_spatial_cv, plot_spatial_cv_results
-            log.info(f"[TRAIN] Running {spatial_cv_folds}-fold spatial CV ({spatial_cv_strategy})...")
+            log.info("Running %s-fold spatial CV (%s)...", spatial_cv_folds, spatial_cv_strategy)
             
             spatial_cv_summary = run_spatial_cv(
                 df,
@@ -2207,13 +2147,13 @@ def train_sdb_model(
                 )
                 
             log.info(
-                f"[TRAIN] Spatial CV complete: RMSE={spatial_cv_summary.rmse_mean:.3f}±{spatial_cv_summary.rmse_std:.3f}m, "
+                f"Spatial CV complete: RMSE={spatial_cv_summary.rmse_mean:.3f}±{spatial_cv_summary.rmse_std:.3f}m, "
                 f"R²={spatial_cv_summary.r2_mean:.3f}±{spatial_cv_summary.r2_std:.3f}"
             )
         except ImportError:
-            log.debug("[TRAIN] spatial_cv module not available")
+            log.debug("spatial_cv module not available")
         except Exception as e:
-            log.warning("[TRAIN] Spatial CV failed: %s", e)
+            log.warning("Spatial CV failed: %s", e)
 
     # --- Training Data Diversity Analysis ---
     diversity_report = None
@@ -2221,14 +2161,14 @@ def train_sdb_model(
         from training_diversity import add_diversity_analysis_to_training
         diversity_report = add_diversity_analysis_to_training(df, plots_dir, feat_cols)
         if diversity_report and "overall_score" in diversity_report:
-            log.info(f"[TRAIN] Data diversity score: {diversity_report['overall_score']*100:.0f}%")
+            log.info(f"Data diversity score: {diversity_report['overall_score']*100:.0f}%")
             if diversity_report.get("recommendations"):
                 for rec in diversity_report["recommendations"][:3]:
-                    log.info("[TRAIN] → %s", rec)
+                    log.info("→ %s", rec)
     except ImportError:
-        log.debug("[TRAIN] training_diversity module not available")
+        log.debug("training_diversity module not available")
     except Exception as e:
-        log.warning("[TRAIN] Diversity analysis failed: %s", e)
+        log.warning("Diversity analysis failed: %s", e)
 
     if plots_dir:
         plots_dir.mkdir(parents=True, exist_ok=True)
@@ -2250,30 +2190,22 @@ def train_sdb_model(
             max_depth=max_depth_sdb
         )
 
-        # === NEW: Source-specific validation ===
+        # Source-specific validation
         if 'source' in df_te.columns or 'source_norm' in df_te.columns:
             source_col = 'source_norm' if 'source_norm' in df_te.columns else 'source'
-            log.info("=" * 60)
-            log.info("[TRAIN] VALIDATION BY DATA SOURCE:")
-            log.info("=" * 60)
-            
             from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-            
             source_validation = {}
+            log.info("Validation by source:")
             for source in df_te[source_col].unique():
                 mask = df_te[source_col] == source
                 n_source = mask.sum()
-                
                 if n_source < 3:
                     continue
-                
                 y_true = df_te.loc[mask, 'depth_m'].values
                 y_pred = df_te.loc[mask, 'depth_pred_m'].values
-                
                 rmse = np.sqrt(mean_squared_error(y_true, y_pred))
                 mae = mean_absolute_error(y_true, y_pred)
                 r2 = r2_score(y_true, y_pred) if n_source >= 5 else np.nan
-                
                 source_validation[source] = {
                     'n': int(n_source),
                     'rmse_m': float(rmse),
@@ -2281,16 +2213,9 @@ def train_sdb_model(
                     'r2': float(r2) if np.isfinite(r2) else None,
                     'depth_range': [float(y_true.min()), float(y_true.max())]
                 }
-                
-                # FIX: Safe format string handling for R²
                 r2_str = f"{r2:5.3f}" if np.isfinite(r2) else "  N/A"
-                log.info(
-                    f"  {source:20s}: n={n_source:5d}, RMSE={rmse:5.2f}m, "
-                    f"MAE={mae:5.2f}m, R²={r2_str}"
-                )
-            
-            log.info("=" * 60)
-            
+                log.info("  %-20s n=%5d  RMSE=%5.2fm  MAE=%5.2fm  R²=%s",
+                         source, n_source, rmse, mae, r2_str)
             # Save to metadata
             if rr is not None:
                 try:
@@ -2299,11 +2224,10 @@ def train_sdb_model(
                     elif hasattr(rr, "data") and isinstance(rr.data, dict):
                         rr.data["validation.by_source"] = source_validation
                 except Exception:
-                    log.debug("Optional step failed; continuing.", exc_info=True)
+                    log.debug("ignored", exc_info=True)
 
         max_depth_sdb_auto = None
         max_depth_diag = {}
-        # UPDATED: Run auto-depth diagnostics regardless of split type if target is set
         if (spatial_split or max_depth_sdb == "auto") or (rmse_target_sdb is not None):
             try:
                 # Use a safe cap for calculation if max_depth_sdb is "auto" string
@@ -2340,7 +2264,7 @@ def train_sdb_model(
                     )
 
             except Exception:
-                log.exception("[TRAIN] Auto max-depth estimation failed")
+                log.exception("Auto max-depth estimation failed")
 
         metadata["rmse_target_sdb"] = float(rmse_target_sdb)
         metadata["depth_bin_m"] = float(depth_bin_m)
@@ -2374,7 +2298,7 @@ def train_sdb_model(
                     limiting = physics_depth_result.get("limiting_factor", "unknown")
                     
                     log.info(
-                        f"[TRAIN] Physics-based depth: Kd(490)={kd_median:.3f} m⁻¹ ({water_type}), "
+                        f"Physics-based depth: Kd(490)={kd_median:.3f} m⁻¹ ({water_type}), "
                         f"optical limit={phys_max:.1f}m"
                     )
                     
@@ -2385,16 +2309,16 @@ def train_sdb_model(
                     
                     if combined is not None:
                         log.info(
-                            f"[TRAIN] Operational depth cap candidate (combined physics+rmse): {combined:.1f}m "
+                            f"Operational depth cap candidate (combined physics+rmse): {combined:.1f}m "
                             f"(limited by {limiting})"
                         )
                         metadata["max_depth_sdb_combined"] = float(combined)
                         metadata["max_depth_limiting_factor"] = limiting
                         
             except ImportError:
-                log.debug("[TRAIN] kd_estimation module not available, skipping physics-based depth")
+                log.debug("kd_estimation module not available, skipping physics-based depth")
             except Exception as e:
-                log.warning("[TRAIN] Physics-based depth estimation failed: %s", e)
+                log.warning("Physics-based depth estimation failed: %s", e)
 
         # --- Physics-based enhancements (Kim et al. 2024) ---
         # Estimate scene-specific bottom endmembers and geometry-corrected attenuation
@@ -2406,7 +2330,7 @@ def train_sdb_model(
                     str(s2_dir) if s2_dir else None
                 )
                 
-                log.info(f"[TRAIN][PHYSICS] Sun zenith: {sza:.1f}°, View zenith: {vza:.1f}°")
+                log.info("Sun zenith: %.1f°, View zenith: %.1f°", sza, vza)
                 
                 # Store angles in metadata
                 metadata["physics"] = {
@@ -2439,9 +2363,9 @@ def train_sdb_model(
                     try:
                         kd_mean = float(np.nanmean(list(metadata["physics"]["kd_corrected"].values()))) if metadata["physics"]["kd_corrected"] else float('nan')
                         ku_mean = float(np.nanmean(list(metadata["physics"]["ku_corrected"].values()))) if metadata["physics"]["ku_corrected"] else float('nan')
-                        log.info(f"[TRAIN][PHYSICS] Geometry-corrected (mean over bands): Kd={kd_mean:.4f}, Ku={ku_mean:.4f}")
+                        log.info("Geometry-corrected (mean over bands): Kd=%.4f, Ku=%.4f", kd_mean, ku_mean)
                     except Exception:
-                        log.debug("[TRAIN][PHYSICS] Geometry correction summary failed", exc_info=True)
+                        log.debug("Geometry correction summary failed", exc_info=True)
                 
                 # Estimate bottom endmembers from scene
                 try:
@@ -2462,30 +2386,23 @@ def train_sdb_model(
                         sand = endmember_result.get("endmembers", {}).get("sand", {})
                         if sand.get("Green", 0) > sand.get("Blue", 0):
                             metadata["physics"]["seagrass_detected"] = True
-                            log.info("[TRAIN][PHYSICS] ⚠️ Seagrass signature detected (Green > Blue in shallow)")
+                            log.info("Seagrass signature detected (Green > Blue in shallow)")
                         else:
                             metadata["physics"]["seagrass_detected"] = False
                         
-                        log.info(f"[TRAIN][PHYSICS] Bottom endmembers estimated: {list(endmember_result.get('endmembers', {}).keys())}")
+                        log.info(f"Bottom endmembers estimated: {list(endmember_result.get('endmembers', {}).keys())}")
                     else:
-                        log.debug(f"[TRAIN][PHYSICS] Endmember estimation skipped: {endmember_result.get('reason', 'unknown')}")
+                        log.debug("Endmember estimation skipped: %s", endmember_result.get('reason', 'unknown'))
                         
                 except Exception as e:
-                    log.debug("[TRAIN][PHYSICS] Endmember estimation failed: %s", e)
+                    log.debug("Endmember estimation failed: %s", e)
                     
             except Exception as e:
-                log.warning("[TRAIN][PHYSICS] Physics integration failed: %s", e)
+                log.warning("Physics integration failed: %s", e)
         elif not PHYSICS_AVAILABLE:
-            log.debug("[TRAIN] physics_integration module not available")
+            log.debug("physics_integration module not available")
 
-        # =========================================================================
-        # CANONICAL max_depth_sdb_final - THE SINGLE SOURCE OF TRUTH
-        # =========================================================================
-        # Priority depends on max_depth_source parameter:
-        #   - "physics": Use Kd-based optical limit only
-        #   - "rmse": Use RMSE-based depth-of-support only  
-        #   - "combined": Use min(physics, rmse)
-        #   - "training_p95": Use 95th percentile of training depths
+        # Resolve max_depth_sdb_final from available estimates per max_depth_source setting
         final_depth = None
         final_depth_source = "default"
         
@@ -2512,7 +2429,7 @@ def train_sdb_model(
                 final_depth = float(combined_max)
                 final_depth_source = "combined_fallback"
             else:
-                log.warning("[TRAIN] Physics-based depth not available, falling back to training_p95")
+                log.warning("Physics-based depth not available, falling back to training_p95")
                 if training_p95 is not None:
                     final_depth = training_p95
                     final_depth_source = "training_p95_fallback"
@@ -2522,7 +2439,7 @@ def train_sdb_model(
                 final_depth = float(rmse_max)
                 final_depth_source = "rmse_depth_of_support"
             else:
-                log.warning("[TRAIN] RMSE-based depth not available, falling back to training_p95")
+                log.warning("RMSE-based depth not available, falling back to training_p95")
                 if training_p95 is not None:
                     final_depth = training_p95
                     final_depth_source = "training_p95_fallback"
@@ -2575,18 +2492,18 @@ def train_sdb_model(
         metadata["max_depth_sdb_final"] = final_depth
         metadata["max_depth_sdb_final_source"] = final_depth_source
         log.info(
-            f"[TRAIN] Canonical requested-source depth candidate (max_depth_sdb_final) = "
+            f"Canonical requested-source depth candidate (max_depth_sdb_final) = "
             f"{final_depth:.2f}m (source: {final_depth_source}, requested: {max_depth_source})"
         )
         if combined_max is not None and physics_max is not None and str(max_depth_source).lower() == "physics":
             try:
                 if np.isfinite(float(combined_max)) and np.isfinite(float(final_depth)) and float(combined_max) < float(final_depth):
                     log.info(
-                        f"[TRAIN] Note: RMSE-constrained combined/operational cap is {float(combined_max):.2f}m "
+                        f"Note: RMSE-constrained combined/operational cap is {float(combined_max):.2f}m "
                         f"(< physics candidate {float(final_depth):.2f}m); downstream product code may enforce the stricter cap."
                     )
             except Exception:
-                pass
+                log.debug("ignored", exc_info=True)
 
         # Add spatial CV results to metadata
         if spatial_cv_summary is not None and spatial_cv_summary.n_folds > 0:
@@ -2629,13 +2546,12 @@ def train_sdb_model(
             rep["train"]["depth_bin_m"] = metadata.get("depth_bin_m")
             rep["train"]["min_samples_per_bin"] = metadata.get("min_samples_per_bin")
             
-            # CANONICAL max depth values - these are what sdb_main.py should use
             rep["train"]["max_depth_sdb_final"] = metadata.get("max_depth_sdb_final")
             rep["train"]["max_depth_sdb_final_source"] = metadata.get("max_depth_sdb_final_source")
             rep["train"]["max_depth_sdb_auto_physics"] = metadata.get("max_depth_sdb_auto_physics")
             rep["train"]["max_depth_options"] = metadata.get("max_depth_options", {})
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
         try:
             if df_te is not None and (not df_te.empty) and ("depth_pred_m" in df_te.columns) and ("depth_m" in df_te.columns):
                 _bins = _np.array([0, 5, 10, 15, 20, 30, 50], dtype=float)
@@ -2658,7 +2574,7 @@ def train_sdb_model(
                 rep["train"]["rmse_per_depth_bin_m"] = _rmse
                 rep["train"]["n_per_depth_bin"] = _counts
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
         if "depth_m" in df.columns and len(df) > 0:
             d = df["depth_m"].to_numpy(dtype=float)
@@ -2688,7 +2604,7 @@ def train_sdb_model(
                     }
                 rep["train"]["source_breakdown"] = _src_stats
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
         try:
             imps = rf.feature_importances_
@@ -2696,7 +2612,7 @@ def train_sdb_model(
             pairs.sort(key=lambda x: x[1], reverse=True)
             rep["train"]["feature_importance"] = [{"feature": k, "importance": v} for k, v in pairs[:15]]
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
         try:
             top_feats = [p["feature"] for p in rep["train"].get("feature_importance", [])[:8]]
             fstats = {}
@@ -2712,7 +2628,7 @@ def train_sdb_model(
                         }
             rep["train"]["feature_stats_top"] = fstats
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
         metadata["train_report"] = rep["train"]
         # Write to diagnostics dir if provided, otherwise fallback to plots_dir parent
@@ -2721,11 +2637,11 @@ def train_sdb_model(
         else:
             report_dir = _Path(plots_dir).parent if plots_dir is not None else _Path(".")
         report_dir.mkdir(parents=True, exist_ok=True)
-        with open(report_dir / "train_report.json", "w") as f:
+        with open(report_dir / "train_report.json", "w", encoding="utf-8") as f:
             import json as _json
             _json.dump(rep, f, indent=2)
     except Exception:
-        log.debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("ignored", exc_info=True)
 
     return rf, stumpf_lr, df_tr, df_te, metadata
 
@@ -2791,9 +2707,9 @@ def main():
     args = parser.parse_args()
 
     if args.validate_spatial:
-        log.info("[TRAIN] Spatial validation ENABLED (default)")
+        log.info("Spatial validation enabled")
     else:
-        log.warning("[TRAIN] Spatial validation DISABLED — using random split")
+        log.warning("Spatial validation disabled — using random split")
 
     out_dir = Path(args.out_model_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -3009,14 +2925,14 @@ def main():
 
     if ab_summary is not None:
         chosen["meta"]["s2_ab_test"] = ab_summary
-        with open(out_dir / "s2_ab_test.json", "w") as f:
+        with open(out_dir / "s2_ab_test.json", "w", encoding="utf-8") as f:
             json.dump(ab_summary, f, indent=2)
 
     joblib.dump(chosen["rf"], out_dir / "rf_model.pkl")
     if chosen["lr"]:
         joblib.dump(chosen["lr"], out_dir / "stumpf_lr.pkl")
 
-    with open(out_dir / "model_meta.json", "w") as f:
+    with open(out_dir / "model_meta.json", "w", encoding="utf-8") as f:
         json.dump(chosen["meta"], f, indent=2)
 
     log.info(f"Model saved to {out_dir} (variant={chosen.get('variant')})")

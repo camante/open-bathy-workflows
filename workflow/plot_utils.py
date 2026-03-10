@@ -39,6 +39,6 @@ def lazy_pyplot(backend: str = "Agg"):
         try:
             matplotlib.use(backend)
         except Exception:
-            pass
+            pass  # best-effort backend switch
     import matplotlib.pyplot as plt
     return plt

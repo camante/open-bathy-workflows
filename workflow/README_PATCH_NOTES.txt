@@ -1,7 +1,11 @@
 Changes:
-- river_skeleton_bathy.py: widen mainstem preserve corridor (min_corr 250m; multipliers 2.0x / 2.75x), improved corridor logging.
-- regression_metrics.py: skip output/logs folders; find channel mask via bathy_report.json cached path if not present in run dir.
-- debug.sh: (if included) always cleans river cache + outputs before rerun.
+- Refreshed repository documentation to match the current workflow state.
+- Replaced stale version-specific language with current operational behavior and invariant-based guidance.
+- Corrected depth-sign documentation to match the present deliverable convention (negative-down depth rasters).
+- Updated docs to emphasize explicit manifests/reports instead of guessed canonical filenames.
+- Added `CHECKLIST_A_GRADE.md` so repo hygiene and documentation expectations are explicit and testable.
+- Updated seam-stability README files to connect them to the current workflow and manifest-based seam comparisons.
+- Removed committed cache/slop artifacts from the packaged repo tree.
 
 Recommended commit message:
-  Widen mainstem preserve corridor; make regression metrics find cached channel masks and skip logs
+  Refresh workflow documentation, add enforceable checklist, and clean packaged repo artifacts

@@ -56,12 +56,12 @@ def _json_safe(obj: Any) -> Any:
         return str(obj)
 
 def _load_json(path: Path) -> Dict[str, Any]:
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
 
 def _encode_rng_state(state: object) -> str:
@@ -74,8 +74,8 @@ def _default_meta(max_samples: int, seed: int, target_col: str) -> Dict[str, Any
     import datetime as _dt
     return {
         "version": 1,
-        "created_utc": _dt.datetime.utcnow().isoformat() + "Z",
-        "updated_utc": _dt.datetime.utcnow().isoformat() + "Z",
+        "created_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "updated_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         "max_samples": int(max_samples),
         "seed": int(seed),
         "target_col": str(target_col),
@@ -109,7 +109,7 @@ def load_reservoir(bank_dir: Path) -> pd.DataFrame:
     try:
         return pd.read_pickle(p, compression="gzip")
     except Exception as ex:
-        log.warning(f"[MODEL_BANK] Failed to read reservoir {p}: {ex}")
+        log.warning("Failed to read reservoir %s: %s", p, ex)
         return pd.DataFrame()
 
 def save_reservoir(bank_dir: Path, df: pd.DataFrame) -> None:
@@ -186,7 +186,8 @@ def reservoir_update(existing: pd.DataFrame, new_df: pd.DataFrame, meta: Dict[st
     meta["last_added"] = int(added)
     meta["last_replaced"] = int(replaced)
     meta["rng_state"] = _encode_rng_state(rs.get_state())
-    meta["updated_utc"] = __import__("datetime").datetime.utcnow().isoformat() + "Z"
+    import datetime as _dt
+    meta["updated_utc"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
 
     # Persist feature_columns for sanity
     meta["feature_columns"] = [c for c in reservoir.columns if c != target_col]
@@ -225,11 +226,11 @@ def update_bank(
             if not res.empty:
                 res = res.reindex(columns=cols)
         except Exception:
-            pass
+            log.debug("ignored", exc_info=True)
         try:
             new_training_df = new_training_df.reindex(columns=cols)
         except Exception:
-            pass
+            log.debug("ignored", exc_info=True)
         meta["feature_columns"] = [c for c in cols if c != target_col]
 
     res2, meta2 = reservoir_update(res, new_training_df, meta)

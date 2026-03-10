@@ -123,7 +123,7 @@ def fingerprint_path(path: Path) -> Dict[str, Any]:
                                 f.seek(max(0, size - tail_len))
                                 h.update(f.read(tail_len))
                             except Exception:
-                                pass
+                                log.debug("ignored", exc_info=True)
                 h.update(str(size).encode("utf-8"))
                 return h.hexdigest()
             except Exception:
@@ -179,7 +179,7 @@ def enforce_or_write_lock(lock_path: Optional[Path], provenance: Dict[str, Any])
     existing = load_lock(lock_path)
     if existing is None:
         write_lock(lock_path, provenance)
-        log.info("[PROVENANCE] Wrote river network lock: %s", str(lock_path))
+        log.info("Wrote river network lock: %s", str(lock_path))
         return
     # Exact-match enforcement on key fields
     keys = ["source_path", "layer", "fingerprint"]
@@ -196,7 +196,7 @@ def enforce_or_write_lock(lock_path: Optional[Path], provenance: Dict[str, Any])
             "got": {k: provenance.get(k) for k in keys},
         }
         raise RuntimeError(json.dumps(msg, indent=2))
-    log.info("[PROVENANCE] River network lock matched: %s", str(lock_path))
+    log.info("River network lock matched: %s", str(lock_path))
 
 
 TNM_PRODUCTS_URL = "https://tnmaccess.nationalmap.gov/api/v1/products"
@@ -280,7 +280,7 @@ def arcgis_query_layer_geojson(
 
         # Safety stop: avoid runaway downloads on huge AOIs
         if offset > 200000:
-            log.warning("[ARCGIS] Stopping pagination after %d features (safety cap).", offset)
+            log.warning("Stopping pagination after %d features (safety cap).", offset)
             break
 
     if not all_frames:
@@ -310,8 +310,8 @@ def try_arcgis_nhd_flowlines(
     """
     # 1) NHDPlus HR
     try:
-        log.info("[ARCGIS] Querying NHDPlus_HR NetworkNHDFlowline (layer 3) ...")
-        # NOTE: do not rely on ArcGIS defaults for outFields. Request the specific
+        log.info("Querying NHDPlus_HR NetworkNHDFlowline (layer 3) ...")
+        # Do not rely on ArcGIS defaults for outFields. Request the specific
         # attributes we need for deterministic physics priors (e.g., drainage area).
         # Field names are case-insensitive on the server side, but GeoJSON property
         # keys may arrive with varying case across drivers. We normalize to lowercase.
@@ -333,7 +333,7 @@ def try_arcgis_nhd_flowlines(
             gdf_ll = arcgis_query_layer_geojson(NHDPLUS_HR_MAPSERVER, 3, aoi, timeout_s=timeout_s, out_fields=out_fields)
         except Exception as e_fields:
             # Some ArcGIS instances are strict about outFields; retry with '*' to avoid hard failure.
-            log.warning("[ARCGIS] NHDPlus_HR query with explicit fields failed (%s); retrying with outFields='*'", str(e_fields))
+            log.warning("NHDPlus_HR query with explicit fields failed (%s); retrying with outFields='*'", str(e_fields))
             gdf_ll = arcgis_query_layer_geojson(NHDPLUS_HR_MAPSERVER, 3, aoi, timeout_s=timeout_s, out_fields="*")
         if gdf_ll is not None and not gdf_ll.empty:
             # Normalize columns to lowercase for deterministic downstream access.
@@ -353,11 +353,11 @@ def try_arcgis_nhd_flowlines(
                 da = pd.to_numeric(gdf_ll[da_field], errors="coerce")
                 n_valid = int(np.isfinite(da).sum())
                 if n_valid > 0:
-                    log.info("[ARCGIS][ATTR] Drainage area available: field=%s valid=%d/%d", da_field, n_valid, int(len(da)))
+                    log.info("Drainage area available: field=%s valid=%d/%d", da_field, n_valid, int(len(da)))
                 else:
-                    log.warning("[ARCGIS][ATTR] Drainage area field present but all null: field=%s", da_field)
+                    log.warning("Drainage area field present but all null: field=%s", da_field)
             else:
-                log.warning("[ARCGIS][ATTR] Drainage area field not returned by service (expected %s)", da_field)
+                log.warning("Drainage area field not returned by service (expected %s)", da_field)
             # Standardized schema for downstream XS code
             # - drain_area_km2: used for DA/Q priors (energy solver)
             # - slope_mpm: placeholder; may be filled later from WSE fit or proxies
@@ -430,11 +430,11 @@ def try_arcgis_nhd_flowlines(
             gdfp["source"] = "arcgis_nhdplus_hr"
             return gdfp
     except Exception as e:
-        log.warning("[ARCGIS] NHDPlus_HR query failed: %s", str(e))
+        log.warning("NHDPlus_HR query failed: %s", str(e))
 
     # 2) NHD Flowline Large Scale
     try:
-        log.info("[ARCGIS] Querying NHD Flowline - Large Scale (layer 6) ...")
+        log.info("Querying NHD Flowline - Large Scale (layer 6) ...")
         gdf_ll = arcgis_query_layer_geojson(NHD_MAPSERVER, 6, aoi, timeout_s=timeout_s)
         if gdf_ll is not None and not gdf_ll.empty:
             if "Permanent_Identifier" in gdf_ll.columns:
@@ -467,7 +467,7 @@ def try_arcgis_nhd_flowlines(
             gdfp["source"] = "arcgis_nhd"
             return gdfp
     except Exception as e:
-        log.warning("[ARCGIS] NHD query failed: %s", str(e))
+        log.warning("NHD query failed: %s", str(e))
 
     return gpd.GeoDataFrame(columns=["geometry"], crs="EPSG:4326")
 
@@ -515,7 +515,7 @@ def _clean_polys(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     if gdf.empty:
         return gdf
     if (~gdf.is_valid).any():
-        log.info("[CLEAN] Fixing invalid polygon geometries with buffer(0) where possible.")
+        log.warning("Fixing invalid polygon geometries with buffer(0); input data has geometry errors.")
         fixed = gdf.geometry.buffer(0)
         ok = fixed.geom_type.isin(["Polygon", "MultiPolygon"])
         gdf.loc[ok, "geometry"] = fixed[ok].values
@@ -585,7 +585,7 @@ def try_arcgis_nhdarea_polygons(
     #   7 = Area - Small Scale
     for layer_id, label in [(9, "area_large"), (7, "area_small")]:
         try:
-            log.info("[ARCGIS] Querying NHD Area polygons (%s layer %d) ...", NHD_MAPSERVER, layer_id)
+            log.info("Querying NHD Area polygons (%s layer %d) ...", NHD_MAPSERVER, layer_id)
             gdf_ll = arcgis_query_layer_geojson(NHD_MAPSERVER, layer_id, aoi, timeout_s=timeout_s)
             if gdf_ll is None or gdf_ll.empty:
                 continue
@@ -595,7 +595,7 @@ def try_arcgis_nhdarea_polygons(
                 gdfp["source"] = f"arcgis_{label}"
                 return gdfp
         except Exception as e:
-            log.warning("[ARCGIS] Area polygon query failed (layer=%d): %s", layer_id, str(e))
+            log.warning("Area polygon query failed (layer=%d): %s", layer_id, str(e))
 
     # If we couldn't get StreamRiver polygons, return empty to trigger downstream corridor fallback.
     return gpd.GeoDataFrame(columns=["geometry"], crs=crs_out)
@@ -686,7 +686,7 @@ def tnm_pick_hydro_datasets(user_dataset_hint: Optional[str] = None) -> List[str
     try:
         datasets = tnm_list_datasets()
     except Exception as e:
-        log.warning("[TNM] Failed to list datasets (%s). Using common guesses.", str(e))
+        log.warning("Failed to list datasets (%s). Using common guesses.", str(e))
         datasets = []
 
     names: List[str] = []
@@ -748,13 +748,13 @@ def tnm_search_products(
         if prod_formats:
             params["prodFormats"] = ",".join(prod_formats)
 
-        log.info("[TNM] Searching products datasets='%s' bbox=%s", ds, bbox)
+        log.info("Searching products datasets='%s' bbox=%s", ds, bbox)
         try:
             r = requests.get(TNM_PRODUCTS_URL, params=params, timeout=timeout_s)
             r.raise_for_status()
             js = r.json()
         except Exception as e:
-            log.warning("[TNM] Search failed for dataset '%s': %s", ds, str(e))
+            log.warning("Search failed for dataset '%s': %s", ds, str(e))
             continue
 
         ds_items: List[Dict[str, Any]] = []
@@ -768,11 +768,11 @@ def tnm_search_products(
 
         if not ds_items:
             tot = js.get("total", 0) if isinstance(js, dict) else 0
-            log.info("[TNM] No items for '%s' (total=%s).", ds, str(tot))
+            log.info("No items for '%s' (total=%s).", ds, str(tot))
             continue
 
         items.extend([x for x in ds_items if isinstance(x, dict)])
-        log.info("[TNM] Found %d items for '%s'.", len(ds_items), ds)
+        log.info("Found %d items for '%s'.", len(ds_items), ds)
 
         if len(items) >= max_items:
             items = items[:max_items]
@@ -817,11 +817,11 @@ def tnm_download_products(items: List[Dict[str, Any]], out_dir: Path, timeout_s:
         dst = out_dir / f"{fn}{ext}"
 
         if dst.exists() and dst.stat().st_size > 0:
-            log.info("[TNM] Exists, skipping: %s", dst.name)
+            log.info("Exists, skipping: %s", dst.name)
             downloaded.append(dst)
             continue
 
-        log.info("[TNM] Downloading %d/%d: %s", i, len(items), url)
+        log.info("Downloading %d/%d: %s", i, len(items), url)
         try:
             with requests.get(url, stream=True, timeout=timeout_s) as r:
                 r.raise_for_status()
@@ -833,13 +833,13 @@ def tnm_download_products(items: List[Dict[str, Any]], out_dir: Path, timeout_s:
                 tmp.replace(dst)
             downloaded.append(dst)
         except Exception as e:
-            log.warning("[TNM] Download failed: %s (%s)", url, str(e))
+            log.warning("Download failed: %s (%s)", url, str(e))
             try:
                 part = dst.with_suffix(dst.suffix + ".part")
                 if part.exists():
                     part.unlink()
             except Exception:
-                log.debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("ignored", exc_info=True)
 
     return downloaded
 
@@ -864,7 +864,7 @@ def extract_archives(downloads: List[Path], work_dir: Path) -> List[Path]:
                     z.extractall(sub)
                 roots.append(sub)
             except Exception as e:
-                log.warning("[TNM] Failed to extract %s: %s", p.name, str(e))
+                log.warning("Failed to extract %s: %s", p.name, str(e))
         else:
             roots.append(p)
 
@@ -890,7 +890,7 @@ def find_best_flowline_source(extract_roots: List[Path]) -> Tuple[Optional[Path]
         if root.is_file():
             candidates.append(root)
             continue
-        # NOTE: rglob order is filesystem-dependent; we sort later for determinism.
+        # rglob order is filesystem-dependent; we sort later for determinism.
         candidates.extend(root.rglob("*.gpkg"))
         candidates.extend([p for p in root.rglob("*.gdb") if p.is_dir()])
         candidates.extend(root.rglob("*.shp"))
@@ -1003,10 +1003,10 @@ def download_hydrorivers_zip(region: str, out_dir: Path, timeout_s: int = 600) -
     dst = out_dir / f"HydroRIVERS_v10_{region}_shp.zip"
 
     if dst.exists() and dst.stat().st_size > 0:
-        log.info("[HYRIV] Exists, skipping download: %s", dst.name)
+        log.info("Exists, skipping download: %s", dst.name)
         return dst
 
-    log.info("[HYRIV] Downloading HydroRIVERS region='%s' → %s", region, dst)
+    log.info("Downloading HydroRIVERS region='%s' → %s", region, dst)
     try:
         with requests.get(url, stream=True, timeout=timeout_s) as r:
             r.raise_for_status()
@@ -1017,13 +1017,13 @@ def download_hydrorivers_zip(region: str, out_dir: Path, timeout_s: int = 600) -
                         f.write(chunk)
             tmp.replace(dst)
     except Exception as e:
-        log.error("[HYRIV] Download failed (%s): %s", url, str(e))
+        log.error("Download failed (%s): %s", url, str(e))
         try:
             part = dst.with_suffix(dst.suffix + ".part")
             if part.exists():
                 part.unlink()
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
         raise
 
     return dst
@@ -1071,7 +1071,7 @@ def _clean_lines(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     gdf = gdf[~gdf.geometry.is_empty]
     gdf = gdf[gdf.geometry.geom_type.isin(["LineString", "MultiLineString"])]
     if (~gdf.is_valid).any():
-        log.info("[CLEAN] Fixing invalid geometries with buffer(0) where possible.")
+        log.warning("Fixing invalid geometries with buffer(0); input data has geometry errors.")
         fixed = gdf.geometry.buffer(0)
         ok = fixed.geom_type.isin(["LineString", "MultiLineString"])
         gdf.loc[ok, "geometry"] = fixed[ok].values
@@ -1093,7 +1093,7 @@ def ingest_flowlines(
     if not flowlines_path.exists():
         raise FileNotFoundError(flowlines_path)
 
-    log.info("[READ] %s (layer=%s)", flowlines_path, layer or "<default>")
+    log.info("%s (layer=%s)", flowlines_path, layer or "<default>")
     gdf = gpd.read_file(flowlines_path, layer=layer) if layer else gpd.read_file(flowlines_path)
     if gdf.empty:
         return gdf
@@ -1506,7 +1506,7 @@ def main() -> None:
         )
         if gdf is not None and not gdf.empty:
             gdf["source"] = "nhd_local"
-            log.info("[OK] Loaded %d reaches from --nhd-flowlines.", len(gdf))
+            log.info("Loaded %d reaches from --nhd-flowlines.", len(gdf))
 
             # Provenance lock (file-based)
             prov = {
@@ -1555,17 +1555,17 @@ def main() -> None:
             max_items=int(args.tnm_max_items),
             timeout_s=int(args.tnm_timeout),
         )
-        log.info("[TNM] Total unique candidate products: %d", len(items))
+        log.info("Total unique candidate products: %d", len(items))
 
         if items and not args.tnm_dry_run:
             downloads = tnm_download_products(items, dl_dir, timeout_s=int(args.tnm_timeout))
-            log.info("[TNM] Downloaded %d files.", len(downloads))
+            log.info("Downloaded %d files.", len(downloads))
 
             roots = extract_archives(downloads, wk_dir)
             src_path, src_layer = find_best_flowline_source(roots)
 
             if src_path:
-                log.info("[TNM] Using flowlines source: %s (layer=%s)", src_path, src_layer or "<default>")
+                log.info("Using flowlines source: %s (layer=%s)", src_path, src_layer or "<default>")
 
                 # Provenance lock (file-based)
                 prov = {
@@ -1587,13 +1587,13 @@ def main() -> None:
                 )
                 if gdf is not None and not gdf.empty:
                     gdf["source"] = "tnm_nhd"
-                    log.info("[OK] Loaded %d reaches from TNM download.", len(gdf))
+                    log.info("Loaded %d reaches from TNM download.", len(gdf))
             else:
-                log.warning("[TNM] Could not locate a flowline dataset/layer in downloaded products.")
+                log.warning("Could not locate a flowline dataset/layer in downloaded products.")
         elif args.tnm_dry_run:
-            log.info("[TNM] Dry-run enabled; skipping download.")
+            log.info("Dry-run enabled; skipping download.")
         else:
-            log.warning("[TNM] No products found for AOI.")
+            log.warning("No products found for AOI.")
 
     # 2c) Guardrail: if user forced TNM but it failed, try ArcGIS so the run can proceed.
     if (gdf is None or gdf.empty) and (not args.nhd_flowlines) and hydro_src == "tnm":
@@ -1607,7 +1607,7 @@ def main() -> None:
         )
         if gdf_arc is not None and not gdf_arc.empty:
             gdf = gdf_arc
-            log.warning("[TNM] No usable TNM flowlines; falling back to ArcGIS REST (%s).",
+            log.warning("No usable TNM flowlines; falling back to ArcGIS REST (%s).",
                         str(gdf.get("source", ["arcgis"]).iloc[0]) if "source" in gdf.columns else "arcgis")
 # 3) HydroRIVERS fallback — local path OR auto-download
     if gdf is None or gdf.empty:
@@ -1627,7 +1627,7 @@ def main() -> None:
             zip_path = download_hydrorivers_zip(region, dl_dir, timeout_s=int(args.hydrorivers_timeout))
             extracted = extract_hydrorivers(zip_path, wk_dir)
             hydrorivers_path = find_hydrorivers_shp(extracted)
-            log.info("[HYRIV] Using downloaded HydroRIVERS shapefile: %s", hydrorivers_path)
+            log.info("Using downloaded HydroRIVERS shapefile: %s", hydrorivers_path)
 
         if hydrorivers_path is None:
             raise RuntimeError(
@@ -1635,7 +1635,7 @@ def main() -> None:
                 "OR enable HydroRIVERS fallback with --hydrorivers-auto-download (or provide --hydrorivers)."
             )
 
-        log.warning("[FALLBACK] Using HydroRIVERS (%s).", hydrorivers_path)
+        log.warning("Using HydroRIVERS (%s).", hydrorivers_path)
         gdf = ingest_flowlines(
             flowlines_path=hydrorivers_path,
             layer=None,
@@ -1648,7 +1648,7 @@ def main() -> None:
         if gdf is None or gdf.empty:
             raise RuntimeError("HydroRIVERS fallback returned no reaches in AOI.")
         gdf["source"] = "hydrorivers"
-        log.info("[OK] Loaded %d HydroRIVERS reaches in AOI.", len(gdf))
+        log.info("Loaded %d HydroRIVERS reaches in AOI.", len(gdf))
 
     # AOI polygon in projected CRS
     crs_out = CRS.from_user_input(gdf.crs)
@@ -1666,11 +1666,11 @@ def main() -> None:
             nhdarea_aoi = try_arcgis_nhdarea_polygons(aoi=aoi, out_crs=str(crs_out), timeout_s=int(getattr(args, "arcgis_timeout", 120)))
             if nhdarea_aoi is not None and not nhdarea_aoi.empty:
                 nhdarea_clip = clip_polys_to_aoi(nhdarea_aoi, aoi_poly_proj)
-                log.info("[OK] Loaded %d NHDArea polygon(s) via ArcGIS REST (%s).", len(nhdarea_clip), str(nhdarea_aoi.get("source", ["arcgis"]).iloc[0]) if "source" in nhdarea_aoi.columns else "arcgis")
+                log.info("Loaded %d NHDArea polygon(s) via ArcGIS REST (%s).", len(nhdarea_clip), str(nhdarea_aoi.get("source", ["arcgis"]).iloc[0]) if "source" in nhdarea_aoi.columns else "arcgis")
             else:
-                log.info("[ARCGIS] No NHDArea polygons found in AOI (continuing).")
+                log.info("No NHDArea polygons found in AOI (continuing).")
         except Exception as e:
-            log.warning("[ARCGIS] NHDArea polygon fetch failed (continuing): %s", str(e))
+            log.warning("NHDArea polygon fetch failed (continuing): %s", str(e))
 
     nodes_gdf, edges_gdf = build_reach_graph(rivers_clip, snap_m=float(args.snap_m))
     edges_gdf = station_edges_from_root(nodes_gdf, edges_gdf)
@@ -1679,7 +1679,7 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     layers = [s.strip() for s in args.write_layers.split(",") if s.strip()]
 
-    log.info("[WRITE] %s", out_path)
+    log.info("%s", out_path)
     if "rivers_aoi" in layers:
         rivers_aoi.to_file(out_path, layer="rivers_aoi", driver="GPKG")
     if "rivers_clip" in layers:

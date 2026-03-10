@@ -33,7 +33,7 @@ def convert_sdb_msl_to_navd88(
     dlim_exe = shutil.which("dlim")
     if dlim_exe is None:
         msg = "dlim not found on PATH; cannot perform vertical datum transformation"
-        log.warning("[VDATUM] %s", msg)
+        log.warning("%s", msg)
         return False, msg
 
     input_tif = Path(input_tif)
@@ -41,7 +41,7 @@ def convert_sdb_msl_to_navd88(
 
     if not input_tif.exists():
         msg = f"Input raster not found: {input_tif}"
-        log.error("[VDATUM] %s", msg)
+        log.error("%s", msg)
         return False, msg
 
     output_tif.parent.mkdir(parents=True, exist_ok=True)
@@ -54,17 +54,17 @@ def convert_sdb_msl_to_navd88(
         "-O", str(output_tif),
     ]
 
-    log.info("[VDATUM] Converting SDB from MSL to NAVD88")
+    log.info("Converting SDB from MSL to NAVD88")
     res = run_cmd(cmd, timeout=600)
 
     if res.returncode != 0:
         msg = f"dlim failed with code {res.returncode}: {res.stderr_tail[:500]}"
-        log.error("[VDATUM] %s", msg)
+        log.error("%s", msg)
         return False, msg
 
     if not output_tif.exists():
         msg = f"dlim completed but output not found: {output_tif}"
-        log.error("[VDATUM] %s", msg)
+        log.error("%s", msg)
         return False, msg
 
     return True, f"Converted {input_tif.name} from MSL to NAVD88: {output_tif}"

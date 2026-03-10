@@ -263,7 +263,7 @@ def estimate_kd_from_rasters(
     
     n_water = np.count_nonzero(water_mask)
     if n_water < 100:
-        log.warning("[Kd] Insufficient water pixels (%s) for Kd estimation", n_water)
+        log.warning("Insufficient water pixels (%s) for Kd estimation", n_water)
         return {"error": "insufficient_water_pixels", "n_water": n_water}
     
     # Sample pixels for speed
@@ -293,7 +293,7 @@ def estimate_kd_from_rasters(
     kd_deep = kd_values[deep_mask & np.isfinite(kd_values)] if deep_mask.any() else kd_all
     
     if kd_all.size == 0:
-        log.warning("[Kd] No valid Kd values computed")
+        log.warning("No valid Kd values computed")
         return {"error": "no_valid_kd"}
     
     # Compute percentiles
@@ -494,7 +494,7 @@ def compute_physics_based_max_depth(
         kd_stats = estimate_kd_from_rasters(raster_paths, algorithm=algorithm)
         
         if "error" in kd_stats:
-            log.warning(f"[Kd] Estimation failed: {kd_stats['error']}")
+            log.warning(f"Estimation failed: {kd_stats['error']}")
             result["error"] = kd_stats["error"]
             result["physics_max_depth_m"] = None
         else:
@@ -512,7 +512,7 @@ def compute_physics_based_max_depth(
             })
             
     except Exception as e:
-        log.warning("[Kd] Physics-based estimation failed: %s", e)
+        log.warning("Physics-based estimation failed: %s", e)
         result["error"] = str(e)
         result["physics_max_depth_m"] = None
     
@@ -615,7 +615,7 @@ def generate_kd_qc_layer(
             dst.write(max_depth_map, 1)
             dst.set_band_description(1, 'max_optical_depth_m')
     
-    log.info("[Kd] Wrote QC layer: %s", output_path)
+    log.info("Wrote QC layer: %s", output_path)
     return str(output_path)
 
 
@@ -659,7 +659,7 @@ if __name__ == "__main__":
     log.info(json.dumps(result, indent=2))
     
     if args.output_json:
-        with open(args.output_json, "w") as f:
+        with open(args.output_json, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2)
     
     if args.output_qc_raster:

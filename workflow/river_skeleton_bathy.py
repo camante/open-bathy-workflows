@@ -143,7 +143,7 @@ def _junction_zone_mask(
                     gdf = gdf.to_crs(c2)
         except Exception:
             # Best effort; if CRS is missing or parsing fails, rasterize as-is.
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
         # Buffer and dissolve into a single geometry for efficiency
         geom = gdf.geometry.buffer(float(buffer_m))
@@ -235,7 +235,7 @@ def _junction_zone_mask_from_flowlines(
             if not c1.equals(c2):
                 gdf = gdf.to_crs(c2)
     except Exception:
-        log.debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("ignored", exc_info=True)
 
     # Collect coordinates (not just endpoints), tracking which feature each coordinate came from.
     # Confluences are often represented as shared vertices between a mainstem and tributary.
@@ -569,13 +569,13 @@ def _build_wse_longitudinal_profile(
                                         swot_ws.append(float(wsv))
                                         swot_d.append(float(d))
                         except Exception:
-                            log.debug("Optional step failed; continuing.", exc_info=True)
+                            log.debug("ignored", exc_info=True)
 
             if len(ws) < int(min_samples):
                 continue
 
             # Build 1D profile on regular distance grid for smoothing.
-            # NOTE: d_kept was tracked in the sampling loop above, so it is
+            # d_kept was tracked in the sampling loop above, so it is
             # aligned with ws/xs/ys by construction.
             ws = np.asarray(ws, dtype=float)
             d_kept = np.asarray(d_kept, dtype=float)
@@ -682,7 +682,7 @@ def _build_wse_longitudinal_profile(
                         else:
                             wgrid = wfit.astype(float)
                 except Exception:
-                    log.debug("Optional step failed; continuing.", exc_info=True)
+                    log.debug("ignored", exc_info=True)
 
             # map smoothed profile back to sample points and store for KDTree
             w_s = np.interp(d_kept, dgrid, wgrid)
@@ -837,7 +837,7 @@ def _read_swot_riversp_points(paths, template_crs=None, wse_field=None, qual_fie
                             wcol = c
                             break
                     except Exception:
-                        log.debug("Optional step failed; continuing.", exc_info=True)
+                        log.debug("ignored", exc_info=True)
         if wcol is None:
             LOG.warning("SWOT RiverSP: could not find a WSE column in %s (provide --swot-wse-field)", p)
             continue
@@ -875,7 +875,7 @@ def _read_swot_riversp_points(paths, template_crs=None, wse_field=None, qual_fie
                     good = qv.isna() | (qv <= 0.0)
                 gdf = gdf[good].copy()
             except Exception:
-                log.debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("ignored", exc_info=True)
 
 # Iterate rows
         for geom, wv in zip(gdf.geometry, gdf[wcol]):
@@ -996,7 +996,7 @@ def _estimate_swot_vertical_offset(
         try:
             inside = inside & channel[rows.clip(0, h-1), cols.clip(0, w-1)].astype(bool)
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
     if not np.any(inside):
         return 0.0, 0, {}
 
@@ -1080,7 +1080,7 @@ def _read_soundings_file(path: Path):
                         zcol = c
                         break
                 except Exception:
-                    log.debug("Optional step failed; continuing.", exc_info=True)
+                    log.debug("ignored", exc_info=True)
         if zcol is None:
             raise ValueError(f"Could not find a numeric Z/depth/elev column in {path}")
         x = gdf.geometry.x.to_numpy(dtype='float64')
@@ -1180,7 +1180,7 @@ def _soundings_to_grids(
         u = np.unique(channel)
         LOG.info("Channel mask unique values: %s", u.tolist() if hasattr(u,'tolist') else str(u))
     except Exception:
-        pass
+        LOG.debug("ignored", exc_info=True)
 
     depth_grid = np.full(channel.shape, np.nan, dtype="float32")
     dmax_grid = np.full(channel.shape, np.nan, dtype="float32")
@@ -1245,7 +1245,7 @@ def _soundings_to_grids(
             xmin, xmax, ymin, ymax = bb
             LOG.info('Template bounds (crs=%s): x=[%.3f, %.3f] y=[%.3f, %.3f]', str(template_crs), xmin, xmax, ymin, ymax)
     except Exception:
-        pass
+        log.debug("ignored", exc_info=True)
 
     xs_all, ys_all, zs_all = [], [], []
     sizes = []
@@ -1302,7 +1302,7 @@ def _soundings_to_grids(
         if np.isfinite(r0):
             LOG.info('Soundings inside template bbox (raw): %.3f', float(r0))
     except Exception:
-        pass
+        log.debug("ignored", exc_info=True)
 
     n_loaded = int(x.size)
     m = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
@@ -1387,7 +1387,7 @@ def _soundings_to_grids(
             int(cc.max()),
         )
     except Exception:
-        pass
+        log.debug("ignored", exc_info=True)
 
     in_ch = channel[rr, cc]
     n_in_ch = int(np.count_nonzero(in_ch))
@@ -1403,7 +1403,7 @@ def _soundings_to_grids(
                     ", ".join([f"({int(rr[i])},{int(cc[i])},{bool(in_ch[i])})" for i in idx]),
                 )
         except Exception:
-            pass
+            log.debug("ignored", exc_info=True)
 
         # Distance-to-channel diagnostic (pixels). Helps distinguish "mask too narrow" vs "CRS/transform mismatch".
         # Prefer scipy's distance transform when available, but fall back to a deterministic bounded brute-force
@@ -1448,7 +1448,7 @@ def _soundings_to_grids(
                     float(np.max(d)),
                 )
             except Exception:
-                pass
+                log.debug("ignored", exc_info=True)
 
     # Write a diagnostic receipt so CRS/rowcol/mask overlap is provable from artifacts.
     # This is intentionally written even when 0 points fall in the channel mask.
@@ -1849,7 +1849,7 @@ def _densify_linestring_to_points(ls, step_m):
         try:
             pts.append(ls.interpolate(d))
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
     return pts
 
 
@@ -1966,7 +1966,7 @@ def _apply_bed_profile_constraints(
                     line_layer = name
                     break
             except Exception:
-                log.debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("ignored", exc_info=True)
     if line_layer is None:
         for name in layers:
             try:
@@ -1994,7 +1994,7 @@ def _apply_bed_profile_constraints(
     try:
         gdf = gdf.to_crs(crs)
     except Exception:
-        log.debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("ignored", exc_info=True)
 
     transform = template_profile['transform']
     nodata = template_profile.get('nodata', -9999.0)
@@ -2114,6 +2114,268 @@ def _apply_bed_profile_constraints(
                 logger.warning("Failed writing bed profile debug rasters: %s", e)
 
     return out
+
+
+def _detect_mainstem_corridor(
+    args,
+    channel: "np.ndarray",
+    jm: "np.ndarray",
+    template_profile: dict,
+    transform,
+    shape: tuple,
+    pix: float,
+    debug_corr_path=None,
+    debug_jm_path=None,
+    debug_ms_path=None,
+) -> "Tuple[Optional[np.ndarray], Optional[np.ndarray]]":
+    """
+    Detect the mainstem corridor and preserve mask from the river graph.
+
+    Returns (mainstem_corridor, preserve_mainstem) or (None, None) on failure.
+    """
+    preserve_mainstem: "Optional[np.ndarray]" = None
+    mainstem_corridor: "Optional[np.ndarray]" = None
+    try:
+        gpkg = getattr(args, "river_gpkg", None)
+        mainstem_attr = str(getattr(args, "mainstem_order_field", "streamorde") or "streamorde")
+        if gpkg:
+            import geopandas as _gpd
+            from rasterio.features import rasterize as _rasterize
+            from scipy.ndimage import distance_transform_edt as _edt
+    
+            g_edges = _gpd.read_file(gpkg, layer="graph_edges")
+            template_crs = template_profile.get("crs", None)
+            try:
+                if template_crs is not None and getattr(g_edges, 'crs', None) is not None and str(g_edges.crs) != str(template_crs):
+                    g_edges = g_edges.to_crs(template_crs)
+            except Exception:
+                log.debug("ignored", exc_info=True)
+            if (g_edges is not None) and (not g_edges.empty):
+                geoms = list(g_edges.geometry)
+    
+                # Optional stream order
+                orders = None
+                if mainstem_attr in g_edges.columns:
+                    try:
+                        orders = g_edges[mainstem_attr].astype("float64").to_numpy()
+                    except Exception:
+                        orders = None
+    
+                # Build adjacency graph from edge endpoints
+                def _key_xy(x: float, y: float, nd: int = 6):
+                    return (round(float(x), nd), round(float(y), nd))
+    
+                adj = {}
+                edge_ends = []
+                edge_len = np.zeros(len(geoms), dtype="float64")
+    
+                for i, geom in enumerate(geoms):
+                    if geom is None or geom.is_empty:
+                        edge_ends.append((None, None))
+                        edge_len[i] = 0.0
+                        continue
+                    try:
+                        c0 = geom.coords[0]
+                        c1 = geom.coords[-1]
+                    except Exception:
+                        try:
+                            lg = max(list(geom.geoms), key=lambda g: g.length)
+                            c0 = lg.coords[0]
+                            c1 = lg.coords[-1]
+                        except Exception:
+                            edge_ends.append((None, None))
+                            edge_len[i] = 0.0
+                            continue
+                    u = _key_xy(c0[0], c0[1])
+                    v = _key_xy(c1[0], c1[1])
+                    edge_ends.append((u, v))
+                    L = float(getattr(geom, "length", 0.0) or 0.0)
+                    edge_len[i] = L
+                    adj.setdefault(u, []).append((v, i, L))
+                    adj.setdefault(v, []).append((u, i, L))
+    
+                # Pick a seed edge: highest finite order, tie by length
+                seed_idx = None
+                if orders is not None:
+                    finite = np.isfinite(orders)
+                    if np.any(finite):
+                        maxo = float(np.nanmax(orders[finite]))
+                        cand = np.where(finite & (orders >= maxo - 1e-6))[0]
+                        if cand.size > 0:
+                            seed_idx = int(cand[np.argmax(edge_len[cand])])
+                if seed_idx is None:
+                    # Fallback: longest edge
+                    seed_idx = int(np.argmax(edge_len))
+    
+                u0, v0 = edge_ends[seed_idx]
+                if (u0 is not None) and (v0 is not None):
+                    # Determine the connected component containing the seed
+                    allowed_nodes = set()
+                    stack = [u0]
+                    allowed_nodes.add(u0)
+                    while stack:
+                        n0 = stack.pop()
+                        for (nb, ei, L) in adj.get(n0, []):
+                            if nb not in allowed_nodes:
+                                allowed_nodes.add(nb)
+                                stack.append(nb)
+    
+                    # Trace mainstem path outward from the seed, choosing best continuation.
+                    mainstem_edge_mask = np.zeros(len(geoms), dtype=bool)
+                    mainstem_edge_mask[seed_idx] = True
+    
+                    def _edge_score(ei: int):
+                        # Prefer higher order, then length
+                        o = float(orders[ei]) if (orders is not None and np.isfinite(orders[ei])) else -1.0
+                        return (o, float(edge_len[ei]))
+    
+                    def _extend_from(node, prev_node):
+                        cur = node
+                        prev = prev_node
+                        while True:
+                            # Candidate incident edges that stay inside component and not already used
+                            cands = []
+                            for (nb, ei, L) in adj.get(cur, []):
+                                if nb not in allowed_nodes:
+                                    continue
+                                if mainstem_edge_mask[ei]:
+                                    continue
+                                # avoid immediate backtrack if possible
+                                if prev is not None and nb == prev:
+                                    continue
+                                cands.append((nb, ei))
+                            if not cands:
+                                # allow backtrack edge if it's the only option
+                                for (nb, ei, L) in adj.get(cur, []):
+                                    if nb not in allowed_nodes:
+                                        continue
+                                    if mainstem_edge_mask[ei]:
+                                        continue
+                                    cands.append((nb, ei))
+                            if not cands:
+                                break
+                            # Choose best by score (order, length)
+                            best_nb, best_ei = max(cands, key=lambda t: _edge_score(t[1]))
+                            mainstem_edge_mask[best_ei] = True
+                            prev, cur = cur, best_nb
+    
+                    # Extend from both ends of the seed edge
+                    _extend_from(u0, v0)
+                    _extend_from(v0, u0)
+    
+                    ms_geoms = [
+                        geom for geom, keep in zip(geoms, mainstem_edge_mask)
+                        if keep and geom is not None and (not geom.is_empty)
+                    ]
+                    if ms_geoms:
+                        ms_line = _rasterize(
+                            [(geom, 1) for geom in ms_geoms],
+                            out_shape=channel.shape,
+                            transform=transform,
+                            fill=0,
+                            dtype="uint8",
+                            all_touched=True,
+                        )
+                        ms_sum = int(ms_line.sum())
+            if ms_sum == 0:
+                try:
+                    ms_line = _rasterize(
+                        [(geom.buffer(float(pix)*2.0), 1) for geom in ms_geoms],
+                        out_shape=channel.shape,
+                        transform=transform,
+                        fill=0,
+                        dtype="uint8",
+                        all_touched=True,
+                    )
+                    ms_sum = int(ms_line.sum())
+                except Exception:
+                    log.debug("ignored", exc_info=True)
+            if ms_sum > 0:
+                            # Distance to mainstem line (meters)
+                            dist_line = _edt(ms_line == 0) * float(pix)
+                            # Local half-width proxy from channel mask (meters)
+                            chan_mask = (channel > 0) if channel.dtype != bool else channel
+                            halfw = _edt(chan_mask) * float(pix)
+                            if getattr(args, "mainstem_mode", "width_proxy") == "width_proxy":
+                                # Width-proxy mainstem selection (robust alternative to stream order / graph tracing).
+                                                                        # Compute an approximate channel width proxy (meters) from the distance-to-bank field.
+                                                                        w_proxy_m = (2.0 * halfw).astype("float32")
+                                                                        
+                                                                        # Define "mainstem candidates" as the wider portion of the channel.
+                                                                        # Threshold is max(absolute_min_width_m, percentile within channel).
+                                                                        abs_min_width_m = float(getattr(args, "mainstem_width_min_m", 60.0))
+                                                                        pctl = float(getattr(args, "mainstem_width_pctl", 85.0))
+                                                                        try:
+                                                                            vals = w_proxy_m[channel]
+                                                                            vals = vals[np.isfinite(vals)]
+                                                                            thr = float(np.nanpercentile(vals, pctl)) if vals.size else abs_min_width_m
+                                                                            thr = max(thr, abs_min_width_m)
+                                                                        except Exception:
+                                                                            thr = abs_min_width_m
+                                                                        
+                                                                        mainstem_wide = channel & (w_proxy_m >= thr)
+                                                                        
+                                                                        # Keep only the largest connected component of the wide mask to avoid isolated blobs.
+                                                                        try:
+                                                                            from scipy.ndimage import label as _label
+                                                                            lab, nlab = _label(mainstem_wide.astype("uint8"))
+                                                                            if nlab > 1:
+                                                                                # choose largest component by pixel count
+                                                                                counts = np.bincount(lab.ravel())
+                                                                                counts[0] = 0
+                                                                                keep = int(np.argmax(counts))
+                                                                                mainstem_wide = (lab == keep)
+                                                                        except Exception:
+                                                                            log.debug("ignored", exc_info=True)
+                                                                        
+                                                                        # In junction zones, expand protection slightly so tributary smoothing cannot imprint into the mainstem.
+                                                                        mainstem_corridor = mainstem_wide | (jm & channel & (w_proxy_m >= 0.8 * thr))
+                                                                        preserve_mainstem = mainstem_corridor
+                                                                        
+                                                                        # Overwrite ms_line-based corridor logic below by setting dist_line very small within mainstem_corridor.
+                                                                        # (This prevents later code paths that rely on dist_line from restricting the corridor.)
+                                                                        dist_line = np.full(channel.shape, 1e9, dtype="float32")
+                                                                        dist_line[mainstem_corridor] = 0.0
+                            
+    
+    
+                            # Minimum corridor width to ensure continuity through confluences
+                            min_corr = max(75.0, 7.0 * float(pix))
+    
+                            # Base corridor inside channel; widen slightly in junction zone
+                            corr_base = channel & (dist_line <= np.maximum(min_corr, 1.00 * halfw))
+                            corr_junc = channel & jm & (dist_line <= np.maximum(min_corr, 1.25 * halfw))
+                            corridor = corr_base | corr_junc
+    
+                            LOG.info(
+                                "Mainstem corridor: channel_n=%d jm_n=%d corridor_n=%d",
+                                int(np.count_nonzero(channel)),
+                                int(np.count_nonzero(jm)),
+                                int(np.count_nonzero(corridor)),
+                            )
+                            try:
+                                if debug_corr_path is not None:
+                                    _save_f32(debug_corr_path, corridor.astype("float32"), template_profile, nodata=255.0)
+                            except Exception:
+                                log.debug("ignored", exc_info=True)
+                            mainstem_corridor = corridor
+                            if int(np.count_nonzero(preserve_mainstem)) == 0:
+                                LOG.warning("Mainstem preserve mask is empty; mainstem selection/rasterization likely failed.")
+    
+                            # Debug rasters
+                            try:
+                                if debug_jm_path is not None:
+                                    _save_f32(debug_jm_path, jm.astype("uint8"), template_profile, nodata=255.0)
+                                if (debug_ms_path is not None) and (preserve_mainstem is not None):
+                                    _save_f32(debug_ms_path, preserve_mainstem.astype("uint8"), template_profile, nodata=255.0)
+                            except Exception:
+                                log.debug("ignored", exc_info=True)
+    except Exception:
+        LOG.warning("Mainstem corridor detection failed", exc_info=True)
+        return None, None
+    return mainstem_corridor, preserve_mainstem
+
+
 def main(
 ) -> int:
     p = argparse.ArgumentParser(description="Generate river bed elevations using a channel-skeleton distance-transform method.")
@@ -2832,247 +3094,21 @@ def main(
                     debug_ms_path = None
 
                 try:
-                    gpkg = getattr(args, "river_gpkg", None)
-                    mainstem_attr = str(getattr(args, "mainstem_order_field", "streamorde") or "streamorde")
-                    if gpkg:
-                        import geopandas as _gpd
-                        from rasterio.features import rasterize as _rasterize
-                        from scipy.ndimage import distance_transform_edt as _edt
-
-                        g_edges = _gpd.read_file(gpkg, layer="graph_edges")
-                        template_crs = template_profile.get("crs", None)
-                        try:
-                            if template_crs is not None and getattr(g_edges, 'crs', None) is not None and str(g_edges.crs) != str(template_crs):
-                                g_edges = g_edges.to_crs(template_crs)
-                        except Exception:
-                            log.debug("Optional step failed; continuing.", exc_info=True)
-                        if (g_edges is not None) and (not g_edges.empty):
-                            geoms = list(g_edges.geometry)
-
-                            # Optional stream order
-                            orders = None
-                            if mainstem_attr in g_edges.columns:
-                                try:
-                                    orders = g_edges[mainstem_attr].astype("float64").to_numpy()
-                                except Exception:
-                                    orders = None
-
-                            # Build adjacency graph from edge endpoints
-                            def _key_xy(x: float, y: float, nd: int = 6):
-                                return (round(float(x), nd), round(float(y), nd))
-
-                            adj = {}
-                            edge_ends = []
-                            edge_len = np.zeros(len(geoms), dtype="float64")
-
-                            for i, geom in enumerate(geoms):
-                                if geom is None or geom.is_empty:
-                                    edge_ends.append((None, None))
-                                    edge_len[i] = 0.0
-                                    continue
-                                try:
-                                    c0 = geom.coords[0]
-                                    c1 = geom.coords[-1]
-                                except Exception:
-                                    try:
-                                        lg = max(list(geom.geoms), key=lambda g: g.length)
-                                        c0 = lg.coords[0]
-                                        c1 = lg.coords[-1]
-                                    except Exception:
-                                        edge_ends.append((None, None))
-                                        edge_len[i] = 0.0
-                                        continue
-                                u = _key_xy(c0[0], c0[1])
-                                v = _key_xy(c1[0], c1[1])
-                                edge_ends.append((u, v))
-                                L = float(getattr(geom, "length", 0.0) or 0.0)
-                                edge_len[i] = L
-                                adj.setdefault(u, []).append((v, i, L))
-                                adj.setdefault(v, []).append((u, i, L))
-
-                            # Pick a seed edge: highest finite order, tie by length
-                            seed_idx = None
-                            if orders is not None:
-                                finite = np.isfinite(orders)
-                                if np.any(finite):
-                                    maxo = float(np.nanmax(orders[finite]))
-                                    cand = np.where(finite & (orders >= maxo - 1e-6))[0]
-                                    if cand.size > 0:
-                                        seed_idx = int(cand[np.argmax(edge_len[cand])])
-                            if seed_idx is None:
-                                # Fallback: longest edge
-                                seed_idx = int(np.argmax(edge_len))
-
-                            u0, v0 = edge_ends[seed_idx]
-                            if (u0 is not None) and (v0 is not None):
-                                # Determine the connected component containing the seed
-                                allowed_nodes = set()
-                                stack = [u0]
-                                allowed_nodes.add(u0)
-                                while stack:
-                                    n0 = stack.pop()
-                                    for (nb, ei, L) in adj.get(n0, []):
-                                        if nb not in allowed_nodes:
-                                            allowed_nodes.add(nb)
-                                            stack.append(nb)
-
-                                # Trace mainstem path outward from the seed, choosing best continuation.
-                                mainstem_edge_mask = np.zeros(len(geoms), dtype=bool)
-                                mainstem_edge_mask[seed_idx] = True
-
-                                def _edge_score(ei: int):
-                                    # Prefer higher order, then length
-                                    o = float(orders[ei]) if (orders is not None and np.isfinite(orders[ei])) else -1.0
-                                    return (o, float(edge_len[ei]))
-
-                                def _extend_from(node, prev_node):
-                                    cur = node
-                                    prev = prev_node
-                                    while True:
-                                        # Candidate incident edges that stay inside component and not already used
-                                        cands = []
-                                        for (nb, ei, L) in adj.get(cur, []):
-                                            if nb not in allowed_nodes:
-                                                continue
-                                            if mainstem_edge_mask[ei]:
-                                                continue
-                                            # avoid immediate backtrack if possible
-                                            if prev is not None and nb == prev:
-                                                continue
-                                            cands.append((nb, ei))
-                                        if not cands:
-                                            # allow backtrack edge if it's the only option
-                                            for (nb, ei, L) in adj.get(cur, []):
-                                                if nb not in allowed_nodes:
-                                                    continue
-                                                if mainstem_edge_mask[ei]:
-                                                    continue
-                                                cands.append((nb, ei))
-                                        if not cands:
-                                            break
-                                        # Choose best by score (order, length)
-                                        best_nb, best_ei = max(cands, key=lambda t: _edge_score(t[1]))
-                                        mainstem_edge_mask[best_ei] = True
-                                        prev, cur = cur, best_nb
-
-                                # Extend from both ends of the seed edge
-                                _extend_from(u0, v0)
-                                _extend_from(v0, u0)
-
-                                ms_geoms = [
-                                    geom for geom, keep in zip(geoms, mainstem_edge_mask)
-                                    if keep and geom is not None and (not geom.is_empty)
-                                ]
-                                if ms_geoms:
-                                    ms_line = _rasterize(
-                                        [(geom, 1) for geom in ms_geoms],
-                                        out_shape=channel.shape,
-                                        transform=transform,
-                                        fill=0,
-                                        dtype="uint8",
-                                        all_touched=True,
-                                    )
-                                    ms_sum = int(ms_line.sum())
-                        if ms_sum == 0:
-                            try:
-                                ms_line = _rasterize(
-                                    [(geom.buffer(float(pix)*2.0), 1) for geom in ms_geoms],
-                                    out_shape=channel.shape,
-                                    transform=transform,
-                                    fill=0,
-                                    dtype="uint8",
-                                    all_touched=True,
-                                )
-                                ms_sum = int(ms_line.sum())
-                            except Exception:
-                                log.debug("Optional step failed; continuing.", exc_info=True)
-                        if ms_sum > 0:
-                                        # Distance to mainstem line (meters)
-                                        dist_line = _edt(ms_line == 0) * float(pix)
-                                        # Local half-width proxy from channel mask (meters)
-                                        chan_mask = (channel > 0) if channel.dtype != bool else channel
-                                        halfw = _edt(chan_mask) * float(pix)
-                                        if getattr(args, "mainstem_mode", "width_proxy") == "width_proxy":
-                                            # Width-proxy mainstem selection (robust alternative to stream order / graph tracing).
-                                                                                    # Compute an approximate channel width proxy (meters) from the distance-to-bank field.
-                                                                                    w_proxy_m = (2.0 * halfw).astype("float32")
-                                                                                    
-                                                                                    # Define "mainstem candidates" as the wider portion of the channel.
-                                                                                    # Threshold is max(absolute_min_width_m, percentile within channel).
-                                                                                    abs_min_width_m = float(getattr(args, "mainstem_width_min_m", 60.0))
-                                                                                    pctl = float(getattr(args, "mainstem_width_pctl", 85.0))
-                                                                                    try:
-                                                                                        vals = w_proxy_m[channel]
-                                                                                        vals = vals[np.isfinite(vals)]
-                                                                                        thr = float(np.nanpercentile(vals, pctl)) if vals.size else abs_min_width_m
-                                                                                        thr = max(thr, abs_min_width_m)
-                                                                                    except Exception:
-                                                                                        thr = abs_min_width_m
-                                                                                    
-                                                                                    mainstem_wide = channel & (w_proxy_m >= thr)
-                                                                                    
-                                                                                    # Keep only the largest connected component of the wide mask to avoid isolated blobs.
-                                                                                    try:
-                                                                                        from scipy.ndimage import label as _label
-                                                                                        lab, nlab = _label(mainstem_wide.astype("uint8"))
-                                                                                        if nlab > 1:
-                                                                                            # choose largest component by pixel count
-                                                                                            counts = np.bincount(lab.ravel())
-                                                                                            counts[0] = 0
-                                                                                            keep = int(np.argmax(counts))
-                                                                                            mainstem_wide = (lab == keep)
-                                                                                    except Exception:
-                                                                                        log.debug("Optional step failed; continuing.", exc_info=True)
-                                                                                    
-                                                                                    # In junction zones, expand protection slightly so tributary smoothing cannot imprint into the mainstem.
-                                                                                    mainstem_corridor = mainstem_wide | (jm & channel & (w_proxy_m >= 0.8 * thr))
-                                                                                    preserve_mainstem = mainstem_corridor
-                                                                                    
-                                                                                    # Overwrite ms_line-based corridor logic below by setting dist_line very small within mainstem_corridor.
-                                                                                    # (This prevents later code paths that rely on dist_line from restricting the corridor.)
-                                                                                    dist_line = np.full(channel.shape, 1e9, dtype="float32")
-                                                                                    dist_line[mainstem_corridor] = 0.0
-                                        
-
-
-                                        # Minimum corridor width to ensure continuity through confluences
-                                        min_corr = max(75.0, 7.0 * float(pix))
-
-                                        # Base corridor inside channel; widen slightly in junction zone
-                                        corr_base = channel & (dist_line <= np.maximum(min_corr, 1.00 * halfw))
-                                        corr_junc = channel & jm & (dist_line <= np.maximum(min_corr, 1.25 * halfw))
-                                        corridor = corr_base | corr_junc
-
-                                        LOG.info(
-                                            "Mainstem corridor: channel_n=%d jm_n=%d corridor_n=%d",
-                                            int(np.count_nonzero(channel)),
-                                            int(np.count_nonzero(jm)),
-                                            int(np.count_nonzero(corridor)),
-                                        )
-                                        try:
-                                            if debug_corr_path is not None:
-                                                _save_f32(debug_corr_path, corridor.astype("float32"), template_profile, nodata=255.0)
-                                        except Exception:
-                                            log.debug("Optional step failed; continuing.", exc_info=True)
-                                        mainstem_corridor = corridor
-                                        # preserve_mainstem already set by width-proxy selection
-                                        preserve_mainstem = preserve_mainstem
-                                        if int(np.count_nonzero(preserve_mainstem)) == 0:
-                                            LOG.warning("Mainstem preserve mask is empty; mainstem selection/rasterization likely failed.")
-
-                                        # Debug rasters
-                                        try:
-                                            if debug_jm_path is not None:
-                                                _save_f32(debug_jm_path, jm.astype("uint8"), template_profile, nodata=255.0)
-                                            if (debug_ms_path is not None) and (preserve_mainstem is not None):
-                                                _save_f32(debug_ms_path, preserve_mainstem.astype("uint8"), template_profile, nodata=255.0)
-                                        except Exception:
-                                            log.debug("Optional step failed; continuing.", exc_info=True)
+                    mainstem_corridor, preserve_mainstem = _detect_mainstem_corridor(
+                        args=args,
+                        channel=channel,
+                        jm=junction_zone,
+                        template_profile=template_profile,
+                        transform=transform,
+                        shape=shape,
+                        pix=pix,
+                        debug_corr_path=debug_corr_path,
+                        debug_jm_path=debug_jm_path,
+                        debug_ms_path=debug_ms_path,
+                    )
                 except Exception:
                     preserve_mainstem = None
                     mainstem_corridor = None
-
-                # Snapshot values before any junction smoothing so we can restore mainstem corridor
                 depth_pre_smooth = depth.copy()
                 wse_pre_smooth = wse_map.copy()
                 jmode = str(getattr(args, "junction_mode", "smooth")).strip().lower()
@@ -3168,14 +3204,14 @@ def main(
                             # Depth cannot be negative
                             depth = np.where(depth >= 0.0, depth, 0.0).astype('float32')
                         except Exception:
-                            log.debug("Optional step failed; continuing.", exc_info=True)
+                            log.warning("Depth recompute from WSE-bed failed during junction smoothing", exc_info=True)
                         try:
                             if preserve_mainstem is not None and np.any(preserve_mainstem):
                                 depth[preserve_mainstem] = depth_pre_smooth[preserve_mainstem]
                                 wse_map[preserve_mainstem] = wse_pre_smooth[preserve_mainstem]
                                 LOG.info("Preserved mainstem corridor during junction smoothing (cells=%d).", int(np.count_nonzero(preserve_mainstem)))
                         except Exception:
-                            log.debug("Optional step failed; continuing.", exc_info=True)
+                            log.warning("Mainstem preservation step failed during junction smoothing", exc_info=True)
                         LOG.info("Junction mode=smooth: locally smoothed WSE (depth recomputed from WSE-bed) in %d junction-zone cells (sigma_base=%.1fm).", n_jm, sig_m)
                     else:
                         LOG.info("Junction mode=smooth requested but sigma<=0; no smoothing applied.")
@@ -3259,7 +3295,7 @@ def main(
     except Exception as e:
         LOG.warning('Bed profile constraints failed; continuing without them. Error: %s', e)
 
-    # NOTE: Use spaces for indentation in this block to avoid TabError.
+    # Use spaces for indentation in this block to avoid TabError.
     _save_f32(out_bed, bed, template_profile)
 
     if args.debug_dir:

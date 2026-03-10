@@ -1,12 +1,4 @@
-"""
-River Pipeline Report Generation
-
-Provides structured diagnostics and metadata for river bathymetry pipeline.
-Similar to run_report.json for SDB pipeline.
-
-Author: SDB Pipeline Development Team
-Version: 0.7.1
-"""
+"""river_report.py – Structured diagnostics and metadata for the river bathymetry pipeline."""
 
 import json
 import logging
@@ -24,7 +16,7 @@ class RiverReport:
     Tracks all steps, inputs, outputs, and diagnostics.
     """
     
-    def __init__(self, output_dir: Path, version: str = "0.7.1"):
+    def __init__(self, output_dir: Path, version: str = ""):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
@@ -102,7 +94,7 @@ class RiverReport:
         
         # Write to file
         report_path = self.output_dir / "river_report.json"
-        with open(report_path, 'w') as f:
+        with open(report_path, 'w', encoding='utf-8') as f:
             json.dump(self.data, f, indent=2)
         
         log.info("[RIVER REPORT] Written to %s", report_path)
@@ -143,7 +135,6 @@ def track_soundings_usage(
         },
         "usage_summary": "soundings_for_dmax_calibration_only",
         "ml_shape_learning": False,
-        "future_capability": "ML-based cross-section shape learning planned for v0.8.0"
     }
     
     if soundings_df is not None and len(soundings_df) > 0:

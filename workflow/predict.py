@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-predict.py – SDB inference engine (Scene-wide prediction)
+predict.py – SDB inference engine (scene-wide prediction).
 
-UPDATES:
-- POST-PREDICTION ALIGNMENT: optional ICP alignment to independent tie points (e.g., ICESat-2)
-- HYBRID MODE: RF + Stumpf fallback for extrapolation beyond training depth
-- INTEGRATED: Full uncertainty quantification from sdb_uncertainty module
-- FIXED: Smart L_inf warning ignores harmless zero-filled dicts when linf_enabled=False
-- Added explicit land mask semantics (water_only, land_binary, etc.)
-
-FIXES (this patch):
-- Fix runtime NameError: predict_scene() referenced `args` even though it is not in scope.
-  Added `high_unc_threshold` parameter and CLI option.
-- Avoid logging.basicConfig() side effects at import time (configure logging in main()).
-- Make tqdm optional.
+Supports hybrid RF + Stumpf fallback, full uncertainty quantification,
+Domain of Applicability enforcement, and per-pixel confidence/provenance rasters.
 """
 
 
@@ -80,7 +70,7 @@ def _fmt_phys_scalar(value) -> str:
 # Optional modules
 # -----------------------------------------------------------------------------
 
-# Post-prediction alignment (optional; keep conservative and report deltas)
+# Post-prediction alignment
 ALIGNMENT_AVAILABLE: bool = False
 _alignment_import_error: Optional[str] = None
 try:
@@ -90,7 +80,7 @@ except ImportError as e:
     _alignment_import_error = f"ImportError: {e}"
 except Exception as e:
     _alignment_import_error = f"{type(e).__name__}: {e}"
-    log.error("[predict] Alignment module failed to load: %s", _alignment_import_error, exc_info=True)
+    log.error("Alignment module failed to load: %s", _alignment_import_error, exc_info=True)
 
 # Physics-based SDB (Kim et al. 2024)
 PHYSICS_MODULE_AVAILABLE: bool = False
@@ -103,7 +93,7 @@ except ImportError as e:
     _physics_import_error = f"ImportError: {e}"
 except Exception as e:
     _physics_import_error = f"{type(e).__name__}: {e}"
-    log.error("[predict] Physics module failed to load: %s", _physics_import_error, exc_info=True)
+    log.error("Physics module failed to load: %s", _physics_import_error, exc_info=True)
 
 # Import standardized constants
 try:
@@ -169,7 +159,7 @@ def compute_hybrid_prediction(
     if physics_params:
         kd_corrected = physics_params.get("kd_corrected")
         if kd_corrected:
-            log.debug("[HYBRID] Using geometry-corrected Kd=%s", _fmt_phys_scalar(kd_corrected))
+            log.debug("Using geometry-corrected Kd=%s", _fmt_phys_scalar(kd_corrected))
 
     if stumpf_lr_coef is not None and stumpf_lr_intercept is not None:
         stumpf_physics = stumpf_lr_intercept + stumpf_lr_coef * stumpf_idx
@@ -349,7 +339,7 @@ def _smooth_features(brightness, stumpf_idx, kernel_size):
         # This smoothing is optional (artifact suppression / QA). If scipy is missing,
         # return inputs unchanged rather than breaking prediction.
         if not getattr(_smooth_features, "_warned_no_scipy", False):
-            log.warning("[PREDICT] scipy not available; skipping median smoothing filter")
+            log.warning("scipy not available; skipping median smoothing filter")
             _smooth_features._warned_no_scipy = True
         return brightness, stumpf_idx
     b_sm = _scipy_median_filter(brightness, size=k, mode="nearest")
@@ -375,8 +365,8 @@ def _normalize_linf_constants(d):
         if ku in defaults:
             try:
                 out[ku] = float(v)
-            except Exception:
-                log.debug("Optional step failed; continuing.", exc_info=True)
+            except (TypeError, ValueError):
+                pass  # non-numeric linf constant; skip
 
     for k, v in defaults.items():
         out.setdefault(k, v)
@@ -469,7 +459,6 @@ def predict_scene(
     max_depth_hard_cap: float = 50.0,
     hybrid_mode: bool = True,
     diagnostics_dir: Optional[str] = None,
-    # FIX: explicit threshold instead of referencing out-of-scope `args`
     high_unc_threshold: float = 2.0,
     # Post-prediction alignment
     align_mode: str = "median",
@@ -479,11 +468,15 @@ def predict_scene(
     align_source_priority: str = "atl24,atl03,xyz,other",
     align_extra_points: Optional[List[str]] = None,
     align_max_abs_residual_m_for_fit: Optional[float] = 10.0,
+    # Guidance raster outputs
+    write_confidence: bool = True,
+    write_provenance: bool = True,
+    min_confidence_threshold: float = 0.0,
 ):
     # Log optional module status once per run (avoid import-time logging).
     if UNCERTAINTY_STATUS_MSG:
-        log.info("[PREDICT] %s", UNCERTAINTY_STATUS_MSG)
-    log.info("[PREDICT] Loading RF model: %s", rf_model_path)
+        log.info("%s", UNCERTAINTY_STATUS_MSG)
+    log.info("Loading RF model: %s", rf_model_path)
     rf_model = joblib.load(rf_model_path)
     stumpf_lr = joblib.load(stumpf_lr_path) if stumpf_lr_path and os.path.exists(stumpf_lr_path) else None
 
@@ -493,21 +486,21 @@ def predict_scene(
         try:
             stumpf_lr_coef = float(stumpf_lr.coef_[0])
             stumpf_lr_intercept = float(stumpf_lr.intercept_)
-            log.info(f"[PREDICT] Stumpf LR: depth = {stumpf_lr_intercept:.3f} + {stumpf_lr_coef:.3f} * stumpf_idx")
+            log.info("Stumpf LR: depth = %.3f + %.3f * stumpf_idx", stumpf_lr_intercept, stumpf_lr_coef)
         except Exception as e:
-            log.warning("[PREDICT] Could not extract Stumpf LR coefficients: %s", e)
+            log.warning("Could not extract Stumpf LR coefficients: %s", e)
 
-    with open(meta_json_path, "r") as f:
+    with open(meta_json_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
     feature_cols = meta.get("feature_columns", [])
 
     physics_params = meta.get("physics", {})
     if physics_params:
-        log.info(f"[PREDICT][PHYSICS] Loaded physics params: SZA={physics_params.get('sun_zenith_deg', 'N/A')}°")
+        log.info(f"Loaded physics params: SZA={physics_params.get('sun_zenith_deg', 'N/A')}°")
         if physics_params.get("kd_corrected"):
-            log.info("[PREDICT][PHYSICS] Geometry-corrected Kd=%s", _fmt_phys_scalar(physics_params.get('kd_corrected')))
+            log.info("Geometry-corrected Kd=%s", _fmt_phys_scalar(physics_params.get('kd_corrected')))
         if physics_params.get("seagrass_detected"):
-            log.warning("[PREDICT][PHYSICS] ⚠️ Seagrass signature was detected in training scene")
+            log.warning("Seagrass signature detected in training scene")
 
     # DOA weights
     doa_weights: Dict[str, float] = {}
@@ -516,7 +509,7 @@ def predict_scene(
     if isinstance(meta_weights, dict) and meta_weights:
         try:
             doa_weights = {str(k): float(v) for k, v in meta_weights.items()}
-            log.info(f"[PREDICT] Loaded DOA weights from metadata ({len(doa_weights)} features).")
+            log.info("Loaded DOA weights from metadata (%s features).", len(doa_weights))
         except Exception:
             doa_weights = {}
 
@@ -538,16 +531,16 @@ def predict_scene(
 
     if depth_limit_mode == "none":
         max_depth = max_depth_hard_cap
-        log.info(f"[PREDICT] Depth limit mode='none': predicting up to {max_depth:.1f}m hard cap")
+        log.info("Depth limit mode=%s: predicting up to %.1fm hard cap", depth_limit_mode, max_depth)
     elif depth_limit_mode == "optical":
         max_depth = max_depth_hard_cap
-        log.info(f"[PREDICT] Depth limit mode='optical': using Kd-based per-pixel limit (factor={optical_depth_factor})")
-        log.info(f"[PREDICT] Max depth limit from metadata: {max_depth_training:.2f}m (source={max_depth_src})")
+        log.info("Depth limit mode=%s: using Kd-based per-pixel limit (factor=%s)", depth_limit_mode, optical_depth_factor)
+        log.info("Max depth limit from metadata: %.2fm (source=%s)", max_depth_training, max_depth_src)
         if actual_training_depth:
-            log.info(f"[PREDICT] Actual training data depth range: 0 - {actual_training_depth:.2f}m")
+            log.info("Actual training data depth range: 0 - %.2fm", actual_training_depth)
     else:
         max_depth = max_depth_training
-        log.info(f"[PREDICT] Depth limit mode='training': max_depth_sdb = {max_depth:.2f}m (source={max_depth_src})")
+        log.info("Depth limit mode=%s: max_depth_sdb = %.2fm (source=%s)", depth_limit_mode, max_depth, max_depth_src)
 
     linf_enabled = bool(meta.get("linf_enabled", False))
     linf_raw = meta.get("linf") or meta.get("l_inf_constants") or meta.get("l_inf") or meta.get("L_inf") or None
@@ -561,24 +554,24 @@ def predict_scene(
             )
         l_inf_values = _normalize_linf_constants(linf_raw)
         if linf_estimate_deepwater:
-            log.warning("[PREDICT] --linf-estimate-deepwater is deprecated and ignored (strict L∞ consistency).")
+            log.warning("--linf-estimate-deepwater is deprecated and ignored (strict L∞ consistency).")
     else:
         l_inf_values = _normalize_linf_constants({})
         if isinstance(linf_raw, dict) and linf_raw:
             try:
                 if any(float(v) != 0 for v in linf_raw.values()):
-                    log.warning("[PREDICT] linf_enabled=False but NON-ZERO L∞ constants are present in metadata; ignoring.")
+                    log.warning("linf_enabled=False but NON-ZERO L∞ constants are present in metadata; ignoring.")
             except Exception:
-                log.debug("Optional step failed; continuing.", exc_info=True)
-        log.info("[PREDICT] L_inf disabled; using zeros.")
+                log.debug("ignored", exc_info=True)  # linf_raw check failed
+        log.info("L_inf disabled; using zeros.")
 
     training_bounds = meta.get("training_bounds", {})
     if enable_doa and training_bounds:
-        log.info(f"[PREDICT] Enforcing Domain of Applicability using {len(training_bounds)} feature bounds.")
+        log.info("Enforcing Domain of Applicability using %s feature bounds.", len(training_bounds))
     elif not enable_doa:
-        log.warning("[PREDICT] Domain of Applicability DISABLED. Model will extrapolate to unknown areas.")
+        log.warning("Domain of Applicability disabled. Model will extrapolate to unknown areas.")
     else:
-        log.warning("[PREDICT] No training bounds found. Extrapolation is possible.")
+        log.warning("No training bounds found. Extrapolation is possible.")
 
     implemented_set = set(FEATURE_KEYS_IMPLEMENTED)
     missing = [c for c in feature_cols if c not in implemented_set]
@@ -609,6 +602,15 @@ def predict_scene(
 
     out_unc_path = str(Path(out_path).with_name(Path(out_path).stem + "_uncertainty.tif"))
     doa_path = str(Path(out_path).with_name(Path(out_path).stem + "_doa_score.tif")) if write_doa_score else None
+    conf_path = str(Path(out_path).with_name(Path(out_path).stem + "_confidence.tif")) if write_confidence else None
+    prov_path = str(Path(out_path).with_name(Path(out_path).stem + "_provenance.tif")) if write_provenance else None
+
+    if min_confidence_threshold > 0.0 and not write_confidence:
+        log.warning(
+            "[PREDICT] min_confidence_threshold=%.2f has no effect because write_confidence=False; "
+            "depth raster will not be masked. Pass write_confidence=True to enable per-pixel masking.",
+            min_confidence_threshold,
+        )
 
     srcs: Dict[str, rasterio.DatasetReader] = {}
     try:
@@ -665,10 +667,25 @@ def predict_scene(
             dst_unc = stack.enter_context(rasterio.open(out_unc_path, "w", **profile))
             dst_doa = stack.enter_context(rasterio.open(doa_path, "w", **profile)) if doa_path else None
 
+            dst_conf = stack.enter_context(rasterio.open(conf_path, "w", **profile)) if conf_path else None
+            prov_profile = profile.copy()
+            prov_profile.update(dtype=rasterio.uint8, nodata=0)
+            dst_prov = stack.enter_context(rasterio.open(prov_path, "w", **prov_profile)) if prov_path else None
+
             dst_depth.update_tags(UNITS="meters", CONVENTION="negative-down", MAX_DEPTH_SDB=str(max_depth))
             dst_unc.update_tags(UNITS="meters", DESC="1-Sigma Uncertainty", MAX_DEPTH_SDB=str(max_depth))
             if dst_doa is not None:
                 dst_doa.update_tags(UNITS="unitless", DESC="Weighted Domain of Applicability score (0..1)")
+            if dst_conf is not None:
+                dst_conf.update_tags(
+                    UNITS="unitless",
+                    DESC="Per-pixel guidance confidence (0=low/nodata, 1=high): DOA x optical_quality x uncertainty_quality",
+                    MIN_CONFIDENCE_THRESHOLD=str(min_confidence_threshold),
+                )
+            if dst_prov is not None:
+                dst_prov.update_tags(
+                    DESC="Provenance code: 0=nodata/masked, 1=predicted",
+                )
 
             windows = [
                 Window(c, r, min(tile_size, width - c), min(tile_size, height - r))
@@ -742,6 +759,8 @@ def predict_scene(
                 out_block = np.full(b02.shape, NODATA_VAL, dtype=np.float32)
                 out_unc_block = np.full(b02.shape, NODATA_VAL, dtype=np.float32)
                 doa_score_block = np.full(b02.shape, NODATA_VAL, dtype=np.float32) if dst_doa else None
+                confidence_block = np.full(b02.shape, NODATA_VAL, dtype=np.float32) if dst_conf else None
+                provenance_block = np.zeros(b02.shape, dtype=np.uint8) if dst_prov else None
 
                 if np.any(valid_mask):
                     try:
@@ -898,6 +917,25 @@ def predict_scene(
                             out_block[valid_mask] = final_pixels
                             out_unc_block[valid_mask] = final_unc
 
+                            # Confidence: DOA × optical quality × uncertainty quality.
+                            # optical_q normalises CWM above cw_min to [0,1].
+                            # unc_q decays from 1 toward 0 with uncertainty (half-weight at 1.5 m).
+                            if confidence_block is not None:
+                                cw_min_f = float(cw_min) if cw_min is not None else 0.0
+                                cw_range = max(1.0 - cw_min_f, 0.01)
+                                optical_q_valid = np.clip(
+                                    (cwm[valid_mask].astype(np.float32) - cw_min_f) / cw_range,
+                                    0.0, 1.0,
+                                )
+                                optical_q_domain = optical_q_valid[domain_mask_local]
+                                doa_q_domain = doa_score_local[domain_mask_local]
+                                unc_q_domain = (1.0 / (1.0 + y_unc_domain / 1.5)).astype(np.float32)
+                                conf_domain = doa_q_domain * optical_q_domain * unc_q_domain
+
+                                conf_pixels = np.full(int(np.sum(valid_mask)), NODATA_VAL, dtype=np.float32)
+                                conf_pixels[domain_mask_local] = np.where(good, conf_domain, NODATA_VAL)
+                                confidence_block[valid_mask] = conf_pixels
+
                     except Exception:
                         log.exception("Prediction failed on tile")
 
@@ -909,65 +947,95 @@ def predict_scene(
                         out_unc_block[bad] = NODATA_VAL
                         if doa_score_block is not None:
                             doa_score_block[bad] = NODATA_VAL
+                        if confidence_block is not None:
+                            confidence_block[bad] = NODATA_VAL
+                        if provenance_block is not None:
+                            provenance_block[bad] = 0
+
+                # Confidence threshold: nodata-mask depth cells below min threshold
+                if min_confidence_threshold > 0.0 and confidence_block is not None:
+                    low_conf = (
+                        np.isfinite(confidence_block) &
+                        (confidence_block != NODATA_VAL) &
+                        (confidence_block < float(min_confidence_threshold))
+                    )
+                    if np.any(low_conf):
+                        out_block[low_conf] = NODATA_VAL
+                        out_unc_block[low_conf] = NODATA_VAL
+                        if doa_score_block is not None:
+                            doa_score_block[low_conf] = NODATA_VAL
+                        confidence_block[low_conf] = NODATA_VAL
+                        if provenance_block is not None:
+                            provenance_block[low_conf] = 0
+
+                # Provenance: 1 = valid predicted cell, 0 = nodata/masked (background)
+                if provenance_block is not None:
+                    valid_pred = np.isfinite(out_block) & (out_block != NODATA_VAL)
+                    provenance_block[valid_pred] = 1
 
                 dst_depth.write(np.ascontiguousarray(out_block, dtype=np.float32), 1, window=window)
                 dst_unc.write(np.ascontiguousarray(out_unc_block, dtype=np.float32), 1, window=window)
                 if dst_doa is not None and doa_score_block is not None:
                     dst_doa.write(np.ascontiguousarray(doa_score_block, dtype=np.float32), 1, window=window)
+                if dst_conf is not None and confidence_block is not None:
+                    dst_conf.write(np.ascontiguousarray(confidence_block, dtype=np.float32), 1, window=window)
+                if dst_prov is not None and provenance_block is not None:
+                    dst_prov.write(np.ascontiguousarray(provenance_block, dtype=np.uint8), 1, window=window)
 
         # Diagnostic summary
-        log.info("=" * 60)
-        log.info("[PREDICT] PREDICTION SUMMARY")
-        log.info("=" * 60)
+        log.info("Prediction summary:")
         total = max(1, funnel['pixels_total'])
-        log.info(f"  Total pixels processed: {funnel['pixels_total']:,}")
-        log.info(f"  Finite optical values:  {funnel['finite_optical']:,} ({100*funnel['finite_optical']/total:.1f}%)")
-        log.info(f"  Passed clear water:     {funnel['cw_pass']:,} ({100*funnel['cw_pass']/total:.1f}%)")
-        log.info(f"  Passed land mask:       {funnel['land_pass']:,} ({100*funnel['land_pass']/total:.1f}%)")
-        log.info(f"  Base valid:             {funnel['base_valid']:,} ({100*funnel['base_valid']/total:.1f}%)")
-        log.info(f"  Passed DOA:             {funnel['doa_pass']:,} ({100*funnel['doa_pass']/total:.1f}%)")
-        log.info(f"  Final predicted:        {funnel['predicted']:,} ({100*funnel['predicted']/total:.1f}%)")
-        log.info("=" * 60)
-        
+        log.info("  Total pixels:      %10d", funnel['pixels_total'])
+        log.info("  Finite optical:    %10d  (%4.1f%%)", funnel['finite_optical'], 100*funnel['finite_optical']/total)
+        log.info("  Passed clear-water:%10d  (%4.1f%%)", funnel['cw_pass'], 100*funnel['cw_pass']/total)
+        log.info("  Passed land mask:  %10d  (%4.1f%%)", funnel['land_pass'], 100*funnel['land_pass']/total)
+        log.info("  Base valid:        %10d  (%4.1f%%)", funnel['base_valid'], 100*funnel['base_valid']/total)
+        log.info("  Passed DOA:        %10d  (%4.1f%%)", funnel['doa_pass'], 100*funnel['doa_pass']/total)
+        log.info("  Final predicted:   %10d  (%4.1f%%)", funnel['predicted'], 100*funnel['predicted']/total)
+
         if funnel['predicted'] == 0:
-            log.error("[PREDICT] ⚠️ ZERO PIXELS PREDICTED!")
-            log.error("[PREDICT] Possible causes:")
-            log.error("  1. Clear water mask has no valid pixels >= cw_min threshold")
-            log.error("  2. Land mask incorrectly masking water pixels")
-            log.error("  3. Sentinel-2 bands have invalid/missing data over AOI")
-            log.error("  4. DOA filter rejecting all pixels (try --no-doa to disable)")
+            log.error("Zero pixels predicted. Possible causes: "
+                      "cw_min too high; land mask masking water; missing S2 data; DOA rejecting everything (try --no-doa)")
         elif funnel['predicted'] < 0.01 * total:
-            log.warning(f"[PREDICT] ⚠️ Very few pixels predicted ({funnel['predicted']:,})")
-            log.warning("[PREDICT] Consider reviewing mask settings and thresholds")
+            log.warning("Very few pixels predicted (%d). Consider reviewing mask settings.", funnel['predicted'])
+
+        if conf_path:
+            log.info("Confidence raster: %s", conf_path)
+            if min_confidence_threshold > 0:
+                log.info("Applied min_confidence_threshold=%.2f — cells below this are nodata in depth raster", min_confidence_threshold)
+        if prov_path:
+            log.info("Provenance raster: %s  (0=nodata, 1=predicted)", prov_path)
 
         # report
         try:
             report_dir = Path(diagnostics_dir) if diagnostics_dir else Path(out_path).parent
             report_dir.mkdir(parents=True, exist_ok=True)
-            rep = {"predict": {"funnel": funnel, "high_unc_threshold_m": float(high_unc_threshold)}}
-            with open(report_dir / "predict_report.json", "w") as f:
+            rep = {"predict": {"funnel": funnel, "high_unc_threshold_m": float(high_unc_threshold),
+                               "confidence_path": conf_path, "provenance_path": prov_path,
+                               "min_confidence_threshold": min_confidence_threshold}}
+            with open(report_dir / "predict_report.json", "w", encoding="utf-8") as f:
                 json.dump(rep, f, indent=2)
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("Failed to write predict_report.json", exc_info=True)
 
     finally:
         for s in srcs.values():
             try:
                 s.close()
             except Exception:
-                log.debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("ignored", exc_info=True)  # close error
 
-    log.info("[PREDICT] Finished. Depth: %s", out_path)
+    log.info("Finished. Depth: %s", out_path)
     return {"status": "ok"}
 
 
 def reproject_to_nad83(src_path: str, dst_path: str):
     cmd = f"gdalwarp -overwrite -t_srs EPSG:4269 -r bilinear -of GTiff {shlex.quote(src_path)} {shlex.quote(dst_path)}"
-    log.info("[NAD83] Reprojecting with: %s", cmd)
+    log.info("Reprojecting with: %s", cmd)
     try:
         run_cmd(shlex.split(cmd), check=True)
     except Exception:
-        log.warning("[NAD83] gdalwarp failed.")
+        log.warning("gdalwarp failed.")
 
 
 def main(argv=None):
@@ -990,7 +1058,6 @@ def main(argv=None):
     parser.add_argument("--land-mask-invert", action="store_true")
     parser.add_argument("--land-mask-threshold", type=float, default=0.5)
 
-    # FIX: wired into predict_scene()
     parser.add_argument("--high-unc-threshold", type=float, default=2.0, help="Meters; counts pixels above this threshold in report")
 
     args = parser.parse_args(argv)

@@ -130,7 +130,7 @@ try:
     )
 except ImportError:
     # Fallback values with documentation
-    log.warning("[xs_infer] constants module not found, using local defaults")
+    log.warning("constants module not found, using local defaults")
 
     # Leopold & Maddock (1953) coefficients
     HYDRAULIC_GEOMETRY_A = 0.18
@@ -142,7 +142,7 @@ except ImportError:
 
 
 
-# Optional module: Manning inversion utilities (added in v0.7.8+)
+# Optional module: Manning inversion utilities
 try:
     from manning_inversion import invert_manning_for_depth, estimate_q2_from_drainage_area
 except Exception:
@@ -367,8 +367,10 @@ def _read_layer_with_fallback(gpkg: Path, preferred_layer: str, purpose: str = "
             if gdf.crs is None:
                 raise RuntimeError(f"Layer '{preferred_layer}' has no CRS: {gpkg}")
             return gdf, preferred_layer
+    except RuntimeError:
+        raise
     except Exception:
-        pass
+        log.debug("layer not found; falling through to scan", exc_info=True)
 
     try:
         import fiona
@@ -984,7 +986,7 @@ def _manning_n_effective(cfg: InferConfig) -> float:
             if np.isfinite(n_reg) and n_reg > 0:
                 return n_reg
         except Exception:
-            pass
+            log.debug("ignored", exc_info=True)
     return n
 
 
@@ -1045,7 +1047,7 @@ def _compute_manning_weight(row: pd.Series, cfg: InferConfig) -> float:
 
 
 # ---- Regional hydraulic geometry curves (Drainage Area -> bankfull depth) ----
-# IMPORTANT: coefficients are highly region-specific.
+# Coefficients are highly region-specific.
 # Built-ins below are *illustrative placeholders* so the workflow runs end-to-end.
 # For defensible results, supply published coefficients for your state/region via
 # --regional-curve-c/--regional-curve-f and specify the DA units they expect.
@@ -1283,10 +1285,10 @@ def _apply_1d_energy_solver(xs_param: pd.DataFrame, cfg: InferConfig, soundings_
     reason = "ok"
     if n_total == 0:
         reason = "no_valid_stations"
-        log.warning("[ENERGY] No valid solver stations (need >=2 XS per component with finite Q/width/WSE).")
+        log.warning("No valid solver stations (need >=2 XS per component with finite Q/width/WSE).")
     elif n_applied == 0:
         reason = "no_applied"
-        log.warning("[ENERGY] Solver had candidate stations but did not apply to any (numerical/filters).")
+        log.warning("Solver had candidate stations but did not apply to any (numerical/filters).")
 
     if acct is not None:
         acct["energy_solver_enabled"] = True
@@ -1319,7 +1321,7 @@ def _apply_1d_energy_solver(xs_param: pd.DataFrame, cfg: InferConfig, soundings_
             Path(str(acct_p)).parent.mkdir(parents=True, exist_ok=True)
             Path(str(acct_p)).write_text(_json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     except Exception as e:
-        log.warning("[ENERGY] Failed to write 1D solver artifacts: %s", e)
+        log.warning("Failed to write 1D solver artifacts: %s", e)
 
     return xs_param
 
@@ -1579,7 +1581,7 @@ def _compute_dmax_geomorphic_envelope(row: pd.Series, cfg: InferConfig) -> Tuple
             if np.isfinite(unc) and unc > 0:
                 d_env *= (1.0 + unc / 100.0)
         except Exception:
-            pass
+            log.debug("ignored", exc_info=True)
     d_env = float(np.clip(d_env, float(cfg.dmin_m), float(cfg.dmax_m)))
     return d_env, f"rc_cap({det})"
 
@@ -1721,7 +1723,7 @@ def _load_soundings(
     if suf == ".parquet":
         df = pd.read_parquet(path)
         if df.empty:
-            log.warning("[SOUNDINGS] Parquet soundings file is empty (0 rows): %s", path)
+            log.warning("Parquet soundings file is empty (0 rows): %s", path)
             return None
         # Expect x/y/z columns; allow lon/lat as fallback.
         if x_col is None or y_col is None:
@@ -1881,7 +1883,7 @@ def _load_soundings_many(
                 g["_src_file"] = str(p)
                 gdfs.append(g)
         except Exception as e:
-            log.warning("[SOUNDINGS] Failed to load '%s': %s", str(p), e)
+            log.warning("Failed to load '%s': %s", str(p), e)
     if not gdfs:
         return None
     df = pd.concat(gdfs, ignore_index=True)
@@ -1972,10 +1974,10 @@ def _write_soundings_subset(path: Path, soundings: gpd.GeoDataFrame) -> None:
                 )
                 raise ValueError("empty after finite filter")
             tbl.to_parquet(path, index=False)
-            log.debug("[SOUNDINGS] Subset parquet written: %d rows, columns=%s", len(tbl), list(tbl.columns))
+            log.debug("Subset parquet written: %d rows, columns=%s", len(tbl), list(tbl.columns))
             return
         except Exception as e:
-            log.warning("[SOUNDINGS] Parquet write failed (%s); falling back to GPKG.", e)
+            log.warning("Parquet write failed (%s); falling back to GPKG.", e)
             path = path.with_suffix(".gpkg")
 
     # GPKG fallback
@@ -2222,7 +2224,7 @@ def _attach_swot_wse_to_xs(
         tmp.loc[z > float(cfg.swot_outlier_mad_z), "swot_wse_m"] = np.nan
         sw = tmp[["xs_id", "swot_wse_m", "swot_dist_m"]]
     except Exception:
-        log.debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("ignored", exc_info=True)
 
     xs_param = xs_param.merge(sw, on="xs_id", how="left")
     xs_param["swot_wse_m"] = xs_param["swot_wse_m"] + float(cfg.swot_vertical_offset_m)
@@ -2613,7 +2615,7 @@ def _idw_interpolate_on_mask(
                             w_f[bad, :] = w[bad, :]
                         w = w_f
                 except Exception:
-                    pass
+                    log.debug("ignored", exc_info=True)
 
         v = pts_val[idx]
         sw = np.sum(w, axis=1)
@@ -2799,12 +2801,109 @@ def _aniso_idw_interpolate_on_mask(
                             if np.sum(w_f) > 0:
                                 w = w_f
                 except Exception:
-                    log.debug("Optional step failed; continuing.", exc_info=True)
+                    log.debug("ignored", exc_info=True)
             vv = pts_val[ids2]
             sw = np.sum(w)
             out[i] = float(np.sum(w * vv) / sw) if np.isfinite(sw) and sw > 0 else float(np.nan)
         
     return out
+
+
+def _build_thalweg_lines_from_points(
+    pts_gdf: "gpd.GeoDataFrame",
+    max_jump_m: float = 500.0,
+    densify_step_m: float = 5.0,
+    wse_col: str = "wse_m",
+) -> "Optional[gpd.GeoDataFrame]":
+    """Build thalweg spine LineStrings from a GeoDataFrame of thalweg control points.
+
+    Points are ordered by `s_center_m` (if present, otherwise by x-coordinate).
+    Gaps larger than *max_jump_m* between consecutive points break the line into
+    separate segments to avoid cross-channel jump artifacts.
+
+    Parameters
+    ----------
+    pts_gdf : GeoDataFrame
+        Point features representing the thalweg centre-line control points.
+    max_jump_m : float
+        Maximum allowed distance (m) between consecutive points before a new
+        segment is started.
+    densify_step_m : float
+        After building the spine, densify each segment to at most this vertex
+        spacing (m).  Must be >= 1 m.
+    wse_col : str
+        Column name carrying the water-surface elevation; preserved on output
+        segments as the mean of the two endpoint values.
+
+    Returns
+    -------
+    GeoDataFrame with LineString geometries and a `wse_m` attribute, or None if
+    the input is empty or fewer than two valid thalweg points exist.
+    """
+    try:
+        import numpy as _np
+        from shapely.geometry import LineString as _LineString, Point as _SPoint
+        import geopandas as _gpd
+
+        if pts_gdf is None or len(pts_gdf) < 2:
+            return None
+
+        gdf = pts_gdf.copy()
+
+        # Order by station distance if available
+        if "s_center_m" in gdf.columns:
+            gdf = gdf.sort_values("s_center_m", na_position="last").reset_index(drop=True)
+        else:
+            gdf = gdf.sort_values(gdf.geometry.x.name if hasattr(gdf.geometry.x, "name") else "geometry",
+                                  key=lambda s: gdf.geometry.x, na_position="last").reset_index(drop=True)
+
+        # Extract point coordinates
+        coords = _np.column_stack([gdf.geometry.x.values, gdf.geometry.y.values])
+        wse_vals = gdf[wse_col].values.astype("float64") if wse_col in gdf.columns else _np.full(len(gdf), _np.nan)
+
+        # Split into segments on jumps > max_jump_m
+        segments: list = []
+        seg_start = 0
+        for i in range(1, len(coords)):
+            d = _np.hypot(coords[i, 0] - coords[i - 1, 0], coords[i, 1] - coords[i - 1, 1])
+            if d > max_jump_m:
+                if i - seg_start >= 2:
+                    segments.append((seg_start, i))
+                seg_start = i
+        if len(coords) - seg_start >= 2:
+            segments.append((seg_start, len(coords)))
+
+        if not segments:
+            return None
+
+        densify_step_m = max(1.0, float(densify_step_m))
+        rows = []
+        for s0, s1 in segments:
+            seg_coords = coords[s0:s1]
+            seg_wse = wse_vals[s0:s1]
+
+            # Build the line
+            line = _LineString(seg_coords)
+            length = line.length
+
+            # Densify by interpolating along the line
+            if length > densify_step_m * 2 and densify_step_m < length:
+                n_steps = max(2, int(_np.ceil(length / densify_step_m)) + 1)
+                dists = _np.linspace(0.0, length, n_steps)
+                dense_pts = [line.interpolate(d) for d in dists]
+                line = _LineString([(p.x, p.y) for p in dense_pts])
+
+            mean_wse = float(_np.nanmean(seg_wse)) if len(seg_wse) > 0 else _np.nan
+            rows.append({"geometry": line, wse_col: mean_wse})
+
+        if not rows:
+            return None
+
+        result = _gpd.GeoDataFrame(rows, crs=pts_gdf.crs)
+        return result
+
+    except Exception:
+        return None
 
 
 def _rasterize_points_reduce(
@@ -2936,7 +3035,7 @@ def _continuous_surface(
     # Filter points outside raster bounds
     in_bounds = (rr_pts >= 0) & (rr_pts < h) & (cc_pts >= 0) & (cc_pts < w)
     if not np.any(in_bounds):
-        log.warning("[continuous] No control points fall inside template extent.")
+        log.warning("No control points fall inside template extent.")
         arr = np.full((h, w), nodata, dtype="float32")
         m = np.zeros((h, w), dtype="uint8")
         return arr, m
@@ -2949,7 +3048,7 @@ def _continuous_surface(
 
     # WALID expects thalweg emphasis; median reducers destroy that signal.
     if str(method).lower().startswith("walid") and str(overlap_reducer).lower() == "median":
-        log.warning("[continuous] overlap_reducer=median is incompatible with WALID thalweg weighting; using 'min'.")
+        log.warning("overlap_reducer=median is incompatible with WALID thalweg weighting; using 'min'.")
         overlap_reducer = "min"
 
     reducer = str(overlap_reducer).lower().strip()
@@ -2998,7 +3097,7 @@ def _continuous_surface(
             pts_t = gpd.GeoDataFrame({value_col: agg_vals}, geometry=gpd.points_from_xy(xs, ys), crs=template_ds.crs)
 
         else:
-            log.warning("[continuous] Unknown overlap_reducer=%r, using 'min'.", overlap_reducer)
+            log.warning("Unknown overlap_reducer=%r, using 'min'.", overlap_reducer)
             agg_vals = np.minimum.reduceat(vals_s, start)
             sel = []
             for s, e in zip(start, ends):
@@ -3016,7 +3115,7 @@ def _continuous_surface(
             pts_t.set_crs(template_ds.crs, inplace=True)
             pts_t[value_col] = agg_vals
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
         vals = np.asarray(agg_vals, dtype="float64")
 
@@ -3036,7 +3135,7 @@ def _continuous_surface(
             try:
                 mask = _build_corridor_mask_from_lines(corridor_lines_gdf, template_ds, buffer_m=float(buffer_m), all_touched=True)
             except Exception as e:
-                log.warning("[RIVER][MASK] failed to build corridor mask from lines; falling back to point-buffer mask: %s", e)
+                log.warning("failed to build corridor mask from lines; falling back to point-buffer mask: %s", e)
                 mask = None
 
         if mask is None:
@@ -3124,10 +3223,10 @@ def _continuous_surface(
                 pos = pos[pos >= 0]
                 pts_weight[pos] = float(thalweg_weight)
             except Exception as e:
-                log.warning("[continuous] Thalweg weighting failed; continuing unweighted: %s", e)
+                log.warning("Thalweg weighting failed; continuing unweighted: %s", e)
                 pts_weight = None
         else:
-            log.debug("[continuous] WALID requested but xs_id not present; skipping thalweg weighting.")
+            log.debug("WALID requested but xs_id not present; skipping thalweg weighting.")
 
     if method_l in ("aniso", "walid_aniso"):
         centerline = None
@@ -3143,7 +3242,7 @@ def _continuous_surface(
                     else:
                         centerline = merged
             except Exception as e:
-                log.warning("[RIVER][ANISO] centerline extraction failed; falling back to isotropic IDW: %s", e)
+                log.warning("centerline extraction failed; falling back to isotropic IDW: %s", e)
                 centerline = None
 
         if centerline is not None:
@@ -3377,7 +3476,7 @@ def _continuous_surface(
             if np.any(overwrite):
                 out[overwrite] = out_m[overwrite]
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
 
     # ---------------------------------------------------------------------
@@ -3728,7 +3827,7 @@ def _continuous_surface(
                 except Exception:
                     out[overwrite] = out_m[overwrite]
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
     return out, mask_out
 
@@ -3747,7 +3846,7 @@ def _exists_with_retry(path: Path, tries: int = 10, sleep_s: float = 0.2, min_si
                 except FileNotFoundError:
                     pass
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
         time.sleep(sleep_s * (1.0 + 0.15 * i))
     return False
 
@@ -3814,13 +3913,13 @@ def _write_geotiff_gdal(path: Path, arr: np.ndarray, tmpl: rasterio.io.DatasetRe
         try:
             ds.SetProjection(tmpl.crs.to_wkt())
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
     band = ds.GetRasterBand(1)
     try:
         band.SetNoDataValue(float(nodata))
     except Exception:
-        log.debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("ignored", exc_info=True)
 
     band.WriteArray(arr.astype(dtype, copy=False))
     band.FlushCache()
@@ -3881,7 +3980,7 @@ def _write_geotiff(path: Path, arr: np.ndarray, tmpl: rasterio.io.DatasetReader,
             wrote = _exists_with_retry(tmp, tries=8, sleep_s=0.15, min_size_bytes=1)
         except Exception:
             if last_err is not None:
-                log.error("[WRITE] rasterio write failed: %s", last_err)
+                log.error("rasterio write failed: %s", last_err)
             raise
 
     if not wrote:
@@ -4078,7 +4177,7 @@ def infer_bathy(
         try:
             rivers, rivers_layer_used = _read_layer_with_fallback(Path(river_gpkg), rivers_layer, purpose="rivers")
             if rivers_layer_used != rivers_layer:
-                log.info("[RIVER][ATTR] rivers layer '%s' not found/usable; using '%s'", str(rivers_layer), str(rivers_layer_used))
+                log.debug("rivers layer %r not found/usable; using %r", str(rivers_layer), str(rivers_layer_used))
             if "river_id" not in rivers.columns:
                 # fall back to common id fields
                 rid_guess = _guess_field(rivers.columns, ["river_id", "RiverID", "RID", "COMID", "comid"])
@@ -4123,7 +4222,7 @@ def infer_bathy(
                     how="left",
                     suffixes=("", "_r"),
                 )
-                # NOTE: xs_param already contains placeholder columns (drain_area_km2, slope_mpm, ...).
+                # xs_param already contains placeholder columns (drain_area_km2, slope_mpm, ...).
                 # After merge, pandas keeps the left-hand placeholders and writes the attached values
                 # to *_r columns. We must explicitly fill placeholders from the attached columns.
                 for _base in ["drain_area_km2", "slope_mpm", "manning_q_cms", "dist_to_mouth_km"]:
@@ -4142,7 +4241,7 @@ def infer_bathy(
                         xs_param = xs_param.drop(columns=[_r])
                 xs_param = xs_param.drop(columns=["_river_id_str"])
         except Exception as e:
-            log.warning("[RIVER][ATTR] failed to attach river attributes from %s:%s (%s)", river_gpkg, rivers_layer, e)
+            log.warning("failed to attach river attributes from %s:%s (%s)", river_gpkg, rivers_layer, e)
 
     # --------------------------------------------------------------------------------------
     # Reach attribute sanity checks
@@ -4159,7 +4258,7 @@ def infer_bathy(
         xs_param["drain_area_km2"] = da_vals
         da_ok = np.isfinite(da_vals).any()
         if not da_ok:
-            log.warning("[RIVER][ATTR] No valid drainage area values found; disabling DA-dependent priors.")
+            log.warning("No valid drainage area values found; disabling DA-dependent priors.")
             xs_param["drain_area_km2"] = np.nan
     else:
         da_ok = False
@@ -4185,11 +4284,11 @@ def infer_bathy(
             )
             if swot is not None and not swot.empty:
                 xs_param, wse_by_xs = _attach_swot_wse_to_xs(xs_lines, xs_param, swot, cfg)
-                log.info("[SWOT][WSE] Attached/blended WSE observations: n_xs=%d", int(np.isfinite(xs_param["swot_wse_m"]).sum()))
+                log.info("Attached/blended WSE observations: n_xs=%d", int(np.isfinite(xs_param["swot_wse_m"]).sum()))
             else:
-                log.info("[SWOT][WSE] WSE observations empty; using DEM/topo proxy.")
+                log.info("WSE observations empty; using DEM/topo proxy.")
         except Exception as e:
-            log.warning("[SWOT][WSE] Failed to load/attach WSE observations (%s). Using DEM/topo proxy.", e)
+            log.warning("Failed to load/attach WSE observations (%s). Using DEM/topo proxy.", e)
 
     # Record the *anchoring* WSE source for downstream logic (e.g., energy solver gating).
     # This is intentionally conservative: unless we have actual observed stage values
@@ -4217,10 +4316,10 @@ def infer_bathy(
         slope_missing = (not np.isfinite(sl_vals).any()) or cfg.force_slope_proxy
     if not slope_missing:
         n_sl = int(np.isfinite(pd.to_numeric(xs_param.get("slope_mpm", pd.Series([])), errors="coerce")).sum())
-        log.info("[RIVER][SLOPE] Using reach slope from network attributes (NHD): n_valid_xs=%d. "
+        log.info("Using reach slope from network attributes (NHD): n_valid_xs=%d. "
                  "Depth estimates will be AOI-independent.", n_sl)
     else:
-        log.warning("[RIVER][SLOPE] No reach slope from network; will estimate from WSE profile. "
+        log.warning("No reach slope from network; will estimate from WSE profile. "
                     "Depth estimates near AOI edges may vary by up to ~1 m between runs with different AOI extents.")
 
     # If requested, keep observed stage for bed elevations but do NOT let it drive slope fitting.
@@ -4250,7 +4349,7 @@ def infer_bathy(
                 xs_param["wse_fit_m"] = wse_fit
                 xs_param["slope_wse_mpm"] = slope_fit
             except Exception as e:
-                log.warning("[RIVER][WSE] WSE profile fit failed, falling back to slope proxy (%s)", e)
+                log.warning("WSE profile fit failed, falling back to slope proxy (%s)", e)
 
         # 2) Always compute a robust slope proxy as a fallback.
         xs_param["slope_proxy_mpm"] = _compute_slope_proxy(
@@ -4265,11 +4364,11 @@ def infer_bathy(
         if xs_param["slope_wse_mpm"].notna().any():
             xs_param["slope_mpm"] = xs_param["slope_wse_mpm"]
             n_wse = int(xs_param["slope_wse_mpm"].notna().sum())
-            log.info("[RIVER][SLOPE] Source: WSE-profile fit (n=%d XS). AOI-boundary dependent.", n_wse)
+            log.info("Source: WSE-profile fit (n=%d XS). AOI-boundary dependent.", n_wse)
         else:
             xs_param["slope_mpm"] = xs_param["slope_proxy_mpm"]
             n_prx = int(xs_param["slope_proxy_mpm"].notna().sum())
-            log.warning("[RIVER][SLOPE] Source: rolling WSE proxy (n=%d XS). AOI-boundary dependent. "
+            log.warning("Source: rolling WSE proxy (n=%d XS). AOI-boundary dependent. "
                         "Add Slope field to NHD fetch or provide SWOT WSE for stable results.", n_prx)
 
 
@@ -4278,14 +4377,14 @@ def infer_bathy(
         sl_vals = pd.to_numeric(xs_param["slope_mpm"], errors="coerce")
         sl_ok = np.isfinite(sl_vals).any()
         if not sl_ok:
-            log.warning("[RIVER][ATTR] No valid slope values found (even after slope proxy); disabling slope-dependent priors.")
+            log.warning("No valid slope values found (even after slope proxy); disabling slope-dependent priors.")
             xs_param["slope_mpm"] = np.nan
     else:
         sl_ok = False
 
     # If multivariate priors were requested but required reach attributes are missing, fall back.
     if cfg.prior_mode.lower() == "multivariate" and not (da_ok and sl_ok):
-        log.warning("[PRIOR] multivariate prior requested but reach attributes missing (da_ok=%s slope_ok=%s); falling back to powerlaw.", da_ok, sl_ok)
+        log.warning("multivariate prior requested but reach attributes missing (da_ok=%s slope_ok=%s); falling back to powerlaw.", da_ok, sl_ok)
         cfg.prior_mode = "powerlaw"
     # Restore blended WSE after slope estimation if we suppressed SWOT stage during slope fitting.
     if "_wse_blended_m" in xs_param.columns:
@@ -4494,7 +4593,7 @@ def infer_bathy(
                 str(eq_counts),
             )
     except Exception:
-        pass
+        log.debug("ignored", exc_info=True)
     # Receipt: echo energy-solver gating inputs so activation is debuggable from logs.
     try:
         wse_anchor = "unknown"
@@ -4507,7 +4606,7 @@ def infer_bathy(
             wse_anchor,
         )
     except Exception:
-        pass
+        log.debug("ignored", exc_info=True)
 
     # ------------------------
     # Calibration anchors
@@ -4546,7 +4645,7 @@ def infer_bathy(
                 _subset_path,
             )
             raise SystemExit(2)
-        log.info("[CALIB] --soundings-subset validated: n=%d rows. Using subset instead of raw --soundings.", _n_check)
+        log.info("--soundings-subset validated: n=%d rows. Using subset instead of raw --soundings.", _n_check)
         # Override soundings_path so the rest of the function uses the validated subset.
         soundings_path = [_subset_path]
         # Subset parquet has a 'crs' column; do not override with caller's soundings_crs
@@ -4567,29 +4666,48 @@ def infer_bathy(
         )
         if soundings is not None and not soundings.empty:
             n_in_all = int(len(soundings))
-            log.info("[CALIB] Loaded soundings: n=%d", n_in_all)
+            log.info("Loaded soundings: n=%d", n_in_all)
             # Guard against massive point clouds (e.g., Hydronos/eHydro exports).
             max_n = int(cfg.soundings_max_points or 0)
             if max_n > 0 and len(soundings) > max_n:
                 seed = int(cfg.soundings_sample_seed or 0)
                 rng = np.random.default_rng(seed)
                 total = int(len(soundings))
-                # Preserve relative source-file composition when possible.
+                # Preserve relative source-file composition when possible while
+                # enforcing the requested global cap exactly.
                 if "_src_file" in soundings.columns:
+                    groups = list(soundings.groupby("_src_file", sort=False))
+                    sizes = np.array([len(gsrc) for _, gsrc in groups], dtype=np.int64)
+                    if sizes.sum() <= max_n:
+                        take_counts = sizes.copy()
+                    else:
+                        raw = (sizes.astype(float) / float(max(total, 1))) * float(max_n)
+                        take_counts = np.floor(raw).astype(np.int64)
+                        take_counts = np.minimum(take_counts, sizes)
+                        remaining = int(max_n - int(take_counts.sum()))
+                        if remaining > 0:
+                            remainders = raw - take_counts.astype(float)
+                            order = np.argsort(-remainders, kind="mergesort")
+                            for idx_ord in order:
+                                if remaining <= 0:
+                                    break
+                                if take_counts[idx_ord] < sizes[idx_ord]:
+                                    take_counts[idx_ord] += 1
+                                    remaining -= 1
                     parts = []
-                    for src, gsrc in soundings.groupby("_src_file", sort=False):
-                        frac = len(gsrc) / max(total, 1)
-                        take = max(1, int(round(frac * max_n)))
+                    for (src, gsrc), take in zip(groups, take_counts.tolist()):
+                        if take <= 0:
+                            continue
                         if len(gsrc) <= take:
                             parts.append(gsrc)
                         else:
-                            idx = rng.choice(gsrc.index.values, size=take, replace=False)
-                            parts.append(gsrc.loc[idx])
+                            idx = rng.choice(gsrc.index.values, size=int(take), replace=False)
+                            parts.append(gsrc.loc[np.sort(idx)])
                     soundings = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), geometry="geometry", crs=soundings.crs)
                 else:
-                    idx = rng.choice(soundings.index.values, size=max_n, replace=False)
+                    idx = np.sort(rng.choice(soundings.index.values, size=max_n, replace=False))
                     soundings = soundings.loc[idx].copy()
-                log.warning("[CALIB] Downsampled soundings to n=%d (from %d) to avoid OOM (soundings_max_points=%d).",
+                log.warning("Downsampled soundings to n=%d (from %d) to avoid OOM (soundings_max_points=%d).",
                             int(len(soundings)), total, int(max_n))
 
             # Optional: write the unified (possibly downsampled) set for reuse by downstream steps.
@@ -4604,29 +4722,29 @@ def infer_bathy(
                         for k, v in vc.items():
                             kk = Path(str(k)).stem if str(k) not in ["", "nan", "None"] else "unknown"
                             by_src[kk] = int(v)
-                    log.info("[CALIB] %s", _soundings_one_line(out_path, int(len(soundings)), n_in_all, by_src))
+                    log.info("%s", _soundings_one_line(out_path, int(len(soundings)), n_in_all, by_src))
 
                     if cfg.only_write_soundings_subset:
-                        log.info("[CALIB] --only-write-soundings-subset requested; exiting after subset write.")
+                        log.info("--only-write-soundings-subset requested; exiting after subset write.")
                         raise SystemExit(0)
                 except SystemExit:
                     raise
                 except Exception as e:
-                    log.warning("[CALIB] Failed to write soundings subset '%s': %s", str(cfg.write_soundings_subset), e)
+                    log.warning("Failed to write soundings subset '%s': %s", str(cfg.write_soundings_subset), e)
 
             calib_df = _calibrate_dmax_from_soundings(xs_lines[["xs_id", "geometry"]].copy(), soundings, wse_by_xs, cfg)
-            log.info("[CALIB] Matched XS: %d", len(calib_df))
+            log.info("Matched XS: %d", len(calib_df))
         else:
-            log.info("[CALIB] Soundings empty; will use other anchors / priors.")
+            log.info("Soundings empty; will use other anchors / priors.")
     else:
-        log.info("[CALIB] No soundings provided; will use other anchors / priors.")
+        log.info("No soundings provided; will use other anchors / priors.")
 
     xs_param = xs_param.merge(calib_df, on="xs_id", how="left")
     xs_param["soundings_n"] = pd.to_numeric(xs_param["calib_n"], errors="coerce").fillna(0).astype("int64")
     xs_param["soundings_dmax_m"] = pd.to_numeric(xs_param["calib_depth_stat"], errors="coerce")
     xs_param = xs_param.drop(columns=["calib_n", "calib_depth_stat"])
     # ---- Optional: 1D energy-consistent depth solver (flag-controlled) ----
-    # NOTE: To avoid tile-to-tile discontinuities, treat “soundings present” as
+    # To avoid tile-to-tile discontinuities, treat “soundings present” as
     # “at least one XS has usable soundings after masking/subsetting”, not merely
     # “a soundings file path was provided”.
     if cfg.energy_solver_enabled:
@@ -4645,7 +4763,7 @@ def infer_bathy(
                 econf = pd.to_numeric(xs_param.get("energy_conf", np.nan), errors="coerce").astype("float64").clip(0.0, 1.0).fillna(0.0)
 
                 # Default conservative cap for production unless explicitly configured.
-                # NOTE: This is intentionally separate from manning_max_weight to avoid
+                # Intentionally separate from manning_max_weight to avoid
                 # over-weighting the energy solver when Q or slope are uncertain.
                 emax = cfg.energy_max_weight
                 emin = cfg.energy_min_confidence
@@ -4688,7 +4806,7 @@ def infer_bathy(
                                 dmask = np.isfinite(delta.values) & (delta.values > 0)
                                 changed_idx = changed_idx & dmask
                             except Exception:
-                                pass
+                                log.debug("ignored", exc_info=True)
                             changed[changed_idx] = True
                             acct["energy_solver_changed_n"] = int(np.sum(changed))
 
@@ -4709,9 +4827,9 @@ def infer_bathy(
                                     max_run = 0
                             acct["energy_solver_changed_max_run"] = int(max_run)
                         except Exception:
-                            pass
+                            log.debug("ignored", exc_info=True)
         except Exception as e:
-            log.warning("[ENERGY] Energy solver failed; continuing without it (%s)", e)
+            log.warning("Energy solver failed; continuing without it (%s)", e)
 
         # Always emit a single "receipt" line when the solver is requested so runs are
         # verifiable from logs (and not inferred from side-effects).
@@ -4731,11 +4849,11 @@ def infer_bathy(
                 cfg.energy_solver_enabled, reason, n_total, n_applied, blend_n, changed_n, max_run, wse_src, wse_anchor, dmed, dp95,
             )
         except Exception:
-            pass
+            log.debug("ignored", exc_info=True)
     # Write an energy solver receipt alongside the XS constraint meta so the run is
     # inspectable without grepping logs.
     try:
-        # NOTE: do not bind the name "Path" inside infer_bathy(); it is already
+        # Do not bind the name "Path" inside infer_bathy(); it is already
         # imported at module scope, and rebinding it here makes it a local variable
         # which can trigger UnboundLocalError earlier in the function.
         from pathlib import Path as _Path
@@ -4761,9 +4879,9 @@ def infer_bathy(
             "delta_dmax_m_abs_p95": float(acct.get("energy_solver_delta_dmax_m_p95", 0.0) or 0.0),
         }
         _receipt_path.write_text(_json.dumps(_receipt, indent=2, sort_keys=True) + "\n")
-        log.info("[ENERGY] Receipt written: %s", _receipt_path)
+        log.info("Receipt written: %s", _receipt_path)
     except Exception as e:
-        log.warning("[ENERGY] Failed to write receipt: %s", e)
+        log.warning("Failed to write receipt: %s", e)
 
 
 
@@ -4779,7 +4897,7 @@ def infer_bathy(
     xs_param.loc[m_snd, "calib_n"] = xs_param.loc[m_snd, "soundings_n"]
 
     # Build station/gage assignment (used by width-stage and USGS anchors)
-    # IMPORTANT: do not overwrite upstream gage linkage if already present.
+    # Do not overwrite upstream gage linkage if already present.
     if "gage_site_no" not in xs_param.columns:
         xs_param["gage_site_no"] = pd.NA
     if "gage_dist_m" not in xs_param.columns:
@@ -4851,9 +4969,9 @@ def infer_bathy(
                                 gage_rids.append(rid_val)
                             gage_gdf["river_id"] = gage_rids
                         else:
-                            log.info("[CALIB][GAGE] rivers layer has no river_id; using nearest-gage matching.")
+                            log.info("rivers layer has no river_id; using nearest-gage matching.")
                     except Exception as e:
-                        log.info("[CALIB][GAGE] could not snap gages to river network: %s", e)
+                        log.info("could not snap gages to river network: %s", e)
 
                 centers = xs_lines.set_index("xs_id").geometry.interpolate(0.5, normalized=True)
                 gage_cols = ["site_no", "geometry"] + (["river_id"] if "river_id" in gage_gdf.columns else [])
@@ -4883,7 +5001,7 @@ def infer_bathy(
                         xs_param.at[i, "gage_site_no"] = new_site
                         xs_param.at[i, "gage_dist_m"] = new_dist
         except Exception as e:
-            log.warning("[CALIB][USGS] Failed to fetch station locations: %s", e)
+            log.warning("Failed to fetch station locations: %s", e)
 
     # Width-stage inversion anchor (optional)
     if (gage_gdf is not None) and (ws_df is not None) and (not ws_df.empty):
@@ -4977,7 +5095,7 @@ def infer_bathy(
             mean_to_dmax = float(cfg.usgs_mean_to_dmax)
             if (not np.isfinite(mean_to_dmax)) or (mean_to_dmax <= 0):
                 mean_to_dmax = 2.0 / (1.0 + float(cfg.bottom_width_frac))
-                log.info("[CALIB][USGS] mean_to_dmax=auto -> %.3f (bottom_width_frac=%.2f)", mean_to_dmax, float(cfg.bottom_width_frac))
+                log.info("mean_to_dmax=auto -> %.3f (bottom_width_frac=%.2f)", mean_to_dmax, float(cfg.bottom_width_frac))
 
             for site_no in usgs_sites_flat:
                 meas = fetch_discharge_measurements([site_no], start_dt, end_dt, cache_dir=cache_dir)
@@ -5066,7 +5184,7 @@ def infer_bathy(
                     str(site_no), int(n_meas), float(a_site), float(w_usgs), int(m_apply.sum()), str(q_range)
                 )
         except Exception as e:
-            log.warning("[CALIB][USGS] failed to apply USGS measurement calibration: %s", e)
+            log.warning("failed to apply USGS measurement calibration: %s", e)
 
     # Clip and proceed
 
@@ -5091,9 +5209,9 @@ def infer_bathy(
                     try:
                         acct["env_clip_frac"] = float(acct["n_env_clipped"]) / float(max(1, acct["n_env_total"]))
                     except Exception:
-                        pass
+                        log.debug("ignored", exc_info=True)
         except Exception as e:
-            log.warning("[ENVELOPE] failed to apply geomorphic envelope cap: %s", e)
+            log.warning("failed to apply geomorphic envelope cap: %s", e)
 
     xs_param["dmax_raw_m"] = pd.to_numeric(xs_param["dmax_raw_m"], errors="coerce").clip(cfg.dmin_m, cfg.dmax_m)
 
@@ -5258,7 +5376,7 @@ def infer_bathy(
     # Write GPKG
     out_gpkg = Path(out_gpkg)
     out_gpkg.parent.mkdir(parents=True, exist_ok=True)
-    log.info("[WRITE] %s (xs_bathy_points=%d, xs_bathy_xs=%d)", out_gpkg, len(pred_gdf), len(xs_summary_gdf))
+    log.info("%s (xs_bathy_points=%d, xs_bathy_xs=%d)", out_gpkg, len(pred_gdf), len(xs_summary_gdf))
     pred_gdf.to_file(out_gpkg, layer="xs_bathy_points", driver="GPKG")
     xs_summary_gdf.to_file(out_gpkg, layer="xs_bathy_xs", driver="GPKG")
 
@@ -5294,7 +5412,7 @@ def infer_bathy(
                                 if not (px > 0):
                                     raise ValueError("non-positive pixel size")
                         except Exception as e:
-                            log.warning("[THALWEG] Could not read template raster pixel size; defaulting px=10 m: %s", e)
+                            log.warning("Could not read template raster pixel size; defaulting px=10 m: %s", e)
 
                         if thalweg_densify_step_m is not None and float(thalweg_densify_step_m) > 0:
                             thalweg_densify_step_m_eff = float(thalweg_densify_step_m)
@@ -5318,7 +5436,7 @@ def infer_bathy(
                             if thalweg_lines_gdf is not None and (not thalweg_lines_gdf.empty):
                                 corridor_lines = thalweg_lines_gdf
                         except Exception as e:
-                            log.warning("[THALWEG] Failed to build spine from points (%s); using xs_lines axis.", e)
+                            log.warning("Failed to build spine from points (%s); using xs_lines axis.", e)
 
                     bed_arr, mask_arr = _continuous_surface(
                         pts_gdf=pred_gdf,
@@ -5340,7 +5458,7 @@ def infer_bathy(
                         max_query_dist_m=(float(max_query_dist_m) if max_query_dist_m is not None else None),
                     )
                 except Exception as e:
-                    log.warning("[CONTINUOUS] %s failed (%s); falling back to reducer='%s'", str(continuous), e, str(overlap_reducer))
+                    log.warning("%s failed (%s); falling back to reducer='%s'", str(continuous), e, str(overlap_reducer))
                     bed_arr = _rasterize_points_reduce(
                         pred_gdf, raster_value_col, tmpl, nodata=nodata, reducer=str(overlap_reducer)
                     )
@@ -5350,12 +5468,12 @@ def infer_bathy(
                 out_bathy_raster = Path(out_bathy_raster)
                 out_bathy_raster.parent.mkdir(parents=True, exist_ok=True)
                 n_valid = int(np.sum(np.isfinite(bed_arr) & (bed_arr != float(nodata))))
-                log.info("[WRITE] bathy raster -> %s (shape=%s valid=%d)", str(out_bathy_raster), bed_arr.shape, n_valid)
+                log.info("bathy raster -> %s (shape=%s valid=%d)", str(out_bathy_raster), bed_arr.shape, n_valid)
                 _write_geotiff(out_bathy_raster, bed_arr, tmpl, nodata=float(nodata), dtype="float32")
                 if not _exists_with_retry(out_bathy_raster):
-                    log.warning("[WRITE] bathy raster missing after write: %s", str(out_bathy_raster))
+                    log.warning("bathy raster missing after write: %s", str(out_bathy_raster))
                 else:
-                    log.info("[WRITE] bathy raster ok (%d bytes)", out_bathy_raster.stat().st_size)
+                    log.info("bathy raster ok (%d bytes)", out_bathy_raster.stat().st_size)
 
                     # ------------------------------------------------------------------
                     # Explicit constraint metadata sidecar (NO filename guessing)
@@ -5442,20 +5560,20 @@ def infer_bathy(
 
                         meta_path = Path(out_meta_json) if out_meta_json else Path(str(out_bathy_raster) + ".meta.json")
                         meta_path.write_text(_json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
-                        log.info("[WRITE] constraint meta -> %s", str(meta_path))
+                        log.info("constraint meta -> %s", str(meta_path))
                     except Exception as e:
-                        log.warning("[WRITE] Failed to write constraint meta sidecar (%s)", e)
+                        log.warning("Failed to write constraint meta sidecar (%s)", e)
 
             if out_mask_raster:
                 out_mask_raster = Path(out_mask_raster)
                 out_mask_raster.parent.mkdir(parents=True, exist_ok=True)
                 n_valid = int(np.sum(mask_arr.astype(bool)))
-                log.info("[WRITE] mask raster -> %s (shape=%s valid=%d)", str(out_mask_raster), mask_arr.shape, n_valid)
+                log.info("mask raster -> %s (shape=%s valid=%d)", str(out_mask_raster), mask_arr.shape, n_valid)
                 _write_geotiff(out_mask_raster, mask_arr.astype("uint8"), tmpl, nodata=0, dtype="uint8")
                 if not _exists_with_retry(out_mask_raster):
-                    log.warning("[WRITE] mask raster missing after write: %s", str(out_mask_raster))
+                    log.warning("mask raster missing after write: %s", str(out_mask_raster))
                 else:
-                    log.info("[WRITE] mask raster ok (%d bytes)", out_mask_raster.stat().st_size)
+                    log.info("mask raster ok (%d bytes)", out_mask_raster.stat().st_size)
 
             if out_uncert_raster:
                 out_uncert_raster = Path(out_uncert_raster)
@@ -5466,12 +5584,12 @@ def infer_bathy(
                     pred_gdf, raster_uncert_col, tmpl, nodata=float(nodata), reducer="median"
                 )
                 n_valid = int(np.sum(np.isfinite(unc_arr) & (unc_arr != float(nodata))))
-                log.info("[WRITE] uncert raster -> %s (shape=%s valid=%d)", str(out_uncert_raster), unc_arr.shape, n_valid)
+                log.info("uncert raster -> %s (shape=%s valid=%d)", str(out_uncert_raster), unc_arr.shape, n_valid)
                 _write_geotiff(out_uncert_raster, unc_arr, tmpl, nodata=float(nodata), dtype="float32")
                 if not _exists_with_retry(out_uncert_raster):
-                    log.warning("[WRITE] uncert raster missing after write: %s", str(out_uncert_raster))
+                    log.warning("uncert raster missing after write: %s", str(out_uncert_raster))
                 else:
-                    log.info("[WRITE] uncert raster ok (%d bytes)", out_uncert_raster.stat().st_size)
+                    log.info("uncert raster ok (%d bytes)", out_uncert_raster.stat().st_size)
 
     
     # --------------------------------------------------------------------------------------
@@ -5488,7 +5606,7 @@ def infer_bathy(
             acct["n_usgs_applied"] = int(vc.get("usgs", 0))
             acct["n_soundings_calib_applied"] = int(vc.get("soundings", 0))
     except Exception:
-        pass
+        log.debug("ignored", exc_info=True)
 
 
     # Attribute availability accounting (helps diagnose under-constraint).
@@ -5500,7 +5618,7 @@ def infer_bathy(
         sl = pd.to_numeric(xs_param.get("slope_mpm", np.nan), errors="coerce")
         acct["n_with_slope"] = int(np.sum(np.isfinite(sl) & (sl > 0)))
     except Exception:
-        pass
+        log.debug("ignored", exc_info=True)
 
     # Optional: write constraint accounting JSON (explicit path; no guessing)
     if out_accounting_json is not None:
@@ -5522,7 +5640,7 @@ def infer_bathy(
     if out_uncert_raster is not None and not _exists_with_retry(out_uncert_raster):
         raise RuntimeError(f"Requested uncertainty raster was not written: {out_uncert_raster}")
 
-    log.info("[DONE] Inference complete.")
+    log.info("Inference complete.")
 
 
 
@@ -5863,7 +5981,7 @@ def main() -> None:
     try:
         _continuous_surface._river_gpkg = args.river_gpkg
     except Exception:
-        log.debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("ignored", exc_info=True)
 
     # Backwards-compatible alias
     if getattr(args, "manning_enabled", False) and str(getattr(args, "manning_mode", "off")) == "off":
@@ -5915,11 +6033,11 @@ def main() -> None:
 
             if args.out_bathy_raster:
                 _write_geotiff(Path(args.out_bathy_raster), bed, tmpl, nodata=float(args.nodata), dtype="float32")
-                log.info("[WRITE] %s", str(args.out_bathy_raster))
+                log.info("%s", str(args.out_bathy_raster))
 
             if args.out_mask_raster:
                 _write_geotiff(Path(args.out_mask_raster), mask.astype("uint8"), tmpl, nodata=0.0, dtype="uint8")
-                log.info("[WRITE] %s", str(args.out_mask_raster))
+                log.info("%s", str(args.out_mask_raster))
 
             if args.out_uncert_raster:
                 if uncert_col in pred_gdf.columns:
@@ -5927,9 +6045,9 @@ def main() -> None:
                 else:
                     unc = np.full((tmpl.height, tmpl.width), float(args.nodata), dtype="float32")
                 _write_geotiff(Path(args.out_uncert_raster), unc, tmpl, nodata=float(args.nodata), dtype="float32")
-                log.info("[WRITE] %s", str(args.out_uncert_raster))
+                log.info("%s", str(args.out_uncert_raster))
 
-        log.info("[DONE] Raster-only complete.")
+        log.info("Raster-only complete.")
         return
 
     # Inference mode requires xs-gpkg and out-gpkg

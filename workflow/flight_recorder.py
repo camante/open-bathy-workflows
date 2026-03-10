@@ -26,6 +26,7 @@ import atexit
 import contextlib
 import contextvars
 import json
+import logging
 import os
 import sys
 import threading
@@ -39,6 +40,9 @@ from typing import Any, Dict, Optional
 
 _cv_run_id: contextvars.ContextVar[str] = contextvars.ContextVar("run_id", default="-")
 _cv_step: contextvars.ContextVar[str] = contextvars.ContextVar("step", default="-")
+
+
+log = logging.getLogger(__name__)
 
 
 def _utc_now_iso() -> str:
@@ -109,12 +113,12 @@ class FlightRecorder:
                         traceback="".join(traceback.format_exception(exc_type, exc, tb)),
                     )
                 except Exception:
-                    log.debug('Unexpected exception suppressed (was pass).', exc_info=True)
+                    log.debug("ignored", exc_info=True)  # don't let recorder failure mask original exception
                 return prev_hook(exc_type, exc, tb)
 
             sys.excepthook = _hook  # type: ignore
         except Exception:
-            log.debug('Unexpected exception suppressed (was pass).', exc_info=True)
+            log.debug("excepthook installation failed", exc_info=True)
 
     def stop(self) -> None:
         # Best effort stop
@@ -125,13 +129,13 @@ class FlightRecorder:
                 dropped=self._dropped,
             )
         except Exception:
-            log.debug('Unexpected exception suppressed (was pass).', exc_info=True)
+            log.debug("ignored", exc_info=True)  # don't let stop-record failure prevent file close
         try:
             if self._fh is not None:
                 self._fh.flush()
                 self._fh.close()
         except Exception:
-            log.debug('Unexpected exception suppressed (was pass).', exc_info=True)
+            log.debug("ignored", exc_info=True)  # close error
         self._fh = None
 
     def record_event(self, event: str, **fields: Any) -> None:

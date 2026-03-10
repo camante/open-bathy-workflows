@@ -101,15 +101,15 @@ def run_command(
         # Use a regex so we don't depend on exact spacing.
         try:
             if re.search(r"\[\s*ERROR\s*\]", s):
-                log.error(f"{pfx}{s}" if pfx else s)
+                log.error("%s%s", pfx, s) if pfx else log.error("%s", s)
             elif re.search(r"\[\s*WARNING\s*\]", s):
-                log.warning(f"{pfx}{s}" if pfx else s)
+                log.warning("%s%s", pfx, s) if pfx else log.warning("%s", s)
             elif re.search(r"\[\s*INFO\s*\]", s):
-                log.info(f"{pfx}{s}" if pfx else s)
+                log.info("%s%s", pfx, s) if pfx else log.info("%s", s)
             else:
-                log.warning(f"{pfx}{s}" if pfx else s)
+                log.warning("%s%s", pfx, s) if pfx else log.warning("%s", s)
         except Exception:
-            log.warning(f"{pfx}{s}" if pfx else s)
+            log.warning("%s%s", pfx, s) if pfx else log.warning("%s", s)
 
     def _pump(stream, sink, log_fn, pfx: str, enabled: bool, fh=None):
         try:
@@ -132,7 +132,7 @@ def run_command(
             try:
                 stream.close()
             except Exception:
-                pass
+                log.debug("ignored", exc_info=True)
 
     threads: List[threading.Thread] = []
     try:
@@ -169,7 +169,7 @@ def run_command(
             if stderr_fh:
                 stderr_fh.close()
         except Exception:
-            pass
+            log.debug("ignored", exc_info=True)
 
     # stdout_lines/stderr_lines include newline characters; match original behavior
     stdout_tail = "".join(stdout_lines)[-tail_chars:]
@@ -215,7 +215,7 @@ def run_command_stdout_to_file(
         try:
             tmp_path.unlink()
         except Exception:
-            pass
+            log.debug("ignored", exc_info=True)
 
     stderr_fh = None
     if stderr_log_path is not None:
@@ -229,6 +229,7 @@ def run_command_stdout_to_file(
     log.debug("Executing: %s", cmd_str)
 
     proc = None
+    rc = -1
     stderr_tail = ""
     try:
         with open(tmp_path, "w", encoding="utf-8") as f_out:
@@ -250,7 +251,7 @@ def run_command_stdout_to_file(
             if stderr_fh:
                 stderr_fh.close()
         except Exception:
-            pass
+            log.debug("ignored", exc_info=True)
 
     # Caller decides whether tmp_path is valid enough to promote.
     return rc, stderr_tail

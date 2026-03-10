@@ -207,10 +207,10 @@ def _convert_da_to_registry_units(da_km2: float, da_units: str) -> float:
 # =============================================================================
 
 _STATE_TO_REGION_DEFAULT = {
-    # NOTE: These map US state/territory abbreviations to the *simplified* region keys
-    # used by estimate_q2_from_drainage_area(). They are not official USGS "regions".
-    # If you have better regionalization for your study area, pass --river-manning-region
-    # explicitly (or extend this map via a JSON file; see load_state_region_map()).
+    # Maps US state/territory abbreviations to the simplified region keys
+    # used by estimate_q2_from_drainage_area(). These are not official USGS "regions".
+    # For better regionalization, pass --river-manning-region explicitly
+    # (or extend this map via a JSON file; see load_state_region_map()).
     "AL": "coastal_plain",
     "MS": "coastal_plain",
     "LA": "coastal_plain",
@@ -582,7 +582,7 @@ def estimate_q2_from_drainage_area(
                 equation_id=str(ent.get('source','registry'))
             )
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
     # 2) Fallback: coarse built-in regressions (intended only as a last resort).
     

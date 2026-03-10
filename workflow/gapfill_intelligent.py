@@ -3,7 +3,7 @@
 """
 gapfill_intelligent.py - Physics-Informed Gap-Filling for Bathymetry
 
-This module implements intelligent gap-filling using the "prior + residual" framework:
+This module implements physics-informed gap-filling using the "prior + residual" framework:
 
     z_final(x) = z_prior(x) + r_interp(x)
 
@@ -33,8 +33,6 @@ References
 - Merwade, V., et al. (2008). "Anisotropic considerations while interpolating
   river channel bathymetry." J. Hydrology.
 
-Author: SDB Pipeline Development Team
-Version: 0.8.0
 """
 
 
@@ -251,7 +249,7 @@ def _is_geographic_crs(crs) -> bool:
             c = PyprojCRS.from_user_input(crs)
             return c.is_geographic
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
     
     # Fallback: check for common geographic CRS strings
     crs_str = str(crs).lower()
@@ -373,7 +371,7 @@ class BathyInterpolator:
         """
         n_obs = len(obs_xy)
         if n_obs < self.cfg.component_min_points:
-            log.warning("[BathyInterp] Insufficient points (%d < %d)", 
+            log.warning("Insufficient points (%d < %d)", 
                        n_obs, self.cfg.component_min_points)
             self._fitted = False
             return self
@@ -414,7 +412,7 @@ class BathyInterpolator:
         self._fit_model()
         
         self._fitted = True
-        log.info("[BathyInterp] Fitted with %d points, residual RMSE=%.3f m",
+        log.info("Fitted with %d points, residual RMSE=%.3f m",
                  len(self._residuals), self._residual_rmse)
         
         return self
@@ -437,7 +435,7 @@ class BathyInterpolator:
         # If signs are opposite and both have clear bathymetric range
         if obs_med * prior_med < 0:
             if abs(obs_med) > 0.5 and abs(prior_med) > 0.5:
-                log.info("[BathyInterp] Auto-flipping observation depth signs")
+                log.info("Auto-flipping observation depth signs")
                 return -obs_z, prior_z
         
         return obs_z, prior_z
@@ -508,7 +506,7 @@ class BathyInterpolator:
                     smooth=self.cfg.rbf_smoothing
                 )
         except Exception as e:
-            log.warning("[BathyInterp] RBF fit failed: %s", e)
+            log.warning("RBF fit failed: %s", e)
             self._rbf = None
     
     def _fit_gp(self):
@@ -540,7 +538,7 @@ class BathyInterpolator:
                 self._gp.fit(self._obs_xy_m, self._residuals)
                 
         except Exception as e:
-            log.warning("[BathyInterp] GP fit failed: %s", e)
+            log.warning("GP fit failed: %s", e)
             self._gp = None
     
     def predict(
@@ -595,14 +593,14 @@ class BathyInterpolator:
                     # Old Rbf
                     return self._rbf(query_xy_m[:, 0], query_xy_m[:, 1]).astype(np.float32)
             except Exception as e:
-                log.debug("[BathyInterp] RBF predict failed: %s", e)
+                log.debug("RBF predict failed: %s", e)
         
         # Try GP
         if self._gp is not None:
             try:
                 return self._gp.predict(query_xy_m).astype(np.float32)
             except Exception as e:
-                log.debug("[BathyInterp] GP predict failed: %s", e)
+                log.debug("GP predict failed: %s", e)
         
         # IDW fallback
         return self._predict_idw(query_xy_m)
@@ -1189,7 +1187,7 @@ def main():
         xs_params_gpkg=Path(args.xs_gpkg) if args.xs_gpkg else None,
     )
     
-    log.info(f"\nGap-fill complete:")
+    log.info("Gap-fill complete:")
     log.info(f"  HQ points: {stats['n_hq_points']} (in water: {stats['n_hq_points_in_water']})")
     log.info(f"  Components: {stats['n_components']}")
     log.info(f"  Residual RMSE: {stats['residual_rmse']:.3f} m")

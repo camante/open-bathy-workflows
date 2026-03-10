@@ -54,7 +54,7 @@ def print_human_run_summary(stats: Dict[str, Any], log_fn: Optional[Callable[[st
                 return
             except Exception:
                 # Fall back to stdout if logger fails for any reason.
-                log.debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("ignored", exc_info=True)
         log.info(line)
 
     def get(d: Dict[str, Any], *keys: str, default=None):
@@ -163,7 +163,7 @@ def print_human_run_summary(stats: Dict[str, Any], log_fn: Optional[Callable[[st
     lines.append("-" * 72)
 
     # Show combined first, then method-specific.
-    # IMPORTANT: never claim a path exists unless we confirm it on disk.
+    # Only claim a path exists after confirming it on disk.
     from pathlib import Path as _Path
 
     shown_any = False
@@ -316,13 +316,13 @@ def summarize_flight_recorder(fr_path: Path) -> Dict[str, Any]:
                     "rc": obj.get("rc"),
                 })
     except Exception:
-        log.debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("ignored", exc_info=True)
 
     # Sort steps by elapsed desc if available
     try:
         summary["steps"].sort(key=lambda x: (x.get("elapsed_s") is None, -(float(x.get("elapsed_s") or 0.0))))
     except Exception:
-        log.debug('Unexpected exception suppressed (was pass).', exc_info=True)
+        log.debug('step sort failed', exc_info=True)
     return summary
 
 

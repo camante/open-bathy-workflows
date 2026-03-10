@@ -123,7 +123,7 @@ def _resolve_max_depth_sdb(
     try:
         return float(s)
     except Exception:
-        log.debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("ignored", exc_info=True)
 
     if s not in ("auto", "automatic"):
         return default
@@ -162,7 +162,7 @@ def _read_photons_for_plot(h5_path, laser_num, aoi_bbox, conf_min):
     try:
         lat, lon, h_ph, conf, _, _, _, _, _ = read_atl03_basic(h5_path, laser_num)
     except Exception as exc:
-        log.debug(f"[VIS] read_atl03_basic failed for {h5_path}, beam {laser_num}: {exc}")
+        log.debug("read_atl03_basic failed for %s beam %s: %s", h5_path, laser_num, exc)
         return None
 
     W, S, E, N = aoi_bbox
@@ -218,16 +218,16 @@ def generate_atl03_debug_plots(training_df, atl03_files, aoi_bbox, plots_dir,
 
     required_cols = {"longitude", "latitude", "depth_m", "ws_h", "granule", "beam"}
     if required_cols.difference(training_df.columns) or training_df.empty or not atl03_files:
-        log.warning("[VIS] Skipping plots (missing cols/data).")
+        log.warning("Skipping plots (missing cols/data).")
         return
 
     out_dir = plots_dir / "atl03_transects"
     out_dir.mkdir(parents=True, exist_ok=True)
-    log.info("[VIS] Generating ATL03 debug plots in %s ...", out_dir)
+    log.info("Generating ATL03 debug plots in %s ...", out_dir)
 
     unique_pairs = training_df[["granule", "beam"]].drop_duplicates()
     n_water = _n_water_index(float(water_temp_c), float(wavelength_nm))
-    log.info(f"[VIS] Using refractive index n_water={n_water:.6f} (temp_c={water_temp_c}, wavelength_nm={wavelength_nm})")
+    log.info("Using refractive index n_water=%.6f (temp_c=%s, wavelength_nm=%s)", n_water, water_temp_c, wavelength_nm)
 
     # Resolve max depth for depth-of-support annotation (optional)
     max_depth_val = _resolve_max_depth_sdb(
@@ -237,7 +237,7 @@ def generate_atl03_debug_plots(training_df, atl03_files, aoi_bbox, plots_dir,
         default=None,
     )
     if max_depth_val is not None:
-        log.info(f"[VIS] Depth-of-support annotation enabled: max_depth_sdb={max_depth_val:.3f} m")
+        log.info("Depth-of-support annotation enabled: max_depth_sdb=%.3f m", max_depth_val)
 
 
     # Collect per-point metadata linking each training pick to the debug plot PNG it appears in.
@@ -264,7 +264,7 @@ def generate_atl03_debug_plots(training_df, atl03_files, aoi_bbox, plots_dir,
         depth_med = float(np.nanmedian(depth_vals)) if np.isfinite(depth_vals).any() else float("nan")
         neg_down = np.isfinite(depth_med) and (depth_med < 0.0)
         if neg_down:
-            log.warning(f"[VIS] Detected negative-down depth_m in picks (median={depth_med:.3f}). Using abs(depth_m) for visualization.")
+            log.warning("Detected negative-down depth_m in picks (median=%.3f). Using abs(depth_m) for visualization.", depth_med)
             depth_for_vis = np.abs(depth_vals)
         else:
             depth_for_vis = depth_vals
@@ -372,7 +372,7 @@ def generate_atl03_debug_plots(training_df, atl03_files, aoi_bbox, plots_dir,
                             label=f"Depth support ({max_depth_val:.1f} m)",
                         )
                 except Exception:
-                    log.debug("Optional step failed; continuing.", exc_info=True)
+                    log.debug("ignored", exc_info=True)
 
             ax.set_title(f"{granule} – {beam_name} – {int(start_m)}-{int(end_m)} m")
 
@@ -397,7 +397,7 @@ def generate_atl03_debug_plots(training_df, atl03_files, aoi_bbox, plots_dir,
             fig.savefig(out_dir / f"{granule}_{beam_name}_{int(start_m)}m.png", dpi=150)
             plt.close(fig)
 
-    log.info("[VIS] Plots complete.")
+    log.info("Plots complete.")
 
 def main():
     parser = argparse.ArgumentParser(

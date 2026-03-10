@@ -138,7 +138,7 @@ def _clip_raster_to_mask_reproject(
 
         # Reproject mask to raster grid
                 # Reproject mask to raster grid.
-        # IMPORTANT: treat mask nodata / areas outside coverage as OUTSIDE the mask.
+        # Treat mask nodata / areas outside coverage as OUTSIDE the mask.
         fill_val = np.uint8(255)
         m_aligned = np.full((src.height, src.width), fill_val, dtype=np.uint8)
         src_nodata = msrc.nodata
@@ -479,7 +479,7 @@ def _mask_raster_to_waffles(raster_path: Path, waffles_mask_path: Path, nodata: 
             raster_path.unlink()
             shutil.move(str(tmp_copy), str(raster_path))
     except Exception:
-        log.debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("ignored", exc_info=True)
 
     tmp_out = raster_path.with_suffix(".tmp_masked.tif")
 
@@ -495,8 +495,8 @@ def _mask_raster_to_waffles(raster_path: Path, waffles_mask_path: Path, nodata: 
         # Reproject waffles mask to ds grid
         with rasterio.open(waffles_mask_path) as ms:
             mask_src = ms.read(1)
-            # IMPORTANT: initialize destination to LAND(1) so any pixels outside the reprojected
-            # mask footprint remain LAND instead of uninitialized garbage (np.empty()).
+            # Initialize destination to LAND(1) so pixels outside the reprojected
+            # mask footprint remain LAND instead of uninitialized (np.empty()).
             fill_val = 1  # waffles coastline mask convention: land=1, water=0
             mask_dst = np.full((ds.height, ds.width), fill_val, dtype=mask_src.dtype)
 
@@ -532,7 +532,7 @@ def _mask_raster_to_waffles(raster_path: Path, waffles_mask_path: Path, nodata: 
             try:
                 out_ds.update_tags(**ds.tags())
             except Exception:
-                log.debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("ignored", exc_info=True)
 
     # Atomic replace
     try:
@@ -593,7 +593,7 @@ def _mask_raster_to_nhdarea(
             ok = fixed.geom_type.isin(["Polygon", "MultiPolygon"])
             areas.loc[ok, "geometry"] = fixed[ok].values
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
         areas = areas[areas.geometry.notnull() & (~areas.geometry.is_empty)]
         areas = areas[areas.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
 
@@ -613,7 +613,7 @@ def _mask_raster_to_nhdarea(
             areas = areas.to_crs(r_crs)
     except Exception:
         # If CRS handling fails, try rasterizing in-place; worst case it yields empty mask and we no-op.
-        log.debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("ignored", exc_info=True)
 
     try:
         geom = _union_all_geoms(areas.geometry)
@@ -777,7 +777,7 @@ def warp_raster_to_srs(
     """
     gdalwarp = shutil.which("gdalwarp")
     if gdalwarp is None:
-        log.warning("[WARP] gdalwarp not found; cannot reproject %s", in_raster)
+        log.error("gdalwarp not found; cannot reproject %s", in_raster)
         return None
     if out_raster.exists() and out_raster.stat().st_size > 0:
         if reuse_existing and _raster_has_valid_pixels(out_raster):
@@ -790,10 +790,10 @@ def warp_raster_to_srs(
                 if fp.exists():
                     fp.unlink()
             except Exception:
-                pass
+                log.debug("ignored", exc_info=True)
 
 
-    # IMPORTANT: explicitly propagate nodata through warps.
+    # Explicitly propagate nodata through warps.
     # If src/dst nodata are not set, GDAL can yield rasters filled with
     # float32 max (3.402823466e+38) which QGIS shows as huge +/- values.
     src_nodata = None
@@ -822,11 +822,11 @@ def warp_raster_to_srs(
         cmd.extend(["-srcnodata", str(nodata)])
     cmd.extend([str(in_raster), str(out_raster)])
     try:
-        log.info("[WARP] %s -> %s (%s)", in_raster.name, out_raster.name, dst_srs)
+        log.info("%s -> %s (%s)", in_raster.name, out_raster.name, dst_srs)
         run_cmd(cmd, check=True)
         if out_raster.exists() and write_depth_metadata:
             apply_depth_metadata(out_raster)
         return out_raster if out_raster.exists() else None
     except Exception as e:
-        log.warning("[WARP] gdalwarp failed: %s", e)
+        log.warning("gdalwarp failed: %s", e)
         return None

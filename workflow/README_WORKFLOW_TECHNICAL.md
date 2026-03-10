@@ -1,165 +1,126 @@
-# Open Bathy Workflows – Technical Workflow Guide
+# Open Bathy Workflows — Technical Guide
 
+> **Authoritative file list:** each run writes `io_manifest.json` and `io_manifest.md` into `--out-dir`.
+> Treat those manifests, plus `bathy_report.json` and `unified_bathy_report.json`, as the authoritative record of what actually happened.
 
-> **Authoritative file list:** Each run writes `io_manifest.json` and `io_manifest.md` into your `--out-dir`.
-> Use those manifests (and `unified_bathy_report.json`) as the *only* source of truth for exact input/output filenames and paths.
-> Do **not** rely on any “canonical” filenames in docs; outputs can vary by enabled methods and configuration.
+This guide summarizes the key invariants and current technical behavior of the workflow.
 
-This repository runs an end-to-end, **reproducible** bathymetry workflow that can generate:
+## 1) Orchestrator and defaults
 
-- **Coastal / nearshore bathymetry from Satellite-Derived Bathymetry (SDB)** (Sentinel‑2 optical + calibration/constraints)
-- **River channel bathymetry** using a **skeleton / width‑proxy** approach with optional constraints (soundings, slope/curvature, WSE)
-- **A fused/combined product** when both modes run
+`bathy_main.py` is the top-level orchestrator.
+Verified current defaults in code include:
 
-The design goal is **hydrologically safe, domain‑restricted outputs** (no bathy outside intended water domains), with deterministic masking and conservative post‑processing.
+- `--methods=sdb,river,fuse`
+- `--priority=sdb`
+- `--river-method=hybrid`
+- bounded SDB model-bank support enabled by default
+- final-output retention that favors deliverables and run metadata over keeping every intermediate file in `--out-dir`
 
----
+## 2) Depth sign and elevation interpretation
 
-## Coordinate systems and sign conventions
+Current documentation should assume:
 
-- Depth products are **positive down** (meters) where applicable.
-- Bed elevation products are **NAVD88-referenced** where explicitly named `*_navd88_*`.
-- Final deliverable filenames are not guaranteed/canonical. Treat `io_manifest.json` and `unified_bathy_report.json` as the source of truth for exact output paths.
+- deliverable depth rasters are generally **negative-down**
+- bed rasters are elevations referenced to the working DEM vertical reference unless an explicit conversion step is requested
+- optional SDB conversion to NAVD88 is explicit, opt-in, and recorded in reports/manifests
 
-> Tip: Always verify the input DEM vertical datum and units before interpreting output elevations.
+Do not mix the internal sign handling of input soundings with the final deliverable sign convention.
+Several river and calibration routines normalize input soundings internally before writing final products.
 
----
+## 3) Explicit-artifact doctrine
 
-## High-level pipeline (bathy_main.py)
+The workflow is intentionally moving away from filename guessing.
+Important examples:
 
-`bathy_main.py` is the orchestrator. It runs one or more methods based on `--methods`:
+- `bathy_main.py` writes `io_manifest.json` and `io_manifest.md`
+- `sdb_main.py` writes `artifacts_sdb.json`
+- `river_diagnostics.py` writes `unified_bathy_report.json` and `unified_bathy_report.md`
+- `run_summary.py` writes machine, technical, scientific, and human summaries into `run_logs/`
 
-- `--methods=sdb` runs SDB only
-- `--methods=river` runs river only
-- `--methods=sdb,river` runs both, then fuses outputs
+When downstream logic needs an output path, the code increasingly discovers it from these manifests or reports rather than assuming a historical filename.
 
-Each stage writes intermediate products into `cache_root/...` and final products into `out_dir/...`.
+## 4) Domain policy
 
-### Stage A — AOI and region resolution
-- Parses `--aoi W/E/S/N`
-- Sets template grid / resolution
-- Creates run folder structure and logging
+The workflow maintains distinct coastal and river domains.
+The final domain policy in `bathy_main.py` is a last-resort guard that clips deliverables according to the run mode.
+Conceptually:
 
-### Stage B — Masks / domains (critical)
-Two domains are maintained intentionally:
+- SDB-only runs are clipped to the coastal water domain
+- river-only runs are clipped to the river/channel domain and associated coastal safety masks where required by the implementation
+- combined runs are clipped to the appropriate combined allowed-water domain
 
-1) **SDB domain (coastal/ocean water)**  
-   Derived from **waffles coastline masks**. Convention:
-   - water = 0
-   - land = 1
+This protects against lingering bathymetry on land or outside the intended hydrologic domain.
 
-2) **River domain (rivers only)**  
-   Derived from **NHDArea polygons** rasterized to a channel mask:
-   - inside river polygons = 1
-   - outside = 0
+## 5) River methods
 
-#### Final domain clipping policy (mode-dependent)
+### Hybrid
 
-After the pipeline completes, `bathy_main.py` applies a deterministic clipping policy:
+This is the current default and should be treated as the main operational river path.
+It runs mainstem-focused cross-section inference and combines it with skeleton-based river bathymetry elsewhere.
+The goal is better continuity on larger channels without forcing cross-sections across every tributary or junction.
 
-- **SDB only** → clip final combined outputs to **waffles coastline (ocean-only)**
-- **River only** → clip river outputs to **NHDArea channel mask**
-- **SDB + River** → clip combined + river outputs to **waffles coastline with NHD**
+### Skeleton
 
-This is implemented by `_apply_final_domain_policy(...)` in `bathy_main.py`.
+`river_skeleton_bathy.py` is the no-cross-section path.
+It is useful where XS generation is unstable or geometrically awkward.
+It can incorporate soundings, optional authoritative bed blending, WSE smoothing, and SWOT-based residual correction.
 
-This policy is specifically intended to prevent:
-- stray bathymetry in lakes/land
-- outputs outside the intended AOI
-- inconsistencies when only one mode runs
+### XS
 
-### Stage C — River bathymetry (river_skeleton_bathy.py)
-The river method:
-- builds a **river channel mask** (`river_domain_mask.py`)
-- computes a **channel skeleton**
-- uses **width proxy** and WSE smoothing controls to avoid junction artifacts
-- optionally incorporates:
-  - soundings (as constraints / priors)
-  - bed profile constraints (max slope/curvature)
+`xs_builder.py` plus `xs_infer_bathy_raster.py` is the explicit cross-section path.
+It remains important for mainstem structure and hydraulic priors, but it is also the path most sensitive to overlap, junction geometry, and deconfliction settings.
 
-Outputs include:
-- River depth output path (see `io_manifest.json` for exact filename)
+## 6) Hydraulic constraints
 
-### Stage D — SDB bathymetry (sdb_main.py)
-SDB uses:
-- Sentinel‑2 reflectance / water column signal (see `s2_optics.py`)
-- training & prediction utilities (`train.py`, `predict.py`, `predict_chunked.py`)
-- optional uncertainty characterization (`sdb_uncertainty.py`)
-- optional ICESat‑2 constraints (ATL utilities in `atl.py`) depending on your run configuration
+The current river stack can incorporate several optional constraints:
 
-Primary outputs are fed into fusion when both modes run.
+- external soundings
+- drainage-area-based and regional priors
+- Manning-based inversion support
+- optional 1D energy-solver prioring in `xs_infer_bathy_raster.py`
+- optional SWOT RiverSP water-surface elevation anchoring
 
-### Stage E — Fusion (fusion.py / bathy_fusion.py)
-When both modes are enabled, the workflow creates a combined depth surface. The current design prioritizes:
-- correct nodata handling
-- domain clipping by the policy above
-- consistent warping to final CRS
+SWOT is used here as a WSE/stage/slope constraint, not as a direct bed raster.
 
----
+## 7) SDB model bank and cache behavior
 
-## Key final outputs to inspect
+The SDB side supports a bounded model bank so neighboring AOIs do not behave like fully isolated training problems.
+This is intended to improve seam stability without keeping unbounded training state.
+The workflow also uses explicit cache and fingerprint helpers so cache hits can be tied to parameter/input/code state rather than guessed.
 
-Depending on the run mode(s), the main rasters you should inspect:
+## 8) Seam comparison support
 
-### Always (combined folder)
-- `combined/` (see `io_manifest.json` for exact filenames)  
-  Final bathymetry depth (meters, +down), warped to EPSG:4269.
+`bathy_main.py` can compare a run against one or more neighboring `io_manifest.json` files.
+When requested, it writes `seam_comparisons.json` and records those results in the main report.
+Supporting tools also exist under `seam_stability/` for more detailed seam metrics and gating.
 
-If produced:
-- `combined/` (see `io_manifest.json` for exact filenames)  
-  Final bed elevation (NAVD88), warped to EPSG:4269.
+## 9) Verification artifacts and receipts
 
-### River outputs (river folder)
-- River depth output path (see `io_manifest.json`)
+Depending on the path taken, you may see receipts such as:
 
----
+- `input_receipt.json`
+- `soundings_channel_receipt.json`
+- `energy_solver_receipt.json`
+- `*.reproject_receipt.json`
 
-## Metrics / regression runs
+These are intended to make specific decisions auditable rather than inferred from logs alone.
 
-`regression_metrics.py` computes a per-run `metrics_summary.csv`. It expects a channel mask and now:
-- skips non-run folders like `logs/`
-- can read `bathy_report.json` to locate cached channel masks when not present in the run directory
-
----
-
-## What was verified in this review
-
-This review confirmed (by code inspection and executable checks):
-
-- All `*.py` files compile (no indentation/syntax errors).
-- `bathy_main.py`, `river_skeleton_bathy.py`, and `regression_metrics.py` support `--help` successfully.
-- `sdb_main.py --help` was fixed (it previously crashed due to a stray `%` in a help string).
-- Mode-dependent domain clipping is implemented by `_apply_final_domain_policy(...)` and invoked after `_ensure_output_contract(...)`.
-
-> Note: Full numerical/physics validation requires running on real data. The checks above confirm **control flow, argument parsing, file naming, and clipping logic** behave as documented.
-
----
-
-## Reproducible run template
-
-Example (both modes):
+## 10) Verification commands
 
 ```bash
-PYTHONUNBUFFERED=1 python -u bathy_main.py \
-  --aoi="-71.25/-71.00/42.75/43.00" \
-  --start="2025-01-01" --end="2026-01-01" \
-  --methods=sdb,river \
-  --out-dir="output/my_run" \
-  --cache-root="cache/my_run"
+./verify_repo.sh
+./ci_smoke.sh
 ```
 
----
+`verify_repo.sh` is the standard offline repo check.
+`ci_smoke.sh` is stricter and also fails if committed cache artifacts such as `__pycache__`, `.pytest_cache`, or `*.pyc` are present in the repo tree.
 
-## Troubleshooting checklist
+## 11) Recommended debugging order
 
-1) **Outputs outside domain**  
-   Confirm the correct mask exists:
-   - waffles coastline masks in `.../masks/`
-   - `river_channel_mask.tif` exists in the cache river folder
-   Then confirm `--methods` matches the clipping rule you expect.
+When behavior is unclear, inspect:
 
-2) **Metrics summary “No channel mask found”**  
-   Ensure each run folder has `bathy_report.json` or that the cached mask still exists.
-
-3) **Junction artifacts**  
-   River junction handling is controlled in `river_skeleton_bathy.py` (width-proxy mainstem preservation + WSE-only junction smoothing). Check the debug masks (if enabled) to verify mainstem corridor coverage.
+1. `bathy_report.json`
+2. `unified_bathy_report.json`
+3. `io_manifest.json`
+4. `run_logs/`
+5. component-specific receipts and diagnostics in `sdb/`, `river/`, or the cache tree

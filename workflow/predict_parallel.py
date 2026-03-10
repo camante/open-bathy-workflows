@@ -423,9 +423,7 @@ def predict_scene_parallel(
     if config is None:
         config = ParallelConfig()
     
-    log.info("=" * 60)
-    log.info("PARALLEL SDB PREDICTION")
-    log.info("=" * 60)
+    log.info("Parallel SDB prediction starting.")
     
     # Get image dimensions from first band
     ref_band = s2_paths.get("B02") or list(s2_paths.values())[0]
@@ -436,8 +434,8 @@ def predict_scene_parallel(
         crs = ds.crs
         transform = ds.transform
     
-    log.info(f"Image size: {width} x {height} pixels")
-    log.info(f"Tile size: {config.tile_size}, overlap: {config.overlap}")
+    log.info("Image size: %s x %s pixels", width, height)
+    log.info("Tile size: %s, overlap: %s", config.tile_size, config.overlap)
     
     # Create tile specifications
     tiles = create_tile_specs(height, width, config.tile_size, config.overlap)
@@ -503,14 +501,14 @@ def predict_scene_parallel(
                         completed += 1
                         total_valid_pixels += result.metrics.get("valid_pixels", 0)
                     else:
-                        log.warning(f"Tile {tile_id} failed: {result.error}")
+                        log.warning("Tile %s failed: %s", tile_id, result.error)
                         failed += 1
                         
                 except TimeoutError:
                     log.warning("Tile %s timed out", tile_id)
                     failed += 1
                 except Exception as e:
-                    log.warning(f"Tile {tile_id} exception: {e}")
+                    log.warning("Tile %s exception: %s", tile_id, e)
                     failed += 1
                 
                 if pbar:
@@ -581,13 +579,10 @@ def predict_scene_parallel(
         log.info("Wrote uncertainty: %s", uncertainty_path)
     
     # Summary
-    log.info("=" * 60)
-    log.info(f"Completed: {completed}/{n_tiles} tiles")
-    log.info(f"Failed: {failed}/{n_tiles} tiles")
-    log.info(f"Total time: {total_duration:.1f}s")
-    log.info(f"Time per tile: {total_duration / max(completed, 1):.2f}s")
-    log.info(f"Valid pixels: {total_valid_pixels:,}")
-    log.info("=" * 60)
+    log.info("Completed: %s/%s tiles", completed, n_tiles)
+    if failed > 0:
+        log.warning("Failed: %s/%s tiles", failed, n_tiles)
+    log.info("Total time: %.1fs, %.2fs/tile, %s valid pixels", total_duration, total_duration / max(completed, 1), format(total_valid_pixels, ","))
     
     return {
         "success": failed == 0,

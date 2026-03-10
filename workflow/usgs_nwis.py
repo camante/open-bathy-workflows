@@ -42,7 +42,7 @@ def _read_text_cached(url: str, cache_path: Optional[Path], timeout_s: int = 45)
         try:
             return cache_path.read_text(encoding="utf-8", errors="replace")
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
     req = urllib.request.Request(
         url,
@@ -60,7 +60,7 @@ def _read_text_cached(url: str, cache_path: Optional[Path], timeout_s: int = 45)
             _ensure_dir(cache_path.parent)
             cache_path.write_text(text, encoding="utf-8")
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
     # be a polite client
     time.sleep(0.1)
@@ -109,7 +109,7 @@ def fetch_site_locations(
         text = _read_text_cached(url, cache_path, timeout_s=timeout_s)
         df = _parse_rdb(text)
     except Exception as e:
-        log.warning("[USGS] site fetch failed: %s", e)
+        log.warning("site fetch failed: %s", e)
         return pd.DataFrame()
 
     # Normalize
@@ -153,7 +153,7 @@ def fetch_discharge_measurements(
         text = _read_text_cached(url, cache_path, timeout_s=timeout_s)
         df = _parse_rdb(text)
     except Exception as e:
-        log.warning("[USGS] measurements fetch failed: %s", e)
+        log.warning("measurements fetch failed: %s", e)
         return pd.DataFrame()
 
     if df.empty:

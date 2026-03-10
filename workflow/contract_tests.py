@@ -1,14 +1,4 @@
-"""
-Contract Tests for SDB Pipeline
-
-Encodes expectations about pipeline behavior as executable tests.
-Prevents regressions like "XYZ loaded but not used" from returning.
-
-Addresses feedback: "Diagnostics are strong—now make them contract tests"
-
-Author: SDB Pipeline Development Team
-Version: 0.7.1
-"""
+"""contract_tests.py – Executable contract tests encoding pipeline behavioral expectations."""
 
 import pandas as pd
 import json
@@ -363,9 +353,7 @@ class ContractTestSuite:
         Returns:
             Tuple of (total, passed, critical_failed)
         """
-        log.info("=" * 70)
-        log.info("RUNNING CONTRACT TESTS")
-        log.info("=" * 70)
+        log.info("Running contract tests.")
         
         total = len(self.tests)
         passed = 0
@@ -376,10 +364,10 @@ class ContractTestSuite:
                 result = test.run(context)
                 self.results[test.name] = test.to_dict()
                 
-                status = "✓ PASS" if result else "✗ FAIL"
-                criticality = "[CRITICAL]" if test.critical else "[INFO]"
+                status = "PASS" if result else "FAIL"
+                criticality = "critical" if test.critical else "info"
                 
-                log.info(f"{status} {criticality} {test.name}: {test.message}")
+                log.info("%s [%s] %s: %s", status, criticality, test.name, test.message)
                 
                 if result:
                     passed += 1
@@ -387,7 +375,7 @@ class ContractTestSuite:
                     critical_failed += 1
             
             except Exception as e:
-                log.error(f"✗ ERROR {test.name}: {e}")
+                log.error("ERROR %s: %s", test.name, e)
                 self.results[test.name] = {
                     "name": test.name,
                     "passed": False,
@@ -398,11 +386,9 @@ class ContractTestSuite:
                 if test.critical:
                     critical_failed += 1
         
-        log.info("=" * 70)
-        log.info(f"Contract Tests: {passed}/{total} passed")
+        log.info("Contract tests: %d/%d passed.", passed, total)
         if critical_failed > 0:
-            log.error("CRITICAL FAILURES: %s", critical_failed, exc_info=True)
-        log.info("=" * 70)
+            log.error("Critical failures: %d", critical_failed)
         
         return total, passed, critical_failed
     
@@ -430,7 +416,7 @@ class ContractTestSuite:
         summary = self.get_summary()
         summary["timestamp"] = pd.Timestamp.now().isoformat()
         
-        with open(output_path, 'w') as f:
+        with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(summary, f, indent=2)
         
         log.info("[CONTRACT TESTS] Report saved to %s", output_path)
@@ -518,7 +504,7 @@ if __name__ == "__main__":
     output_dir = Path(sys.argv[1])
     
     if not output_dir.exists():
-        log.info("Error: Directory not found: %s", output_dir)
+        log.error("Directory not found: %s", output_dir)
         sys.exit(1)
     
     exit_code = run_contract_tests_cli(output_dir)

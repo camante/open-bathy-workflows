@@ -159,7 +159,7 @@ class PipelineCheckpoint:
     try:
         from constants import PIPELINE_VERSION
     except ImportError:
-        PIPELINE_VERSION = "sdb_river_unified_v0.7.6"
+        PIPELINE_VERSION = "unknown"
     
     def __init__(
         self,
@@ -231,7 +231,7 @@ class PipelineCheckpoint:
         try:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
-            log.warning("[CHECKPOINT] Could not create checkpoint directory: %s", e)
+            log.warning("Could not create checkpoint directory: %s", e)
             self.enabled = False
     
     def _load_or_create_state(self) -> None:
@@ -239,7 +239,7 @@ class PipelineCheckpoint:
         with self._lock:
             if self.state_file.exists():
                 try:
-                    with open(self.state_file, "r") as f:
+                    with open(self.state_file, "r", encoding="utf-8") as f:
                         data = json.load(f)
                     
                     loaded_state = PipelineState.from_dict(data)
@@ -262,7 +262,7 @@ class PipelineCheckpoint:
                         self._save_state()
                         
                 except (json.JSONDecodeError, KeyError, TypeError) as e:
-                    log.warning("[CHECKPOINT] Could not load state, creating new: %s", e)
+                    log.warning("Could not load state, creating new: %s", e)
                     self._state = self._create_new_state()
             else:
                 self._state = self._create_new_state()
@@ -291,14 +291,14 @@ class PipelineCheckpoint:
                 
                 # Write to temp file first, then rename (atomic on most filesystems)
                 temp_file = self.state_file.with_suffix(".tmp")
-                with open(temp_file, "w") as f:
+                with open(temp_file, "w", encoding="utf-8") as f:
                     json.dump(self._state.to_dict(), f, indent=2)
                 
                 # Atomic rename
                 temp_file.rename(self.state_file)
                 
             except Exception as e:
-                log.warning("[CHECKPOINT] Could not save state: %s", e)
+                log.warning("Could not save state: %s", e)
     
     def should_skip(self, stage: CheckpointStage) -> bool:
         """
@@ -330,7 +330,7 @@ class PipelineCheckpoint:
                     )
                     return False
             
-            log.info("[CHECKPOINT] Skipping completed stage: %s", stage_key)
+            log.info("Skipping completed stage: %s", stage_key)
             return True
     
     def mark_complete(
@@ -407,7 +407,7 @@ class PipelineCheckpoint:
             
             self._state.stages[stage_key] = checkpoint
             
-            log.warning(f"[CHECKPOINT] Stage failed: {stage_key} - {error[:100]}")
+            log.warning("Stage failed: %s - %s", stage_key, error[:100])
             
             if self.auto_save:
                 self._save_state()
@@ -498,13 +498,13 @@ class PipelineCheckpoint:
             if stages is None:
                 # Invalidate all
                 self._state = self._create_new_state()
-                log.info("[CHECKPOINT] All checkpoints invalidated")
+                log.info("All checkpoints invalidated")
             else:
                 # Invalidate specific stages
                 for stage in stages:
                     if stage.value in self._state.stages:
                         del self._state.stages[stage.value]
-                        log.info(f"[CHECKPOINT] Invalidated: {stage.value}")
+                        log.info("Invalidated: %s", stage.value)
             
             self._save_state()
     
@@ -513,9 +513,9 @@ class PipelineCheckpoint:
         if self.checkpoint_dir.exists():
             try:
                 shutil.rmtree(self.checkpoint_dir)
-                log.info("[CHECKPOINT] Cleaned checkpoint directory")
+                log.info("Cleaned checkpoint directory")
             except Exception as e:
-                log.warning("[CHECKPOINT] Could not clean: %s", e)
+                log.warning("Could not clean: %s", e)
         
         self._state = None
 
@@ -626,7 +626,7 @@ def resume_or_run(
     # Check if we can skip
     if checkpoint.should_skip(stage):
         artifacts = checkpoint.get_all_artifacts(stage)
-        log.info(f"[CHECKPOINT] Resuming from checkpoint: {stage.value}")
+        log.info("Resuming from checkpoint: %s", stage.value)
         return artifacts
     
     # Run the function
@@ -678,7 +678,7 @@ if __name__ == "__main__":
     )
     
     if len(sys.argv) < 2:
-        log.info("Usage: python checkpoints.py <output_dir> [--status|--clean|--invalidate <stage>]")
+        print("Usage: python checkpoints.py <output_dir> [--status|--clean|--invalidate <stage>]", file=sys.stderr)
         sys.exit(1)
     
     output_dir = Path(sys.argv[1])
@@ -708,7 +708,7 @@ if __name__ == "__main__":
                 checkpoint.invalidate([stage])
                 log.info("Invalidated: %s", stage_name)
             except ValueError as e:
-                log.info("Error: %s", e)
+                log.error("%s", e)
                 sys.exit(1)
         else:
             log.info("Unknown command: %s", cmd)

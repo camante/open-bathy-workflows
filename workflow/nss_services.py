@@ -70,7 +70,7 @@ def cached_get_json(cfg: NSSConfig, url: str) -> Any:
         try:
             return json.load(open(path, "r", encoding="utf-8"))
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
 
     obj = _http_get_json(url, cfg.timeout_s, cfg.user_agent)
 

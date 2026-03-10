@@ -57,7 +57,7 @@ def _normalize_for_json(obj: Any) -> _JSONABLE:
         if isinstance(obj, np.ndarray):
             return _normalize_for_json(obj.tolist())
     except Exception:
-        log.debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("ignored", exc_info=True)
     return str(obj)
 
 def canonical_json(obj: Any) -> str:
@@ -211,7 +211,7 @@ def meta_payload(
     code_fp: Optional[str] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Create a canonical metadata payload to write to disk."""
+    """Create the metadata payload written to each cache entry."""
     from datetime import datetime, timezone
     d: Dict[str, Any] = {
         "cache_key": cache_key,

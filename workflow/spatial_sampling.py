@@ -1,15 +1,7 @@
-"""
-Sophisticated Adaptive Spatial Sampling for Bathymetry Training Data
+"""spatial_sampling.py – Multi-stage adaptive sampling for bathymetry training data.
 
-This module implements a multi-stage sampling strategy that:
-1. Preserves high-accuracy data sources (LiDAR, multibeam, etc.)
-2. Uses ICESat-2 as gap filler where high-accuracy data is unavailable
-3. Adapts sampling density to bathymetric complexity
-4. Ensures balanced depth range coverage
-5. Maintains spatial coverage with no large gaps
-
-Author: SDB Pipeline Development Team
-Version: 0.7.0
+Preserves high-accuracy sources (LiDAR, multibeam), uses ICESat-2 as gap filler,
+adapts to bathymetric complexity, and maintains spatial coverage.
 """
 
 import numpy as np
@@ -82,6 +74,7 @@ class SamplingConfig:
     # ---------------------------------------------------------------------
     max_points_per_source_prethin: int = 500_000
     prethin_cell_scale: float = 1.0
+    random_seed: int = 1337
 
 
 def _lonlat_to_local_m(points_lonlat: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -388,8 +381,7 @@ def adaptive_grid_thinning(
     if n_points == 0:
         return keep
 
-    # NOTE:
-    #   config.grid_* are expressed in **meters**.
+    # config.grid_* are expressed in **meters**.
     #   points are in lon/lat degrees.
     #   The previous implementation mixed these units, causing grid sizes of 15/30/60
     #   to be treated as **degrees**, collapsing most AOIs into ~1 cell and keeping
@@ -514,7 +506,7 @@ def adaptive_grid_thinning(
         # Densify by allowing multiple points per grid cell (still spatially balanced).
         # Use the relaxed min spacing (if any) when densifying.
         #
-        # NOTE: For very large sources (multi-million points), building a Python dict
+        # For very large sources (multi-million points), building a Python dict
         # of cells->indices can dominate runtime/memory. In those cases, fall back to
         # a fast vectorized top-k selection from the remaining points.
         if n_points > 2_000_000:
@@ -544,7 +536,8 @@ def adaptive_grid_thinning(
 
         # Priority within a cell: favor higher complexity and slightly favor deeper points.
         prio = (np.nan_to_num(complexity_scores, nan=0.0) * 1.0) + (np.nan_to_num(np.abs(depths), nan=0.0) * 0.05)
-        prio = prio + (np.random.random(n_points) * 1e-6)
+        rng = np.random.default_rng(int(getattr(config, 'random_seed', 1337)))
+        prio = prio + (rng.random(n_points) * 1e-6)
 
         cells: dict[tuple[int, int], list[int]] = {}
         for ii in range(n_points):
@@ -595,7 +588,7 @@ def depth_stratified_sampling(
     valid_depths = depths[np.isfinite(depths)]
     
     if len(valid_depths) < config.min_points_per_bin * 2:
-        log.warning("[SAMPLING] Too few points for depth stratification")
+        log.warning("Too few points for depth stratification")
         return df
     
     # Compute quantile bins
@@ -608,16 +601,16 @@ def depth_stratified_sampling(
         
         # Log depth distribution
         bin_counts = df['depth_bin'].value_counts().sort_index()
-        log.info(f"[SAMPLING] Depth stratification: {len(bin_edges)-1} bins")
+        log.info("Depth stratification: %s bins", len(bin_edges)-1)
         for bin_idx, count in bin_counts.items():
             if np.isfinite(bin_idx):
                 depth_range = f"[{bin_edges[int(bin_idx)]:.1f}, {bin_edges[int(bin_idx)+1]:.1f}]m"
-                log.info(f"  Bin {int(bin_idx)}: {depth_range} → {count} points")
+                log.info("  Bin %s: %s → %s points", int(bin_idx), depth_range, count)
         
         return df
         
     except Exception as e:
-        log.warning("[SAMPLING] Depth stratification failed: %s", e)
+        log.warning("Depth stratification failed: %s", e)
         df['depth_bin'] = 0
         return df
 
@@ -705,9 +698,7 @@ def adaptive_spatial_sample(
     Returns:
         Tuple of (sampled_df, statistics_dict)
     """
-    log.info("=" * 70)
-    log.info("[SAMPLING] ADAPTIVE SPATIAL SAMPLING - PRIORITY-BASED")
-    log.info("=" * 70)
+    log.info("Adaptive spatial sampling (priority-based).")
     
     # Use default configs if not provided
     if source_configs is None:
@@ -718,7 +709,7 @@ def adaptive_spatial_sample(
     
     # Input statistics
     n_input = len(df)
-    log.info(f"[SAMPLING] Input: {n_input:,} points")
+    log.info("Input: %s points", format(n_input, ","))
 
     # Keep a stable identifier so we can top-up from unselected rows later.
     df = df.copy()
@@ -761,21 +752,21 @@ def adaptive_spatial_sample(
     # =========================================================================
     # STAGE 1: DEPTH STRATIFICATION
     # =========================================================================
-    log.info(f"\n[STAGE 1] Depth Stratification ({sampling_config.depth_bins} bins)")
+    log.info("[STAGE 1] Depth Stratification (%s bins)", sampling_config.depth_bins)
     df = depth_stratified_sampling(df, sampling_config)
     
     # =========================================================================
     # STAGE 2: COMPUTE COMPLEXITY SCORES
     # =========================================================================
-    log.info(f"\n[STAGE 2] Computing Bathymetric Complexity")
+    log.info("[STAGE 2] Computing Bathymetric Complexity")
     
     # OPTIMIZATION:
     #   Complexity computation requires neighbor queries; doing it directly on millions
     #   of points is expensive. We therefore compute complexity on a *coarse* subset,
     #   then transfer those scores back to the full dataset via nearest-neighbor lookup.
     if len(df) > 100000:
-        log.info(f"[SAMPLING] Large dataset detected ({len(df):,} points)")
-        log.info("[SAMPLING] Applying coarse pre-sampling for efficiency (complexity only)...")
+        log.info("Large dataset detected (%s points)", format(len(df), ","))
+        log.info("Applying coarse pre-sampling for efficiency (complexity only)...")
 
         points_all = df[['longitude', 'latitude']].to_numpy()
         lon_min, lat_min = np.nanmin(points_all, axis=0)
@@ -795,7 +786,8 @@ def adaptive_spatial_sample(
             w = pd.to_numeric(df['weight'], errors='coerce').fillna(1.0).to_numpy()
         else:
             w = df['source_normalized'].map(lambda s: source_configs.get(s, source_configs['atl03']).weight).to_numpy()
-        priority = w * (1.0 + np.random.random(len(df)) * 0.01)
+        rng = np.random.default_rng(int(getattr(sampling_config, 'random_seed', 1337)))
+        priority = w * (1.0 + rng.random(len(df)) * 0.01)
 
         tmp = df.copy()
         tmp['_grid_cell'] = grid_cell
@@ -806,7 +798,7 @@ def adaptive_spatial_sample(
         coarse_df = tmp_sorted.loc[coarse_mask].copy()
         coarse_df = coarse_df.drop(columns=['_grid_cell', '_priority'])
 
-        log.info(f"[SAMPLING] Coarse pre-sampling: {len(df):,} → {len(coarse_df):,} points")
+        log.info("Coarse pre-sampling: %s → %s points", format(len(df), ","), format(len(coarse_df), ","))
 
         # Compute complexity on the coarse set
         c_points = coarse_df[['longitude', 'latitude']].values
@@ -817,9 +809,9 @@ def adaptive_spatial_sample(
 
         # Detect transects on coarse set (optional) and map to full set later
         if sampling_config.detect_transects:
-            log.info(f"[SAMPLING] Detecting linear transects...")
+            log.info("Detecting linear transects...")
             coarse_df['is_transect'] = detect_transects(c_points)
-            log.info(f"[SAMPLING] Detected {int(coarse_df['is_transect'].sum())} transect points")
+            log.info(f"Detected {int(coarse_df['is_transect'].sum())} transect points")
         else:
             coarse_df['is_transect'] = False
 
@@ -841,15 +833,15 @@ def adaptive_spatial_sample(
         df['complexity_score'] = complexity_scores
 
         if sampling_config.detect_transects:
-            log.info(f"[SAMPLING] Detecting linear transects...")
+            log.info("Detecting linear transects...")
             df['is_transect'] = detect_transects(points)
-            log.info(f"[SAMPLING] Detected {int(df['is_transect'].sum())} transect points")
+            log.info(f"Detected {int(df['is_transect'].sum())} transect points")
         else:
             df['is_transect'] = False
 
         working_df = df
     
-    log.info(f"[SAMPLING] Complexity distribution:")
+    log.info("Complexity distribution:")
     log.info(f"  High (>{sampling_config.high_complexity_threshold}): "
             f"{(complexity_scores > sampling_config.high_complexity_threshold).sum()} points")
     
@@ -866,7 +858,7 @@ def adaptive_spatial_sample(
     # =========================================================================
     # STAGE 3: PRIORITY-BASED SOURCE PRESERVATION
     # =========================================================================
-    log.info(f"\n[STAGE 3] Priority-Based Source Preservation")
+    log.info("[STAGE 3] Priority-Based Source Preservation")
     
     # Assign tiers and priorities to sources
     working_df['tier'] = working_df['source_key'].map(
@@ -888,7 +880,7 @@ def adaptive_spatial_sample(
     tier2_df = working_df[tier2_mask].copy()
     tier3_df = working_df[tier3_mask].copy()
     
-    log.info(f"[SAMPLING] Tier distribution:")
+    log.info("Tier distribution:")
     log.info(f"  Tier 1 (High accuracy): {len(tier1_df):,} points from {tier1_df['source'].nunique()} sources")
     log.info(f"  Tier 2 (Medium accuracy): {len(tier2_df):,} points from {tier2_df['source'].nunique()} sources")
     log.info(f"  Tier 3 (Gap fillers): {len(tier3_df):,} points from {tier3_df['source'].nunique()} sources")
@@ -899,7 +891,7 @@ def adaptive_spatial_sample(
     selected_tier1 = []
     
     if len(tier1_df) > 0:
-        log.info(f"\n[TIER 1] Processing high-accuracy sources:")
+        log.info("[TIER 1] Processing high-accuracy sources:")
         
         for source in tier1_df['source'].unique():
             source_mask = tier1_df['source'] == source
@@ -907,13 +899,13 @@ def adaptive_spatial_sample(
             source_norm = source_df['source_key'].iloc[0]
             
             if source_norm not in source_configs:
-                log.warning(f"[TIER 1] Unknown source '{source}', using default Tier 1 config")
+                log.warning("[TIER 1] Unknown source %r, using default Tier 1 config", source)
                 source_config = SourceConfig(source_norm, tier=1, weight=10, retention_target=0.75,
                                             min_spacing_m=20, influence_radius_m=60)
             else:
                 source_config = source_configs[source_norm]
             
-            log.info(f"  {source}: {len(source_df)} points (target retention: {source_config.retention_target*100:.0f}%)")
+            log.info("  %s: %s points (target retention: %.0f%%)", source, len(source_df), source_config.retention_target*100)
             
             # Apply gentle adaptive thinning
             keep_mask = adaptive_grid_thinning(
@@ -929,14 +921,14 @@ def adaptive_spatial_sample(
             selected_tier1.append(selected_source)
             
             retention_rate = len(selected_source) / len(source_df)
-            log.info(f"    → Kept {len(selected_source)} points ({retention_rate*100:.1f}% retention)")
+            log.info("    → Kept %s points (%.1f%% retention)", len(selected_source), retention_rate*100)
     
     tier1_selected = pd.concat(selected_tier1) if selected_tier1 else pd.DataFrame()
     
     # -------------------------------------------------------------------------
     # 3.2: Identify gaps not covered by Tier 1
     # -------------------------------------------------------------------------
-    log.info(f"\n[GAP ANALYSIS] Identifying spatial gaps:")
+    log.info("[GAP ANALYSIS] Identifying spatial gaps:")
     
     if len(tier1_selected) > 0:
         tier1_kdtree = compute_influence_zones(
@@ -965,11 +957,11 @@ def adaptive_spatial_sample(
         else:
             tier3_in_gap = np.array([], dtype=bool)
         
-        log.info(f"  Tier 2 points in gaps: {tier2_in_gap.sum():,} / {len(tier2_df):,}")
-        log.info(f"  Tier 3 points in gaps: {tier3_in_gap.sum():,} / {len(tier3_df):,}")
+        log.info("  Tier 2 points in gaps: %s / %s", format(tier2_in_gap.sum(), ","), format(len(tier2_df), ","))
+        log.info("  Tier 3 points in gaps: %s / %s", format(tier3_in_gap.sum(), ","), format(len(tier3_df), ","))
     else:
         # No Tier 1 data - all Tier 2/3 needed
-        log.info(f"  No Tier 1 data - all areas are gaps")
+        log.info("  No Tier 1 data - all areas are gaps")
         if len(tier2_df) > 0:
             tier2_df['in_gap'] = True
         if len(tier3_df) > 0:
@@ -981,7 +973,7 @@ def adaptive_spatial_sample(
     selected_tier2 = []
     
     if len(tier2_df) > 0:
-        log.info(f"\n[TIER 2] Processing gap-filling sources:")
+        log.info("[TIER 2] Processing gap-filling sources:")
         
         # Only sample from gaps (or all if no Tier 1)
         tier2_gaps = tier2_df[tier2_df.get('in_gap', True)].copy()
@@ -1012,7 +1004,7 @@ def adaptive_spatial_sample(
                     f"(cell={cell_m:.1f} m, cap={max_keep:,}; target retention: {source_config.retention_target*100:.0f}%)"
                 )
             else:
-                log.info(f"  {source}: {len(source_df):,} gap points (target retention: {source_config.retention_target*100:.0f}%)")
+                log.info("  %s: %s gap points (target retention: %.0f%%)", source, format(len(source_df), ","), source_config.retention_target*100)
             
             # Apply moderate thinning
             keep_mask = adaptive_grid_thinning(
@@ -1028,7 +1020,7 @@ def adaptive_spatial_sample(
             selected_tier2.append(selected_source)
             
             retention_rate = len(selected_source) / len(source_df) if len(source_df) > 0 else 0
-            log.info(f"    → Kept {len(selected_source)} points ({retention_rate*100:.1f}% retention)")
+            log.info("    → Kept %s points (%.1f%% retention)", len(selected_source), retention_rate*100)
     
     tier2_selected = pd.concat(selected_tier2) if selected_tier2 else pd.DataFrame()
     
@@ -1038,7 +1030,7 @@ def adaptive_spatial_sample(
     selected_tier3 = []
     
     if len(tier3_df) > 0:
-        log.info(f"\n[TIER 3] Processing emergency gap fillers:")
+        log.info("[TIER 3] Processing emergency gap fillers:")
         
         # Only sample from gaps
         tier3_gaps = tier3_df[tier3_df.get('in_gap', True)].copy()
@@ -1066,7 +1058,7 @@ def adaptive_spatial_sample(
                     f"(cell={cell_m:.1f} m, cap={max_keep:,}; target retention: {source_config.retention_target*100:.0f}%)"
                 )
             else:
-                log.info(f"  {source}: {len(source_df):,} gap points (target retention: {source_config.retention_target*100:.0f}%)")
+                log.info("  %s: %s gap points (target retention: %.0f%%)", source, format(len(source_df), ","), source_config.retention_target*100)
             
             # Apply aggressive thinning
             keep_mask = adaptive_grid_thinning(
@@ -1082,14 +1074,14 @@ def adaptive_spatial_sample(
             selected_tier3.append(selected_source)
             
             retention_rate = len(selected_source) / len(source_df) if len(source_df) > 0 else 0
-            log.info(f"    → Kept {len(selected_source)} points ({retention_rate*100:.1f}% retention)")
+            log.info("    → Kept %s points (%.1f%% retention)", len(selected_source), retention_rate*100)
     
     tier3_selected = pd.concat(selected_tier3) if selected_tier3 else pd.DataFrame()
     
     # =========================================================================
     # COMBINE & VALIDATE
     # =========================================================================
-    log.info(f"\n[FINAL] Combining selected points:")
+    log.info("Combining selected points:")
     
     final_dfs = []
     if len(tier1_selected) > 0:
@@ -1100,7 +1092,7 @@ def adaptive_spatial_sample(
         final_dfs.append(tier3_selected)
     
     if not final_dfs:
-        log.error("[SAMPLING] No points survived sampling!")
+        log.error("No points survived sampling.")
         return df.head(100), {}  # Return something to avoid complete failure
     
     result_df = pd.concat(final_dfs, ignore_index=True)
@@ -1112,13 +1104,14 @@ def adaptive_spatial_sample(
     # ---------------------------------------------------------------------
     target_n = int(sampling_config.target_total_points)
     if target_n > 0 and len(result_df) > target_n:
-        log.info(f"[SAMPLING] Capping sampled set to target_total_points={target_n:,} (current={len(result_df):,})")
+        log.info("Capping sampled set to target_total_points=%s (current=%s)", format(target_n, ","), format(len(result_df), ","))
 
         # Priority score: (tier priority) * (source_weight) * (sample_weight) * (1 + complexity)
         sw = pd.to_numeric(result_df.get('source_weight', 1.0), errors='coerce').fillna(1.0)
         w = pd.to_numeric(result_df.get('sample_weight', 1.0), errors='coerce').fillna(1.0)
         c = pd.to_numeric(result_df.get('complexity_score', 0.0), errors='coerce').fillna(0.0)
-        jitter = 1.0 + (np.random.random(len(result_df)) * 0.01)
+        rng = np.random.default_rng(int(getattr(sampling_config, 'random_seed', 1337)))
+        jitter = 1.0 + (rng.random(len(result_df)) * 0.01)
         priority = (sw.to_numpy() * w.to_numpy() * (1.0 + c.to_numpy())) * jitter
 
         # Always keep all Tier 1 points if present; then fill Tier 2, then Tier 3
@@ -1168,7 +1161,7 @@ def adaptive_spatial_sample(
             if cand.empty:
                 continue
             take_n = int(min(need, len(cand)))
-            topups.append(cand.sample(n=take_n, replace=False, random_state=42))
+            topups.append(cand.sample(n=take_n, replace=False, random_state=sampling_config.random_seed))
             need -= take_n
         if topups:
             result_df = pd.concat([result_df, *topups], ignore_index=True)
@@ -1213,18 +1206,16 @@ def adaptive_spatial_sample(
     
     total_effective_weight = sum(stats['effective_weights'].values())
     
-    log.info(f"  Tier 1: {len(tier1_selected):,} points ({len(tier1_selected)/len(result_df)*100:.1f}%)")
-    log.info(f"  Tier 2: {len(tier2_selected):,} points ({len(tier2_selected)/len(result_df)*100:.1f}%)")
-    log.info(f"  Tier 3: {len(tier3_selected):,} points ({len(tier3_selected)/len(result_df)*100:.1f}%)")
-    log.info(f"  Total: {len(result_df):,} points ({100.0 * len(result_df)/n_input:.1f}% of input)")
+    log.info("  Tier 1: %s points (%.1f%%)", format(len(tier1_selected), ","), len(tier1_selected)/len(result_df)*100)
+    log.info("  Tier 2: %s points (%.1f%%)", format(len(tier2_selected), ","), len(tier2_selected)/len(result_df)*100)
+    log.info("  Tier 3: %s points (%.1f%%)", format(len(tier3_selected), ","), len(tier3_selected)/len(result_df)*100)
+    log.info("  Total: %s points (%.1f%% of input)", format(len(result_df), ","), 100.0 * len(result_df)/n_input)
     
-    log.info(f"\n[SAMPLING] Effective Training Influence:")
+    log.info("Effective Training Influence:")
     for tier_name in ['tier1', 'tier2', 'tier3']:
         if tier_name in stats['effective_weights']:
             tier_weight = stats['effective_weights'][tier_name]
             tier_pct = 100.0 * tier_weight / max(total_effective_weight, 1)
-            log.info(f"  {tier_name.upper()}: {tier_pct:.1f}% influence")
-    
-    log.info("=" * 70)
+            log.info("  %s: %.1f%% influence", tier_name.upper(), tier_pct)
     
     return result_df, stats

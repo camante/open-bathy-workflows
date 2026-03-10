@@ -1,366 +1,193 @@
-# Open Bathy Workflows: Detailed Workflow Guide (v2.0.42)
+# Open Bathy Workflows — Detailed Workflow Guide
 
-This document explains **what each stage does**, **what inputs it consumes**, **what it writes**, and the **guardrails** that enforce the intended scientific behavior.
+This document walks through the current end-to-end behavior of the workflow and is intended to stay aligned with the actual repository state rather than older filename conventions.
 
-The orchestration entrypoint is:
+## 0) First principles
 
-- `bathy_main.py` (run from the `workflow/` directory)
+Three rules matter throughout this repository:
 
-It can run:
+1. **Use explicit manifests and reports.**
+   Exact output filenames are not assumed to be canonical across all run modes.
 
-- **SDB** (Sentinel‑2 + ICESat‑2 / extra XYZ)
-- **River** bathymetry (cross‑sections *or* skeleton)
-- **Fusion** (combine SDB + river into a single depth raster)
+2. **Treat final domain clipping as a safety invariant.**
+   Coastal and river deliverables should not survive outside their intended water domain.
 
----
+3. **Interpret final depth rasters as negative-down unless the product explicitly says otherwise.**
 
-## 0) Conventions
+## 1) Main entrypoint
 
-### AOI
-Most commands use an AOI bounding box:
+The orchestration entrypoint is `bathy_main.py`.
+Its current default behavior is to run:
 
-- `--aoi="W/E/S/N"` (lon/lat degrees)
+- SDB
+- river bathymetry
+- fusion
 
-### Sign convention
-Depth products are generally written **negative‑down** (more negative = deeper). Bed/elevation products are in the chosen vertical datum (typically NAVD88 or whatever your DEM is).
+with `--river-method=hybrid` unless the user overrides it.
 
-### Nodata
-River rasters use `--river-nodata` (default `-9999`). Final river outputs are **hard‑clipped** so pixels outside the river/channel domain are nodata.
-
----
-
-## 1) Repository layout
-
-Typical top-level files (in this zip, everything lives in the same folder as `bathy_main.py`):
-
-- `bathy_main.py` – orchestrator; writes `bathy_report.json`
-- `sdb_main.py` – SDB driver
-- `river_network.py` – hydrography/network acquisition & preprocessing
-- `xs_builder.py` – builds cross-sections along river network
-- `xs_infer_bathy_raster.py` – infers bed/depth raster from XS + DEM (+ optional WSE constraints)
-- `river_skeleton_bathy.py` – alternative river method (morphology-driven)
-- `river_domain_mask.py` – constructs the river/channel domain raster mask
-- `bathy_fusion.py` – fuses SDB + river rasters
-
----
-
-## 2) Running the workflow
-
-### Minimal run (SDB + River + Fusion)
-
-```bash
-cd workflow
-python bathy_main.py \
-  --aoi="-74.52/-74.23/40.23/40.52" \
-  --start 2024-01-01 \
-  --end   2026-01-01 \
-  --out-dir output/nyc \
-  --methods sdb,river,fusion
-```
-
-### River-only run
-
-```bash
-cd workflow
-python bathy_main.py \
-  --aoi="-74.52/-74.23/40.23/40.52" \
-  --start 2024-01-01 \
-  --end   2026-01-01 \
-  --out-dir output/nyc \
-  --methods river
-```
-
-### Choose river method
-
-- Cross‑sections: `--river-method xs` (default in many configs)
-- Skeleton: `--river-method skeleton`
-
----
-
-## 3) Outputs (what you get)
-
-Within `--out-dir`, the workflow writes:
-
-- `bathy_report.json` – machine-readable run report (commands, rc, tails)
-- `sdb/` – SDB outputs (when run)
-- `river/` – river outputs
-- `combined/` – fused outputs (when run)
-
-### River outputs (guaranteed river-only)
-
-Inside `output/<name>/river/`:
-
-- `river_bottom_navd88_patch.tif` – river bed elevation raster (same grid as working DEM)
-- `river_depth_terrain_patch.tif` – river depth raster (negative-down) computed from bed and DEM
-- `river_network.gpkg` – processed hydrography network
-- `cross_sections.gpkg` – XS vectors (XS method)
-- `river_channel_mask.tif` – river/channel domain mask raster
-
-**Hard guarantee:** both `river_bottom_navd88_patch.tif` and `river_depth_terrain_patch.tif` are **hard‑clipped** to `river_channel_mask.tif` at the end of the river stage. Pixels outside the channel domain are nodata.
-
----
-
-## 4) Stage-by-stage behavior
-
-### 4.1 Orchestration (`bathy_main.py`)
-
-Responsibilities:
-
-1. Parse CLI args; build a config object
-2. Create cache & output subfolders
-3. Run selected stages (`--methods`)
-4. Capture return codes and output tails in `bathy_report.json`
-
-Key logic that matters scientifically:
-
-- Ensures the **river-only** postcondition by clipping final river rasters to the channel domain mask.
-- Passes the channel mask into the XS inference stage when available.
-
----
-
-### 4.2 SDB stage (`sdb_main.py`)
-
-High-level steps:
-
-1. Acquire Sentinel‑2 scenes over AOI/time window
-2. Apply cloud/QC filtering
-3. Build reflectance composites
-4. Load training points:
-   - ICESat‑2 photons/products (ATL03/ATL24) depending on settings
-   - optional extra XYZ (user-provided)
-5. Train a model (typically Random Forest)
-6. Predict raster tiles and write outputs
-
-Outputs land in `output/<name>/sdb/`.
-
-Masks:
-
-- Uses waffles coastline / land-water masks to limit where SDB is allowed.
-
----
-
-### 4.3 River stage overview
-
-The river stage begins with **hydrography/network** creation and **DEM prep**, then runs either the **XS** method or the **skeleton** method.
-
-Common prerequisites:
-
-1. `river_network.py` generates a network GPKG (and optionally NHDArea polygons/layers).
-2. A river DEM is prepared (user-provided via `--river-dem` or auto-downloaded if enabled).
-3. `river_domain_mask.py` generates a **river/channel domain mask** raster (`river_channel_mask.tif`).
-
-#### River/channel domain mask (`river_domain_mask.py`)
-
-This mask defines **where river bathymetry is allowed**.
-
-Depending on `--river-channel-source`, it uses one of:
-
-- `nhdarea` (polygons from NHDArea)
-- `corridor` (buffer around centerline / corridor estimate)
-- `auto` (best available)
-
-Optional connectivity filter:
-
-- When `--river-connectivity-filter` is enabled, the mask can be filtered to keep only connected components that represent the main connected water network (helpful for removing isolated puddles).
-
-**Downstream contract:** any river bed/depth raster written by this workflow must be nodata outside this mask.
-
----
-
-### 4.4 River: Cross-section method
-
-#### Step A: Build cross-sections (`xs_builder.py`)
-
-Inputs:
-
-- `river_network.gpkg` (centerlines/reaches)
-- `river_dem.tif` (working CRS/resolution)
-
-Outputs:
-
-- `cross_sections.gpkg`
-
-Important controls:
-
-- spacing, half-width, smoothing
-- overlap trimming / global deconfliction
-- junction skipping/snap/buffer parameters
-
-These exist because **intersecting or overly dense XS** are a primary cause of interpolation artifacts.
-
-#### Step B: Infer bed raster from XS (`xs_infer_bathy_raster.py`)
-
-Inputs:
-
-- `cross_sections.gpkg`
-- `river_network.gpkg`
-- `river_dem.tif`
-- optional `--channel-mask-raster=river_channel_mask.tif`
-
-Outputs:
-
-- `river_bottom_navd88_patch.tif` (bed)
-
-Key scientific guardrails implemented here:
-
-1. **Main‑stem priority at confluences**
-   - When multiple branches contribute control points in a local neighborhood, the interpolation prefers the **highest‑priority branch** (typically the larger stream order) so small tributaries do not imprint circular “bullseye” artifacts into the main channel.
-
-2. **Thalweg spine construction uses thalweg points**
-   - The longitudinal spine used for anisotropic interpolation is constructed from one representative thalweg point per XS (deepest predicted within that XS), not all interior points. This avoids spurious cross-channel spurs near junctions.
-
-3. **Channel mask enforcement**
-   - If `--channel-mask-raster` is supplied, inference is constrained to that domain.
-
-After inference, `bathy_main.py` still performs a final **hard clip** to guarantee river-only outputs.
-
----
-
-### 4.5 River: Skeleton method (`river_skeleton_bathy.py`)
-
-This alternative produces a river bed estimate using a longitudinal skeleton approach. It is designed to be simpler and more stable where XS construction is difficult.
-
-Inputs:
-
-- `river_network.gpkg`
-- `river_dem.tif`
-- optional soundings XYZ
-
-Outputs:
-
-- `river_bottom_navd88_patch.tif`
-
-It also produces/uses `river_channel_mask.tif`, and `bathy_main.py` hard-clips the final products.
-
----
-
-## 5) SWOT WSE usage (what it does and does not do)
-
-SWOT is used only as a **Water Surface Elevation (WSE) constraint** to stabilize/anchor the stage profile.
-
-- **It is not used as a direct bathymetry predictor.**
-
-Where it’s applied:
-
-- XS method: `xs_infer_bathy_raster.py` can incorporate WSE observations when available.
-- Skeleton method: `river_skeleton_bathy.py` can apply a smooth residual correction between a modeled WSE profile and SWOT WSE.
-
-Robustness improvements in this repo:
-
-- Uses neighborhood aggregation (KDTree) instead of a single nearest point when multiple SWOT WSE samples exist within `--swot-max-dist-m`.
-- Applies robust MAD-based outlier rejection before computing a representative WSE.
-
-If no valid SWOT WSE is available, the workflow continues without applying SWOT.
-
----
-
-## 6) Fusion stage (`bathy_fusion.py`)
-
-Fusion combines SDB and river rasters into a single product.
-
-Typical behavior:
-
-- Uses masks to prevent SDB from populating river-only regions and vice versa.
-- Gap-fills where one method has nodata and the other has data.
-
-Outputs land in `output/<name>/combined/`.
-
----
-
-## 7) Verifying that outputs match the described behavior
-
-These checks are designed to confirm that the code is doing what this README claims.
-
-### 7.1 River-only guarantee
-
-1) Confirm the mask exists:
-
-```bash
-ls -lh output/<name>/river/river_channel_mask.tif
-```
-
-2) Confirm river rasters are nodata outside mask:
-
-```bash
-gdal_calc.py \
-  -A output/<name>/river/river_depth_terrain_patch.tif \
-  -B output/<name>/river/river_channel_mask.tif \
-  --calc="(B==1)*(A!= -9999)" \
-  --NoDataValue=0 \
-  --outfile=/tmp/river_outside_check.tif
-```
-
-If the workflow is behaving correctly, pixels where `B!=1` should not contain valid river values.
-
-### 7.2 Confluence artifact suppression
-
-Inspect several junctions at common scales and confirm:
-
-- the main stem is continuous through the confluence
-- tributary influence does not produce circular “rings” in the main stem
-
-If rings persist, the first thing to revisit is XS generation (spacing, overlap trimming, junction skipping).
-
----
-
-## 8) Practical run patterns
-
-### River XS with conservative parameters
+Example:
 
 ```bash
 python bathy_main.py \
-  --methods river \
-  --river-method xs \
-  --xs-spacing-m 250 \
-  --xs-length-m 120 \
-  --xs-deconflict-tol-m 3 \
-  --xs-junction-snap-m 30 \
-  --xs-junction-buffer-m 120 \
-  --out-dir output/test_river
+  --aoi="-71.14/-71.10/42.75/42.78" \
+  --start=2025-01-01 \
+  --end=2026-01-01 \
+  --methods=sdb,river,fuse \
+  --river-method=hybrid \
+  --out-dir=output/example_run \
+  --cache-root=cache
 ```
 
-### Skeleton river with SWOT WSE (RiverSP vectors)
+## 2) Repository layout
 
-```bash
-python bathy_main.py \
-  --methods river \
-  --river-method skeleton \
-  --river-swot-riversp /path/to/riversp_points.gpkg \
-  --river-swot-wse-field wse \
-  --river-swot-max-dist-m 1500 \
-  --out-dir output/test_swot
-```
+The repo is organized around a few major layers:
 
----
+- orchestration and fusion: `bathy_main.py`, `bathy_fusion.py`, `fusion.py`
+- SDB processing: `sdb_main.py`, `s2_optics.py`, `atl.py`, `train.py`, `predict.py`, `predict_parallel.py`, and `predict_chunked.py`, `vis.py`
+- river processing: `river_network.py`, `river_domain_mask.py`, `xs_builder.py`, `xs_infer_bathy_raster.py`, `river_skeleton_bathy.py`
+- hydraulics and constraints: `manning_inversion.py`, `river_wse.py`, `usgs_nwis.py`, `swot_riversp_fetch.py`, `xyz_constraints.py`
+- reporting and diagnostics: `run_summary.py`, `river_diagnostics.py`, `river_report.py`, `seam_metrics.py`, `seam_compare.py`, `flight_recorder.py`
+- shared infrastructure: `core/`, `geo/`, `pipeline/`, `cache_utils.py`, `logging_config.py`, `process_utils.py`
 
-## 9) Troubleshooting by stage
+## 3) Stage-by-stage flow
 
-- **Hydrography fetch fails**: check `--river-hydrography-source` and network access.
-- **XS artifacts**: check `xs_builder` parameters first (overlap trimming, spacing, junction skipping).
-- **SWOT does nothing**: confirm you provided a RiverSP vector with a numeric WSE field; check `bathy_report.json` for whether SWOT points were found.
-- **Fusion has river outside rivers**: this should not happen if fusion consumes the clipped `river_depth_terrain_patch.tif`. If it does, verify fusion is using the correct river raster path.
+### Stage A — argument parsing, AOI handling, and run scaffolding
 
----
+`bathy_main.py` parses the AOI, method list, cache/output locations, and optional river/SDB controls.
+It then creates run directories, logging, and flight-recorder state.
 
-## 10) Smoke tests (offline sanity checks)
+Important current behavior:
 
-This repo includes lightweight **offline** smoke tests intended to catch obvious breakages (syntax, basic geometry/math),
-without requiring any external downloads or real rasters.
+- explicit AOI helpers live under `pipeline/aoi.py`
+- output retention is handled later so the run can prune non-deliverables from `--out-dir`
+- run summaries and manifests are written at the end based on actual executed steps and observed outputs
 
-Run:
+### Stage B — SDB pipeline
+
+If `sdb` is enabled, `bathy_main.py` calls into `sdb_main.py`.
+That pipeline performs the optical side of the workflow:
+
+1. prepare or reuse masks and Sentinel-2 composites
+2. ingest ATL03 / ATL24 and optional extra XYZ
+3. normalize and fuse training data
+4. train the model and optional uncertainty helpers
+5. predict SDB rasters
+6. write `run_report.json` and `artifacts_sdb.json`
+
+Supporting modules include:
+
+- `s2_optics.py` for Sentinel-2 acquisition and compositing
+- `atl.py` for ICESat-2 acquisition and point extraction
+- `fusion.py` for training-point fusion
+- `train.py`, `predict.py`, `predict_parallel.py`, and `predict_chunked.py` for model training and raster prediction
+- `alignment.py`, `sdb_uncertainty.py`, `bottom_physics.py`, and `physics_integration.py` for optional refinement paths
+
+### Stage C — river network and domain construction
+
+If `river` is enabled, the workflow prepares the river side before choosing a bathymetry method.
+Key steps include:
+
+1. hydrography acquisition and preparation with `river_network.py`
+2. river/channel domain raster creation with `river_domain_mask.py`
+3. DEM preparation or auto-acquisition if configured
+4. optional setup of soundings, drainage area, SWOT WSE, and hydraulic priors
+
+The river/channel domain is operationally important because later deliverables are clipped to it.
+
+### Stage D — river method execution
+
+#### Hybrid method (current default)
+
+The hybrid path focuses explicit XS inference on the mainstem and lets the skeleton method fill the broader river domain.
+This is the workflow's current operational default because it balances continuity and geometric robustness better than using XS everywhere.
+
+#### XS method
+
+The explicit XS path uses:
+
+- `xs_builder.py` to generate and deconflict cross-sections
+- `xs_infer_bathy_raster.py` to infer the river bed and rasterize a DEM-aligned patch
+
+This path supports optional soundings, Manning/drainage-area priors, and optional 1D energy-solver logic.
+It can also write auditable receipts when those constraints are used.
+
+#### Skeleton method
+
+The skeleton path uses `river_skeleton_bathy.py` to derive a channel-bottom surface without XS generation.
+It supports WSE smoothing, soundings, SWOT residual anchoring, optional authoritative-bed blending, and diagnostic receipts.
+
+### Stage E — fusion
+
+If `fuse` is enabled, `bathy_main.py` fuses the available SDB and river rasters under `out_dir/combined/`.
+Current fusion behavior includes:
+
+- fast-path handling when only one source is available
+- optional sanitization of problematic SDB zero-valued regions before fusion
+- alignment to a template grid
+- domain-aware source separation so river and non-river areas do not bleed across the wrong mask
+- provenance output alongside the fused raster where supported
+
+### Stage F — final domain policy and post-processing
+
+Near the end of the run, `bathy_main.py` applies final domain clipping rules.
+This is intentionally late in the pipeline so it can act as a final safety net even if an upstream stage produced a broader raster than intended.
+
+Optional additional late-stage tasks may include:
+
+- SDB vertical-datum conversion when explicitly requested
+- seam comparison against neighboring `io_manifest.json` files
+- transition and seam receipts where those checks are enabled
+
+### Stage G — reports, manifests, and summaries
+
+The workflow writes multiple layers of metadata after execution:
+
+- `bathy_report.json` — main orchestrator report
+- `unified_bathy_report.json` and `.md` — whole-run summary
+- `io_manifest.json` and `.md` — explicit paths observed during the run
+- `run_logs/run_summary_*` — machine, technical, scientific, and human summaries
+- `run_logs/flight_recorder_*.jsonl` — structured execution trace
+
+These files are intended to replace old habits of inferring output locations from memory.
+
+## 4) Output retention behavior
+
+By default, the workflow keeps final deliverables and run metadata in `--out-dir` and removes or relocates non-deliverable intermediates.
+If `--save-intermediates` is enabled, the run retains more artifacts under the configured intermediates directory.
+
+This means the output directory is intentionally not a dump of every temporary file by default.
+The manifest and reports are the stable way to know what survived the retention policy.
+
+## 5) Important receipts and diagnostics
+
+Depending on the exact path taken, the workflow may write:
+
+- `input_receipt.json`
+- `soundings_channel_receipt.json`
+- `energy_solver_receipt.json`
+- `*.reproject_receipt.json`
+- `seam_comparisons.json`
+
+These are best-effort audit artifacts and are especially useful when verifying a bugfix or reviewing a questionable result.
+
+## 6) Verification and packaging
+
+Before packaging a zip or committing changes, run:
 
 ```bash
 ./verify_repo.sh
-# or
-./run_smoke.sh
-# (compat wrapper)
-./tests/run_smoke.sh
+./ci_smoke.sh
 ```
 
-What is tested:
+The second script is the stronger hygiene gate and will fail if the repo tree contains committed cache artifacts such as `__pycache__`, `.pytest_cache`, or `*.pyc` files.
 
-- **Compile-only:** compiles all `*.py` files (`tests/test_compile.py`)
-- **River XS deconflict:** verifies intersecting cross-sections are dropped deterministically (`tests/smoke_test_river_xs.py`)
-- **WSE profile fitting (SWOT-like):** verifies monotone-smoothed WSE fitting on a noisy synthetic series (`tests/smoke_test_river_skeleton_swot.py`)
+## 7) Practical debugging order
 
-These tests do **not** validate full data-dependent river inference or SDB alignment correctness.
+When something is wrong, check in this order:
+
+1. `bathy_report.json`
+2. `unified_bathy_report.json`
+3. `io_manifest.json`
+4. `run_logs/`
+5. component-specific receipts in `sdb/`, `river/`, or the cache tree
+6. source-specific manifests such as `artifacts_sdb.json`

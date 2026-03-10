@@ -1,21 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-xs_builder.py – Build river cross-sections (XS) from a river network + DEM/topo rasters
+xs_builder.py – Build river cross-sections (XS) from a river network and DEM/topo rasters.
 
-Build river cross-sections (XS) for CUDEM-style coastal river bathymetry workflows.
+Keeps the largest connected components, applies rolling-window orientation smoothing,
+and trims intersecting XS lines to prevent zipper artifacts.
 
-Key Features:
-- **Component-based Pruning**: Keeps largest connected river networks to avoid minor/artificial paths.
-- **Orientation Smoothing**: Uses a rolling window for tangents to fan XS lines around bends.
-- **Overlap Trimming**: Detects and trims intersecting cross-sections to prevent "zipper" artifacts.
-
-Inputs:
-- river_network.gpkg (from river_network.py)
-- Rasters: --dem (required), --topo-lidar (optional)
-
-Outputs:
-- Output GPKG with 'xs_lines' and 'xs_points' layers.
+Inputs:  river_network.gpkg, --dem (required), --topo-lidar (optional)
+Outputs: GPKG with 'xs_lines' and 'xs_points' layers.
 """
 
 
@@ -162,17 +154,17 @@ def filter_by_component_length(
     edges = edges.copy()
 
     if "component_id" not in edges.columns:
-        log.warning("[COMPONENT] graph_edges has no component_id; skipping component pruning.")
+        log.warning("graph_edges has no component_id; skipping component pruning.")
         return rivers
 
     rivers = _attach_component_id_to_rivers(rivers, edges)
     if "component_id" not in rivers.columns:
-        log.warning("[COMPONENT] rivers_clip has no component_id and could not be joined; skipping component pruning.")
+        log.warning("rivers_clip has no component_id and could not be joined; skipping component pruning.")
         return rivers
 
     comp_len = compute_component_lengths(edges)
     if comp_len.empty:
-        log.warning("[COMPONENT] No component lengths computed; skipping component pruning.")
+        log.warning("No component lengths computed; skipping component pruning.")
         return rivers
 
     keep_top_components = max(1, int(keep_top_components))
@@ -217,26 +209,26 @@ def filter_centerlines(
     if col_ftype:
         before = len(gdf)
         gdf = gdf[gdf[col_ftype].astype("float64").isin([float(x) for x in ftype_allow])]
-        log.info("[FILTER] ftype allow=%s (%s): %d → %d", ftype_allow, col_ftype, before, len(gdf))
+        log.info("ftype allow=%s (%s): %d → %d", ftype_allow, col_ftype, before, len(gdf))
     else:
-        log.info("[FILTER] No ftype field found; skipping ftype filter.")
+        log.info("No ftype field found; skipping ftype filter.")
 
     if col_order:
         before = len(gdf)
         gdf = gdf[pd.to_numeric(gdf[col_order], errors="coerce").fillna(-1) >= int(min_stream_order)]
-        log.info("[FILTER] min_stream_order=%d (%s): %d → %d", int(min_stream_order), col_order, before, len(gdf))
+        log.info("min_stream_order=%d (%s): %d → %d", int(min_stream_order), col_order, before, len(gdf))
     else:
-        log.info("[FILTER] No stream order field found; skipping stream order filter.")
+        log.info("No stream order field found; skipping stream order filter.")
 
     if col_len:
         before = len(gdf)
         gdf = gdf[pd.to_numeric(gdf[col_len], errors="coerce").fillna(0.0) >= float(min_length_km)]
-        log.info("[FILTER] min_length_km=%.3f (%s): %d → %d", float(min_length_km), col_len, before, len(gdf))
+        log.info("min_length_km=%.3f (%s): %d → %d", float(min_length_km), col_len, before, len(gdf))
     else:
-        log.info("[FILTER] No lengthkm field found; skipping length filter.")
+        log.info("No lengthkm field found; skipping length filter.")
 
     gdf = gdf[gdf.geometry.notnull() & ~gdf.geometry.is_empty].copy()
-    log.info("[FILTER] centerlines kept: %d / %d", len(gdf), n0)
+    log.info("centerlines kept: %d / %d", len(gdf), n0)
     return gdf
 
 
@@ -340,7 +332,7 @@ def _trim_overlapping_xs(xs_list: List[Dict]) -> List[Dict]:
             log.debug("XS trim failed for pair %s/%s; skipping.", curr.get("xs_id"), next_xs.get("xs_id"), exc_info=True)
 
     if modified > 0:
-        log.info("[XS] Trimmed %d intersecting cross-section pairs.", modified)
+        log.info("Trimmed %d intersecting cross-section pairs.", modified)
         
     return xs_list
 
@@ -529,7 +521,7 @@ def _global_deconflict_xs_all(xs_lines_records: List[Dict], tol_m: float) -> Lis
             kept.add(rec_i)
 
     if dropped:
-        log.info("[XS] Global deconflict (all) dropped %d intersecting XS across AOI.", len(dropped))
+        log.info("Global deconflict (all) dropped %d intersecting XS across AOI.", len(dropped))
 
     # Return records in original order for stability
     out: List[Dict] = []
@@ -568,7 +560,7 @@ def _global_deconflict_xs(xs_list: List[Dict], tol_m: float) -> List[Dict]:
 
     dropped = len(xs_list) - len(kept)
     if dropped > 0:
-        log.info("[XS] Global deconflict dropped %d intersecting XS within reach.", dropped)
+        log.info("Global deconflict dropped %d intersecting XS within reach.", dropped)
     return kept
 
 
@@ -729,8 +721,8 @@ def build_xs_for_river(
                 raise RuntimeError(f"Topo raster has no CRS: {topo_path}")
             xform_to_topo = None if rivers_crs == topo_crs else Transformer.from_crs(rivers_crs, topo_crs, always_xy=True)
 
-        log.info("[CRS] rivers=%s | dem=%s | topo=%s", rivers_crs.to_string(), dem_crs.to_string(), topo_crs.to_string() if topo_crs else "<none>")
-        log.info("[DEM] nodata=%s | bounds=%s", str(dem_ds.nodata), str(dem_ds.bounds))
+        log.info("rivers=%s | dem=%s | topo=%s", rivers_crs.to_string(), dem_crs.to_string(), topo_crs.to_string() if topo_crs else "<none>")
+        log.info("nodata=%s | bounds=%s", str(dem_ds.nodata), str(dem_ds.bounds))
 
         xs_lines_records = []
         xs_points_records = []
@@ -751,9 +743,9 @@ def build_xs_for_river(
                 junction_pts = _compute_junction_points(lines, snap_m=float(cfg.junction_snap_m), min_degree=3)
                 if junction_pts:
                     junction_tree = STRtree(junction_pts)
-                    log.info("[XS] Detected %d junction node(s) from reach endpoints.", len(junction_pts))
+                    log.info("Detected %d junction node(s) from reach endpoints.", len(junction_pts))
             except Exception as e:
-                log.debug("[XS] Junction detection failed: %s", e)
+                log.debug("Junction detection failed: %s", e)
                 junction_tree = None
         # Determine smoothing window (use spacing if not explicit)
         smoothing_eps = (cfg.smoothing_window_m / 2.0) if cfg.smoothing_window_m > 0 else (cfg.spacing_m / 2.0)
@@ -798,7 +790,7 @@ def build_xs_for_river(
                             if any(center_pt.distance(pt) <= float(cfg.junction_buffer_m) for pt in _hit_jpts):
                                 continue
                     except Exception:
-                        log.debug("[XS] Junction proximity check failed; skipping.", exc_info=True)
+                        log.debug("Junction proximity check failed; skipping.", exc_info=True)
 
                 # Use smoothed tangent for orientation
                 tan = _line_tangent(geom, s_center, eps=smoothing_eps)
@@ -913,7 +905,7 @@ def build_xs_for_river(
         xs_lines_gdf = gpd.GeoDataFrame(xs_lines_records, crs=rivers_clip.crs)
         xs_pts_gdf = gpd.GeoDataFrame(xs_points_records, crs=rivers_clip.crs)
 
-        log.info("[WRITE] %s (xs_lines=%d, xs_points=%d)", out_gpkg, len(xs_lines_gdf), len(xs_pts_gdf))
+        log.info("%s (xs_lines=%d, xs_points=%d)", out_gpkg, len(xs_lines_gdf), len(xs_pts_gdf))
         xs_lines_gdf.to_file(out_gpkg, layer="xs_lines", driver="GPKG")
         xs_pts_gdf.to_file(out_gpkg, layer="xs_points", driver="GPKG")
 
@@ -922,13 +914,13 @@ def build_xs_for_river(
             out_csv.parent.mkdir(parents=True, exist_ok=True)
             df_csv = xs_pts_gdf.drop(columns=["geometry"]).copy()
             df_csv.to_csv(out_csv, index=False)
-            log.info("[WRITE] %s", out_csv)
+            log.info("%s", out_csv)
 
         if topo_ds_ctx is not None:
             try:
                 topo_ds_ctx.close()
             except Exception:
-                pass
+                log.debug("ignored", exc_info=True)
 
 
 # --------------------------------------------------------------------------------------
@@ -1041,7 +1033,7 @@ def main() -> None:
         try:
             ftype_allow.append(int(float(s)))
         except Exception:
-            log.debug("[CLI] Could not parse ftype value %r; skipping.", s, exc_info=True)
+            log.debug("Could not parse ftype value %r; skipping.", s, exc_info=True)
     if not ftype_allow:
         ftype_allow = [460, 558]
 

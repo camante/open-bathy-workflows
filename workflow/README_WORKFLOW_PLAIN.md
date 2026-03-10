@@ -1,84 +1,79 @@
-# Open Bathy Workflows – Plain-language guide
+# Open Bathy Workflows — Plain-Language Guide
 
+> **Authoritative outputs:** use `io_manifest.json`, `io_manifest.md`, and `unified_bathy_report.json` from the run you just made.
+> Older notes may mention filenames that are no longer guaranteed.
 
-> **Authoritative file list:** Each run writes `io_manifest.json` and `io_manifest.md` into your `--out-dir`.
-> Use those manifests (and `unified_bathy_report.json`) as the *only* source of truth for exact input/output filenames and paths.
-> Do **not** rely on any “canonical” filenames in docs; outputs can vary by enabled methods and configuration.
+This workflow makes bathymetry in two different water settings and can merge them into one final result.
 
-This project makes “underwater maps” (bathymetry) using a mix of satellite images and river mapping data.
+## The three main parts
 
-It can do two main jobs:
+### Coastal / nearshore bathymetry
 
-1) **Coastal / ocean bathymetry (SDB)**  
-   Uses Sentinel‑2 satellite imagery to estimate water depth near the coast.
+The workflow uses Sentinel-2 imagery, ICESat-2 data, and optional external soundings to estimate depth in coastal water.
 
-2) **River bathymetry**  
-   Uses river polygons (NHDArea) to estimate where the river channel is, then predicts a smooth river bottom that is safe for modeling.
+### River bathymetry
 
-You can run either one, or both together.
+The workflow uses river hydrography, a DEM, masks, and optional soundings or hydraulic constraints to estimate the river bed.
 
----
+### Fusion
 
-## The most important idea: “Only predict in the right water”
+If both coastal and river products are available, the workflow combines them into one final raster.
 
-The workflow keeps **separate areas (domains)** for the coast and for rivers:
+## The most important safety idea
 
-- **Coast domain (SDB):** where ocean/coastal water is allowed  
-- **River domain:** where river water is allowed (from NHDArea)
+The code keeps separate ideas of where bathymetry is allowed:
 
-Sometimes these can overlap near river mouths. The workflow handles this in a predictable way.
+- a **coastal water domain**
+- a **river/channel domain**
 
-### The rule the code follows
+At the end of the run, the workflow clips deliverables so that depths do not remain outside the intended water area.
+That final clipping is a safety net, not a replacement for correct upstream masking.
 
-- If you run **SDB only**, final results are clipped to the **coast water mask**
-- If you run **River only**, final results are clipped to the **river mask**
-- If you run **both**, final results are clipped to the **combined “coast + river” mask**
+## What “hybrid river” means now
 
-This prevents weird outputs like:
-- depth appearing on land
-- depth appearing in lakes when you only want rivers
-- depth appearing outside your area of interest
+The current default river mode is `hybrid`.
+That means the workflow does not try to force cross-sections everywhere.
+Instead, it uses cross-section inference where it is most useful on the mainstem and uses the skeleton method to stabilize the rest of the river network.
 
----
+## What SWOT does here
 
-## What file should I look at?
+SWOT RiverSP observations are used to help stabilize water-surface elevation and slope where requested.
+They are not treated as a direct bathymetry raster.
 
-After the run finishes, the main output is usually:
+## What files should I inspect after a run?
 
-- `combined/` (see `io_manifest.json` for exact filenames)
+Start here:
 
-If you ran the river method, you will also get:
+- `io_manifest.json` to see the exact files that went in and came out
+- `bathy_report.json` to see which stages ran and whether they succeeded
+- `unified_bathy_report.json` for a simpler whole-run summary
+- `run_logs/` for human-readable and technical summaries
 
-- River depth output filename varies by configuration/run; see `io_manifest.json` and `unified_bathy_report.json` for exact paths.
-
----
-
-## One command to run both SDB + River
+## One example command
 
 ```bash
-PYTHONUNBUFFERED=1 python -u bathy_main.py \
-  --aoi="-71.25/-71.00/42.75/43.00" \
-  --start="2025-01-01" --end="2026-01-01" \
-  --methods=sdb,river \
-  --out-dir="output/my_run" \
-  --cache-root="cache/my_run"
+python bathy_main.py \
+  --aoi="-71.14/-71.10/42.75/42.78" \
+  --start=2025-01-01 \
+  --end=2026-01-01 \
+  --methods=sdb,river,fuse \
+  --out-dir=output/example_run \
+  --cache-root=cache
 ```
 
----
+## Common confusion points
 
-## Common problems
+### “Why are the filenames different from an older run?”
 
-### “I see depths outside where I expected”
-That usually means the correct mask wasn’t found or wasn’t applied.
-Make sure:
-- the waffles coastline masks were created
-- the river channel mask (`river_channel_mask.tif`) exists
-- your `--methods` setting matches what you intended
+The workflow now treats manifests and reports as authoritative.
+Do not assume an older canonical filename still applies.
 
-### “The summary metrics say no channel mask found”
-The metrics script needs a channel mask to measure the results.
-It can now also read `bathy_report.json` to find the cached mask automatically.
+### “Why is there river depth only inside the channel mask?”
 
-### “Weird circles at stream junctions”
-Those were caused by how junction smoothing blended values from small tributaries into the main channel.
-The river method now uses a “main channel width proxy” approach so the main river stays continuous.
+That is intentional.
+River deliverables are clipped to the river/channel domain.
+
+### “Why does the combined raster not extend everywhere both methods had values?”
+
+Fusion still respects domain policies and source priority.
+The goal is not to keep every pixel at all costs, but to keep the final product physically and operationally defensible.

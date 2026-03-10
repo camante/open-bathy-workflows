@@ -19,7 +19,7 @@ def write_json(path: Path, obj: Dict[str, Any]) -> None:
     """Write JSON to disk (and emit a flight-recorder breadcrumb when available)."""
     path = Path(path)
     ensure_dir(path.parent)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2)
 
     # Flight recorder breadcrumb (best effort)

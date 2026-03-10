@@ -67,7 +67,7 @@ def _log_funnel(stage: str, df: Optional[pd.DataFrame], rr: Optional[Any] = None
             f"max={stats.get('p100', float('nan')):.2f}"
         )
     else:
-        log.info(f"[Funnel] {stage}: n={stats['n']}")
+        log.info(f"{stage}: n={stats['n']}")
 
     if rr is not None:
         try:
@@ -76,7 +76,7 @@ def _log_funnel(stage: str, df: Optional[pd.DataFrame], rr: Optional[Any] = None
             elif hasattr(rr, "data") and isinstance(rr.data, dict):
                 rr.data[f"funnel.{stage}"] = stats
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("run-recorder funnel update failed", exc_info=True)
 
 # -----------------------------------------------------------------------------
 # Helper: local metric projection
@@ -97,14 +97,14 @@ def _build_local_transformer(latitudes: np.ndarray, longitudes: np.ndarray) -> T
     longitudes = np.asarray(longitudes, dtype=float)
 
     if latitudes.size == 0 or longitudes.size == 0:
-        log.warning("[Fusion] Empty lat/lon arrays in _build_local_transformer; using EPSG:3857 fallback.")
+        log.warning("Empty lat/lon arrays in _build_local_transformer; using EPSG:3857 fallback.")
         return Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 
     mean_lat = float(np.nanmean(latitudes))
     mean_lon = float(np.nanmean(longitudes))
 
     if not np.isfinite(mean_lat) or not np.isfinite(mean_lon):
-        log.warning("[Fusion] Non-finite mean lat/lon; using EPSG:3857 fallback.")
+        log.warning("Non-finite mean lat/lon; using EPSG:3857 fallback.")
         return Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 
     try:
@@ -114,10 +114,10 @@ def _build_local_transformer(latitudes: np.ndarray, longitudes: np.ndarray) -> T
             epsg_code = f"EPSG:{32600 + utm_zone}"
         else:
             epsg_code = f"EPSG:{32700 + utm_zone}"
-        log.info("[Fusion] Using local metric CRS %s for KDTree distances.", epsg_code)
+        log.info("Using local metric CRS %s for KDTree distances.", epsg_code)
         return Transformer.from_crs("EPSG:4326", epsg_code, always_xy=True)
     except Exception as exc:
-        log.warning("[Fusion] Failed to build UTM CRS (%s); using EPSG:3857.", exc)
+        log.warning("Failed to build UTM CRS (%s); using EPSG:3857.", exc)
         return Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 
 
@@ -237,11 +237,11 @@ def check_atl_consistency_and_fuse(
         return pd.DataFrame(columns=["longitude", "latitude", "depth_m", "source"])
 
     if df_atl03.empty and not df_atl24.empty:
-        log.info(f"[ATL Fusion] ATL03 empty; keeping all ATL24 points: {len(df_atl24)}.")
+        log.info("[ATL Fusion] ATL03 empty; keeping all ATL24 points: %s.", len(df_atl24))
         return df_atl24.copy()
 
     if df_atl24.empty and not df_atl03.empty:
-        log.info(f"[ATL Fusion] ATL24 empty; keeping all ATL03 points: {len(df_atl03)}.")
+        log.info("[ATL Fusion] ATL24 empty; keeping all ATL03 points: %s.", len(df_atl03))
         return df_atl03.copy()
 
     log.info(
@@ -269,15 +269,18 @@ def check_atl_consistency_and_fuse(
     collocated_mask03 = (idx != tree24.n)
 
     n_collocated = int(np.sum(collocated_mask03))
-    log.info(f"[ATL Fusion] {n_collocated} ATL03 points collocated with ATL24 within {max_dist_m:.1f} m.")
+    log.info("[ATL Fusion] %s ATL03 points collocated with ATL24 within %.1f m.", n_collocated, max_dist_m)
 
     if n_collocated == 0:
-        log.info("[ATL Fusion] No collocated pairs; keeping all ATL03 and ATL24 points.")
-        # Diagnostic: show spatial extent of both datasets
-        log.info(f"[ATL Fusion] ATL03 lat range: [{df_atl03['latitude'].min():.6f}, {df_atl03['latitude'].max():.6f}]")
-        log.info(f"[ATL Fusion] ATL24 lat range: [{df_atl24['latitude'].min():.6f}, {df_atl24['latitude'].max():.6f}]")
-        log.info(f"[ATL Fusion] ATL03 lon range: [{df_atl03['longitude'].min():.6f}, {df_atl03['longitude'].max():.6f}]")
-        log.info(f"[ATL Fusion] ATL24 lon range: [{df_atl24['longitude'].min():.6f}, {df_atl24['longitude'].max():.6f}]")
+        log.info(
+            "[ATL Fusion] No collocated pairs; keeping all %d ATL03 + %d ATL24 points. "
+            "ATL03 lon=[%.4f,%.4f] lat=[%.4f,%.4f] ATL24 lon=[%.4f,%.4f] lat=[%.4f,%.4f]",
+            len(df_atl03), len(df_atl24),
+            df_atl03["longitude"].min(), df_atl03["longitude"].max(),
+            df_atl03["latitude"].min(), df_atl03["latitude"].max(),
+            df_atl24["longitude"].min(), df_atl24["longitude"].max(),
+            df_atl24["latitude"].min(), df_atl24["latitude"].max(),
+        )
         return pd.concat([df_atl03, df_atl24], ignore_index=True)
 
     df03_c = df_atl03[collocated_mask03].copy().reset_index(drop=False)
@@ -289,12 +292,14 @@ def check_atl_consistency_and_fuse(
     d_avg = (d03 + d24) / 2.0
     d_diff = np.abs(d03 - d24)
     
-    # Diagnostic: show depth difference statistics for collocated pairs
-    log.info(f"[ATL Fusion] Collocated depth stats:")
-    log.info(f"  ATL03 depth: min={d03.min():.2f}, median={np.median(d03):.2f}, max={d03.max():.2f} m")
-    log.info(f"  ATL24 depth: min={d24.min():.2f}, median={np.median(d24):.2f}, max={d24.max():.2f} m")
-    log.info(f"  Difference:  min={d_diff.min():.2f}, median={np.median(d_diff):.2f}, max={d_diff.max():.2f} m")
-    log.info(f"  Pairs with |diff| <= {max_abs_diff_m}m: {np.sum(d_diff <= max_abs_diff_m)} / {len(d_diff)}")
+    # Diagnostic: depth stats for collocated pairs
+    log.info(
+        "[ATL Fusion] Collocated depth stats: ATL03[%.2f..%.2f] ATL24[%.2f..%.2f] "
+        "diff[med=%.2f max=%.2f] agree_within_%.2fm: %d/%d",
+        d03.min(), d03.max(), d24.min(), d24.max(),
+        float(np.median(d_diff)), d_diff.max(), max_abs_diff_m,
+        int(np.sum(d_diff <= max_abs_diff_m)), len(d_diff),
+    )
 
     # Depths in this pipeline are negative-down. Apply thresholds on magnitude.
     d_mag = np.abs(d_avg)
@@ -348,7 +353,7 @@ def check_atl_consistency_and_fuse(
     if keep_unmatched_atl03:
         df03_u = df_atl03.loc[~collocated_mask03].copy()
         if not df03_u.empty:
-            log.info(f"[ATL Fusion] Keeping {len(df03_u)} unmatched ATL03 points.")
+            log.info("[ATL Fusion] Keeping %s unmatched ATL03 points.", len(df03_u))
             out_parts.append(df03_u)
 
     if keep_unmatched_atl24:
@@ -356,7 +361,7 @@ def check_atl_consistency_and_fuse(
         matched24 = np.isin(all24_idx, idx24_c)
         df24_u = df_atl24.loc[~matched24].copy()
         if not df24_u.empty:
-            log.info(f"[ATL Fusion] Keeping {len(df24_u)} unmatched ATL24 points.")
+            log.info("[ATL Fusion] Keeping %s unmatched ATL24 points.", len(df24_u))
             out_parts.append(df24_u)
 
     if not out_parts:
@@ -364,7 +369,7 @@ def check_atl_consistency_and_fuse(
         return pd.DataFrame(columns=["longitude", "latitude", "depth_m", "source"])
 
     df_out = pd.concat(out_parts, ignore_index=True)
-    log.info(f"[ATL Fusion] Final ATL points after collocation-aware fusion: {len(df_out)}.")
+    log.info("[ATL Fusion] Final ATL points after collocation-aware fusion: %s.", len(df_out))
     return df_out
 # -----------------------------------------------------------------------------
 # 3. Schema enforcement & final training frame builder
@@ -424,9 +429,9 @@ def _ensure_training_schema(
     # Logging weight distribution for verification (mean weight by source)
     try:
         stats = df.groupby("source")["sample_weight"].mean().to_dict()
-        log.info("[Fusion] Weight distribution (mean by source): %s", stats)
+        log.info("Weight distribution (mean by source): %s", stats)
     except Exception:
-        log.debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("Weight distribution log failed", exc_info=True)
 
     # Enforce column order
     col_order = [
@@ -436,44 +441,21 @@ def _ensure_training_schema(
     extra_cols = [c for c in df.columns if c not in col_order]
     df = df[col_order + extra_cols]
 
-    # === DIAGNOSTIC LOGGING: Data composition by source ===
+    # Log data composition by source (single pass)
     if not df.empty and 'source' in df.columns:
-        log.info("=" * 60)
-        log.info("[Fusion] FINAL DATA COMPOSITION:")
-        log.info("=" * 60)
-        
         source_counts = df['source'].value_counts()
         total_rows = len(df)
-        
-        for source in source_counts.index:
-            count = source_counts[source]
-            pct = 100.0 * count / total_rows
-            
-            # Get sample weights for this source
-            source_mask = df['source'] == source
-            weights = df.loc[source_mask, 'sample_weight']
-            mean_weight = weights.mean()
-            total_weight = weights.sum()
-            
-            log.info(
-                f"  {source:20s}: n={count:6d} ({pct:5.1f}%), "
-                f"weight_mean={mean_weight:5.1f}, weight_total={total_weight:8.0f}"
-            )
-        
-        # Total weighted samples
         total_weighted = df['sample_weight'].sum()
-        log.info(f"\n  Total samples: {total_rows:,}")
-        log.info(f"  Total weighted: {total_weighted:,.0f}")
-        
-        # Effective sample counts (if all had weight=1.0)
-        log.info(f"\n  Effective contribution by source:")
+        log.info("Final data composition (%d rows):", total_rows)
         for source in source_counts.index:
-            source_mask = df['source'] == source
-            weight_contrib = df.loc[source_mask, 'sample_weight'].sum()
-            effective_pct = 100.0 * weight_contrib / total_weighted
-            log.info(f"    {source:20s}: {effective_pct:5.1f}% of training influence")
-        
-        log.info("=" * 60)
+            count = int(source_counts[source])
+            pct = 100.0 * count / total_rows
+            weight_contrib = df.loc[df['source'] == source, 'sample_weight'].sum()
+            eff_pct = 100.0 * weight_contrib / total_weighted if total_weighted > 0 else 0.0
+            log.info(
+                "  %-20s n=%6d (%5.1f%%)  weight_mean=%5.1f  training_influence=%5.1f%%",
+                source, count, pct, weight_contrib / count if count else 0, eff_pct,
+            )
     
     return df
 
@@ -492,21 +474,18 @@ def build_fused_training_dataframe(
     atl24_weight: float = 1.0,
     xyz_weight: float = 10.0,
     rr: Optional[object] = None,
-    # NEW in v0.7.0: Adaptive Spatial Sampling (ENABLED BY DEFAULT)
-    enable_adaptive_sampling: bool = True,  # Changed from False to True
+    enable_adaptive_sampling: bool = True,
     sampling_target_points: int = 2000,
     sampling_min_threshold: int = 3000,
     sampling_max_gap_m: float = 100.0,
 ) -> pd.DataFrame:
     """
     Build fused training dataframe from ATL03, ATL24, and optional XYZ data.
-    
-    FIXES in v0.6.1:
-    - Relaxed XYZ filtering (100m radius, 1.5m tolerance) for sparse surveys
-    - Force source normalization to "extra_xyz" for all XYZ data
-    - Added comprehensive diagnostic logging
+
+    XYZ filtering uses a 100m radius / 1.5m tolerance for sparse surveys.
+    All XYZ source labels are normalized to "extra_xyz".
     """
-    # >>> FIX: Initialize with empty schema to avoid KeyError if one source is missing <<<
+    # Initialize with empty schema to avoid KeyError if one source is missing
     empty_schema = pd.DataFrame(columns=["longitude", "latitude", "depth_m", "source"])
     
     atl03_df = atl03_df.copy() if (atl03_df is not None and not atl03_df.empty) else empty_schema.copy()
@@ -514,29 +493,9 @@ def build_fused_training_dataframe(
     xyz_df = xyz_df.copy() if (xyz_df is not None and not xyz_df.empty) else empty_schema.copy()
 
     _log_funnel('fusion.input.atl03', atl03_df, rr)
+    # ATL03 shallow-collapse QC: warn and optionally drop if bottom-picking appears clipped.
     try:
         if not atl03_df.empty and 'depth_m' in atl03_df.columns:
-            _d = pd.to_numeric(atl03_df['depth_m'], errors='coerce')
-            _d = _d[np.isfinite(_d)]
-            if len(_d) >= 50:
-                dmin = float(np.nanmin(_d.to_numpy()))
-                p95 = float(np.nanpercentile(_d.to_numpy(), 95))
-                spread95 = p95 - dmin
-                if spread95 < 0.25:
-                    log.warning(
-                        "[ATL03_QC] ATL03 depths are tightly clustered near their shallow limit (min=%.2f, p95=%.2f, spread95=%.2f m). This often indicates bottom-picking clipping / poor penetration. Consider checking ATL03 params (min-depth-atl03, conf/min-bottom-photons, water class) and rely more on ATL24/XYZ for this run.",
-                        dmin, p95, spread95,
-                    )
-        
-    except Exception:
-        log.debug("Optional ATL03 QC warning failed", exc_info=True)
-    _log_funnel('fusion.input.atl24', atl24_df, rr)
-    _log_funnel('fusion.input.xyz', xyz_df, rr)
-
-    # Defensive ATL03 QC: if ATL03 collapses near the shallow floor (failed bottom-pick signature),
-    # prevent it from poisoning training when stronger anchors exist.
-    try:
-        if not atl03_df.empty and 'depth_m' in atl03_df.columns and len(atl03_df) >= 50:
             _d = pd.to_numeric(atl03_df['depth_m'], errors='coerce').to_numpy()
             _d = _d[np.isfinite(_d)]
             if _d.size >= 50:
@@ -552,8 +511,15 @@ def build_fused_training_dataframe(
                     )
                     atl03_df = atl03_df.iloc[0:0].copy()
                     _log_funnel('fusion.input.atl03.quarantined', atl03_df, rr)
+                elif _spread95 < 0.25:
+                    log.warning(
+                        "[ATL03_QC] ATL03 depths are tightly clustered (min=%.2f, p95=%.2f, spread95=%.2f m). May indicate bottom-picking clipping; consider checking ATL03 params.",
+                        _dmin, _p95, _spread95,
+                    )
     except Exception:
-        log.debug("Optional ATL03 quarantine QC failed", exc_info=True)
+        log.debug("Optional ATL03 QC failed", exc_info=True)
+    _log_funnel('fusion.input.atl24', atl24_df, rr)
+    _log_funnel('fusion.input.xyz', xyz_df, rr)
 
     log.info(
         f"[Fusion] Starting build_fused_training_dataframe with "
@@ -569,16 +535,16 @@ def build_fused_training_dataframe(
     if not xyz_df.empty:
         if ("source" not in xyz_df.columns) or xyz_df["source"].isna().all():
             xyz_df["source"] = "extra_xyz"
-            log.info(f"[Fusion] XYZ source normalized: {len(xyz_df)} points set to 'extra_xyz'")
+            log.info("XYZ source normalized: %s points set to source=extra_xyz", len(xyz_df))
         else:
             # Fill only missing entries; preserve existing tags
             n_missing = int(xyz_df["source"].isna().sum())
             if n_missing > 0:
                 xyz_df.loc[xyz_df["source"].isna(), "source"] = "extra_xyz"
-            log.info(f"[Fusion] XYZ source preserved: {len(xyz_df)} points (missing filled={n_missing})")
+            log.info("XYZ source preserved: %s points (missing filled=%s)", len(xyz_df), n_missing)
     # Step 1: Filter ATL against XYZ, if XYZ provided
     if not xyz_df.empty and (not atl03_df.empty or not atl24_df.empty):
-        log.info("[Fusion] Stage 1: Filter ATL03/ATL24 against high-quality XYZ data.")
+        log.info("Stage 1: Filter ATL03/ATL24 against high-quality XYZ data.")
         parts = [df for df in (atl03_df, atl24_df) if df is not None and not df.empty]
         df_atl_combined = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
         _log_funnel('fusion.xyz_filter.atl_combined.pre', df_atl_combined, rr)
@@ -599,10 +565,10 @@ def build_fused_training_dataframe(
         _log_funnel('fusion.xyz_filter.atl03.post', atl03_df, rr)
         _log_funnel('fusion.xyz_filter.atl24.post', atl24_df, rr)
     else:
-        log.info("[Fusion] Skipping XYZ filter: XYZ is empty or no ATL data.")
+        log.info("Skipping XYZ filter: XYZ is empty or no ATL data.")
 
     # Step 2: ATL03 vs ATL24 fusion
-    log.info("[Fusion] Stage 2: ATL03 vs ATL24 consistency check and fusion.")
+    log.info("Stage 2: ATL03 vs ATL24 consistency check and fusion.")
     _log_funnel('fusion.atl_fuse.atl03.pre', atl03_df, rr)
     _log_funnel('fusion.atl_fuse.atl24.pre', atl24_df, rr)
     atl_fused = check_atl_consistency_and_fuse(
@@ -623,11 +589,11 @@ def build_fused_training_dataframe(
     else:
         final_df = atl_fused
 
-    log.info(f"[Fusion] Stage 3: Combined ATL (fused) + XYZ -> total points: {len(final_df)}.")
+    log.info("Stage 3: Combined ATL (fused) + XYZ -> total points: %s.", len(final_df))
     _log_funnel('fusion.combined.post', final_df, rr)
 
     if final_df.empty:
-        log.warning("[Fusion] Final fused DataFrame is empty.")
+        log.warning("Final fused DataFrame is empty.")
         return final_df
 
     # Step 4: Enforce schema + weights
@@ -637,11 +603,10 @@ def build_fused_training_dataframe(
         atl24_weight=atl24_weight,
         xyz_weight=xyz_weight,
     )
-    log.info("[Fusion] Final training DataFrame is schema-consistent and weighted.")
+    log.info("Final training DataFrame is schema-consistent and weighted.")
     _log_funnel('fusion.schema_weighted.final', final_df, rr)
     
-    # Step 5: Adaptive Spatial Sampling (NEW in v0.7.0)
-    # Apply sophisticated sampling if enabled
+    # Step 5: Adaptive Spatial Sampling
     if enable_adaptive_sampling:
         try:
             from spatial_sampling import adaptive_spatial_sample, SamplingConfig, DEFAULT_SOURCE_CONFIGS
@@ -650,7 +615,7 @@ def build_fused_training_dataframe(
             apply_sampling = len(final_df) >= sampling_min_threshold
             
             if apply_sampling:
-                log.info(f"[Fusion] Applying adaptive spatial sampling (input: {len(final_df):,} points)")
+                log.info("Applying adaptive spatial sampling (input: %s points)", format(len(final_df), ","))
                 
                 # Create sampling config
                 sampling_config = SamplingConfig(
@@ -670,7 +635,7 @@ def build_fused_training_dataframe(
                 )
                 
                 # Log results
-                log.info(f"[Fusion] Adaptive sampling complete: {len(final_df):,} → {len(sampled_df):,} points "
+                log.info(f"Adaptive sampling complete: {len(final_df):,} → {len(sampled_df):,} points "
                         f"({sampling_stats['reduction_pct']:.1f}% reduction)")
                 
                 # Save sampling statistics to run report
@@ -681,26 +646,26 @@ def build_fused_training_dataframe(
                         elif hasattr(rr, "data") and isinstance(rr.data, dict):
                             rr.data["fusion.adaptive_sampling"] = sampling_stats
                     except Exception:
-                        log.debug("Optional step failed; continuing.", exc_info=True)
+                        log.debug("Adaptive sampling failed; using unsampled points", exc_info=True)
                 
                 _log_funnel('fusion.sampled.final', sampled_df, rr)
                 return sampled_df
             else:
-                log.info(f"[Fusion] Skipping adaptive sampling (only {len(final_df):,} points, threshold: {sampling_min_threshold:,})")
+                log.info("Skipping adaptive sampling (only %s points, threshold: %s)", format(len(final_df), ","), format(sampling_min_threshold, ","))
                 return final_df
                 
         except ImportError as e:
-            log.warning("[Fusion] Adaptive sampling module not available: %s", e)
-            log.warning(f"[Fusion] Proceeding with unsampled data ({len(final_df):,} points)")
+            log.warning("Adaptive sampling module not available: %s", e)
+            log.warning("Proceeding with unsampled data (%s points)", format(len(final_df), ","))
             return final_df
         except Exception as e:
-            log.error("[Fusion] Adaptive sampling failed: %s", e, exc_info=True)
-            log.error(f"[Fusion] Proceeding with unsampled data ({len(final_df):,} points)")
+            log.error("Adaptive sampling failed: %s", e, exc_info=True)
+            log.error("Proceeding with unsampled data (%s points)", format(len(final_df), ","))
             import traceback
             traceback.print_exc()
             return final_df
     else:
-        log.info(f"[Fusion] Adaptive sampling disabled (use --enable-adaptive-sampling to enable)")
+        log.info("Adaptive sampling disabled (use --enable-adaptive-sampling to enable)")
         return final_df
 
 # -----------------------------------------------------------------------------
@@ -712,10 +677,10 @@ def _read_optional_csv(path: Optional[str]) -> pd.DataFrame:
         return pd.DataFrame()
     p = Path(path)
     if (not p.exists()) or p.stat().st_size == 0:
-        log.warning("[CLI] CSV not found or empty: %s", p)
+        log.warning("CSV not found or empty: %s", p)
         return pd.DataFrame()
     df = pd.read_csv(p)
-    log.info(f"[CLI] Loaded {len(df)} rows from {p}")
+    log.info("Loaded %s rows from %s", len(df), p)
     return df
 
 
@@ -726,8 +691,8 @@ def main(argv=None) -> int:
     parser.add_argument("--xyz-csv", type=str)
     parser.add_argument("--out", type=str, default="training_fused.csv")
 
-    parser.add_argument("--xyz-max-dist-m", type=float, default=30.0)
-    parser.add_argument("--xyz-max-abs-diff-m", type=float, default=0.5)
+    parser.add_argument("--xyz-max-dist-m", type=float, default=100.0)
+    parser.add_argument("--xyz-max-abs-diff-m", type=float, default=1.5)
     parser.add_argument("--atl-max-dist-m", type=float, default=20.0)
     parser.add_argument("--atl-max-abs-diff-m", type=float, default=1.0)
     parser.add_argument("--atl-max-rel-diff", type=float, default=0.15)
@@ -764,7 +729,7 @@ def main(argv=None) -> int:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fused_df.to_csv(out_path, index=False)
-    log.info(f"[CLI] Wrote {len(fused_df)} rows to {out_path}")
+    log.info("Wrote %s rows to %s", len(fused_df), out_path)
     return 0
 
 

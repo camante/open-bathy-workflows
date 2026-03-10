@@ -55,7 +55,7 @@ def _read_text_xyz(path: Path) -> np.ndarray:
 
 def _read_csv_xyz(path: Path) -> np.ndarray:
     import csv
-    with path.open('r', newline='') as f:
+    with path.open('r', newline='', encoding='utf-8') as f:
         r = csv.DictReader(f)
         rows = list(r)
     if not rows:
@@ -77,7 +77,7 @@ def _read_csv_xyz(path: Path) -> np.ndarray:
                 x = float(row[kx]); y = float(row[ky]); z = float(row[kz])
                 out.append((x,y,z)); continue
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
         # fallback: first 3 numeric fields
         vals=[]
         for v in row.values():

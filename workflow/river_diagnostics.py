@@ -123,18 +123,18 @@ def compute_xs_diagnostics(
         RiverDiagnostics with computed statistics
     """
     if not GEOPANDAS_AVAILABLE:
-        log.warning("[DIAG] geopandas not available; returning empty diagnostics")
+        log.warning("geopandas not available; returning empty diagnostics")
         return RiverDiagnostics()
     
     xs_gpkg = Path(xs_gpkg)
     if not xs_gpkg.exists():
-        log.warning("[DIAG] XS GPKG not found: %s", xs_gpkg)
+        log.warning("XS GPKG not found: %s", xs_gpkg)
         return RiverDiagnostics()
     
     try:
         gdf = gpd.read_file(xs_gpkg, layer=layer)
     except Exception as e:
-        log.warning(f"[DIAG] Failed to read {xs_gpkg}/{layer}: {e}")
+        log.warning("Failed to read %s/%s: %s", xs_gpkg, layer, e)
         return RiverDiagnostics()
     
     if gdf.empty:
@@ -150,7 +150,7 @@ def compute_xs_diagnostics(
             break
     
     if depth_col is None:
-        log.warning("[DIAG] No depth column found in XS data")
+        log.warning("No depth column found in XS data")
         return diag
     
     depths = pd.to_numeric(gdf[depth_col], errors="coerce").dropna()
@@ -190,7 +190,7 @@ def compute_raster_diagnostics(
         Dictionary with raster statistics
     """
     if not RASTERIO_AVAILABLE:
-        log.warning("[DIAG] rasterio not available")
+        log.warning("rasterio not available")
         return {}
     
     raster_path = Path(raster_path)
@@ -227,7 +227,7 @@ def compute_raster_diagnostics(
                 "crs": str(crs) if crs else None,
             }
     except Exception as e:
-        log.warning(f"[DIAG] Failed to read raster {raster_path}: {e}")
+        log.warning("Failed to read raster %s: %s", raster_path, e)
         return {}
 
 
@@ -280,7 +280,7 @@ def summarize_river_run(
         try:
             report.add("diagnostics", summary)
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("report.add diagnostics failed", exc_info=True)
     
     return summary
 
@@ -302,7 +302,7 @@ def create_unified_bathy_report(
       - <output_dir>/unified_bathy_report.md
     """
     import json
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -313,7 +313,7 @@ def create_unified_bathy_report(
     rep: Dict[str, Any] = {
         "pipeline": "unified_bathy",
         "version": "0.1",
-        "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "methods": list(methods) if methods is not None else [],
         "priority": str(priority) if priority is not None else None,
         "status": {},
@@ -333,7 +333,7 @@ def create_unified_bathy_report(
                 rep["status"]["river"] = main_rep.get("river", {}).get("status")
                 rep["status"]["fusion"] = main_rep.get("fusion", {}).get("status")
             except Exception:
-                pass
+                log.debug("ignored", exc_info=True)
             # Keep the main report embedded for traceability (users can inspect one file)
             rep["bathy_report"] = main_rep
         except Exception as e:
@@ -361,7 +361,7 @@ def create_unified_bathy_report(
             if mm.exists():
                 rep["artifacts"]["sdb_model_meta"] = json.loads(mm.read_text(errors="ignore"))
         except Exception:
-            pass
+            log.debug("ignored", exc_info=True)
 
     # River outputs
     if river_out is not None and river_out.exists():
@@ -374,7 +374,7 @@ def create_unified_bathy_report(
     try:
         out_json.write_text(json.dumps(rep, indent=2), encoding="utf-8")
     except Exception as e:
-        log.warning("[DIAG] Failed to write unified JSON report: %s", e)
+        log.warning("Failed to write unified JSON report: %s", e)
 
     # Simple markdown mirror for humans
     try:
@@ -407,7 +407,7 @@ def create_unified_bathy_report(
                 lines.append("")
         out_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
     except Exception as e:
-        log.warning("[DIAG] Failed to write unified markdown report: %s", e)
+        log.warning("Failed to write unified markdown report: %s", e)
 
     return out_json
 

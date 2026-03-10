@@ -121,7 +121,7 @@ def fetch_riversp(
         return RiverspFetchResult(files=[], cache_dir=str(out_dir), used_short_name=None, message=msg)
 
     if logger:
-        logger.info(f"[SWOT] Searching RiverSP ({used_short}) for bbox={w:.4f},{s:.4f},{e:.4f},{n:.4f} time={start_date}..{end_date}")
+        logger.info("[SWOT] Searching RiverSP (%s) for bbox=%.4f,%.4f,%.4f,%.4f time=%s..%s", used_short, w, s, e, n, start_date, end_date)
 
     try:
         granules = earthaccess.search_data(
@@ -136,13 +136,13 @@ def fetch_riversp(
 
     if not granules:
         msg = "No SWOT RiverSP granules found for AOI/time window"
-        if logger: logger.info(f"[SWOT] {msg}")
+        if logger: logger.info("[SWOT] %s", msg)
         return RiverspFetchResult(files=[], cache_dir=str(out_dir), used_short_name=used_short, message=msg)
 
     if len(granules) > max_granules:
         granules = granules[:max_granules]
         if logger:
-            logger.warning(f"[SWOT] Capping download to first {max_granules} granules; narrow --start/--end or AOI to reduce")
+            logger.warning("[SWOT] Capping download to first %s granules; narrow --start/--end or AOI to reduce", max_granules)
 
     # Download locally. earthaccess handles auth + redirects.
     try:

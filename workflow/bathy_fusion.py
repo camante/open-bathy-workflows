@@ -280,11 +280,11 @@ def _validate_crs_compatibility(src_crs, dst_crs, src_name: str = "source", dst_
     from pyproj import CRS
     
     if src_crs is None:
-        log.warning("[CRS] %s has no CRS defined - assuming EPSG:4326", src_name)
+        log.warning("%s has no CRS defined - assuming EPSG:4326", src_name)
         return False
     
     if dst_crs is None:
-        log.warning("[CRS] %s has no CRS defined - assuming EPSG:4326", dst_name)
+        log.warning("%s has no CRS defined - assuming EPSG:4326", dst_name)
         return False
     
     try:
@@ -297,13 +297,13 @@ def _validate_crs_compatibility(src_crs, dst_crs, src_name: str = "source", dst_
         
         # Warn about geographic vs projected mismatches
         if src.is_geographic and not dst.is_geographic:
-            log.info("[CRS] Reprojecting %s from geographic to projected CRS", src_name)
+            log.info("Reprojecting %s from geographic to projected CRS", src_name)
         elif not src.is_geographic and dst.is_geographic:
-            log.info("[CRS] Reprojecting %s from projected to geographic CRS", src_name)
+            log.info("Reprojecting %s from projected to geographic CRS", src_name)
         
         # Warn about different datums
         if src.datum != dst.datum:
-            log.warning(f"[CRS] Different datums: {src_name}={src.datum}, {dst_name}={dst.datum}")
+            log.warning("Different datums: %s=%s, %s=%s", src_name, src.datum, dst_name, dst.datum)
         
         # Check for very different coordinate systems (e.g., different hemispheres)
         src_bounds = src.area_of_use
@@ -320,7 +320,7 @@ def _validate_crs_compatibility(src_crs, dst_crs, src_name: str = "source", dst_
         return True
         
     except Exception as e:
-        log.error("[CRS] Failed to validate CRS compatibility: %s", e, exc_info=True)
+        log.error("Failed to validate CRS compatibility: %s", e, exc_info=True)
         return False
 
 
@@ -558,7 +558,7 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
         if mp.exists():
             aligned_domain_mask = _reproject_to_template_file(mp, _aligned_path("river_domain_mask"), resampling=Resampling.nearest)
         else:
-            log.warning("[FUSION] river_domain_mask does not exist: %s", str(mp))
+            log.warning("river_domain_mask does not exist: %s", str(mp))
 
 
     # Optional ocean domain mask (WAFFLES ocean-only, aligned using nearest; water==0, land==1)
@@ -568,7 +568,7 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
         if op.exists():
             aligned_ocean_mask = _reproject_to_template_file(op, _aligned_path("ocean_domain_mask"), resampling=Resampling.nearest)
         else:
-            log.warning("[FUSION] ocean_domain_mask does not exist: %s", str(op))
+            log.warning("ocean_domain_mask does not exist: %s", str(op))
 
     has_unc_inputs = any(p is not None for p in aligned_unc.values())
 
@@ -1062,7 +1062,7 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
                                         result.stats["seam_overlap"]["n"] += int(dd.size)
                                         result.stats["seam_overlap"].setdefault("median_delta_samples", []).append(float(np.nanmedian(dd)))
                                 except Exception:
-                                    pass
+                                    log.debug("ignored", exc_info=True)
 
                         # Fill remaining with DEM if available
                         if dem is not None:
@@ -1122,17 +1122,17 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
             try:
                 ds.close()
             except Exception:
-                log.debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("ignored", exc_info=True)
         for ds in list(unc_ds.values()):
             try:
                 ds.close()
             except Exception:
-                log.debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("ignored", exc_info=True)
         if domain_ds is not None:
             try:
                 domain_ds.close()
             except Exception:
-                log.debug("Optional step failed; continuing.", exc_info=True)
+                log.debug("ignored", exc_info=True)
 
     if has_unc_inputs and wrote_unc_any and uncertainty_path.exists():
         result.uncertainty_raster = uncertainty_path
@@ -1141,7 +1141,7 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
             if uncertainty_path.exists():
                 uncertainty_path.unlink()
         except Exception:
-            log.debug("Optional step failed; continuing.", exc_info=True)
+            log.debug("ignored", exc_info=True)
         result.uncertainty_raster = None
 
     result.stats["pixel_counts"] = cnt
@@ -1218,10 +1218,10 @@ def main():
     result = fuse_bathymetry(cfg)
     
     if result.status == "success":
-        log.info(f"Combined bathymetry: {result.combined_raster}")
+        log.info("Combined bathymetry: %s", result.combined_raster)
         sys.exit(0)
     else:
-        log.info(f"Fusion failed: {result.error}")
+        log.error("Fusion failed: %s", result.error)
         sys.exit(1)
 
 

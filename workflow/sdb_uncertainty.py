@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-sdb_uncertainty.py - Uncertainty-Aware Satellite Derived Bathymetry
+sdb_uncertainty.py - Uncertainty quantification for Satellite Derived Bathymetry.
 
-This module enables SDB prediction with comprehensive uncertainty quantification,
-supporting scenarios from pure physics-based prediction (no training data) to
-fully calibrated ML models with ATL validation.
+Supports scenarios from pure physics-based prediction to fully calibrated ML
+models with ATL validation.
 
 UNCERTAINTY FRAMEWORK
 =====================
@@ -768,7 +767,7 @@ def predict_sdb_with_uncertainty(
     # Log dominant uncertainty sources
     sorted_var = sorted(var_summary.items(), key=lambda x: x[1]["variance_fraction"], reverse=True)
     top_sources = ", ".join([f"{k}:{v['variance_fraction']*100:.0f}%" for k, v in sorted_var[:3]])
-    log.info("[SDB] Dominant uncertainty sources: %s", top_sources)
+    log.info("Dominant uncertainty sources: %s", top_sources)
     
     return SDBPrediction(
         depth=depth.astype(np.float32),
@@ -827,7 +826,7 @@ def _predict_calibrated_with_tree_variance(
     
     # Handle missing features
     if X.shape[1] < len(feat_cols):
-        log.warning(f"[SDB] Missing some features, prediction may be less accurate")
+        log.warning("Missing some features, prediction may be less accurate")
     
     # Predict
     depth = rf_model.predict(X).reshape(shape).astype(np.float32)
@@ -920,7 +919,7 @@ def write_uncertainty_rasters(
         dst.set_band_description(3, "confidence_0_1")
     outputs["combined"] = combined_path
     
-    log.info("[SDB] Wrote uncertainty-aware outputs to %s", output_dir)
+    log.info("Wrote uncertainty-aware outputs to %s", output_dir)
     
     return outputs
 
@@ -986,7 +985,7 @@ def predict_physics_only(
         center_lon = (bounds.left + bounds.right) / 2
         center_lat = (bounds.bottom + bounds.top) / 2
         region = estimate_region_from_location(center_lon, center_lat)
-        log.info("[SDB] Auto-detected region: %s", region)
+        log.info("Auto-detected region: %s", region)
     
     # Estimate Kd
     kd_map = None
@@ -997,7 +996,7 @@ def predict_physics_only(
             algorithm=kd_algorithm
         )
     except ImportError:
-        log.warning("[SDB] kd_estimation module not available, using regional typical Kd")
+        log.warning("kd_estimation module not available, using regional typical Kd")
     
     # Predict
     prediction = predict_sdb_with_uncertainty(
@@ -1013,7 +1012,7 @@ def predict_physics_only(
     # Save metadata
     import json
     meta_path = output_dir / "sdb_physics_meta.json"
-    with open(meta_path, "w") as f:
+    with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(prediction.metadata, f, indent=2)
     
     return prediction
@@ -1060,8 +1059,8 @@ if __name__ == "__main__":
         allow_heuristic_region=bool(args.allow_heuristic_region),
     )
     
-    log.info(f"\nResults saved to {args.output_dir}")
-    log.info(f"Mode: {prediction.mode}")
+    log.info("Results saved to %s", args.output_dir)
+    log.info("Mode: %s", prediction.mode)
     log.info(f"Depth range: {prediction.metadata['depth_stats']['min']:.1f} - {prediction.metadata['depth_stats']['max']:.1f} m")
     log.info(f"Mean uncertainty: {prediction.metadata['uncertainty_stats']['mean']:.2f} m")
     log.info(f"High confidence fraction: {prediction.metadata['confidence_stats']['high_confidence_fraction']*100:.1f}%")

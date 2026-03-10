@@ -49,7 +49,7 @@ def _union_all_geoms(geos):
         if hasattr(geos, "union_all"):
             return geos.union_all()
     except Exception:
-        log.debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("ignored", exc_info=True)
     # fallback
     try:
         return geos.unary_union
@@ -94,7 +94,6 @@ def _warp_mask_to_template(mask_path: Path, template_profile: dict) -> np.ndarra
     with rasterio.open(mask_path) as src:
         src_arr = src.read(1)
 
-        # IMPORTANT:
         # Some mask rasters use semantic values (0/1) for water/land and may also
         # set nodata to 0 or 1. If we pass that through as src_nodata, rasterio
         # will treat real water/land as nodata and destroy the mask.
@@ -210,7 +209,7 @@ def main() -> int:
                 str(crs),
             )
     except Exception:
-        log.debug("Optional step failed; continuing.", exc_info=True)
+        log.debug("ignored", exc_info=True)
 
     # Load rivers layer
     rivers = gpd.read_file(args.river_gpkg, layer=args.rivers_layer)
@@ -219,7 +218,7 @@ def main() -> int:
     rivers = rivers.to_crs(crs)
 
     # Optional: NHDArea polygons to constrain channel predictions.
-    # IMPORTANT: We extract *river/stream polygons only* (exclude lakes/reservoirs).
+    # Extract river/stream polygons only (exclude lakes/reservoirs).
     nhdarea_mask = None
     if args.nhdarea_gpkg and (args.channel_source in ("auto", "nhdarea")):
         try:
@@ -255,7 +254,7 @@ def main() -> int:
                                     return v.lower().replace(" ", "")
 
                                 # Minimal mapping needed for safe filtering.
-                                # NOTE: We only *include* allow_ftype, so unrecognized labels are excluded.
+                                # Only include allow_ftype values; unrecognized labels are excluded.
                                 label_to_ftype = {
                                     _norm("StreamRiver"): 460,
                                     _norm("Stream/River"): 460,
@@ -499,7 +498,7 @@ def main() -> int:
             water = corridor.copy()
             LOG.warning("No --water-mask or --ocean-mask supplied; using buffered corridor as 'water' (ocean separation degraded).")
 
-    # NOTE: We do NOT replace the water mask with NHDArea here because NHDArea is filtered
+    # Do not replace the water mask with NHDArea here because NHDArea is filtered
     # to river/stream polygons only (excluding lakes). Using that as a general water mask
     # would incorrectly remove valid non-river water needed for width estimation.
     # Width proxy from distance to boundary (land)

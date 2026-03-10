@@ -25,4 +25,4 @@ try:
         pd.UInt64Index = pd.Index  # type: ignore[attr-defined]
 except Exception:
     # If pandas is not available, callers will fail elsewhere anyway.
-    log.debug("Optional step failed; continuing.", exc_info=True)
+    log.debug("ignored", exc_info=True)

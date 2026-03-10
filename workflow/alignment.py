@@ -782,7 +782,7 @@ def align_raster_to_tie_points(
             plot_path = str(Path(plots_dir) / plot_name)
             _plot_residuals(res, np.asarray(post.get("residuals_m", np.array([]))), ref_pd, plot_path, title=title)
         except Exception as exc:
-            log.warning("[ALIGN] Plot generation failed: %s", exc)
+            log.warning("Plot generation failed: %s", exc)
             plot_path = None
 
     out = {
