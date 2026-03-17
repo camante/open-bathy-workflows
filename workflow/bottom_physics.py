@@ -778,8 +778,9 @@ def physics_sdb_inversion(
         "bands_used": bands,
     }
     
-    log.info(f"Converged: {diagnostics['n_converged']}/{n_pixels} "
-             f"({diagnostics['convergence_rate']*100:.1f}%)")
+    log.info("Converged: %d/%d (%.1f%%)",
+             diagnostics['n_converged'], n_pixels,
+             diagnostics['convergence_rate'] * 100)
     
     return depth.astype(np.float32), sand_frac.astype(np.float32), uncertainty.astype(np.float32), diagnostics
 

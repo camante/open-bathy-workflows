@@ -1188,11 +1188,11 @@ def main():
     )
     
     log.info("Gap-fill complete:")
-    log.info(f"  HQ points: {stats['n_hq_points']} (in water: {stats['n_hq_points_in_water']})")
-    log.info(f"  Components: {stats['n_components']}")
-    log.info(f"  Residual RMSE: {stats['residual_rmse']:.3f} m")
-    log.info(f"  Pixels corrected: {stats['pixels_corrected']}")
-    log.info(f"  Pixels prior-only: {stats['pixels_prior_only']}")
+    log.info("  HQ points: %s (in water: %s)", stats['n_hq_points'], stats['n_hq_points_in_water'])
+    log.info("  Components: %s", stats['n_components'])
+    log.info("  Residual RMSE: %.3f m", stats['residual_rmse'])
+    log.info("  Pixels corrected: %s", stats['pixels_corrected'])
+    log.info("  Pixels prior-only: %s", stats['pixels_prior_only'])
 
 
 if __name__ == "__main__":

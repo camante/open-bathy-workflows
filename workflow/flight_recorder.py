@@ -94,7 +94,7 @@ class FlightRecorder:
             self._fh = open(self.cfg.path, "a", encoding="utf-8", buffering=1)
             _cv_run_id.set(self.cfg.run_id)
             self.record_event("run_start", pid=os.getpid(), argv=sys.argv)
-        except Exception:
+        except OSError:
             # Best effort: do not raise.
             self._fh = None
         # Ensure we attempt to stop/flush
@@ -112,12 +112,12 @@ class FlightRecorder:
                         message=str(exc),
                         traceback="".join(traceback.format_exception(exc_type, exc, tb)),
                     )
-                except Exception:
+                except (OSError, TypeError, ValueError):
                     log.debug("ignored", exc_info=True)  # don't let recorder failure mask original exception
                 return prev_hook(exc_type, exc, tb)
 
             sys.excepthook = _hook  # type: ignore
-        except Exception:
+        except (AttributeError, RuntimeError):
             log.debug("excepthook installation failed", exc_info=True)
 
     def stop(self) -> None:
@@ -128,13 +128,13 @@ class FlightRecorder:
                 events_written=self._events_written,
                 dropped=self._dropped,
             )
-        except Exception:
+        except (OSError, TypeError, ValueError):
             log.debug("ignored", exc_info=True)  # don't let stop-record failure prevent file close
         try:
             if self._fh is not None:
                 self._fh.flush()
                 self._fh.close()
-        except Exception:
+        except OSError:
             log.debug("ignored", exc_info=True)  # close error
         self._fh = None
 
@@ -169,7 +169,7 @@ class FlightRecorder:
                 self._events_written += 1
                 if self.cfg.flush_every and (self._events_written % self.cfg.flush_every == 0):
                     self._fh.flush()
-        except Exception:
+        except (OSError, TypeError, ValueError):
             self._dropped += 1
 
 
@@ -209,7 +209,7 @@ def current_flight_path() -> str:
     rec = FlightRecorder.global_instance()
     try:
         return str(rec.cfg.path) if rec is not None else ''
-    except Exception:
+    except AttributeError:
         return ''
 
 
@@ -224,8 +224,8 @@ def emit_event(event_type: str, **payload: Any) -> None:
     if rec is None:
         return
     try:
-        rec.record_event(event_type, payload)
-    except Exception:
+        rec.record_event(event_type, **payload)
+    except (OSError, TypeError, ValueError):
         return
 
 
@@ -243,7 +243,7 @@ def emit_artifact_written(path: Any, *, kind: str = "artifact", role: str = "") 
     """
     try:
         p = str(path)
-    except Exception:
+    except (TypeError, ValueError):
         p = ""
     if not p:
         return

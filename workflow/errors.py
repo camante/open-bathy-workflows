@@ -226,63 +226,6 @@ class GeospatialError(SDBError):
     pass
 
 
-def validate_aoi(aoi: str) -> tuple:
-    """
-    Validate AOI string format and bounds.
-    
-    Args:
-        aoi: AOI string in format "W/E/S/N"
-    
-    Returns:
-        Tuple of (west, east, south, north) as floats
-    
-    Raises:
-        ConfigError: If AOI format is invalid
-        ValidationError: If bounds are invalid
-    """
-    try:
-        parts = [float(x.strip()) for x in aoi.split("/")]
-        if len(parts) != 4:
-            raise ConfigError(
-                "AOI must have 4 values: W/E/S/N",
-                details={"aoi": aoi, "parts": len(parts)}
-            )
-        
-        w, e, s, n = parts
-        
-        if not (-180 <= w <= 180 and -180 <= e <= 180):
-            raise ValidationError(
-                "Longitude out of range",
-                details={"west": w, "east": e, "valid_range": (-180, 180)}
-            )
-        
-        if not (-90 <= s <= 90 and -90 <= n <= 90):
-            raise ValidationError(
-                "Latitude out of range",
-                details={"south": s, "north": n, "valid_range": (-90, 90)}
-            )
-        
-        if w >= e:
-            raise ValidationError(
-                "West must be less than East",
-                details={"west": w, "east": e}
-            )
-        
-        if s >= n:
-            raise ValidationError(
-                "South must be less than North",
-                details={"south": s, "north": n}
-            )
-        
-        return w, e, s, n
-        
-    except ValueError as e:
-        raise ConfigError(
-            "AOI values must be numeric",
-            details={"aoi": aoi, "error": str(e)}
-        ) from e
-
-
 def handle_exception(exc: Exception, context: str = "") -> None:
     """
     Log exception with appropriate level based on type.

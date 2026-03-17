@@ -1,6 +1,19 @@
 """AOI / bbox utilities.
 
-Lifted from bathy_main.py (Phase-2 refactor). No behavior changes intended.
+Canonical home for AOI string parsing.  All modules that need to turn a
+``"W/E/S/N"`` string into numeric bounds should import from here.
+
+**Bbox convention used throughout this module:**
+
+* ``(W, S, E, N)`` – used by ``parse_aoi_bbox``, ``expand_bbox_*``,
+  ``aoi_centroid``, and any function that *accepts or returns* a bbox tuple.
+  This matches the OGC/Shapely ``(minx, miny, maxx, maxy)`` convention.
+
+* ``(W, E, S, N)`` – the *string* order callers type on the CLI and the order
+  returned by ``parse_aoi_wesn``.  This matches the GMT / GDAL tradition.
+
+Use ``parse_aoi_wesn`` when you need the values in CLI/string order.
+Use ``parse_aoi_bbox`` when you need an OGC-style ``(minx, miny, maxx, maxy)`` bbox.
 """
 
 from __future__ import annotations
@@ -10,11 +23,15 @@ import re
 from typing import Optional, Tuple
 
 
-def parse_aoi_bbox(aoi: Optional[str]) -> Optional[Tuple[float, float, float, float]]:
-    """Parse AOI bbox from 'W/E/S/N' string.
+# ---------------------------------------------------------------------------
+# Core parser – single implementation, two return conventions
+# ---------------------------------------------------------------------------
+
+def _parse_aoi_core(aoi: Optional[str]) -> Optional[Tuple[float, float, float, float]]:
+    """Parse an AOI string into (W, E, S, N) floats.
 
     Accepts values separated by commas, slashes, or whitespace.
-    Returns (W, S, E, N) as (lon_min, lat_min, lon_max, lat_max).
+    Returns None on any parse failure (no exceptions).
     """
     if not aoi:
         return None
@@ -24,11 +41,57 @@ def parse_aoi_bbox(aoi: Optional[str]) -> Optional[Tuple[float, float, float, fl
     if len(parts) != 4:
         return None
     try:
-        w, e, s_, n = [float(p) for p in parts]
-    except Exception:
+        w, e, s_, n = (float(p) for p in parts)
+    except (ValueError, TypeError):
         return None
-    if not (w < e and s_ < n):
+    # Auto-fix reversed bounds (user typo)
+    if e < w:
+        w, e = e, w
+    if n < s_:
+        s_, n = n, s_
+    if w == e or s_ == n:
         return None
+    return (w, e, s_, n)
+
+
+def parse_aoi_wesn(aoi: Optional[str], *, strict: bool = False,
+                   ) -> Optional[Tuple[float, float, float, float]]:
+    """Parse AOI string into ``(W, E, S, N)`` – the CLI / GMT convention.
+
+    This is the **canonical** AOI parser.  All other per-module parsers
+    (``atl.parse_aoi_string``, ``s2_optics.parse_aoi``,
+    ``river_network._parse_aoi``, ``bathy_main._parse_aoi_bounds_deg``)
+    should delegate here.
+
+    Parameters
+    ----------
+    aoi : str or None
+        ``"W/E/S/N"`` string (commas, slashes, or whitespace accepted).
+    strict : bool
+        If *True*, raise ``ValueError`` on bad input instead of returning
+        ``None``.
+
+    Returns
+    -------
+    (W, E, S, N) or None
+    """
+    result = _parse_aoi_core(aoi)
+    if result is None and strict:
+        raise ValueError(f"Cannot parse AOI string: {aoi!r}  (expected W/E/S/N)")
+    return result
+
+
+def parse_aoi_bbox(aoi: Optional[str]) -> Optional[Tuple[float, float, float, float]]:
+    """Parse AOI bbox from 'W/E/S/N' string.
+
+    Accepts values separated by commas, slashes, or whitespace.
+    Returns (W, S, E, N) as (lon_min, lat_min, lon_max, lat_max)
+    — the OGC / Shapely bounds convention.
+    """
+    wesn = _parse_aoi_core(aoi)
+    if wesn is None:
+        return None
+    w, e, s_, n = wesn
     return (w, s_, e, n)
 
 
@@ -98,11 +161,9 @@ def utm_epsg_from_lonlat(lon: float, lat: float) -> str:
 
 
 def aoi_center_lonlat(aoi: str) -> tuple[float, float]:
-    bbox = parse_aoi_bbox(aoi)
-    if not bbox:
-        raise ValueError(f"Cannot parse AOI bbox from: {aoi!r}")
-    lon, lat = aoi_centroid(bbox)
-    return lon, lat
+    wesn = parse_aoi_wesn(aoi, strict=True)
+    w, e, s, n = wesn
+    return ((w + e) / 2.0, (s + n) / 2.0)
 
 
 def buffer_aoi(aoi: str, buf_deg: float = 0) -> str:
@@ -111,8 +172,5 @@ def buffer_aoi(aoi: str, buf_deg: float = 0) -> str:
     Mirrors prior bathy_main behavior: expects 'w/e/s/n' and emits fixed
     precision formatting.
     """
-    try:
-        w, e, s, n = [float(x) for x in aoi.split("/")[:4]]
-    except Exception as exc:
-        raise ValueError(f"Invalid AOI string: {aoi!r}") from exc
+    w, e, s, n = parse_aoi_wesn(aoi, strict=True)
     return f"{w - buf_deg:.8f}/{e + buf_deg:.8f}/{s - buf_deg:.8f}/{n + buf_deg:.8f}"

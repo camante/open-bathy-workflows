@@ -10,7 +10,6 @@ This module handles the fusion of multiple bathymetric data sources with:
 """
 
 
-import os
 import sys
 import argparse
 import logging
@@ -62,12 +61,13 @@ def _log_funnel(stage: str, df: Optional[pd.DataFrame], rr: Optional[Any] = None
     stats = _depth_funnel_stats(df)
     if "finite_n" in stats:
         log.info(
-            f"[Funnel] {stage}: n={stats['n']} finite={stats['finite_n']} "
-            f"p50={stats.get('p50', float('nan')):.2f} p95={stats.get('p95', float('nan')):.2f} "
-            f"max={stats.get('p100', float('nan')):.2f}"
+            "[Funnel] %s: n=%s finite=%s p50=%.2f p95=%.2f max=%.2f",
+            stage, stats['n'], stats['finite_n'],
+            stats.get('p50', float('nan')), stats.get('p95', float('nan')),
+            stats.get('p100', float('nan'))
         )
     else:
-        log.info(f"{stage}: n={stats['n']}")
+        log.info("%s: n=%s", stage, stats['n'])
 
     if rr is not None:
         try:
@@ -143,8 +143,8 @@ def filter_by_reference_data(
     _log_funnel('fusion.xyz_filter.func.xyz_in', df_xyz, None)
 
     log.info(
-        f"[XYZ Filter] Comparing {len(df_atl)} ATL points against {len(df_xyz)} XYZ points "
-        f"(max_dist={max_dist_m:.1f} m, max_abs_diff={max_abs_diff_m:.2f} m)."
+        "[XYZ Filter] Comparing %s ATL points against %s XYZ points  (max_dist=%1f m, max_abs_diff=%2f m).",
+        len(df_atl), len(df_xyz), max_dist_m, max_abs_diff_m,
     )
 
     # Build local metric transform
@@ -188,8 +188,8 @@ def filter_by_reference_data(
         original_indices_to_drop = df_atl[collocated_mask].index[conflict_mask]
         df_atl_final = df_atl.drop(index=original_indices_to_drop).reset_index(drop=True)
         log.info(
-            f"[XYZ Filter] Dropped {n_conflict} ATL points conflicting with XYZ "
-            f"(abs diff > {max_abs_diff_m:.2f} m). Remaining ATL: {len(df_atl_final)}."
+            "[XYZ Filter] Dropped %s ATL points conflicting with XYZ  (abs diff > %2f m). Remaining ATL: %s.",
+            n_conflict, max_abs_diff_m, len(df_atl_final),
         )
         _log_funnel('fusion.xyz_filter.func.atl_out', df_atl_final, None)
         return df_atl_final
@@ -245,8 +245,8 @@ def check_atl_consistency_and_fuse(
         return df_atl03.copy()
 
     log.info(
-        f"[ATL Fusion] Collocation-aware start: ATL03={len(df_atl03)}, ATL24={len(df_atl24)}. "
-        f"max_dist={max_dist_m:.1f} m, max_abs_diff={max_abs_diff_m:.2f} m, max_rel_diff={max_rel_diff:.2f}."
+        "[ATL Fusion] Collocation-aware start: ATL03=%s, ATL24=%s.  max_dist=%1f m, max_abs_diff=%2f m, max_rel_diff=%2f.",
+        len(df_atl03), len(df_atl24), max_dist_m, max_abs_diff_m, max_rel_diff,
     )
 
     all_lats = np.concatenate([df_atl03["latitude"].values, df_atl24["latitude"].values])
@@ -323,8 +323,8 @@ def check_atl_consistency_and_fuse(
     n_keep_shallow = int(np.sum(keep_shallow_both))
 
     log.info(
-        f"[ATL Fusion] Collocated pairs: agreed(deep)={n_keep_agreed}, conflicts_dropped(deep)={n_drop_conflict}, "
-        f"shallow_pairs_kept_as_both={n_keep_shallow} (<{require_agreement_depth_min_m:.2f} m)."
+        "[ATL Fusion] Collocated pairs: agreed(deep)=%s, conflicts_dropped(deep)=%s,  shallow_pairs_kept_as_both=%s (<%2f m).",
+        n_keep_agreed, n_drop_conflict, n_keep_shallow, require_agreement_depth_min_m,
     )
 
     out_parts = []
@@ -402,9 +402,12 @@ def _ensure_training_schema(
     # Apply default weights only where sample_weight is NaN
     m_nan = df["sample_weight"].isna()
 
-    m_atl03 = (df["source"] == "atl03") & m_nan
-    m_atl24 = (df["source"] == "atl24") & m_nan
-    m_xyz = (df["source"] == "extra_xyz") & m_nan
+    source_norm = df["source"].astype(str).str.lower()
+    m_atl03 = (source_norm == "atl03") & m_nan
+    m_atl24 = (source_norm == "atl24") & m_nan
+    # Preserve per-file authoritative provenance (e.g. extra_xyz:hydronos)
+    # while still assigning the configured XYZ training weight.
+    m_xyz = source_norm.str.startswith("extra_xyz") & m_nan
 
     if m_atl03.any():
         df.loc[m_atl03, "sample_weight"] = float(atl03_weight)
@@ -522,8 +525,8 @@ def build_fused_training_dataframe(
     _log_funnel('fusion.input.xyz', xyz_df, rr)
 
     log.info(
-        f"[Fusion] Starting build_fused_training_dataframe with "
-        f"ATL03={len(atl03_df)}, ATL24={len(atl24_df)}, XYZ={len(xyz_df)}."
+        "[Fusion] Starting build_fused_training_dataframe with  ATL03=%s, ATL24=%s, XYZ=%s.",
+        len(atl03_df), len(atl24_df), len(xyz_df),
     )
 
     # Normalize sensor sources. Keep XYZ provenance if provided (e.g., extra_xyz:<subset>).
@@ -618,10 +621,29 @@ def build_fused_training_dataframe(
                 log.info("Applying adaptive spatial sampling (input: %s points)", format(len(final_df), ","))
                 
                 # Create sampling config
+                eff_target_points = int(sampling_target_points)
+                if not xyz_df.empty:
+                    xyz_n = int(len(xyz_df))
+                    atl_n = int(len(atl_fused))
+                    if xyz_n >= 100000 and eff_target_points < 12000:
+                        eff_target_points = 12000
+                    if xyz_n >= 500000 and eff_target_points < 20000:
+                        eff_target_points = 20000
+                    if xyz_n >= 1000000 and eff_target_points < 30000:
+                        eff_target_points = 30000
+                    if eff_target_points != int(sampling_target_points):
+                        log.info(
+                            "[XYZ][SDB] Upscaling adaptive sampling target from %s to %s because authoritative extra_xyz support is dense (xyz=%s, atl=%s).",
+                            format(int(sampling_target_points), ','),
+                            format(int(eff_target_points), ','),
+                            format(xyz_n, ','),
+                            format(atl_n, ','),
+                        )
                 sampling_config = SamplingConfig(
-                    target_total_points=sampling_target_points,
+                    target_total_points=eff_target_points,
                     max_gap_m=sampling_max_gap_m,
                     depth_bins=10,
+                    min_points_per_source=max(500, int(getattr(SamplingConfig, 'min_points_per_source', 50) or 50)),
                     grid_high_complexity=15.0,
                     grid_medium_complexity=30.0,
                     grid_low_complexity=60.0
@@ -635,8 +657,8 @@ def build_fused_training_dataframe(
                 )
                 
                 # Log results
-                log.info(f"Adaptive sampling complete: {len(final_df):,} → {len(sampled_df):,} points "
-                        f"({sampling_stats['reduction_pct']:.1f}% reduction)")
+                log.info("Adaptive sampling complete: %s → %s points (%.1f%% reduction)",
+                        len(final_df), len(sampled_df), sampling_stats['reduction_pct'])
                 
                 # Save sampling statistics to run report
                 if rr is not None:

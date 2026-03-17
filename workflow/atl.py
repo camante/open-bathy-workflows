@@ -38,6 +38,7 @@ import zipfile
 import time
 import logging
 import hashlib
+import pickle
 import argparse
 import textwrap
 import shlex
@@ -54,7 +55,7 @@ def _lazy_requests():
     """
     try:
         import requests  # type: ignore
-    except Exception as e:  # pragma: no cover
+    except (ImportError, AttributeError, OSError, SyntaxError) as e:  # pragma: no cover
         raise RuntimeError("The 'requests' package is required for ATL downloads.") from e
     return requests
 
@@ -63,11 +64,13 @@ def _lazy_h5py():
     """Import h5py only when needed (ATL HDF5 readers)."""
     try:
         import h5py  # type: ignore
-    except Exception as e:  # pragma: no cover
+    except (ImportError, AttributeError, OSError, SyntaxError) as e:  # pragma: no cover
         raise RuntimeError("The 'h5py' package is required to read ATL HDF5 files.") from e
     return h5py
 import numpy as np
 import pandas as pd
+from scipy.spatial import cKDTree
+from pyproj import Transformer
 
 # Ensure GeoPandas remains usable on pandas>=2.0 even if GeoPandas lags.
 import compat_pandas  # noqa: F401
@@ -87,7 +90,7 @@ try:
         cache_hit,
     )
     _CACHE_UTILS_AVAILABLE = True
-except Exception:  # pragma: no cover
+except (ImportError, AttributeError, OSError, SyntaxError):  # pragma: no cover
     _CACHE_UTILS_AVAILABLE = False
 
 
@@ -96,7 +99,7 @@ except Exception:  # pragma: no cover
 # -----------------------------------------------------------------------------
 try:
     from log_report import RunReport
-except Exception:  # pragma: no cover
+except (ImportError, AttributeError, OSError, SyntaxError):  # pragma: no cover
     RunReport = None  # type: ignore
 
 def _rr_add(rr, key, value):
@@ -104,7 +107,7 @@ def _rr_add(rr, key, value):
     try:
         if rr is not None:
             rr.add(key, value)
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         log.debug("ignored", exc_info=True)
 
 def _rr_artifact(rr, kind: str, path: str):
@@ -112,7 +115,7 @@ def _rr_artifact(rr, kind: str, path: str):
     try:
         if rr is not None and hasattr(rr, "record_artifact"):
             rr.record_artifact(kind, path)
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         log.debug("run-recorder add failed", exc_info=True)
 
 
@@ -148,10 +151,8 @@ def _log_depth_funnel(stage: str, df: pd.DataFrame, *, rr=None, depth_col: str =
         # Human log line (compact)
         if "finite_n" in s and s.get("finite_n", 0) > 0:
             log.info(
-                f"[Funnel] {stage}: n={s.get('n')} finite={s.get('finite_n')} "
-                f"p50={s.get('p50', float('nan')):.2f} "
-                f"p95={s.get('p95', float('nan')):.2f} "
-                f"max={s.get('p100', float('nan')):.2f}"
+                "[Funnel] %s: n=%s finite=%s  p50=%2f  p95=%2f  max=%2f",
+                stage, s.get('n'), s.get('finite_n'), s.get('p50', float('nan')), s.get('p95', float('nan')), s.get('p100', float('nan')),
             )
         else:
             log.info("%s: n=%s (no '%s' or no finite values)", stage, s.get('n'), depth_col)
@@ -164,7 +165,7 @@ def _log_depth_funnel(stage: str, df: pd.DataFrame, *, rr=None, depth_col: str =
                 _rr_add(rr, f"funnel.{stage}.depth.{k}", s[k])
         if "hist_0_40_1m" in s:
             _rr_add(rr, f"funnel.{stage}.depth.hist_0_40_1m", s["hist_0_40_1m"])
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         log.debug("ignored", exc_info=True)
 
 # Heavy geospatial imports are lazy: this module may be used in environments
@@ -234,7 +235,7 @@ def transform_xyz_dataframe_crs(
         logx.info(f"[ATL][CRS] Transformed {len(out)} points (horizontal only): {src_h} -> {dst_h}")
         logx.info(f"[ATL][CRS] depth_m NOT transformed (it's relative depth, not geodetic height)")
         return out
-    except Exception as e:
+    except (ProjError, TypeError, ValueError) as e:
         logx.warning(f"[ATL][CRS] Could not transform ATL dataframe ({src_h} -> {dst_h}): {e}")
         return df
 
@@ -254,7 +255,7 @@ def _atl_exact_cache_key(*, stage: str, params: Dict[str, Any], inputs: Dict[str
     if not cache_ignore_code:
         try:
             code_fp = fingerprint_code(Path(__file__), strict=bool(cache_code_strict))
-        except Exception:
+        except (OSError, TypeError, ValueError):
             code_fp = ""
     return artifact_cache_key(stage=stage, params=params, inputs=inputs, code_fp=code_fp, key_len=20)
 
@@ -314,18 +315,18 @@ def _maybe_load_cached_training_points(
             try:
                 write_meta(meta_path, payload)
                 reason = "legacy_no_meta_upgraded"
-            except Exception:
+            except (OSError, TypeError, ValueError):
                 reason = "legacy_no_meta"
             _rr_add(rr, f"{stage}.cache.legacy_upgrade", True)
             return df, "hit_legacy_no_meta", key, data_path, meta_path
-        except Exception:
+        except (OSError, EOFError, pickle.UnpicklingError, ValueError):
             return None, "read_failed", key, data_path, meta_path
 
     if hit and data_path.exists() and data_path.stat().st_size > 0:
         try:
             df = pd.read_pickle(data_path)
             return df, "hit", key, data_path, meta_path
-        except Exception:
+        except (OSError, EOFError, pickle.UnpicklingError, ValueError):
             return None, "read_failed", key, data_path, meta_path
 
     return None, reason, key, data_path, meta_path
@@ -387,8 +388,9 @@ def _iso(d: Any, end: bool = False) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def parse_aoi_string(aoi: str) -> Tuple[float, float, float, float]:
-    W, E, S, N = [float(x) for x in aoi.split("/")]
-    return W, E, S, N
+    """Parse ``"W/E/S/N"`` → ``(W, E, S, N)``.  Delegates to :func:`pipeline.aoi.parse_aoi_wesn`."""
+    from pipeline.aoi import parse_aoi_wesn
+    return parse_aoi_wesn(aoi, strict=True)
 
 def _atl_cache_key(aoi_str: str, start: str, end: str, product_key: str) -> str:
     s = f"{ATL_CACHE_VERSION}|{aoi_str}|{start}|{end}|{product_key}"
@@ -435,8 +437,8 @@ def _filter_points_by_mask(
     _log_depth_funnel("atl.mask_filter.input", df, rr=rr)
 
     log.info(
-        f"[ATL-MASK] Filtering {len(df)} points against mask: {Path(mask_path).name} "
-        f"(mask_type={mask_type}, water_val={water_val}, invert={invert}, threshold={threshold})"
+        "[ATL-MASK] Filtering %s points against mask: %s  (mask_type=%s, water_val=%s, invert=%s, threshold=%s)",
+        len(df), Path(mask_path).name, mask_type, water_val, invert, threshold,
     )
 
     try:
@@ -488,8 +490,8 @@ def _filter_points_by_mask(
                         frac1 = 1.0 - frac0
                         wv = 0 if frac0 >= frac1 else 1
                         log.info(
-                            f"[ATL-MASK] auto mask_type: inferred binary water_val={wv} "
-                            f"from sampled fractions (0:{frac0:.3f}, 1:{frac1:.3f})."
+                            "[ATL-MASK] auto mask_type: inferred binary water_val=%s  from sampled fractions (0:%3f, 1:%3f).",
+                            wv, frac0, frac1,
                         )
                         _rr_add(rr, "atl.mask_filter.auto.frac0", frac0)
                         _rr_add(rr, "atl.mask_filter.auto.frac1", frac1)
@@ -498,16 +500,15 @@ def _filter_points_by_mask(
                         # If it is constrained to [0,1] but not binary-ish, assume "land probability".
                         if (sv_min >= -1e-6) and (sv_max <= 1.0 + 1e-6):
                             log.info(
-                                f"[ATL-MASK] auto mask_type: detected 0..1 continuous mask "
-                                f"(min={sv_min:.3f}, max={sv_max:.3f}); treating as land_probability "
-                                f"(keep <= {float(threshold):.2f})."
+                                "[ATL-MASK] auto mask_type: detected 0..1 continuous mask  (min=%3f, max=%3f); treating as land_probability  (keep <= %2f).",
+                                sv_min, sv_max, float(threshold),
                             )
                             mtype = "land_probability"
                         else:
                             # Non-binary, non-probability: fall back to provided water_val/invert equality.
                             log.info(
-                                f"[ATL-MASK] auto mask_type: non-binary mask values detected "
-                                f"(min={sv_min:.3f}, max={sv_max:.3f}); using water_val/invert equality rule."
+                                "[ATL-MASK] auto mask_type: non-binary mask values detected  (min=%3f, max=%3f); using water_val/invert equality rule.",
+                                sv_min, sv_max,
                             )
 
                 if mtype == "land_binary":
@@ -530,8 +531,9 @@ def _filter_points_by_mask(
                 if (sv_min >= -1e-6) and (sv_max <= 1.0 + 1e-6) and (mtype not in ("land_probability", "land_prob", "probability")):
                     keep_v = sampled_v <= float(threshold)
                     log.warning(
-                        f"[ATL-MASK] Kept 0 points with initial semantics; "
-                        f"falling back to land_probability keep<=threshold ({float(threshold):.2f})."
+                        "[ATL-MASK] Kept 0 points with initial semantics; "
+                        "falling back to land_probability keep<=threshold (%.2f).",
+                        float(threshold),
                     )
                     _rr_add(rr, "atl.mask_filter.auto.fallback_land_probability", True)
 # Map keep_v back onto full-length mask
@@ -549,7 +551,7 @@ def _filter_points_by_mask(
             _log_depth_funnel("atl.mask_filter.output", out_df, rr=rr)
             return out_df
 
-    except Exception as e:
+    except (OSError, TypeError, ValueError, AttributeError) as e:
         log.warning("[ATL-MASK] Failed to filter points by mask: %s. Returning original points.", e)
         _rr_add(rr, "atl.mask_filter.failed", True)
         return df
@@ -567,7 +569,7 @@ def _iter_h5_recursive(d: Path):
         try:
             if f.is_file() and f.stat().st_size > 0:
                 yield f
-        except Exception:
+        except OSError:
             continue
 
 def existing_atl_files(d: Path, product_key: str) -> List[str]:
@@ -626,7 +628,7 @@ def _safe_unzip(z: Path, d: Path) -> List[str]:
                     shutil.copyfileobj(src, dst)
                 if dest.exists() and dest.stat().st_size > 0:
                     out.append(str(dest))
-            except Exception:
+            except (OSError, KeyError, RuntimeError, zipfile.BadZipFile):
                 continue
 
     return out
@@ -640,7 +642,7 @@ def _cmr_latest_concept_id(short_name: str) -> Optional[str]:
         r.raise_for_status()
         items = r.json().get("feed", {}).get("entry", [])
         return items[0]["id"] if items else None
-    except Exception: return None
+    except (TypeError, ValueError, KeyError): return None
 
 def cmr_search_atl24_full(bbox, start, end, page_size=200) -> List[dict]:
     url = "https://cmr.earthdata.nasa.gov/search/granules.json"
@@ -675,7 +677,7 @@ def harmony_subset(product_key, bbox, start, end, out_dir) -> List[str]:
     saved = []
     for fut in client.download_all(job, directory=str(out_dir), overwrite=False):
         try: saved.append(fut.result())
-        except Exception: log.debug("ignored", exc_info=True)
+        except (OSError, ValueError, TypeError, KeyError): log.debug("ignored", exc_info=True)
     norm = []
     for p in saved:
         P = Path(p)
@@ -697,7 +699,7 @@ def ensure_icesat_files_harmony_cachefirst(d, product_key, bbox, start, end, for
     if cached and not force_redl:
         if product_key == "ATL24":
             try: entries = cmr_search_atl24_full(bbox, start, end)
-            except Exception: entries = []
+            except (OSError, ValueError, KeyError): entries = []
         _rr_add(rr, f"atl.{product_key}.status", "cached")
         _rr_add(rr, f"atl.{product_key}.files_n", int(len(cached)))
         _rr_add(rr, f"atl.{product_key}.cmr_entries_n", int(len(entries) if entries else 0))
@@ -709,7 +711,7 @@ def ensure_icesat_files_harmony_cachefirst(d, product_key, bbox, start, end, for
                 _rr_add(rr, f"atl.{product_key}.status", "no_cmr_results")
                 _rr_add(rr, f"atl.{product_key}.cmr_entries_n", 0)
                 return cached, entries, "no_cmr_results"
-        except Exception: log.debug("ignored", exc_info=True)
+        except (OSError, ValueError, TypeError, KeyError): log.debug("ignored", exc_info=True)
     files = harmony_subset(product_key, bbox, start, end, d)
     _rr_add(rr, f"atl.{product_key}.harmony.files_n", int(len(files) if files else 0))
     if files:
@@ -929,7 +931,7 @@ def _collect_points_from_atl24_file(h5_path, conf_min, segment_length_m=5.0):
                 x_v, y_v = txy.transform(lon_v, lat_v)
                 x_v = np.asarray(x_v, dtype="float64")
                 y_v = np.asarray(y_v, dtype="float64")
-            except Exception:
+            except (ProjError, TypeError, ValueError):
                 # Fallback: approximate meters using degrees (coarse)
                 x_v = lon_v.astype("float64") * 111320.0 * np.cos(np.deg2rad(np.median(lat_v)))
                 y_v = lat_v.astype("float64") * 111320.0
@@ -947,7 +949,7 @@ def _collect_points_from_atl24_file(h5_path, conf_min, segment_length_m=5.0):
                     axis = v[:, int(np.argmax(w))]
                     t = xy0 @ axis
                     order = np.argsort(t)
-                except Exception:
+                except (np.linalg.LinAlgError, ValueError, FloatingPointError):
                     order = np.argsort(x_v)
 
             x_o = x_v[order]
@@ -986,7 +988,7 @@ def _collect_points_from_atl24_file(h5_path, conf_min, segment_length_m=5.0):
                 if dt_o is not None:
                     try:
                         seg_delta_time = float(np.median(dt_o[mseg]))
-                    except Exception:
+                    except (TypeError, ValueError):
                         seg_delta_time = None
 
                 all_segments.append({
@@ -1027,11 +1029,237 @@ def _fingerprint_path(p: Optional[str], cache_strict: bool = True) -> Optional[s
             return fingerprint_file(pp, strict=bool(cache_strict))
         st = pp.stat()
         return f"{pp.resolve()}|{st.st_size}|{int(st.st_mtime)}"
-    except Exception:
+    except (OSError, TypeError, ValueError):
         return str(p)
 
 
 
+
+
+def _safe_depth_stats(depth_series: pd.Series) -> dict:
+    vals = pd.to_numeric(depth_series, errors="coerce").to_numpy(dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return {"n": 0, "p50": None, "p95": None, "min": None, "max": None}
+    return {
+        "n": int(vals.size),
+        "p50": float(np.nanpercentile(vals, 50)),
+        "p95": float(np.nanpercentile(vals, 95)),
+        "min": float(np.nanmin(vals)),
+        "max": float(np.nanmax(vals)),
+    }
+
+
+def _metric_xy_from_lonlat(lon: np.ndarray, lat: np.ndarray):
+    if lon.size == 0:
+        return np.empty((0, 2), dtype=float), None
+    lon0 = float(np.nanmean(lon))
+    lat0 = float(np.nanmean(lat))
+    zone = int(np.floor((lon0 + 180.0) / 6.0) + 1)
+    epsg = 32600 + zone if lat0 >= 0 else 32700 + zone
+    transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
+    x, y = transformer.transform(lon, lat)
+    return np.column_stack([np.asarray(x, dtype=float), np.asarray(y, dtype=float)]), epsg
+
+
+def _audit_stage_rows(stage_counts: List[Dict[str, Any]], source: str) -> pd.DataFrame:
+    rows = []
+    for item in stage_counts or []:
+        rows.append({
+            "source": str(source),
+            "stage": str(item.get("stage", "unknown")),
+            "rows": int(item.get("rows", 0) or 0),
+            "detail": str(item.get("detail", "") or ""),
+        })
+    return pd.DataFrame(rows)
+
+
+def _default_atl_audit(source: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+    retained = int(len(df)) if isinstance(df, pd.DataFrame) else 0
+    tracks = 0
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        if "track_id" in df.columns:
+            tracks = int(pd.Series(df["track_id"]).astype(str).nunique(dropna=True))
+        elif {"granule", "beam"}.issubset(df.columns):
+            tracks = int(df[["granule", "beam"]].astype(str).agg("::".join, axis=1).nunique(dropna=True))
+        elif "granule" in df.columns:
+            tracks = int(pd.Series(df["granule"]).astype(str).nunique(dropna=True))
+    return {
+        "source": str(source),
+        "cache": {"hit": False, "mode": "none"},
+        "stage_counts": [{"stage": "retained_points", "rows": retained, "detail": "final returned training points"}],
+        "retained_points": retained,
+        "unique_tracks": tracks,
+    }
+
+
+def _normalize_atl_audit(source: str, audit: Optional[Dict[str, Any]], df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+    out = _default_atl_audit(source, df=df)
+    if isinstance(audit, dict):
+        out.update({k: v for k, v in audit.items() if k != "stage_counts"})
+        stage_counts = audit.get("stage_counts")
+        if isinstance(stage_counts, list) and stage_counts:
+            out["stage_counts"] = []
+            for item in stage_counts:
+                if not isinstance(item, dict):
+                    continue
+                out["stage_counts"].append({
+                    "stage": str(item.get("stage", "unknown")),
+                    "rows": int(item.get("rows", 0) or 0),
+                    "detail": str(item.get("detail", "") or ""),
+                })
+    retained = int(out.get("retained_points", 0) or 0)
+    if retained == 0 and isinstance(df, pd.DataFrame):
+        retained = int(len(df))
+        out["retained_points"] = retained
+    tracks = out.get("unique_tracks")
+    if (tracks is None or int(tracks or 0) == 0) and isinstance(df, pd.DataFrame) and not df.empty:
+        if "track_id" in df.columns:
+            out["unique_tracks"] = int(pd.Series(df["track_id"]).astype(str).nunique(dropna=True))
+        elif {"granule", "beam"}.issubset(df.columns):
+            out["unique_tracks"] = int(df[["granule", "beam"]].astype(str).agg("::".join, axis=1).nunique(dropna=True))
+    return out
+
+
+def summarize_atl_raw_to_retained_audit(
+    atl03_audit: Optional[Dict[str, Any]],
+    atl24_audit: Optional[Dict[str, Any]],
+    *,
+    df_atl03: Optional[pd.DataFrame] = None,
+    df_atl24: Optional[pd.DataFrame] = None,
+) -> Tuple[Dict[str, Any], pd.DataFrame]:
+    a03 = _normalize_atl_audit("atl03", atl03_audit, df=df_atl03)
+    a24 = _normalize_atl_audit("atl24", atl24_audit, df=df_atl24)
+
+    rows = pd.concat([
+        _audit_stage_rows(a03.get("stage_counts", []), "atl03"),
+        _audit_stage_rows(a24.get("stage_counts", []), "atl24"),
+    ], ignore_index=True)
+
+    combined_retained = int(a03.get("retained_points", 0) or 0) + int(a24.get("retained_points", 0) or 0)
+    notes = []
+    if int(a03.get("retained_points", 0) or 0) == 0 and int(a24.get("retained_points", 0) or 0) == 0:
+        recommended_use = "no_atl_training_points"
+        notes.append("Neither ATL03 nor ATL24 retained usable training points for this AOI/run.")
+    elif int(a24.get("retained_points", 0) or 0) > 0 and int(a03.get("retained_points", 0) or 0) == 0:
+        recommended_use = "atl24_primary"
+        notes.append("ATL24 retained points are available; ATL03 did not retain usable points in this run.")
+    elif int(a03.get("retained_points", 0) or 0) > 0 and int(a24.get("retained_points", 0) or 0) == 0:
+        recommended_use = "atl03_primary"
+        notes.append("ATL03 retained points are available; ATL24 did not retain usable points in this run.")
+    else:
+        recommended_use = "multi_source_atl"
+        notes.append("Both ATL03 and ATL24 retained usable points; cross-source comparison is appropriate.")
+
+    if bool(a03.get("cache", {}).get("hit", False)) or bool(a24.get("cache", {}).get("hit", False)):
+        notes.append("At least one ATL training-point dataset came from exact-match cache; raw stage counts may reflect cached final outputs rather than a fresh parse.")
+
+    summary = {
+        "atl03": a03,
+        "atl24": a24,
+        "combined": {
+            "retained_points": combined_retained,
+            "unique_tracks": int(a03.get("unique_tracks", 0) or 0) + int(a24.get("unique_tracks", 0) or 0),
+        },
+        "cudem_framework_assessment": {
+            "recommended_use": recommended_use,
+            "notes": notes,
+        },
+    }
+    return summary, rows
+
+
+def summarize_atl_training_quality(df_atl03: pd.DataFrame, df_atl24: pd.DataFrame, min_depth_floor_m: float = 0.5, colloc_dist_m: float = 20.0):
+    df03 = df_atl03.copy() if isinstance(df_atl03, pd.DataFrame) else pd.DataFrame()
+    df24 = df_atl24.copy() if isinstance(df_atl24, pd.DataFrame) else pd.DataFrame()
+    for df, source in ((df03, "atl03"), (df24, "atl24")):
+        if not df.empty:
+            if "source" not in df.columns:
+                df["source"] = source
+            if "track_id" not in df.columns:
+                gran = df.get("granule", pd.Series([source] * len(df), index=df.index)).astype(str)
+                beam = df.get("beam", pd.Series(["unknown"] * len(df), index=df.index)).astype(str)
+                df["track_id"] = gran + "::" + beam
+            df["depth_abs_m"] = np.abs(pd.to_numeric(df.get("depth_m"), errors="coerce"))
+
+    def _source_summary(df: pd.DataFrame, source: str):
+        if df.empty:
+            return {"source": source, "accepted_points": 0, "unique_tracks": 0, "dominant_track_fraction": None, "depth_abs": _safe_depth_stats(pd.Series(dtype=float)), "near_floor_fraction": None}
+        counts = df["track_id"].value_counts(dropna=False)
+        depth_abs = pd.to_numeric(df["depth_abs_m"], errors="coerce")
+        finite = depth_abs[np.isfinite(depth_abs)]
+        near_floor = None
+        if len(finite) > 0:
+            near_floor = float(np.mean(np.abs(finite - float(min_depth_floor_m)) <= 0.20))
+        return {
+            "source": source,
+            "accepted_points": int(len(df)),
+            "unique_tracks": int(df["track_id"].nunique(dropna=True)),
+            "dominant_track_fraction": float(counts.iloc[0] / len(df)) if len(counts) else None,
+            "depth_abs": _safe_depth_stats(depth_abs),
+            "near_floor_fraction": near_floor,
+        }
+
+    pass_rows = []
+    for source, df in (("atl03", df03), ("atl24", df24)):
+        if df.empty:
+            continue
+        grp = df.groupby("track_id", dropna=False)
+        for track_id, g in grp:
+            d = pd.to_numeric(g["depth_abs_m"], errors="coerce")
+            finite = d[np.isfinite(d)]
+            pass_rows.append({
+                "source": source,
+                "track_id": str(track_id),
+                "granule": str(g.get("granule", pd.Series([""])).iloc[0]) if "granule" in g.columns else "",
+                "beam": str(g.get("beam", pd.Series([""])).iloc[0]) if "beam" in g.columns else "",
+                "accepted_points": int(len(g)),
+                "depth_abs_p50_m": float(np.nanpercentile(finite, 50)) if len(finite) else np.nan,
+                "depth_abs_p95_m": float(np.nanpercentile(finite, 95)) if len(finite) else np.nan,
+                "near_floor_fraction": float(np.mean(np.abs(finite - float(min_depth_floor_m)) <= 0.20)) if len(finite) else np.nan,
+                "lon_mean": float(pd.to_numeric(g["longitude"], errors="coerce").mean()),
+                "lat_mean": float(pd.to_numeric(g["latitude"], errors="coerce").mean()),
+            })
+    passes_df = pd.DataFrame(pass_rows)
+
+    cross = {"collocated_pairs": 0, "median_bias_m": None, "rmse_m": None, "mad_m": None, "agreement_within_1m_fraction": None}
+    if not df03.empty and not df24.empty and cKDTree is not None:
+        lon03 = pd.to_numeric(df03["longitude"], errors="coerce").to_numpy(dtype=float)
+        lat03 = pd.to_numeric(df03["latitude"], errors="coerce").to_numpy(dtype=float)
+        lon24 = pd.to_numeric(df24["longitude"], errors="coerce").to_numpy(dtype=float)
+        lat24 = pd.to_numeric(df24["latitude"], errors="coerce").to_numpy(dtype=float)
+        xy03, epsg = _metric_xy_from_lonlat(lon03, lat03)
+        xy24, _ = _metric_xy_from_lonlat(lon24, lat24)
+        if xy03.shape[0] and xy24.shape[0]:
+            tree = cKDTree(xy24)
+            dist, idx = tree.query(xy03, k=1)
+            keep = np.isfinite(dist) & (dist <= float(colloc_dist_m))
+            if np.any(keep):
+                d03 = np.abs(pd.to_numeric(df03["depth_m"], errors="coerce").to_numpy(dtype=float)[keep])
+                d24 = np.abs(pd.to_numeric(df24["depth_m"], errors="coerce").to_numpy(dtype=float)[idx[keep]])
+                finite = np.isfinite(d03) & np.isfinite(d24)
+                if np.any(finite):
+                    resid = d03[finite] - d24[finite]
+                    cross = {
+                        "collocated_pairs": int(np.sum(finite)),
+                        "metric_epsg": int(epsg) if epsg is not None else None,
+                        "max_collocation_dist_m": float(colloc_dist_m),
+                        "median_bias_m": float(np.nanmedian(resid)),
+                        "rmse_m": float(np.sqrt(np.nanmean(resid ** 2))),
+                        "mad_m": float(np.nanmedian(np.abs(resid - np.nanmedian(resid)))),
+                        "agreement_within_1m_fraction": float(np.mean(np.abs(resid) <= 1.0)),
+                    }
+
+    summary = {
+        "atl03": _source_summary(df03, "atl03"),
+        "atl24": _source_summary(df24, "atl24"),
+        "cross_source": cross,
+        "combined": {
+            "accepted_points_total": int(len(df03) + len(df24)),
+            "unique_tracks_total": int(pd.concat([df03.get("track_id", pd.Series(dtype=str)), df24.get("track_id", pd.Series(dtype=str))], ignore_index=True).nunique(dropna=True)) if (not df03.empty or not df24.empty) else 0,
+        },
+    }
+    return summary, passes_df
 def collect_training_points_from_atl03(
     atl03_files: List[str], lat_res: float, height_res: float, aoi_str: str,
     atl03_conf_min: int, atl03_bottom_percentile: float, use_refraction: bool,
@@ -1047,9 +1275,23 @@ def collect_training_points_from_atl03(
     cache_code_strict: bool = False,
     cache_ignore_code: bool = True,
     rr=None,
-) -> pd.DataFrame:
+    return_audit: bool = False,
+) -> Union[pd.DataFrame, Tuple[pd.DataFrame, Dict[str, Any]]]:
     W, E, S, N = [float(x) for x in aoi_str.split("/")]
     all_rows = []
+    audit = {
+        "source": "atl03",
+        "cache": {"hit": False, "mode": "none"},
+        "stage_counts": [{"stage": "input_files", "rows": int(len(atl03_files or [])), "detail": "ATL03 granules supplied to collector"}],
+        "parse_failures": [],
+    }
+    photons_total = 0
+    photons_geo_finite = 0
+    photons_in_aoi = 0
+    photons_confident = 0
+    bottom_candidates = 0
+    depth_gate_kept = 0
+    support_gate_kept = 0
 
 
     # ---------------------------------------------------------------------
@@ -1101,8 +1343,14 @@ def collect_training_points_from_atl03(
                 Path(cache_data_path).name if cache_data_path else cache_key,
             )
         else:
-            log.info(f"[ATL03_TRAINING_POINTS-CACHE] HIT: {Path(cache_data_path).name if cache_data_path else cache_key} ({cache_reason}, n={len(df_cached)})")
-        return df_cached.reset_index(drop=True)
+            log.info("[ATL03_TRAINING_POINTS-CACHE] HIT: %s (%s, n=%d)",
+                     Path(cache_data_path).name if cache_data_path else cache_key,
+                     cache_reason, len(df_cached))
+        audit["cache"] = {"hit": True, "mode": str(cache_reason), "key": str(cache_key) if cache_key else None, "data_path": str(cache_data_path) if cache_data_path else None, "meta_path": str(cache_meta_path) if cache_meta_path else None}
+        audit["stage_counts"].append({"stage": "cache_retained_points", "rows": int(len(df_cached)), "detail": "exact-match cached ATL03 training points"})
+        audit["retained_points"] = int(len(df_cached))
+        out_cached = df_cached.reset_index(drop=True)
+        return (out_cached, audit) if return_audit else out_cached
     else:
         if cache_dir is not None and _CACHE_UTILS_AVAILABLE:
             log.info("[ATL03_TRAINING_POINTS-CACHE] MISS: %s", cache_reason)
@@ -1115,15 +1363,19 @@ def collect_training_points_from_atl03(
                     (lat, lon, h_ph, conf, ref_elev, _, _, _, _) = read_atl03_basic(atl03_path, laser_num)
                 except Exception: continue
 
+                photons_total += int(np.size(lat))
                 m_geo = (np.isfinite(lat) & np.isfinite(lon) & np.isfinite(h_ph) & np.isfinite(conf))
                 lat = lat[m_geo]; lon = lon[m_geo]; h_ph = h_ph[m_geo]; conf = conf[m_geo]
+                photons_geo_finite += int(lat.size)
 
                 m_aoi = (lon >= W) & (lon <= E) & (lat >= S) & (lat <= N)
                 lat = lat[m_aoi]; lon = lon[m_aoi]; h_ph = h_ph[m_aoi]; conf = conf[m_aoi]
+                photons_in_aoi += int(lat.size)
                 if lat.size == 0: continue
 
                 m_conf = conf >= atl03_conf_min
                 df_beam = pd.DataFrame({"latitude": lat[m_conf], "longitude": lon[m_conf], "photon_height": h_ph[m_conf]}).dropna()
+                photons_confident += int(len(df_beam))
                 if df_beam.empty: continue
 
                 theta_air_med = None
@@ -1144,7 +1396,9 @@ def collect_training_points_from_atl03(
                 # Enforce negative-down convention (depth below surface = negative)
                 bath_df["depth_m"] = -np.abs(bath_df["depth_m"])
 
+                bottom_candidates += int(len(bath_df))
                 bath_df = bath_df[(bath_df["depth_m"] <= -min_depth_m) & (bath_df["depth_m"] >= -max_depth_m)]
+                depth_gate_kept += int(len(bath_df))
                 try:
                     if len(bath_df) > 0 and "depth_m" in bath_df.columns:
                         d = bath_df["depth_m"].astype(float).to_numpy()
@@ -1162,13 +1416,25 @@ def collect_training_points_from_atl03(
                 except Exception:
                     log.debug("ATL03 shallow-floor QC warning failed", exc_info=True)
                 bath_df = bath_df[(bath_df["n_bottom"] >= min_bottom_photons) & (bath_df["frac_bottom"] >= min_bottom_frac)]
+                support_gate_kept += int(len(bath_df))
 
                 bath_df["granule"] = Path(atl03_path).stem; bath_df["beam"] = f"gt{laser_num}"; bath_df["source"] = "atl03"
 
                 all_rows.append(bath_df[["longitude", "latitude", "depth_m", "ws_h", "photon_height", "n_bottom", "n_subsurface", "frac_bottom", "granule", "beam", "source"]])
 
         except Exception as exc:
+            audit["parse_failures"].append({"file": str(Path(atl03_path).name), "error": str(exc)})
             log.warning("[TRAIN-ATL03] failed to parse %s: %s", Path(atl03_path).name, exc)
+
+    audit["stage_counts"].extend([
+        {"stage": "input_photons", "rows": int(photons_total), "detail": "all raw ATL03 photons read before filtering"},
+        {"stage": "finite_photons", "rows": int(photons_geo_finite), "detail": "photons with finite lon/lat/height/confidence"},
+        {"stage": "aoi_photons", "rows": int(photons_in_aoi), "detail": "photons inside requested AOI"},
+        {"stage": "confidence_photons", "rows": int(photons_confident), "detail": "photons meeting atl03_conf_min"},
+        {"stage": "bottom_candidates", "rows": int(bottom_candidates), "detail": "candidate ATL03 bottom picks before depth limits"},
+        {"stage": "after_depth_gate", "rows": int(depth_gate_kept), "detail": "bottom picks within configured ATL03 depth range"},
+        {"stage": "after_support_gate", "rows": int(support_gate_kept), "detail": "bottom picks meeting min_bottom_photons and min_bottom_frac"},
+    ])
 
     # If we have no valid rows, still write an empty cache entry.
     # This avoids repeated expensive parsing work across identical runs.
@@ -1187,14 +1453,19 @@ def collect_training_points_from_atl03(
                 df=out_empty,
                 extra={"rows": 0, "empty": True},
             )
-        return out_empty
+        audit["retained_points"] = 0
+        out_empty = out_empty.reset_index(drop=True)
+        return (out_empty, audit) if return_audit else out_empty
     out = pd.concat(all_rows, ignore_index=True)
     _log_depth_funnel("atl03.points.concat", out, rr=rr)
+
+    audit["stage_counts"].append({"stage": "concat_points", "rows": int(len(out)), "detail": "ATL03 beam-level retained points before land mask"})
 
     # Filter by Land Mask
     if land_mask_path and os.path.exists(land_mask_path):
         out = _filter_points_by_mask(out, land_mask_path, water_val=land_mask_water_val, invert=land_mask_invert, mask_type=land_mask_type, threshold=land_mask_threshold, rr=rr)
         _log_depth_funnel("atl03.points.landmask", out, rr=rr)
+        audit["stage_counts"].append({"stage": "landmask_points", "rows": int(len(out)), "detail": "ATL03 retained points after land mask gate"})
 
     # Cache write (best-effort)
     if cache_dir is not None and _CACHE_UTILS_AVAILABLE and cache_key and cache_data_path and cache_meta_path:
@@ -1211,7 +1482,9 @@ def collect_training_points_from_atl03(
             extra={"rows": int(len(out)), "empty": bool(len(out) == 0)},
         )
 
-    return out.reset_index(drop=True)
+    out = out.reset_index(drop=True)
+    audit["retained_points"] = int(len(out))
+    return (out, audit) if return_audit else out
 
 
 def collect_training_points_from_atl24(
@@ -1227,9 +1500,16 @@ def collect_training_points_from_atl24(
     cache_code_strict: bool = False,
     cache_ignore_code: bool = True,
     rr=None,
-) -> pd.DataFrame:
+    return_audit: bool = False,
+) -> Union[pd.DataFrame, Tuple[pd.DataFrame, Dict[str, Any]]]:
     """Core ATL24 segment parsing logic."""
 
+    audit = {
+        "source": "atl24",
+        "cache": {"hit": False, "mode": "none"},
+        "stage_counts": [{"stage": "input_files", "rows": int(len(atl24_files or [])), "detail": "ATL24 granules supplied to collector"}],
+        "parse_failures": [],
+    }
 
     # ---------------------------------------------------------------------
     # Exact-match cache (derived training points)
@@ -1273,8 +1553,14 @@ def collect_training_points_from_atl24(
                 Path(cache_data_path).name if cache_data_path else cache_key,
             )
         else:
-            log.info(f"[ATL24_TRAINING_POINTS-CACHE] HIT: {Path(cache_data_path).name if cache_data_path else cache_key} ({cache_reason}, n={len(df_cached)})")
-        return df_cached.reset_index(drop=True)
+            log.info("[ATL24_TRAINING_POINTS-CACHE] HIT: %s (%s, n=%d)",
+                     Path(cache_data_path).name if cache_data_path else cache_key,
+                     cache_reason, len(df_cached))
+        audit["cache"] = {"hit": True, "mode": str(cache_reason), "key": str(cache_key) if cache_key else None, "data_path": str(cache_data_path) if cache_data_path else None, "meta_path": str(cache_meta_path) if cache_meta_path else None}
+        audit["stage_counts"].append({"stage": "cache_retained_points", "rows": int(len(df_cached)), "detail": "exact-match cached ATL24 training points"})
+        audit["retained_points"] = int(len(df_cached))
+        out_cached = df_cached.reset_index(drop=True)
+        return (out_cached, audit) if return_audit else out_cached
     else:
         if cache_dir is not None and _CACHE_UTILS_AVAILABLE:
             log.info("[ATL24_TRAINING_POINTS-CACHE] MISS: %s", cache_reason)
@@ -1284,35 +1570,49 @@ def collect_training_points_from_atl24(
         try:
             df = _collect_points_from_atl24_file(h5, conf_min=atl24_conf_min)
             if not df.empty: pts.append(df)
-        except Exception: log.debug("ignored", exc_info=True)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            audit["parse_failures"].append({"file": str(Path(h5).name), "error": str(exc)})
+            log.debug("ignored", exc_info=True)
 
-    if not pts: return pd.DataFrame()
+    if not pts:
+        audit["retained_points"] = 0
+        out_empty = pd.DataFrame()
+        return (out_empty, audit) if return_audit else out_empty
     df_all = pd.concat(pts).reset_index(drop=True)
+    audit["stage_counts"].append({"stage": "parsed_points", "rows": int(len(df_all)), "detail": "ATL24 points parsed before AOI/depth filters"})
     _log_depth_funnel("atl24.points.concat", df_all, rr=rr)
     W, E, S, N = parse_aoi_string(aoi_str)
     train_df = df_all[(df_all.longitude >= W) & (df_all.longitude <= E) & (df_all.latitude >= S) & (df_all.latitude <= N)]
     _log_depth_funnel("atl24.points.aoi_clip", train_df, rr=rr)
+    audit["stage_counts"].append({"stage": "aoi_points", "rows": int(len(train_df)), "detail": "ATL24 points inside requested AOI"})
 
     if train_df.empty and train_relax_buffer > 0:
         bw = (E-W)*train_relax_buffer; bh = (N-S)*train_relax_buffer
         train_df = df_all[(df_all.longitude >= W-bw) & (df_all.longitude <= E+bw) & (df_all.latitude >= S-bh) & (df_all.latitude <= N+bh)]
         _log_depth_funnel("atl24.points.relax_clip", train_df, rr=rr)
+        audit["stage_counts"].append({"stage": "relax_aoi_points", "rows": int(len(train_df)), "detail": "ATL24 points inside relaxed AOI buffer"})
 
-    if train_df.empty: return pd.DataFrame()
+    if train_df.empty:
+        audit["retained_points"] = 0
+        out_empty = pd.DataFrame()
+        return (out_empty, audit) if return_audit else out_empty
     _log_depth_funnel("atl24.points.pre_depth_cap", train_df, rr=rr)
     # Filter by depth (negative-down convention: -max_depth_m <= depth_m <= -min_depth)
     # depth_m is negative, so we filter: depth >= -max_depth_m (i.e., not deeper than max)
     train_df = train_df[train_df["depth_m"] >= -max_depth_m]
     _log_depth_funnel("atl24.points.post_depth_cap", train_df, rr=rr)
+    audit["stage_counts"].append({"stage": "depth_capped_points", "rows": int(len(train_df)), "detail": "ATL24 points shallower than configured max depth"})
 
     if limit_train_samples and len(train_df) > limit_train_samples:
         train_df = train_df.sample(limit_train_samples, random_state=seed)
         _log_depth_funnel("atl24.points.sample_limit", train_df, rr=rr)
+        audit["stage_counts"].append({"stage": "sample_limited_points", "rows": int(len(train_df)), "detail": "ATL24 points after optional sample limit"})
 
     # Filter by Land Mask
     if land_mask_path and os.path.exists(land_mask_path):
         train_df = _filter_points_by_mask(train_df, land_mask_path, water_val=land_mask_water_val, invert=land_mask_invert, mask_type=land_mask_type, threshold=land_mask_threshold, rr=rr)
         _log_depth_funnel("atl24.points.landmask", train_df, rr=rr)
+        audit["stage_counts"].append({"stage": "landmask_points", "rows": int(len(train_df)), "detail": "ATL24 retained points after land mask gate"})
 
     # Cache write (best-effort)
     if cache_dir is not None and _CACHE_UTILS_AVAILABLE and cache_key and cache_data_path and cache_meta_path:
@@ -1329,7 +1629,9 @@ def collect_training_points_from_atl24(
             extra={"rows": int(len(train_df))},
         )
 
-    return train_df.reset_index(drop=True)
+    train_df = train_df.reset_index(drop=True)
+    audit["retained_points"] = int(len(train_df))
+    return (train_df, audit) if return_audit else train_df
 
 def build_gl_atl24_like_product(
     atl03_files: List[str], aoi_str: str, out_path: str,
@@ -1384,7 +1686,7 @@ def build_atl03_track_lines(atl03_files: List[str], aoi_str: str, out_shp: str):
                     lines.append(LineString(pts))
                     names.append(Path(f).name)
                     beams.append(f"gt{laser}")
-        except Exception: log.debug("ignored", exc_info=True)
+        except (OSError, ValueError, TypeError, KeyError): log.debug("ignored", exc_info=True)
 
     if lines:
         gdf = gpd.GeoDataFrame({"granule": names, "beam": beams, "geometry": lines}, crs="EPSG:4326")
@@ -1394,7 +1696,7 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
     """
     Load external XYZ bathymetry data from multiple files.
 
-    Supports CSV, TXT, and GPKG formats. Reprojects from ``crs`` to EPSG:4326
+    Supports CSV, TXT, Parquet, and vector formats. Reprojects from ``crs`` to EPSG:4326
     and clips to ``aoi_str`` (W/E/S/N). All rows are labelled source="extra_xyz".
 
     Args:
@@ -1405,7 +1707,7 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
     Returns:
         DataFrame with columns: longitude, latitude, depth_m, source
     """
-    from pyproj import Transformer, CRS
+    from pyproj import Transformer
     import geopandas as gpd
     import re
 
@@ -1453,7 +1755,20 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
                 except Exception as e:
                     log.debug("Not a vector file: %s", e)
 
-            # Try CSV/TXT
+            # Try Parquet first when explicitly requested. This is important for
+            # river guidance support, where bathy_main wires authoritative
+            # soundings subsets through a .parquet cache for performance.
+            if tmp is None and filepath.suffix.lower() == '.parquet':
+                try:
+                    tmp = pd.read_parquet(f)
+                    log.info("Loaded as Parquet: %s points, %s columns", len(tmp), len(tmp.columns))
+                except Exception as e:
+                    log.error("Failed to read parquet file %s: %s", filepath.name, e)
+                    # Do NOT fall through to CSV for .parquet files — binary files
+                    # will always fail CSV parsing with confusing codec errors.
+                    raise
+
+            # Try CSV/TXT (only for non-parquet, non-vector files)
             if tmp is None:
                 tmp = pd.read_csv(f)
 
@@ -1466,6 +1781,14 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
 
             # Normalize column names
             tmp.columns = [c.lower() for c in tmp.columns]
+
+            # Resolve already-standard parquet columns before generic renaming.
+            if 'longitude' in tmp.columns and 'x_orig' not in tmp.columns:
+                tmp['x_orig'] = pd.to_numeric(tmp['longitude'], errors='coerce')
+            if 'latitude' in tmp.columns and 'y_orig' not in tmp.columns:
+                tmp['y_orig'] = pd.to_numeric(tmp['latitude'], errors='coerce')
+            if 'depth_m' in tmp.columns and isinstance(tmp['depth_m'], pd.DataFrame):
+                tmp['depth_m'] = tmp['depth_m'].bfill(axis=1).iloc[:, 0]
 
             # Map columns to standard names with case-insensitive matching
             rename_map = {}
@@ -1488,6 +1811,22 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
                     rename_map[c] = 'depth_m'
 
             tmp = tmp.rename(columns=rename_map)
+
+            # Duplicate standardized columns can happen for parquet subsets that already
+            # carry both x/y/z and longitude/latitude/depth_m. Coalesce duplicates explicitly.
+            for canon in ('x_orig', 'y_orig', 'depth_m'):
+                if canon in tmp.columns:
+                    col_data = tmp[canon]
+                    if isinstance(col_data, pd.DataFrame):
+                        # Multiple columns mapped to the same name — take the first non-null
+                        tmp = tmp.loc[:, ~tmp.columns.duplicated(keep='first')]
+                        log.info("Coalesced duplicate column '%s' in %s", canon, filepath.name)
+
+            # If columns are still duplicated after coalescing, drop all duplicates
+            if tmp.columns.duplicated().any():
+                dup_cols = list(tmp.columns[tmp.columns.duplicated()])
+                log.info("Dropping remaining duplicate columns: %s", dup_cols)
+                tmp = tmp.loc[:, ~tmp.columns.duplicated(keep='first')]
 
             # Check required columns
             if 'x_orig' not in tmp.columns or 'y_orig' not in tmp.columns:
@@ -1532,10 +1871,10 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
                 tmp['latitude'] = lat
 
                 # Sanity check: log range before/after
-                log.info(f"Input range: X=[{x_in.min():.2f}, {x_in.max():.2f}], "
-                        f"Y=[{y_in.min():.2f}, {y_in.max():.2f}]")
-                log.info(f"Output range: Lon=[{lon.min():.4f}, {lon.max():.4f}], "
-                        f"Lat=[{lat.min():.4f}, {lat.max():.4f}]")
+                log.info("Input range: X=[%.2f, %.2f], Y=[%.2f, %.2f]",
+                        x_in.min(), x_in.max(), y_in.min(), y_in.max())
+                log.info("Output range: Lon=[%.4f, %.4f], Lat=[%.4f, %.4f]",
+                        lon.min(), lon.max(), lat.min(), lat.max())
             else:
                 # No transformation needed
                 tmp['longitude'] = tmp['x_orig']
@@ -1552,9 +1891,8 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
             pct_positive = (finite_depths > 0).sum() / len(finite_depths)
             depth_min, depth_max = finite_depths.min(), finite_depths.max()
 
-            log.info(f"Depth statistics: "
-                    f"min={depth_min:.2f}, max={depth_max:.2f}, "
-                    f"pct_positive={pct_positive*100:.1f}%")
+            log.info("Depth statistics: min=%.2f, max=%.2f, pct_positive=%.1f%%",
+                    depth_min, depth_max, pct_positive * 100)
 
             # Infer depth sign from distribution and convert to negative-down
             if pct_positive >= 0.9:
@@ -1567,8 +1905,9 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
             else:
                 # Mixed signs -> ambiguous, warn user
                 log.warning(
-                    f"[load_extra_xyz]   Mixed depth signs detected ({pct_positive*100:.1f}% positive). "
-                    f"Not auto-converting. Please verify depth convention or add --xyz-depth-convention flag."
+                    "[load_extra_xyz]   Mixed depth signs detected (%.1f%% positive). "
+                    "Not auto-converting. Please verify depth convention or add --xyz-depth-convention flag.",
+                    pct_positive * 100,
                 )
                 log.warning("Depth range: [%.2f, %.2f] m", depth_min, depth_max)
 
@@ -1594,7 +1933,8 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
 
                 if n_too_deep > 0 or n_too_shallow > 0:
                     log.warning(
-                        f"[load_extra_xyz] QC WARNING: Potential outliers detected in {filepath.name}"
+                        "[load_extra_xyz] QC WARNING: Potential outliers detected in %s",
+                        filepath.name,
                     )
                     if n_too_deep > 0:
                         log.warning("  %s points deeper than %sm", n_too_deep, expected_min_depth)
@@ -1613,9 +1953,10 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
                     if n_outliers > 0:
                         pct_outliers = 100.0 * n_outliers / len(tmp)
                         log.warning(
-                            f"[load_extra_xyz] QC: Removing {n_outliers} outliers "
-                            f"({pct_outliers:.1f}%) beyond 12×MAD "
-                            f"(median={median_depth:.2f}, MAD={mad:.2f})"
+                            "[load_extra_xyz] QC: Removing %d outliers "
+                            "(%.1f%%) beyond 12×MAD "
+                            "(median=%.2f, MAD=%.2f)",
+                            n_outliers, pct_outliers, median_depth, mad,
                         )
                         tmp = tmp[~outlier_mask].copy()
 
@@ -1625,9 +1966,10 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
 
                 if lon_range > 10.0 or lat_range > 10.0:
                     log.warning(
-                        f"[load_extra_xyz] QC WARNING: Very large coordinate range "
-                        f"(lon_range={lon_range:.2f}°, lat_range={lat_range:.2f}°). "
-                        f"Check CRS transformation!"
+                        "[load_extra_xyz] QC WARNING: Very large coordinate range "
+                        "(lon_range=%.2f deg, lat_range=%.2f deg). "
+                        "Check CRS transformation!",
+                        lon_range, lat_range,
                     )
 
             # Clip to AOI
@@ -1645,6 +1987,8 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
                 # If the input already has a meaningful 'source' column, keep it. Otherwise tag by filename.
                 if "source" in tmp.columns and tmp["source"].notna().any():
                     tmp["source"] = tmp["source"].astype(str)
+                elif "_src_file" in tmp.columns and tmp["_src_file"].notna().any():
+                    tmp["source"] = tmp["_src_file"].astype(str)
                 else:
                     tag = filepath.stem.lower().strip()
                     # normalize common prefixes
@@ -1656,8 +2000,8 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
 
                 # Log depth statistics
                 depth_stats = tmp['depth_m'].describe()
-                log.info(f"Depth stats: min={depth_stats['min']:.2f}, "
-                        f"median={depth_stats['50%']:.2f}, max={depth_stats['max']:.2f} m")
+                log.info("Depth stats: min=%.2f, median=%.2f, max=%.2f m",
+                        depth_stats['min'], depth_stats['50%'], depth_stats['max'])
 
                 dfs.append(tmp)
             else:

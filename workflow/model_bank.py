@@ -117,6 +117,50 @@ def save_reservoir(bank_dir: Path, df: pd.DataFrame) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     df.to_pickle(p, compression="gzip")
 
+def _canonicalize_reservoir_aliases(df: pd.DataFrame) -> pd.DataFrame:
+    """Backfill canonical reservoir columns from older alias names.
+
+    Older model-bank reservoirs may store geographic support columns as ``lon``/``lat``
+    and omit ``source_norm``. If we blindly reindex to the new schema, those rows lose
+    their usable support coordinates and later prediction can fail closed for the wrong
+    reason because only a handful of fresh rows still carry ``longitude``/``latitude``.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+
+    def _fill_from_alias(canonical: str, aliases: list[str]) -> None:
+        existing = pd.to_numeric(out.get(canonical), errors="coerce") if canonical in out.columns else None
+        for alias in aliases:
+            if alias not in out.columns:
+                continue
+            alias_vals = pd.to_numeric(out[alias], errors="coerce")
+            if canonical not in out.columns:
+                out[canonical] = alias_vals
+                existing = pd.to_numeric(out[canonical], errors="coerce")
+                continue
+            if existing is None:
+                existing = pd.to_numeric(out[canonical], errors="coerce")
+            fill_mask = (~alias_vals.isna()) & (existing.isna())
+            if bool(fill_mask.any()):
+                out.loc[fill_mask, canonical] = alias_vals.loc[fill_mask]
+                existing = pd.to_numeric(out[canonical], errors="coerce")
+
+    _fill_from_alias("longitude", ["lon"])
+    _fill_from_alias("latitude", ["lat"])
+
+    if "source_norm" not in out.columns and "source" in out.columns:
+        out["source_norm"] = out["source"]
+    elif "source_norm" in out.columns and "source" in out.columns:
+        srcn = out["source_norm"].astype(object)
+        src = out["source"].astype(object)
+        miss = srcn.isna() | (srcn.astype(str).str.strip() == "") | (srcn.astype(str).str.lower() == "nan")
+        if bool(miss.any()):
+            out.loc[miss, "source_norm"] = src.loc[miss]
+
+    return out
+
+
 def _deterministic_row_order(df: pd.DataFrame) -> pd.DataFrame:
     # Stable ordering reduces run-to-run nondeterminism.
     cols = [c for c in ["lon", "longitude", "x", "lat", "latitude", "y", "z", "depth", "depth_m", "bed_elev"] if c in df.columns]
@@ -213,7 +257,8 @@ def update_bank(
         meta.setdefault("extra", {})
         meta["extra"].update(_json_safe(extra_meta))
 
-    res = load_reservoir(bank_dir)
+    res = _canonicalize_reservoir_aliases(load_reservoir(bank_dir))
+    new_training_df = _canonicalize_reservoir_aliases(new_training_df)
 
     # Enforce a stable schema to avoid the reservoir "growing" columns over time
     # (e.g., when upstream feature engineering changes). This keeps disk bounded

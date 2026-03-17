@@ -1455,6 +1455,11 @@ def _soundings_to_grids(
     if diag_json_path is not None:
         try:
             diag_path = Path(diag_json_path)
+            bb_diag = _template_bbox_xy()
+            if bb_diag is None:
+                xmin_d = ymin_d = xmax_d = ymax_d = None
+            else:
+                xmin_d, xmax_d, ymin_d, ymax_d = bb_diag
 
             # Swapped-axis diagnostic: if any upstream bug swapped (x,y)->(y,x),
             # this may show non-zero overlaps.
@@ -1484,10 +1489,10 @@ def _soundings_to_grids(
                     "shape": [int(H), int(W)],
                     "transform_gdal": [float(v) for v in transform.to_gdal()],
                     "bounds": {
-                        "left": float(bounds.left),
-                        "bottom": float(bounds.bottom),
-                        "right": float(bounds.right),
-                        "top": float(bounds.top),
+                        "left": (float(xmin_d) if xmin_d is not None else None),
+                        "bottom": (float(ymin_d) if ymin_d is not None else None),
+                        "right": (float(xmax_d) if xmax_d is not None else None),
+                        "top": (float(ymax_d) if ymax_d is not None else None),
                     },
                 },
                 "channel": {
@@ -3111,6 +3116,7 @@ def main(
                     mainstem_corridor = None
                 depth_pre_smooth = depth.copy()
                 wse_pre_smooth = wse_map.copy()
+                bed_pre_smooth = (wse_pre_smooth - depth_pre_smooth).astype("float32")
                 jmode = str(getattr(args, "junction_mode", "smooth")).strip().lower()
                 if jmode == "mask":
                     depth[jm] = np.nan
@@ -3200,7 +3206,7 @@ def main(
                             wse_map = _smooth_in_zone(wse_map, jm_small, sigma_px_small)
                         # Recompute depth from (smoothed) WSE and current bed to keep mainstem continuity
                         try:
-                            depth = (wse_map - bed).astype('float32')
+                            depth = (wse_map - bed_pre_smooth).astype('float32')
                             # Depth cannot be negative
                             depth = np.where(depth >= 0.0, depth, 0.0).astype('float32')
                         except Exception:

@@ -33,7 +33,7 @@ def main() -> int:
     failures: list[str] = []
 
     # 1) Syntax compile sweep (fast, avoids importing heavyweight geo stacks)
-    print("[SMOKE] Step 1/4: py_compile sweep", flush=True)
+    print("[SMOKE] Step 1/3: py_compile sweep", flush=True)
     py_files = sorted(glob.glob(str(here / "*.py")))
     for fn in py_files:
         mod = os.path.splitext(os.path.basename(fn))[0]

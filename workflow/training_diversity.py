@@ -9,14 +9,14 @@ Key metrics:
 1. Spatial coverage - Are training points well-distributed across the AOI?
 2. Depth coverage - Do we have training data across the full depth range?
 3. Spectral coverage - Do training points span the range of water/bottom conditions?
-4. Track diversity - How many independent ICESat-2 passes contribute data?
+4. Source diversity - How many independent support groups or passes contribute data?
 
 The goal is to collect training data that spans the full "feature space" so the
 model learns generalizable relationships rather than location-specific patterns.
 """
 
 import logging
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 from dataclasses import dataclass
 import numpy as np
 import pandas as pd
@@ -46,7 +46,9 @@ class DiversityReport:
     # Track diversity
     n_unique_tracks: int
     track_contribution: Dict[str, int]  # track_id -> n_points
-    
+    temporal_diversity_score: float
+    month_histogram: Dict[str, int]
+
     # Overall
     overall_score: float
     recommendations: List[str]
@@ -57,48 +59,78 @@ def analyze_spatial_coverage(
     lon_col: str = "longitude",
     lat_col: str = "latitude",
     n_grid_cells: int = 25,
+    aoi_bounds: Optional[Tuple[float, float, float, float]] = None,
+    support_radius_fraction: float = 0.5,
 ) -> Tuple[float, List[Tuple[float, float, float, float]]]:
     """
-    Analyze how well training points cover the AOI spatially.
-    
-    Returns coverage score (0-1) and list of gap regions.
+    Analyze how well retained training points cover the AOI spatially.
+
+    When AOI bounds are available, coverage is evaluated against the AOI rather
+    than only the retained-point bounding box. This avoids overstating coverage
+    when points occupy just a corridor inside a much larger tile.
+
+    A cell is considered supported when either the raw count threshold is met or
+    points are sufficiently close to the cell center relative to local cell size.
+    This better matches the workflow's intent of conservative interpolation
+    guidance rather than dense-survey occupancy.
     """
-    lons = df[lon_col].to_numpy()
-    lats = df[lat_col].to_numpy()
-    
-    lon_min, lon_max = np.nanmin(lons), np.nanmax(lons)
-    lat_min, lat_max = np.nanmin(lats), np.nanmax(lats)
-    
-    # Create grid
-    n_x = int(np.sqrt(n_grid_cells))
+    lons = pd.to_numeric(df[lon_col], errors="coerce").to_numpy(dtype=float)
+    lats = pd.to_numeric(df[lat_col], errors="coerce").to_numpy(dtype=float)
+    valid = np.isfinite(lons) & np.isfinite(lats)
+    if not np.any(valid):
+        return 0.0, []
+    lons = lons[valid]
+    lats = lats[valid]
+
+    if aoi_bounds is not None and len(aoi_bounds) == 4:
+        lon_min, lon_max, lat_min, lat_max = map(float, aoi_bounds)
+    else:
+        lon_min, lon_max = np.nanmin(lons), np.nanmax(lons)
+        lat_min, lat_max = np.nanmin(lats), np.nanmax(lats)
+
+    if not np.isfinite([lon_min, lon_max, lat_min, lat_max]).all() or lon_max <= lon_min or lat_max <= lat_min:
+        return 0.0, []
+
+    target_cells = int(min(n_grid_cells, max(4, len(df) // 8)))
+    n_x = max(2, int(np.sqrt(target_cells)))
     n_y = n_x
-    
+
     lon_edges = np.linspace(lon_min, lon_max, n_x + 1)
     lat_edges = np.linspace(lat_min, lat_max, n_y + 1)
-    
-    # Count points per cell
+
     occupied_cells = 0
     gaps = []
-    min_points_per_cell = 10  # Threshold for "covered"
-    
+    avg_points_per_cell = max(len(lons) / max(n_x * n_y, 1), 1.0)
+    min_points_per_cell = int(np.clip(np.ceil(avg_points_per_cell * 0.5), 3, 10))
+    cell_width = max(float((lon_max - lon_min) / n_x), 1e-12)
+    cell_height = max(float((lat_max - lat_min) / n_y), 1e-12)
+    support_rx = max(cell_width * support_radius_fraction, 1e-12)
+    support_ry = max(cell_height * support_radius_fraction, 1e-12)
+
     for i in range(n_x):
         for j in range(n_y):
+            lon_upper_ok = (lons <= lon_edges[i+1]) if i == (n_x - 1) else (lons < lon_edges[i+1])
+            lat_upper_ok = (lats <= lat_edges[j+1]) if j == (n_y - 1) else (lats < lat_edges[j+1])
             mask = (
-                (lons >= lon_edges[i]) & (lons < lon_edges[i+1]) &
-                (lats >= lat_edges[j]) & (lats < lat_edges[j+1])
+                (lons >= lon_edges[i]) & lon_upper_ok &
+                (lats >= lat_edges[j]) & lat_upper_ok
             )
-            n_in_cell = np.sum(mask)
-            
-            if n_in_cell >= min_points_per_cell:
+            n_in_cell = int(np.sum(mask))
+            center_lon = 0.5 * (lon_edges[i] + lon_edges[i+1])
+            center_lat = 0.5 * (lat_edges[j] + lat_edges[j+1])
+            near_center = (((lons - center_lon) / support_rx) ** 2 + ((lats - center_lat) / support_ry) ** 2) <= 1.0
+            supported = n_in_cell >= min_points_per_cell or bool(np.any(near_center))
+
+            if supported:
                 occupied_cells += 1
             else:
                 gaps.append((
                     float(lon_edges[i]), float(lon_edges[i+1]),
                     float(lat_edges[j]), float(lat_edges[j+1])
                 ))
-    
-    coverage_score = occupied_cells / (n_x * n_y)
-    return coverage_score, gaps
+
+    coverage_score = occupied_cells / max((n_x * n_y), 1)
+    return float(coverage_score), gaps
 
 
 def analyze_depth_coverage(
@@ -109,47 +141,48 @@ def analyze_depth_coverage(
 ) -> Tuple[float, List[Tuple[float, float]], Dict[str, int]]:
     """
     Analyze depth distribution of training data.
-    
-    Returns coverage score, gap ranges, and histogram.
+
+    Depths may be stored either positive-down or negative-down in this workflow,
+    so coverage must be evaluated on absolute magnitudes. The analysis is scored
+    over the *observed supported range* rather than always forcing the full
+    nominal max_expected_depth, otherwise shallow-but-valid training sets can be
+    misreported as having 0% depth coverage.
     """
     depths = pd.to_numeric(df[depth_col], errors="coerce").to_numpy(dtype=float)
-    depths = depths[np.isfinite(depths) & (depths > 0)]
-    
+    depths = np.abs(depths[np.isfinite(depths)])
+
     if len(depths) == 0:
-        return 0.0, [(0, max_expected_depth)], {}
-    
-    # Create bins
-    bins = np.arange(0, max_expected_depth + bin_size, bin_size)
+        return 0.0, [(0.0, float(max_expected_depth))], {}
+
+    q99 = float(np.nanpercentile(depths, 99))
+    analysis_max = min(float(max_expected_depth), max(float(bin_size), q99))
+    bins = np.arange(0.0, analysis_max + bin_size, bin_size, dtype=float)
+    if bins.size < 2:
+        bins = np.array([0.0, max(float(bin_size), analysis_max)], dtype=float)
     hist, edges = np.histogram(depths, bins=bins)
-    
-    # Find gaps (bins with < 10 points)
+
     gaps = []
-    min_points = 10
+    min_points = int(np.clip(np.ceil(len(depths) / max(len(hist) * 4, 1)), 3, 10))
     in_gap = False
-    gap_start = 0
-    
+    gap_start = float(edges[0])
     for i, count in enumerate(hist):
         if count < min_points:
             if not in_gap:
                 in_gap = True
-                gap_start = edges[i]
+                gap_start = float(edges[i])
         else:
             if in_gap:
                 gaps.append((float(gap_start), float(edges[i])))
                 in_gap = False
-    
     if in_gap:
         gaps.append((float(gap_start), float(edges[-1])))
-    
-    # Coverage score = fraction of depth range with adequate data
-    covered_bins = np.sum(hist >= min_points)
-    max_bin = int(np.ceil(np.max(depths) / bin_size))
-    coverage_score = covered_bins / max(max_bin, 1)
-    
-    # Create histogram dict
+
+    covered_bins = int(np.sum(hist >= min_points))
+    n_bins = max(int(len(hist)), 1)
+    coverage_score = covered_bins / n_bins
+
     histogram = {f"{edges[i]:.0f}-{edges[i+1]:.0f}m": int(hist[i]) for i in range(len(hist))}
-    
-    return coverage_score, gaps, histogram
+    return float(coverage_score), gaps, histogram
 
 
 def analyze_spectral_diversity(
@@ -196,35 +229,88 @@ def analyze_spectral_diversity(
     return overall_score, ranges
 
 
+
+
+def analyze_temporal_diversity(
+    df: pd.DataFrame,
+    date_col: str = "datetime",
+) -> Tuple[float, Dict[str, int]]:
+    """
+    Analyze seasonal/temporal spread of retained support.
+
+    Returns a score in [0,1] based on monthly occupancy and a histogram of month
+    counts. This helps distinguish multiple truly independent sampling windows
+    from a dense cluster of tracks acquired under nearly identical conditions.
+    """
+    if date_col not in df.columns:
+        return 0.0, {}
+    try:
+        dt = pd.to_datetime(df[date_col], errors="coerce")
+    except (TypeError, ValueError):
+        return 0.0, {}
+    months = dt.dt.month.dropna().astype(int)
+    if months.empty:
+        return 0.0, {}
+    month_counts = months.value_counts().sort_index()
+    n_months = int(month_counts.index.nunique())
+    score = min(n_months / 6.0, 1.0)
+    return float(score), {f"{int(k):02d}": int(v) for k, v in month_counts.items()}
+
 def analyze_track_diversity(
     df: pd.DataFrame,
-    track_col: str = "gt",
+    track_col: str = "track_id",
     date_col: str = "datetime",
     source_col: str = "source",
 ) -> Tuple[int, Dict[str, int]]:
     """
-    Analyze ICESat-2 track diversity.
-    
-    More independent tracks = more diverse viewing conditions.
+    Analyze diversity of independent support groups.
+
+    Prefer explicit track/pass identifiers when available. For non-ATL inputs,
+    fall back to stable source labels instead of pretending they are ICESat-2
+    passes. Missing identifiers are normalized away so logs do not report
+    artifacts like ``nan::nan``.
     """
-    # Try to identify unique acquisition events
-    if track_col in df.columns and date_col in df.columns:
-        try:
-            dates = pd.to_datetime(df[date_col]).dt.date.astype(str)
-            tracks = df[track_col].astype(str)
-            unique_passes = tracks + "_" + dates
-        except Exception:
-            unique_passes = df[track_col].astype(str) if track_col in df.columns else df[source_col].astype(str)
-    elif track_col in df.columns:
-        unique_passes = df[track_col].astype(str)
-    elif source_col in df.columns:
-        unique_passes = df[source_col].astype(str)
+    def _clean_labels(series: pd.Series) -> pd.Series:
+        s = series.astype("string").fillna("").str.strip()
+        invalid = s.isin(["", "nan", "NaN", "None", "<NA>"])
+        s = s.mask(invalid)
+        return s
+
+    if track_col in df.columns and _clean_labels(df[track_col]).notna().any():
+        tracks = _clean_labels(df[track_col])
+    elif {"granule", "beam"}.issubset(df.columns):
+        gran = _clean_labels(df["granule"])
+        beam = _clean_labels(df["beam"])
+        if gran.notna().any() or beam.notna().any():
+            tracks = (gran.fillna("unknown") + "::" + beam.fillna("unknown")).astype("string")
+            tracks = tracks.mask(tracks.str.contains(r"^unknown::unknown$", na=False))
+        elif source_col in df.columns and _clean_labels(df[source_col]).notna().any():
+            tracks = _clean_labels(df[source_col])
+        else:
+            tracks = pd.Series(pd.array([pd.NA] * len(df), dtype="string"), index=df.index)
+    elif "gt" in df.columns and _clean_labels(df["gt"]).notna().any():
+        tracks = _clean_labels(df["gt"])
+    elif source_col in df.columns and _clean_labels(df[source_col]).notna().any():
+        tracks = _clean_labels(df[source_col])
     else:
         return 1, {"unknown": len(df)}
-    
+
+    tracks = tracks.fillna("unknown")
+
+    if date_col in df.columns:
+        try:
+            dt = pd.to_datetime(df[date_col], errors="coerce")
+            date_str = pd.Series(dt.dt.strftime("%Y-%m-%d"), index=df.index, dtype="string")
+            date_str = _clean_labels(date_str)
+            unique_passes = tracks.where(date_str.isna(), tracks + "_" + date_str.fillna(""))
+            unique_passes = pd.Series(unique_passes, index=df.index, dtype="string").fillna("unknown")
+        except (TypeError, ValueError):
+            unique_passes = pd.Series(tracks, index=df.index, dtype="string")
+    else:
+        unique_passes = pd.Series(tracks, index=df.index, dtype="string")
+
     track_counts = unique_passes.value_counts().to_dict()
     n_unique = len(track_counts)
-    
     return n_unique, {str(k): int(v) for k, v in track_counts.items()}
 
 
@@ -233,6 +319,7 @@ def compute_diversity_score(
     depth: float,
     spectral: float,
     n_tracks: int,
+    temporal: float = 0.0,
     weights: Dict[str, float] = None,
 ) -> float:
     """
@@ -240,10 +327,11 @@ def compute_diversity_score(
     """
     if weights is None:
         weights = {
-            "spatial": 0.3,
-            "depth": 0.3,
-            "spectral": 0.2,
-            "tracks": 0.2,
+            "spatial": 0.28,
+            "depth": 0.28,
+            "spectral": 0.18,
+            "tracks": 0.16,
+            "temporal": 0.10,
         }
     
     # Track score: diminishing returns after ~10 tracks
@@ -253,7 +341,8 @@ def compute_diversity_score(
         weights["spatial"] * spatial +
         weights["depth"] * depth +
         weights["spectral"] * spectral +
-        weights["tracks"] * track_score
+        weights["tracks"] * track_score +
+        weights["temporal"] * temporal
     )
     
     return float(overall)
@@ -267,6 +356,8 @@ def generate_recommendations(
     spectral_score: float,
     n_tracks: int,
     track_contribution: Dict[str, int],
+    temporal_score: float = 0.0,
+    month_hist: Optional[Dict[str, int]] = None,
 ) -> List[str]:
     """
     Generate actionable recommendations for improving training data.
@@ -276,39 +367,39 @@ def generate_recommendations(
     # Spatial recommendations
     if spatial_score < 0.5:
         recommendations.append(
-            f"SPATIAL: Only {spatial_score*100:.0f}% of AOI has adequate training data. "
-            f"Consider adding ICESat-2 tracks that cross the {len(spatial_gaps)} gap regions."
+            f"SPATIAL: Only {spatial_score*100:.0f}% of the retained-support grid is adequately sampled. "
+            f"Consider adding ICESat-2 tracks that cross the {len(spatial_gaps)} under-supported regions."
         )
     elif spatial_score < 0.8:
         recommendations.append(
-            f"SPATIAL: Coverage is moderate ({spatial_score*100:.0f}%). "
-            f"Adding data in {len(spatial_gaps)} gap regions would improve generalization."
+            f"SPATIAL: Retained support coverage is moderate ({spatial_score*100:.0f}%). "
+            f"Adding data in {len(spatial_gaps)} under-supported regions would improve generalization."
         )
     
     # Depth recommendations
     if depth_gaps:
         gap_str = ", ".join([f"{g[0]:.0f}-{g[1]:.0f}m" for g in depth_gaps[:3]])
         recommendations.append(
-            f"DEPTH: Gaps in training data at depths: {gap_str}. "
-            f"Model predictions will be less reliable in these ranges."
+            f"DEPTH: Gaps in retained training support at depths: {gap_str}. "
+            f"Model predictions will be less reliable where optical conditions reach these unsupported ranges."
         )
     
     if depth_score < 0.5:
         recommendations.append(
-            "DEPTH: Training data is concentrated in a narrow depth range. "
-            "Consider adding tracks over areas with greater depth variation."
+            "DEPTH: Retained training data is concentrated in a narrow depth range. "
+            "For CUDEM guidance use, treat predictions outside that supported depth band conservatively."
         )
     
     # Track recommendations
     if n_tracks < 3:
         recommendations.append(
-            f"TRACKS: Only {n_tracks} unique ICESat-2 passes. "
-            "This limits the model's ability to generalize across different acquisition conditions. "
+            f"TRACKS: Only {n_tracks} unique support groups/passes. "
+            "This limits the model's ability to generalize across different source or acquisition conditions. "
             "Aim for 5+ independent passes."
         )
     elif n_tracks < 5:
         recommendations.append(
-            f"TRACKS: {n_tracks} unique passes is adequate but more would improve robustness."
+            f"TRACKS: {n_tracks} unique support groups/passes is adequate but more would improve robustness."
         )
     
     # Check for dominant track
@@ -322,6 +413,14 @@ def generate_recommendations(
                 "Model may overfit to conditions of this single pass."
             )
     
+    # Temporal recommendations
+    if temporal_score < 0.34 and month_hist:
+        months = ", ".join(month_hist.keys())
+        recommendations.append(
+            f"TEMPORAL: Retained support is concentrated in limited sampling months ({months}). "
+            "This can make the model sensitive to season-specific water clarity or bottom conditions."
+        )
+
     # Spectral recommendations
     if spectral_score < 0.4:
         recommendations.append(
@@ -342,6 +441,7 @@ def analyze_training_diversity(
     df: pd.DataFrame,
     feature_cols: List[str] = None,
     max_expected_depth: float = 20.0,
+    aoi_bounds: Optional[Tuple[float, float, float, float]] = None,
 ) -> DiversityReport:
     """
     Comprehensive analysis of training data diversity.
@@ -365,7 +465,7 @@ def analyze_training_diversity(
     log.info("Analyzing training data diversity (%s points)...", len(df))
     
     # Spatial analysis
-    spatial_score, spatial_gaps = analyze_spatial_coverage(df)
+    spatial_score, spatial_gaps = analyze_spatial_coverage(df, aoi_bounds=aoi_bounds)
     
     # Cluster analysis for spatial distribution
     from sklearn.cluster import KMeans
@@ -389,12 +489,13 @@ def analyze_training_diversity(
     # Spectral analysis
     spectral_score, feature_ranges = analyze_spectral_diversity(df, feature_cols)
     
-    # Track analysis
+    # Track / temporal analysis
     n_tracks, track_contrib = analyze_track_diversity(df)
-    
+    temporal_score, month_hist = analyze_temporal_diversity(df)
+
     # Overall score
     overall = compute_diversity_score(
-        spatial_score, depth_score, spectral_score, n_tracks
+        spatial_score, depth_score, spectral_score, n_tracks, temporal_score
     )
     
     # Recommendations
@@ -403,6 +504,8 @@ def analyze_training_diversity(
         depth_score, depth_gaps,
         spectral_score,
         n_tracks, track_contrib,
+        temporal_score=temporal_score,
+        month_hist=month_hist,
     )
     
     report = DiversityReport(
@@ -417,6 +520,8 @@ def analyze_training_diversity(
         feature_ranges=feature_ranges,
         n_unique_tracks=n_tracks,
         track_contribution=track_contrib,
+        temporal_diversity_score=temporal_score,
+        month_histogram=month_hist,
         overall_score=overall,
         recommendations=recommendations,
     )
@@ -426,6 +531,7 @@ def analyze_training_diversity(
     log.info("Depth coverage: %.0f%%", depth_score*100)
     log.info("Spectral diversity: %.0f%%", spectral_score*100)
     log.info("Unique tracks: %s", n_tracks)
+    log.info("Temporal diversity: %.0f%%", temporal_score*100)
     log.info("Overall score: %.0f%%", overall*100)
     for rec in recommendations:
         log.info("→ %s", rec)
@@ -575,6 +681,7 @@ def add_diversity_analysis_to_training(
     df: pd.DataFrame,
     plots_dir: Path,
     feature_cols: List[str] = None,
+    aoi_bounds: Optional[Tuple[float, float, float, float]] = None,
 ) -> Dict[str, Any]:
     """
     Run diversity analysis and add to training metadata.
@@ -582,7 +689,7 @@ def add_diversity_analysis_to_training(
     Call this from train_sdb_model() to include diversity metrics.
     """
     try:
-        report = analyze_training_diversity(df, feature_cols)
+        report = analyze_training_diversity(df, feature_cols, aoi_bounds=aoi_bounds)
         
         if plots_dir:
             plot_diversity_analysis(
@@ -596,6 +703,9 @@ def add_diversity_analysis_to_training(
             "depth_coverage_score": report.depth_coverage_score,
             "spectral_coverage_score": report.spectral_coverage_score,
             "n_unique_tracks": report.n_unique_tracks,
+            "track_contribution": report.track_contribution,
+            "temporal_diversity_score": report.temporal_diversity_score,
+            "month_histogram": report.month_histogram,
             "overall_score": report.overall_score,
             "n_spatial_gaps": len(report.coverage_gaps),
             "depth_gaps": report.depth_gaps,

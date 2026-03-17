@@ -59,8 +59,8 @@ if "_stable_hash_str" not in globals():
         try:
             h = hashlib.sha1(text.encode("utf-8")).hexdigest()
             return h[:n]
-        except Exception:
-            return hashlib.md5(text.encode("utf-8")).hexdigest()[:n]
+        except (AttributeError, TypeError, UnicodeError):
+            return hashlib.md5(str(text).encode("utf-8", errors="ignore")).hexdigest()[:n]
 
 from core.cmd import build_cmd as _build_cmd
 from core.json_io import write_json
@@ -99,6 +99,1081 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+
+
+def _load_river_authoritative_support_points(cfg: "BathyConfig"):
+    """Load authoritative river support points from configured soundings or extra_xyz fallback.
+
+    Returns a pandas DataFrame with lon/lat/depth_m/source when possible.
+    This is used to build guidance-only artifacts; failure to load points should not fail the run.
+    """
+    try:
+        import pandas as pd
+        from atl import load_extra_xyz_points
+    except ImportError:
+        return None
+
+    files = []
+    try:
+        rs = getattr(cfg, "river_soundings", None)
+        if rs:
+            # river_soundings is a comma-separated string of file paths
+            for part in str(rs).split(","):
+                part = part.strip()
+                if part:
+                    files.append(part)
+        if not files:
+            xyz = getattr(cfg, "extra_xyz_files", None)
+            if xyz:
+                if isinstance(xyz, str):
+                    for part in xyz.split(","):
+                        part = part.strip()
+                        if part:
+                            files.append(part)
+                else:
+                    files.extend([str(x) for x in xyz if x])
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not files:
+        return None
+    crs = str(getattr(cfg, "extra_xyz_crs", None) or getattr(cfg, "working_srs", None) or "EPSG:4326")
+    try:
+        df = load_extra_xyz_points(files, crs=crs, aoi_str=str(cfg.aoi))
+    except (OSError, ValueError, RuntimeError):
+        return None
+    if df is None or getattr(df, "empty", True):
+        return None
+    keep = [c for c in ("lon", "lat", "depth_m", "source") if c in df.columns]
+    if not keep:
+        return None
+    out = df[keep].copy()
+    if "depth_m" in out.columns:
+        out["depth_m"] = pd.to_numeric(out["depth_m"], errors="coerce")
+        out = out[out["depth_m"].notna()]
+    out = out.reset_index(drop=True)
+    try:
+        src_counts = out["source"].astype(str).value_counts().to_dict() if "source" in out.columns else {}
+        log.info("[RIVER][GUIDANCE] Loaded %d authoritative support points for river guidance (sources=%s)", len(out), src_counts)
+    except Exception:
+        log.debug("ignored", exc_info=True)
+    return out
+
+
+def _guess_first_existing_field(columns, candidates):
+    """Return the first candidate field present in ``columns``.
+
+    Matching is case-sensitive first, then falls back to case-insensitive
+    comparison so we can tolerate common NHD/source capitalization variants.
+    """
+    cols = list(columns)
+    colset = set(cols)
+    for cand in candidates:
+        if cand in colset:
+            return cand
+    lower_map = {str(c).lower(): c for c in cols}
+    for cand in candidates:
+        got = lower_map.get(str(cand).lower())
+        if got is not None:
+            return str(got)
+    return None
+
+
+def _clip_channel_mask_for_estuary(
+    channel_mask_tif: "Path",
+    cfg: "BathyConfig",
+    *,
+    ocean_mask_path: "Optional[Path]",
+    report: "Dict[str, Any]",
+) -> "Tuple[int, Optional[Path]]":
+    """Remove estuary pixels from the river channel mask IN-PLACE.
+
+    Returns (n_removed, estuary_mask_path).
+
+    The estuary boundary is auto-detected from two physically-grounded signals:
+
+      1. **Width ratio** — channel pixels where the local width proxy abruptly
+         widens relative to the upstream median (morphometric regime change).
+         This is the primary signal: the actual physical signature of a river
+         entering estuarine regime is that it widens.  Uses the distance-to-bank
+         width proxy already computed by the channel mask grid.
+
+      2. **Low slope** — reaches with slope below ``river_manning_backwater_slope_thresh``
+         (default 1e-4 m/m) indicating tidal/backwater influence.  This is
+         grounded in hydraulic engineering: below ~1e-4 m/m, tidal and
+         backwater effects dominate over gravitational normal-depth flow.
+
+    Both signals require the river network GPKG with NHD attributes (slope,
+    geometry) and the rasterized channel mask.  If neither signal fires, no
+    clipping occurs and the river module runs everywhere in the channel domain.
+
+    The removed pixels are saved as ``estuary_clip_mask.tif`` so that downstream
+    fusion can treat them as SDB-admissible (estuaries where SDB optics may
+    still be useful even though river physics break down).
+    """
+    import numpy as np
+    import rasterio
+    from rasterio.warp import reproject, Resampling
+
+    channel_mask_tif = Path(channel_mask_tif)
+    if not channel_mask_tif.exists():
+        return 0, None
+
+    with rasterio.open(channel_mask_tif) as ds:
+        channel = ds.read(1).astype("uint8")
+        prof = ds.profile.copy()
+        transform = ds.transform
+        crs = ds.crs
+        px_size_m = max(abs(float(transform.a)), abs(float(transform.e)), 1e-6)
+        h, w = ds.height, ds.width
+
+    if not np.any(channel > 0):
+        return 0, None
+
+    estuary_mask = np.zeros_like(channel, dtype=bool)
+    meta = {"signals": {}}
+
+    # --- Signal 1: Width-ratio morphometric detection ---
+    # Where the channel abruptly widens relative to typical upstream width,
+    # the fluvial regime is transitioning to estuarine.  Uses the distance-
+    # transform width proxy on the channel mask itself.
+    try:
+        from scipy.ndimage import distance_transform_edt, label
+        # Compute local width proxy from distance-to-bank within channel
+        chan_bool = (channel > 0)
+        d_bank = distance_transform_edt(chan_bool, sampling=px_size_m).astype("float32")
+        local_width = (2.0 * d_bank).astype("float32")
+
+        # Typical fluvial width: use the 50th percentile of width within the channel
+        # as the "expected" channelized width.  Pixels wider than width_ratio_thresh
+        # times this median are classified as estuarine widening.
+        valid_widths = local_width[chan_bool & (local_width > 0)]
+        if valid_widths.size > 100:
+            width_ratio_thresh = float(getattr(cfg, "estuary_width_ratio_thresh", 3.0) or 3.0)
+            median_width = float(np.median(valid_widths))
+            # Don't fire if the channel is uniformly wide (e.g., a lake)
+            p25 = float(np.percentile(valid_widths, 25))
+            if median_width > 0 and p25 > 0:
+                threshold_width = median_width * width_ratio_thresh
+                width_estuary = chan_bool & (local_width > threshold_width)
+                n_width = int(width_estuary.sum())
+                if n_width > 0:
+                    estuary_mask |= width_estuary
+                    log.info(
+                        "[ESTUARY-CLIP] Width-ratio: %d pixels exceed %.0f m (%.1fx median %.0f m, p25=%.0f m)",
+                        n_width, threshold_width, width_ratio_thresh, median_width, p25,
+                    )
+                meta["signals"]["width_ratio"] = {
+                    "median_width_m": round(float(median_width), 1),
+                    "threshold_width_m": round(float(threshold_width), 1),
+                    "ratio_thresh": float(width_ratio_thresh),
+                    "pixels_flagged": n_width,
+                }
+    except Exception:
+        log.debug("[ESTUARY-CLIP] Width-ratio signal failed", exc_info=True)
+
+    # --- Signal 2: Low slope expands width-ratio detections ---
+    # Low slope alone is NOT sufficient to classify estuary (many inland
+    # reaches have low NHD slope values).  Instead, low-slope reaches that
+    # are NEAR an already-detected width-ratio pixel get included — this
+    # extends the estuary boundary upstream along backwater-prone reaches
+    # connected to the widening zone.
+    try:
+        if np.any(estuary_mask):
+            hydraulic_hint, hydraulic_meta = _build_hydraulic_estuary_hint_mask(
+                cfg=cfg,
+                channel=(channel > 0),
+                transform=transform,
+                crs=crs,
+                px_size_m=px_size_m,
+            )
+            if np.any(hydraulic_hint > 0):
+                from scipy.ndimage import distance_transform_edt as _edt_slope
+                # Only keep low-slope pixels within 1km of a width-ratio detection
+                dist_to_width_det = _edt_slope(~estuary_mask) * px_size_m
+                slope_near_widening = (hydraulic_hint > 0) & (dist_to_width_det <= 1000.0)
+                n_slope_add = int(((~estuary_mask) & slope_near_widening).sum())
+                if n_slope_add > 0:
+                    estuary_mask |= slope_near_widening
+                    log.info(
+                        "[ESTUARY-CLIP] Low-slope extension: %d pixels added near width-ratio detections (backwater=%d reaches)",
+                        n_slope_add, hydraulic_meta.get("backwater_slope_reaches", 0),
+                    )
+            meta["signals"]["low_slope_extension"] = {
+                "backwater_slope_reaches": hydraulic_meta.get("backwater_slope_reaches", 0),
+                "pixels_added": n_slope_add if 'n_slope_add' in dir() else 0,
+                "max_extension_m": 1000.0,
+                "note": "low-slope only extends width-ratio detections, never independent",
+            }
+    except Exception:
+        log.debug("[ESTUARY-CLIP] Low-slope extension failed", exc_info=True)
+
+    # --- Signal 3: Ocean connectivity via flood-fill ---
+    # Keep only estuary pixels that are reachable from the ocean domain by
+    # walking through contiguous detected-estuary pixels.  This replaces a
+    # fixed-distance buffer with a proper topological connectivity test:
+    # if a detected-estuary pixel is connected to the ocean through other
+    # detected-estuary (or ocean) pixels, it stays.  Inland clusters of
+    # low-slope reaches that happen to be near a width-ratio detection but
+    # are NOT connected to the ocean get filtered out.
+    if ocean_mask_path is not None and Path(ocean_mask_path).exists():
+        try:
+            from scipy.ndimage import label as _label, binary_dilation
+            ocean_raw = np.zeros_like(channel, dtype="uint8")
+            with rasterio.open(ocean_mask_path) as om:
+                reproject(
+                    source=rasterio.band(om, 1), destination=ocean_raw,
+                    src_transform=om.transform, src_crs=om.crs,
+                    dst_transform=transform, dst_crs=crs,
+                    resampling=Resampling.nearest,
+                    src_nodata=om.nodata, dst_nodata=255,
+                )
+            ocean_water = (ocean_raw == 0)
+            if np.any(ocean_water) and np.any(estuary_mask):
+                # Build a connectivity domain: estuary detections + ocean pixels.
+                # Then find connected components and keep only those that touch ocean.
+                # First dilate ocean slightly (1 px) to bridge the boundary gap
+                # between the ocean mask and the channel mask edge.
+                ocean_bridge = binary_dilation(ocean_water, iterations=3)
+                connect_domain = estuary_mask | ocean_bridge
+                labeled, n_components = _label(connect_domain)
+                # Find which labels touch ocean
+                ocean_labels = set(np.unique(labeled[ocean_water & (labeled > 0)]))
+                # Keep only estuary pixels whose label is ocean-connected
+                n_before_connect = int(estuary_mask.sum())
+                if ocean_labels:
+                    ocean_connected = np.isin(labeled, list(ocean_labels))
+                    estuary_mask &= ocean_connected
+                else:
+                    # No estuary pixels are connected to ocean at all
+                    estuary_mask[:] = False
+                n_after_connect = int(estuary_mask.sum())
+                if n_before_connect > n_after_connect:
+                    log.info(
+                        "[ESTUARY-CLIP] Ocean flood-fill: trimmed %d disconnected inland pixels (%d components checked, %d ocean-connected)",
+                        n_before_connect - n_after_connect, n_components, len(ocean_labels),
+                    )
+                meta["signals"]["ocean_connectivity"] = {
+                    "method": "flood_fill",
+                    "n_components": int(n_components),
+                    "ocean_connected_components": len(ocean_labels),
+                    "trimmed_inland_pixels": n_before_connect - n_after_connect,
+                }
+                # Dilate the estuary mask by 2 pixels to capture thin edge strips
+                # where the channel meets the ocean mask boundary.  Only keep
+                # dilated pixels that are actually in the channel mask (don't
+                # expand onto land).
+                estuary_dilated = binary_dilation(estuary_mask, iterations=2)
+                n_edge_added = int((estuary_dilated & (channel > 0) & ~estuary_mask).sum())
+                estuary_mask = estuary_dilated & (channel > 0)
+                if n_edge_added > 0:
+                    log.info("[ESTUARY-CLIP] Edge dilation: added %d channel-edge pixels to estuary mask", n_edge_added)
+
+                # Morphological opening (erode then dilate) to remove the thin
+                # rounded artifacts left by the Euclidean-distance low-slope
+                # extension.  The EDT-based 1km buffer creates circular/rounded
+                # edges that don't follow channel geometry.  Opening with a 3px
+                # kernel removes these small protrusions while preserving the
+                # main estuary body.
+                from scipy.ndimage import binary_erosion, binary_opening
+                estuary_opened = binary_opening(estuary_mask, iterations=2)
+                # Re-dilate to recover the main body edges
+                estuary_opened = binary_dilation(estuary_opened, iterations=2) & (channel > 0)
+                n_smoothed = int(estuary_mask.sum() - estuary_opened.sum())
+                if n_smoothed > 0 and estuary_opened.sum() > 0.5 * estuary_mask.sum():
+                    estuary_mask = estuary_opened
+                    log.info("[ESTUARY-CLIP] Morphological opening: removed %d rounded buffer artifact pixels", n_smoothed)
+        except Exception:
+            log.debug("[ESTUARY-CLIP] Ocean connectivity filter failed", exc_info=True)
+
+    n_removed = int(((channel > 0) & estuary_mask).sum())
+    if n_removed == 0:
+        log.info("[ESTUARY-CLIP] No estuary pixels detected in channel mask; no clipping applied.")
+        return 0, None
+
+    # Save the estuary clip mask as a separate raster (for SDB domain expansion)
+    estuary_clip_path = channel_mask_tif.parent / "estuary_clip_mask.tif"
+    prof_u8 = prof.copy()
+    prof_u8.update(dtype="uint8", nodata=0, compress="deflate")
+    with rasterio.open(estuary_clip_path, "w", **prof_u8) as dst:
+        dst.write(estuary_mask.astype("uint8"), 1)
+
+    # Zero out estuary pixels in the channel mask
+    channel[estuary_mask] = 0
+
+    # Erode the channel mask by 2 pixels along the estuary boundary.
+    # The estuary clip mask and channel mask have slightly different pixel-level
+    # geometries at the boundary, leaving 1-2 pixel strips of river data visible
+    # in the estuary zone.  Eroding the channel adjacent to the estuary removes
+    # these ragged edges.
+    try:
+        from scipy.ndimage import binary_erosion as _be, binary_dilation as _bd
+        # Create a mask of pixels that are adjacent to the estuary boundary
+        estuary_border = _bd(estuary_mask, iterations=2) & ~estuary_mask
+        # Remove channel pixels in this border zone
+        border_channel = (channel > 0) & estuary_border
+        n_border_eroded = int(border_channel.sum())
+        if n_border_eroded > 0:
+            channel[border_channel] = 0
+            log.info("[ESTUARY-CLIP] Border erosion: removed %d channel-edge pixels adjacent to estuary boundary", n_border_eroded)
+    except Exception:
+        pass
+
+    prof.update(dtype="uint8", nodata=0)
+    with rasterio.open(channel_mask_tif, "w", **prof) as dst:
+        dst.write(channel.astype("uint8"), 1)
+
+    n_remaining = int((channel > 0).sum())
+    log.info(
+        "[ESTUARY-CLIP] Removed %d estuary pixels from channel mask (%d remaining). Estuary mask: %s",
+        n_removed, n_remaining, estuary_clip_path,
+    )
+    report.setdefault("river", {}).setdefault("estuary_clip", {}).update({
+        "pixels_removed": n_removed,
+        "pixels_remaining": n_remaining,
+        "estuary_clip_mask": str(estuary_clip_path),
+        "method": "width_ratio + low_slope, ocean-connectivity filtered",
+        "signals": meta.get("signals", {}),
+    })
+    return n_removed, estuary_clip_path
+
+
+def _build_hydraulic_estuary_hint_mask(*, cfg: "BathyConfig", channel, transform, crs, px_size_m: float):
+    """Build a conservative hydraulic estuary hint mask aligned to ``channel``.
+
+    This does not attempt full estuary arbitration.  It only marks river-domain
+    pixels that are likely transitioning away from a clean fluvial regime based
+    on already-available hydraulic indicators:
+
+      - distance-to-mouth reach attribute (near-mouth reaches)
+      - low-slope / backwater-prone reach attribute (Manning guard analogue)
+
+    The output is intentionally conservative and only expands a modest distance
+    from flagged reaches into the channel domain.
+    """
+    import numpy as np
+    import pandas as pd
+
+    meta = {
+        "enabled": False,
+        "network_gpkg": None,
+        "rivers_layer": None,
+        "slope_field": None,
+        "dist_to_mouth_field": None,
+        "flagged_reaches": 0,
+        "near_mouth_reaches": 0,
+        "backwater_slope_reaches": 0,
+        "reach_buffer_m": 0.0,
+        "reason": "uninitialized",
+    }
+    out = np.zeros_like(channel, dtype="uint8")
+    if not np.any(channel):
+        meta["reason"] = "empty_channel"
+        return out, meta
+
+    try:
+        import geopandas as gpd
+        from rasterio.features import rasterize
+        from scipy.ndimage import distance_transform_edt
+    except Exception:
+        meta["reason"] = "missing_geo_dependencies"
+        return out, meta
+
+    network_gpkg = Path(cfg.derived_cache_root) / "river" / "work" / "river_network.gpkg"
+    if not network_gpkg.exists():
+        meta["reason"] = "river_network_missing"
+        return out, meta
+    meta["network_gpkg"] = str(network_gpkg)
+
+    try:
+        rivers = gpd.read_file(network_gpkg, layer="rivers_clip")
+        meta["rivers_layer"] = "rivers_clip"
+    except Exception:
+        try:
+            rivers = gpd.read_file(network_gpkg)
+            meta["rivers_layer"] = "<default>"
+        except Exception:
+            meta["reason"] = "river_network_unreadable"
+            return out, meta
+
+    if rivers.empty:
+        meta["reason"] = "river_network_empty"
+        return out, meta
+    if rivers.crs is None:
+        meta["reason"] = "river_network_missing_crs"
+        return out, meta
+    try:
+        if str(rivers.crs) != str(crs):
+            rivers = rivers.to_crs(crs)
+    except Exception:
+        meta["reason"] = "river_network_reproject_failed"
+        return out, meta
+
+    dist_candidates = []
+    dist_cfg = getattr(cfg, "river_manning_dist_to_mouth_field", None)
+    if dist_cfg:
+        dist_candidates.append(str(dist_cfg))
+    dist_candidates.extend([
+        "dist_to_mouth_km", "DIST_TO_MOUTH_KM", "distance_to_mouth_km",
+        "DistanceToMouthKm", "dist_mouth_km",
+    ])
+    slope_candidates = ["slope_mpm", "SLOPE", "slope", "Slope", "gradient", "GRADIENT"]
+
+    dist_field = _guess_first_existing_field(rivers.columns, dist_candidates)
+    slope_field = _guess_first_existing_field(rivers.columns, slope_candidates)
+    meta["dist_to_mouth_field"] = dist_field
+    meta["slope_field"] = slope_field
+
+    near_mouth = np.zeros(len(rivers), dtype=bool)
+    if dist_field is not None:
+        dist_vals = pd.to_numeric(rivers[dist_field], errors="coerce")
+        dist_limit = float(getattr(cfg, "river_manning_dist_to_mouth_km_max", 10.0) or 10.0)
+        near_mouth = np.isfinite(dist_vals) & (dist_vals >= 0.0) & (dist_vals <= dist_limit)
+
+    low_slope = np.zeros(len(rivers), dtype=bool)
+    if slope_field is not None:
+        slope_vals = pd.to_numeric(rivers[slope_field], errors="coerce")
+        slope_limit = float(getattr(cfg, "river_manning_backwater_slope_thresh", 1e-4) or 1e-4)
+        low_slope = np.isfinite(slope_vals) & (slope_vals >= 0.0) & (slope_vals <= slope_limit)
+
+    flagged = near_mouth | low_slope
+    meta["near_mouth_reaches"] = int(np.sum(near_mouth))
+    meta["backwater_slope_reaches"] = int(np.sum(low_slope))
+    meta["flagged_reaches"] = int(np.sum(flagged))
+    if not np.any(flagged):
+        meta["reason"] = "no_hydraulic_reaches_flagged"
+        return out, meta
+
+    geoms = rivers.loc[flagged, "geometry"]
+    geoms = geoms[geoms.notna()]
+    geoms = geoms[~geoms.is_empty]
+    if geoms.empty:
+        meta["reason"] = "flagged_reaches_without_geometry"
+        return out, meta
+
+    line_mask = rasterize(
+        [(geom, 1) for geom in geoms],
+        out_shape=channel.shape,
+        transform=transform,
+        fill=0,
+        dtype="uint8",
+    )
+    if not np.any(line_mask):
+        meta["reason"] = "flagged_reaches_not_on_grid"
+        return out, meta
+
+    reach_buffer_m = max(
+        3.0 * float(px_size_m),
+        min(
+            float(getattr(cfg, "estuary_transition_m", 500.0) or 500.0),
+            max(
+                float(getattr(cfg, "river_channel_buffer_m", 0.0) or 0.0) * 0.5,
+                float(getattr(cfg, "river_max_channel_width_m", 0.0) or 0.0) * 0.5,
+                60.0,
+            ),
+        ),
+    )
+    meta["reach_buffer_m"] = float(reach_buffer_m)
+
+    dist_to_flagged_m = distance_transform_edt(line_mask == 0) * float(px_size_m)
+    out = (channel & (dist_to_flagged_m <= reach_buffer_m)).astype("uint8")
+    meta["enabled"] = bool(np.any(out))
+    meta["reason"] = "ok" if meta["enabled"] else "empty_after_channel_intersection"
+    return out, meta
+
+
+def _write_river_guidance_artifacts(
+    cfg: "BathyConfig",
+    *,
+    bed_tif: "Path",
+    depth_tif: "Path",
+    channel_mask_tif: "Optional[Path]",
+    river_dir: "Path",
+    report: "Dict[str, Any]",
+) -> "Dict[str, Optional[str]]":
+    """Export guidance-first river artifacts.
+
+    The inferred river bed remains available as an internal helper surface, but the main exported
+    intelligence is a set of guidance rasters/points describing where the product should influence
+    downstream interpolation.
+
+    Also produces an estuary_transition mask where the river channel domain
+    overlaps or borders the ocean domain — a reduced-trust handoff zone where
+    neither SDB nor river should dominate.
+    """
+    import numpy as np
+    import rasterio
+    from rasterio.features import rasterize
+
+    artifacts = {
+        "guidance_weight": None,
+        "trusted_interior": None,
+        "admissibility": None,
+        "guide_points": None,
+        "authoritative_support": None,
+        "authoritative_support_depth": None,
+    }
+    with rasterio.open(depth_tif) as ds:
+        depth = ds.read(1).astype("float32")
+        nodata = ds.nodata if ds.nodata is not None else float(getattr(cfg, "river_nodata", -9999.0))
+        valid = np.isfinite(depth) & (depth != nodata)
+        channel = valid.copy()
+        if channel_mask_tif is not None and Path(channel_mask_tif).exists():
+            with rasterio.open(channel_mask_tif) as ms:
+                cm = np.zeros((ds.height, ds.width), dtype="uint8")
+                from rasterio.warp import reproject, Resampling
+                reproject(
+                    source=rasterio.band(ms, 1), destination=cm,
+                    src_transform=ms.transform, src_crs=ms.crs,
+                    dst_transform=ds.transform, dst_crs=ds.crs,
+                    resampling=Resampling.nearest,
+                    src_nodata=ms.nodata, dst_nodata=0,
+                )
+                channel &= (cm > 0)
+        support_points = _load_river_authoritative_support_points(cfg)
+        support = np.zeros((ds.height, ds.width), dtype="uint8")
+        support_depth = np.full((ds.height, ds.width), np.nan, dtype="float32")
+        support_used = 0
+        if support_points is not None and not support_points.empty and {"lon", "lat"}.issubset(set(support_points.columns)):
+            shapes = [((float(r.lon), float(r.lat)), 1) for r in support_points.itertuples() if np.isfinite(r.lon) and np.isfinite(r.lat)]
+            depth_shapes = []
+            if "depth_m" in support_points.columns:
+                depth_shapes = [
+                    ((float(r.lon), float(r.lat)), float(r.depth_m))
+                    for r in support_points.itertuples()
+                    if np.isfinite(r.lon) and np.isfinite(r.lat) and np.isfinite(r.depth_m)
+                ]
+            if shapes:
+                support = rasterize(shapes, out_shape=(ds.height, ds.width), transform=ds.transform, fill=0, dtype="uint8")
+                support = ((support > 0) & channel).astype("uint8")
+                support_used = int(support.sum())
+            if depth_shapes:
+                support_depth = rasterize(
+                    depth_shapes,
+                    out_shape=(ds.height, ds.width),
+                    transform=ds.transform,
+                    fill=np.nan,
+                    dtype="float32",
+                )
+                support_depth[(support <= 0) | (~channel)] = np.nan
+        trusted_interior = support.astype("uint8")
+        guidance_weight = channel.astype("float32")
+        if support_used > 0:
+            try:
+                from scipy.ndimage import distance_transform_edt
+                px_x = abs(float(ds.transform.a))
+                px_y = abs(float(ds.transform.e))
+                px_m = max(min(px_x, px_y), 1e-6)
+                ramp_m = float(min(max(3.0 * px_m, 30.0), 250.0))
+                dist_px = distance_transform_edt(1 - support)
+                dist_m = dist_px * px_m
+                guidance_weight = np.clip(dist_m / ramp_m, 0.0, 1.0).astype("float32")
+                guidance_weight *= channel.astype("float32")
+                guidance_weight[trusted_interior > 0] = 0.0
+            except Exception:
+                guidance_weight = channel.astype("float32")
+                guidance_weight[trusted_interior > 0] = 0.0
+        admissibility = ((channel) & (~valid | np.isfinite(depth))).astype("uint8")
+        admissibility[~channel] = 0
+
+        prof_u8 = ds.profile.copy(); prof_u8.update(dtype="uint8", nodata=0, compress="deflate", count=1)
+        prof_f32 = ds.profile.copy(); prof_f32.update(dtype="float32", nodata=0.0, compress="deflate", count=1)
+        prof_depth = ds.profile.copy(); prof_depth.update(dtype="float32", nodata=float(nodata), compress="deflate", count=1)
+
+    gw_path = river_dir / "river_guidance_weight.tif"
+    ti_path = river_dir / "river_trusted_interior.tif"
+    ad_path = river_dir / "river_admissibility.tif"
+    sp_path = river_dir / "river_authoritative_support.tif"
+    sd_path = river_dir / "river_authoritative_support_depth.tif"
+    with rasterio.open(gw_path, "w", **prof_f32) as dst:
+        dst.write(guidance_weight.astype("float32"), 1)
+    with rasterio.open(ti_path, "w", **prof_u8) as dst:
+        dst.write(trusted_interior.astype("uint8"), 1)
+    with rasterio.open(ad_path, "w", **prof_u8) as dst:
+        dst.write(admissibility.astype("uint8"), 1)
+    with rasterio.open(sp_path, "w", **prof_u8) as dst:
+        dst.write(support.astype("uint8"), 1)
+    with rasterio.open(sd_path, "w", **prof_depth) as dst:
+        dst.write(np.where(np.isfinite(support_depth), support_depth, float(nodata)).astype("float32"), 1)
+
+    artifacts.update({
+        "guidance_weight": str(gw_path),
+        "trusted_interior": str(ti_path),
+        "admissibility": str(ad_path),
+        "authoritative_support": str(sp_path),
+        "authoritative_support_depth": str(sd_path),
+    })
+
+    # ---------------------------------------------------------------
+    # Estuary transition mask
+    #
+    # Identifies the reduced-trust handoff zone where the river channel
+    # transitions away from a clean fluvial regime.  In v10 this was a
+    # purely spatial buffer from the ocean mask.  Here we keep that guard
+    # but add conservative hydraulic hints from the river network:
+    #
+    #   - near-mouth reaches (distance-to-mouth field)
+    #   - low-slope / backwater-prone reaches (Manning guard analogue)
+    #
+    # This keeps the transition mask tied to actual regime-change signals,
+    # not just geometric proximity to the ocean boundary.
+    # ---------------------------------------------------------------
+    estuary_transition = np.zeros_like(channel, dtype="uint8")
+    estuary_px_count = 0
+    ocean_proximity_mask = np.zeros_like(channel, dtype="uint8")
+    hydraulic_hint_mask = np.zeros_like(channel, dtype="uint8")
+    hydraulic_hint_meta = {
+        "enabled": False,
+        "flagged_reaches": 0,
+        "near_mouth_reaches": 0,
+        "backwater_slope_reaches": 0,
+        "reach_buffer_m": 0.0,
+        "reason": "not_attempted",
+    }
+    try:
+        # Use the estuary_clip_mask produced by _clip_channel_mask_for_estuary
+        # rather than recomputing from scratch.  The clip mask was computed on
+        # the ORIGINAL channel mask before clipping; the channel array here has
+        # already been clipped so recomputing would give the wrong answer.
+        estuary_clip_path = Path(cfg.derived_cache_root) / "river" / "work" / "estuary_clip_mask.tif"
+        if estuary_clip_path.exists():
+            with rasterio.open(estuary_clip_path) as ec:
+                ec_data = ec.read(1).astype("uint8")
+                # Align to depth raster grid if needed
+                with rasterio.open(depth_tif) as ds_ref:
+                    if ec_data.shape != (ds_ref.height, ds_ref.width):
+                        from rasterio.warp import reproject, Resampling as _Rs
+                        ec_aligned = np.zeros((ds_ref.height, ds_ref.width), dtype="uint8")
+                        reproject(
+                            source=rasterio.band(ec, 1), destination=ec_aligned,
+                            src_transform=ec.transform, src_crs=ec.crs,
+                            dst_transform=ds_ref.transform, dst_crs=ds_ref.crs,
+                            resampling=_Rs.nearest,
+                        )
+                        ec_data = ec_aligned
+            estuary_transition = (ec_data > 0).astype("uint8")
+            estuary_px_count = int(estuary_transition.sum())
+            log.info(
+                "[ESTUARY] Transition mask loaded from estuary_clip_mask: %d pixels",
+                estuary_px_count,
+            )
+        else:
+            log.info("[ESTUARY] No estuary_clip_mask found; transition mask will be empty.")
+    except Exception:
+        log.debug("[ESTUARY] Transition mask generation failed; continuing without it.", exc_info=True)
+
+    et_path = river_dir / "estuary_transition_mask.tif"
+    with rasterio.open(et_path, "w", **prof_u8) as dst:
+        dst.write(estuary_transition.astype("uint8"), 1)
+    artifacts["estuary_transition"] = str(et_path)
+
+    # Sparse guide points sampled from the guidance-weighted raster support.
+    try:
+        import geopandas as gpd
+        from shapely.geometry import Point
+        with rasterio.open(depth_tif) as ds:
+            depth = ds.read(1).astype("float32")
+            nodata = ds.nodata if ds.nodata is not None else float(getattr(cfg, "river_nodata", -9999.0))
+            valid_guides = np.isfinite(depth) & (depth != nodata) & (guidance_weight > 0.05) & channel
+            rows, cols = np.where(valid_guides)
+            if rows.size > 0:
+                step = max(int(np.sqrt(rows.size / 2000.0)), 1)
+                sel = np.arange(0, rows.size, step, dtype=int)
+                rows = rows[sel]
+                cols = cols[sel]
+                xs, ys = rasterio.transform.xy(ds.transform, rows, cols, offset='center')
+                vals = depth[rows, cols]
+                wts = guidance_weight[rows, cols]
+                gdf = gpd.GeoDataFrame({
+                    'depth_m': vals.astype('float32'),
+                    'guidance_weight': wts.astype('float32'),
+                    'artifact_role': ['guide_point'] * len(vals),
+                }, geometry=[Point(x, y) for x, y in zip(xs, ys)], crs=ds.crs)
+                gp_path = river_dir / 'river_guide_points.gpkg'
+                if gp_path.exists():
+                    gp_path.unlink()
+                gdf.to_file(gp_path, driver='GPKG')
+                artifacts['guide_points'] = str(gp_path)
+    except (ImportError, OSError, ValueError):
+        pass
+
+    support_source_counts = {}
+    try:
+        if support_points is not None and not support_points.empty and 'source' in support_points.columns:
+            support_source_counts = {
+                str(k): int(v)
+                for k, v in support_points['source'].astype(str).value_counts().to_dict().items()
+            }
+    except Exception:
+        support_source_counts = {}
+
+    report.setdefault('river', {}).setdefault('guidance', {}).update({
+        'guidance_only': True,
+        'non_authoritative': True,
+        'authoritative_support_pixels': int(support_used),
+        'authoritative_support_source_counts': support_source_counts,
+        'trusted_interior_definition': 'authoritative-support pixels only',
+        'authoritative_support_depth_definition': 'rasterized trusted support depth used for exact overwrite where available',
+        'guidance_weight_definition': '0 at authoritative support; ramps to 1 away from trusted support within the channel domain',
+        'admissibility_definition': '1 inside river channel domain where river guidance may participate in downstream interpolation',
+        'estuary_transition_definition': '1 inside river channel domain where ocean-proximity or conservative hydraulic hints (near-mouth / low-slope backwater risk) indicate a reduced-trust handoff zone',
+        'estuary_transition_pixels': estuary_px_count,
+        'estuary_transition_buffer_m': float(getattr(cfg, 'estuary_transition_m', 500.0) or 500.0),
+        'estuary_transition_ocean_pixels': int(ocean_proximity_mask.sum()),
+        'estuary_transition_hydraulic_pixels': int(hydraulic_hint_mask.sum()),
+        'estuary_transition_hydraulic': hydraulic_hint_meta,
+        'bed_surface_is_internal_helper': True,
+    })
+    return artifacts
+
+
+def _apply_residual_correction(
+    raster_path: "Path",
+    xyz_df: "pd.DataFrame",
+    *,
+    sigma_m: float = 500.0,
+    max_correction_m: float = 10.0,
+    min_points: int = 10,
+    label: str = "residual_correction",
+) -> "Dict[str, Any]":
+    """Apply smooth residual correction to a raster using authoritative XYZ data.
+
+    Computes residual = predicted - observed at each XYZ location, then
+    interpolates the error field using normalized-convolution Gaussian
+    smoothing and subtracts it from the raster.
+
+    The correction decays naturally with distance from support because the
+    Gaussian convolution spreads the correction signal; far from any
+    measurement point the correction converges to zero.
+
+    Args:
+        raster_path: Path to the raster to correct (modified in-place).
+        xyz_df: DataFrame with columns [lon, lat, depth_m] in geographic CRS.
+        sigma_m: Gaussian smoothing sigma in meters.
+        max_correction_m: Cap the maximum correction magnitude.
+        min_points: Minimum number of valid residual points to apply correction.
+        label: Label for logging and report.
+
+    Returns:
+        Dict with correction statistics.
+    """
+    import numpy as np
+    import rasterio
+    from scipy.ndimage import gaussian_filter
+
+    raster_path = Path(raster_path)
+    stats = {"applied": False, "label": label, "n_points": 0, "n_valid": 0}
+    if not raster_path.exists():
+        stats["reason"] = "raster_not_found"
+        return stats
+    if xyz_df is None or len(xyz_df) < min_points:
+        stats["reason"] = "insufficient_xyz_points"
+        return stats
+
+    with rasterio.open(raster_path, "r+") as ds:
+        arr = ds.read(1).astype("float32")
+        nodata = float(ds.nodata) if ds.nodata is not None else -9999.0
+        transform = ds.transform
+        px_size_m = max(abs(float(transform.a)), abs(float(transform.e)), 1e-6)
+
+        # Determine if CRS is geographic (degrees) — need to convert sigma
+        is_geographic = ds.crs is not None and ds.crs.is_geographic
+        if is_geographic:
+            # Approximate: 1 degree ≈ 111km at equator, less at higher latitudes
+            mid_lat = abs(float(transform.f + transform.e * ds.height / 2))
+            deg_per_m = 1.0 / (111_000.0 * max(np.cos(np.radians(mid_lat)), 0.1))
+            sigma_px = sigma_m * deg_per_m / abs(float(transform.a))
+        else:
+            sigma_px = sigma_m / px_size_m
+
+        # Cap sigma to prevent enormous kernels
+        sigma_px = min(sigma_px, min(ds.height, ds.width) / 4.0)
+
+        # Sample raster at XYZ locations
+        lons = np.asarray(xyz_df["lon"] if "lon" in xyz_df.columns else xyz_df["longitude"], dtype=float)
+        lats = np.asarray(xyz_df["lat"] if "lat" in xyz_df.columns else xyz_df["latitude"], dtype=float)
+        depths = np.asarray(xyz_df["depth_m"], dtype=float)
+
+        rows, cols = rasterio.transform.rowcol(transform, lons, lats)
+        rows = np.asarray(rows, dtype=int)
+        cols = np.asarray(cols, dtype=int)
+
+        # Filter to valid in-bounds pixels
+        h, w = arr.shape
+        valid = (
+            (rows >= 0) & (rows < h) & (cols >= 0) & (cols < w)
+            & np.isfinite(depths) & np.isfinite(lons) & np.isfinite(lats)
+        )
+        rows, cols, depths = rows[valid], cols[valid], depths[valid]
+
+        # Get predicted values at XYZ locations
+        predicted = arr[rows, cols]
+        pred_valid = np.isfinite(predicted) & (predicted != nodata)
+        rows, cols, depths, predicted = rows[pred_valid], cols[pred_valid], depths[pred_valid], predicted[pred_valid]
+
+        stats["n_points"] = int(len(rows))
+        if len(rows) < min_points:
+            stats["reason"] = "insufficient_valid_residuals"
+            return stats
+
+        # Compute residuals: positive = predicted too deep, negative = predicted too shallow
+        residuals = predicted - depths
+
+        # Clip extreme residuals (likely datum mismatches or bad soundings)
+        residuals = np.clip(residuals, -max_correction_m, max_correction_m)
+
+        # Build sparse residual field and weight field
+        resid_field = np.zeros_like(arr, dtype="float64")
+        weight_field = np.zeros_like(arr, dtype="float64")
+        # Use np.add.at for accumulation at duplicate pixel locations
+        np.add.at(resid_field, (rows, cols), residuals)
+        np.add.at(weight_field, (rows, cols), 1.0)
+
+        # Normalized convolution: smooth both numerator and denominator
+        resid_smooth = gaussian_filter(resid_field, sigma=sigma_px, mode="constant", cval=0.0)
+        weight_smooth = gaussian_filter(weight_field, sigma=sigma_px, mode="constant", cval=0.0)
+
+        # Avoid division by zero — where weight is negligible, correction is zero
+        correction = np.where(weight_smooth > 1e-10, resid_smooth / weight_smooth, 0.0).astype("float32")
+
+        # Cap correction magnitude
+        correction = np.clip(correction, -max_correction_m, max_correction_m)
+
+        # Apply correction: subtract residual (if predicted was too deep, reduce depth)
+        valid_arr = np.isfinite(arr) & (arr != nodata)
+        arr_corrected = arr.copy()
+        arr_corrected[valid_arr] -= correction[valid_arr]
+
+        # Write back
+        ds.write(arr_corrected.astype("float32"), 1)
+
+    stats.update({
+        "applied": True,
+        "n_valid": int(len(rows)),
+        "sigma_m": float(sigma_m),
+        "max_correction_m": float(max_correction_m),
+        "residual_median": float(np.median(residuals)),
+        "residual_p95": float(np.percentile(np.abs(residuals), 95)),
+        "residual_max_abs": float(np.max(np.abs(residuals))),
+        "correction_field_p50": float(np.median(np.abs(correction[valid_arr]))),
+        "correction_field_p95": float(np.percentile(np.abs(correction[valid_arr]), 95)),
+    })
+    log.info(
+        "[%s] Applied to %s: %d points, residual median=%.2f m, p95=%.2f m, correction p50=%.2f m",
+        label, raster_path.name, len(rows),
+        stats["residual_median"], stats["residual_p95"], stats["correction_field_p50"],
+    )
+    return stats
+
+
+def _apply_river_guidance_to_fused_output(
+    combined_path: "Path",
+    *,
+    river_path: "Optional[Path]",
+    sdb_path: "Optional[Path]",
+    provenance_path: "Optional[Path]",
+    river_outputs: "Dict[str, Any]",
+    report: "Dict[str, Any]",
+    estuary_max_weight: float = 0.25,
+) -> None:
+    """Apply guidance-only river controls to the fused raster.
+
+    Domain-aware fusion policy:
+      - authoritative support / trusted interior => exact overwrite (unchanged)
+      - fluvial_core (admissible & NOT estuary_transition) => full river guidance weight
+      - estuary_transition => river guidance weight capped to estuary_max_weight
+      - outside admissible domain => river has no influence
+
+    The estuary transition zone is a reduced-trust handoff where neither
+    river nor SDB should dominate.  Capping river weight there prevents
+    the raw ``(1-w)*sdb + w*river`` blend from creating seams where the
+    river model's physical assumptions break down.
+    """
+    import numpy as np
+    import rasterio
+    from rasterio.warp import reproject, Resampling
+
+    def _align_to_template(src_path: Optional[Path], tmpl) -> Optional[np.ndarray]:
+        if src_path is None:
+            return None
+        sp = Path(src_path)
+        if not sp.exists():
+            return None
+        with rasterio.open(sp) as src:
+            dtype = src.dtypes[0]
+            if dtype.startswith('uint') or dtype.startswith('int'):
+                out = np.zeros((tmpl.height, tmpl.width), dtype=np.float32)
+                dst_nodata = 0.0
+                rs = Resampling.nearest
+            else:
+                out = np.full((tmpl.height, tmpl.width), np.nan, dtype=np.float32)
+                dst_nodata = np.nan
+                rs = Resampling.nearest
+            reproject(
+                source=rasterio.band(src, 1),
+                destination=out,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=tmpl.transform,
+                dst_crs=tmpl.crs,
+                resampling=rs,
+                src_nodata=src.nodata,
+                dst_nodata=dst_nodata,
+            )
+            return out
+
+    with rasterio.open(combined_path, 'r+') as ds:
+        arr = ds.read(1).astype('float32')
+        nodata = ds.nodata if ds.nodata is not None else -9999.0
+        river = _align_to_template(river_path, ds)
+        sdb = _align_to_template(sdb_path, ds)
+        gw = _align_to_template(Path(river_outputs.get('guidance_weight')) if river_outputs.get('guidance_weight') else None, ds)
+        ti = _align_to_template(Path(river_outputs.get('trusted_interior')) if river_outputs.get('trusted_interior') else None, ds)
+        adm = _align_to_template(Path(river_outputs.get('admissibility')) if river_outputs.get('admissibility') else None, ds)
+        sup = _align_to_template(Path(river_outputs.get('authoritative_support')) if river_outputs.get('authoritative_support') else None, ds)
+        sup_depth = _align_to_template(Path(river_outputs.get('authoritative_support_depth')) if river_outputs.get('authoritative_support_depth') else None, ds)
+        et = _align_to_template(Path(river_outputs.get('estuary_transition')) if river_outputs.get('estuary_transition') else None, ds)
+        # Estuary clip mask: pixels removed from river channel because fluvial
+        # physics break down there.  SDB should be the sole guidance source in
+        # these zones (the river module produced no values here).
+        estuary_clip = _align_to_template(Path(river_outputs.get('estuary_clip_mask')) if river_outputs.get('estuary_clip_mask') else None, ds)
+
+        if river is None or gw is None or adm is None:
+            report.setdefault('fusion', {}).setdefault('guidance_controls', {})['river_guidance_applied'] = False
+            report['fusion']['guidance_controls']['reason'] = 'missing_required_river_guidance_artifacts'
+            return
+
+        valid_riv = np.isfinite(river) & (river != nodata)
+        valid_sdb = np.isfinite(sdb) & (sdb != nodata) if sdb is not None else np.zeros_like(valid_riv, dtype=bool)
+        domain = (adm > 0.5)
+        is_estuary = (et > 0.5) if et is not None else np.zeros_like(domain, dtype=bool)
+        ti_mask = (ti > 0.5) if ti is not None else np.zeros_like(domain, dtype=bool)
+        sup_mask = (sup > 0.5) if sup is not None else np.zeros_like(domain, dtype=bool)
+        exact = domain & (ti_mask | sup_mask)
+
+        # --- Domain-aware weight capping ---
+        # In estuary_transition, cap river guidance weight to estuary_max_weight.
+        # In fluvial_core (domain & ~estuary), use full guidance weight.
+        w = np.clip(np.nan_to_num(gw, nan=0.0), 0.0, 1.0).astype('float32')
+        w_capped = w.copy()
+        estuary_cap = float(np.clip(estuary_max_weight, 0.0, 1.0))
+        w_capped[is_estuary] = np.minimum(w[is_estuary], estuary_cap)
+
+        blend = domain & (~exact) & valid_riv
+        sup_depth_valid = np.isfinite(sup_depth) & (sup_depth != nodata) if sup_depth is not None else np.zeros_like(domain, dtype=bool)
+        exact_support = exact & sup_depth_valid
+        exact_river = exact & (~exact_support) & valid_riv
+        exact_written = int(np.sum(exact_support | exact_river))
+
+        # Blend zones: estuary uses capped weight, fluvial_core uses full weight
+        both = blend & valid_sdb
+        river_only = blend & (~valid_sdb)
+
+        # Sub-classify blend zones
+        both_estuary = both & is_estuary
+        both_fluvial = both & (~is_estuary)
+        river_only_estuary = river_only & is_estuary
+        river_only_fluvial = river_only & (~is_estuary)
+
+        arr_out = arr.copy()
+
+        # Exact overwrites (unchanged — authoritative always wins)
+        if np.any(exact_support):
+            arr_out[exact_support] = sup_depth[exact_support]
+        if np.any(exact_river):
+            arr_out[exact_river] = river[exact_river]
+
+        # Fluvial core: full-strength river guidance blend
+        if np.any(both_fluvial):
+            wf = w[both_fluvial]
+            arr_out[both_fluvial] = ((1.0 - wf) * sdb[both_fluvial]) + (wf * river[both_fluvial])
+        if np.any(river_only_fluvial):
+            arr_out[river_only_fluvial] = river[river_only_fluvial]
+
+        # Estuary transition: capped-weight blend (reduced trust)
+        if np.any(both_estuary):
+            we = w_capped[both_estuary]
+            arr_out[both_estuary] = ((1.0 - we) * sdb[both_estuary]) + (we * river[both_estuary])
+        estuary_no_base_fill_skipped = 0
+        if np.any(river_only_estuary):
+            # In the estuary transition, river guidance is reduced-trust.
+            # If there is already a fused/base value, blend toward river with the capped weight.
+            # If there is no existing base value, do not inject pure river structure into the
+            # handoff zone; leave the cell unchanged and record the skip in the report.
+            we_ro = w_capped[river_only_estuary]
+            existing = arr[river_only_estuary]
+            has_existing = np.isfinite(existing) & (existing != nodata)
+            riv_vals = river[river_only_estuary]
+            updated = np.where(
+                has_existing,
+                ((1.0 - we_ro) * existing) + (we_ro * riv_vals),
+                existing,
+            )
+            arr_out[river_only_estuary] = updated
+            estuary_no_base_fill_skipped = int(np.sum(~has_existing))
+
+        # --- Estuary clip zone: SDB is sole guidance source ---
+        # Where the estuary clip mask is active, the river module produced
+        # no values (the channel mask was zeroed there).  If SDB has valid
+        # data in those pixels, write it directly — this is the estuarine
+        # zone where SDB optics may still work even though river physics
+        # broke down.  Authoritative exact-overwrites are preserved.
+        estuary_sdb_fill_n = 0
+        is_clipped_estuary = (estuary_clip > 0.5) if estuary_clip is not None else np.zeros_like(domain, dtype=bool)
+        if np.any(is_clipped_estuary) and sdb is not None:
+            sdb_fill = is_clipped_estuary & valid_sdb & (~exact_support)
+            if np.any(sdb_fill):
+                arr_out[sdb_fill] = sdb[sdb_fill]
+                estuary_sdb_fill_n = int(sdb_fill.sum())
+                log.info(
+                    "[FUSION] SDB fills %d pixels in estuary-clip zone (river excluded, SDB admissible).",
+                    estuary_sdb_fill_n,
+                )
+
+        ds.write(arr_out.astype('float32'), 1)
+
+    # --- Provenance update ---
+    if provenance_path is not None and Path(provenance_path).exists():
+        try:
+            from constants import Provenance
+            with rasterio.open(provenance_path, 'r+') as dp:
+                prov = dp.read(1)
+                if np.any(exact_support):
+                    prov[exact_support] = Provenance.MEASURED
+                if np.any(exact_river):
+                    prov[exact_river] = Provenance.RIVER
+                if np.any(both_fluvial):
+                    prov[both_fluvial] = Provenance.BLENDED
+                if np.any(river_only_fluvial):
+                    prov[river_only_fluvial] = Provenance.RIVER
+                # Estuary transition gets its own provenance code
+                if np.any(both_estuary):
+                    prov[both_estuary] = Provenance.ESTUARY_TRANSITION
+                if np.any(river_only_estuary):
+                    prov[river_only_estuary] = Provenance.ESTUARY_TRANSITION
+                # Estuary clip zone filled by SDB
+                if estuary_sdb_fill_n > 0:
+                    prov[is_clipped_estuary & valid_sdb & (~exact_support)] = Provenance.SDB
+                dp.write(prov, 1)
+        except Exception:
+            log.debug('ignored', exc_info=True)
+
+    n_estuary_blend = int(np.sum(both_estuary)) + int(np.sum(river_only_estuary))
+    report.setdefault('fusion', {}).setdefault('guidance_controls', {}).update({
+        'river_guidance_applied': True,
+        'authoritative_exact_overwrite_pixels': exact_written,
+        'river_guidance_blend_fluvial_pixels': int(np.sum(both_fluvial)),
+        'river_guidance_river_only_fluvial_pixels': int(np.sum(river_only_fluvial)),
+        'estuary_transition_blend_pixels': n_estuary_blend,
+        'estuary_transition_no_base_fill_skipped_pixels': int(estuary_no_base_fill_skipped),
+        'estuary_clip_sdb_fill_pixels': int(estuary_sdb_fill_n),
+        'estuary_max_weight': estuary_cap,
+        'policy': (
+            'trusted support exact overwrite using authoritative depth where available; '
+            'full-strength river guidance only in fluvial_core; '
+            'capped river guidance (max_w=%.2f) in estuary_transition; '
+            'SDB-only outside admissible river domain' % estuary_cap
+        ),
+    })
 def _apply_final_domain_policy(cfg: "BathyConfig", out_dir: Path, derived_cache_root: Path) -> None:
     """Apply final domain clipping rules:
 
@@ -129,7 +1204,7 @@ def _apply_final_domain_policy(cfg: "BathyConfig", out_dir: Path, derived_cache_
                 continue
             try:
                 data = json.loads(rp.read_text(encoding="utf-8"))
-            except Exception:
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
                 continue
 
             def _walk(obj: Any) -> None:
@@ -227,7 +1302,7 @@ def _apply_final_domain_policy(cfg: "BathyConfig", out_dir: Path, derived_cache_
         except StopIteration:
             try:
                 d.rmdir()
-            except Exception:
+            except OSError:
                 log.debug("ignored", exc_info=True)
 
 
@@ -259,7 +1334,7 @@ def _confirm_exists(path: str | Path) -> bool:
     """Return True if a path exists on disk (files or directories)."""
     try:
         return Path(path).exists()
-    except Exception:
+    except (OSError, TypeError, ValueError):
         return False
 
 
@@ -472,7 +1547,7 @@ def _collect_paths_from_obj(obj: Any, out: list[str]) -> None:
         elif isinstance(obj, str):
             if _is_probably_path(obj):
                 out.append(obj)
-    except Exception:
+    except (RecursionError, TypeError, ValueError):
         return
 
 
@@ -487,7 +1562,7 @@ def _parse_paths_from_command(cmd: str) -> dict[str, list[str]]:
         return {"inputs": ins, "outputs": outs}
     try:
         toks = shlex.split(cmd)
-    except Exception:
+    except ValueError:
         toks = cmd.split()
 
     # Flags where the next token is a path
@@ -615,6 +1690,131 @@ def build_io_manifest(report: dict[str, Any]) -> dict[str, Any]:
     manifest["inputs"] = inputs
     manifest["outputs"] = outputs
     return manifest
+
+
+def _write_guidance_manifest(cfg: "BathyConfig", report: "Dict[str, Any]") -> Path:
+    """Write guidance_manifest.json — a single machine-readable inventory of all
+    guidance artifacts produced by this run.
+
+    Downstream CUDEM tile builders consume this to understand:
+      - what guidance artifacts exist and where they are
+      - what domain class each artifact belongs to (fluvial, estuary, coastal_sdb)
+      - whether each artifact is authoritative or guidance-only
+      - what fusion policy was applied
+      - what the estuary detection method and parameters were
+
+    This is the contract between the open-bathy-workflows pipeline and
+    production DEM tiling.
+    """
+    from constants import Provenance, PIPELINE_VERSION
+
+    river_outputs = report.get("river", {}).get("outputs", {})
+    river_guidance = report.get("river", {}).get("guidance", {})
+    estuary_clip = report.get("river", {}).get("estuary_clip", {})
+    fusion_controls = report.get("fusion", {}).get("guidance_controls", {})
+    sdb_report = report.get("sdb", {})
+
+    def _artifact(path_str, *, role, domain, authoritative=False, description=""):
+        """Build a single artifact entry."""
+        entry = {
+            "path": str(path_str) if path_str else None,
+            "exists": bool(path_str and Path(path_str).exists()) if path_str else False,
+            "role": role,
+            "domain_class": domain,
+            "authoritative": authoritative,
+        }
+        if description:
+            entry["description"] = description
+        return entry
+
+    artifacts = []
+
+    # --- River guidance artifacts ---
+    for key, role, desc in [
+        ("guidance_weight", "guidance_weight", "0 at authoritative support; ramps to 1 away from trusted support within fluvial channel"),
+        ("trusted_interior", "trusted_interior", "1 at authoritative-support pixels only"),
+        ("admissibility", "admissibility", "1 inside fluvial channel domain where river guidance is valid"),
+        ("guide_points", "guide_points", "Spatially thinned pseudo-soundings with confidence weights"),
+        ("authoritative_support", "authoritative_support", "Rasterized authoritative support mask"),
+        ("authoritative_support_depth", "authoritative_support_depth", "Rasterized authoritative support depth for exact overwrite"),
+    ]:
+        p = river_outputs.get(key)
+        if p:
+            artifacts.append(_artifact(p, role=role, domain="fluvial_core", authoritative=(key == "authoritative_support_depth"), description=desc))
+
+    # Estuary masks
+    et_path = river_outputs.get("estuary_transition")
+    if et_path:
+        artifacts.append(_artifact(et_path, role="estuary_transition_mask", domain="estuary_transition",
+                                   description="1 where river-to-ocean handoff zone; reduced-trust guidance"))
+    ec_path = estuary_clip.get("estuary_clip_mask") or river_outputs.get("estuary_clip_mask")
+    if ec_path:
+        artifacts.append(_artifact(ec_path, role="estuary_clip_mask", domain="estuary_transition",
+                                   description="1 where river channel was clipped (SDB may fill); river physics invalid here"))
+
+    # --- SDB guidance artifacts ---
+    sdb_artifacts = sdb_report.get("artifacts", {})
+    for key, role, desc in [
+        ("depth_raster", "sdb_depth", "SDB depth raster (guidance-only, non-authoritative)"),
+        ("confidence_raster", "sdb_confidence", "Per-pixel SDB confidence"),
+        ("guidance_weight_raster", "sdb_guidance_weight", "SDB guidance weight for interpolation"),
+        ("uncertainty_raster", "sdb_uncertainty", "SDB 1-sigma uncertainty"),
+        ("admissibility_raster", "sdb_admissibility", "SDB optical domain admissibility"),
+        ("provenance_raster", "sdb_provenance", "SDB provenance (0=nodata, 1=predicted)"),
+    ]:
+        p = sdb_artifacts.get(key)
+        if p:
+            artifacts.append(_artifact(p, role=role, domain="coastal_sdb", description=desc))
+
+    # --- Combined / fused artifacts ---
+    combined = report.get("outputs", {})
+    for key, role, desc in [
+        ("depth", "combined_depth", "Fused depth raster (river + SDB + authoritative)"),
+        ("provenance", "combined_provenance", "Provenance code per pixel (see constants.Provenance)"),
+    ]:
+        p = combined.get(key)
+        if p:
+            artifacts.append(_artifact(p, role=role, domain="combined", description=desc))
+
+    manifest = {
+        "schema_version": 1,
+        "pipeline_version": str(PIPELINE_VERSION),
+        "aoi": str(cfg.aoi),
+        "run_id": str(cfg.run_id or ""),
+        "domain_classes": {
+            "fluvial_core": "River channel where channelized-flow assumptions are valid; river guidance is primary",
+            "estuary_transition": "Handoff zone where river physics break down; reduced-trust, SDB may fill",
+            "coastal_sdb": "Open water / coastal domain; SDB guidance is primary",
+            "combined": "Fused output incorporating all sources with domain-aware arbitration",
+        },
+        "fusion_policy": {
+            "authoritative_exact_overwrite": True,
+            "fluvial_core_river_primary": True,
+            "estuary_transition_river_excluded": True,
+            "estuary_sdb_fill_enabled": True,
+            "estuary_max_weight": float(fusion_controls.get("estuary_max_weight", 0.25)),
+            "estuary_detection_method": estuary_clip.get("method", "width_ratio + low_slope"),
+            "estuary_detection_signals": estuary_clip.get("signals", {}),
+        },
+        "provenance_codes": {
+            str(code): desc
+            for code, desc in [
+                (Provenance.NODATA, "NoData"),
+                (Provenance.SDB, "SDB guidance"),
+                (Provenance.RIVER, "River guidance"),
+                (Provenance.MEASURED, "Authoritative measurement"),
+                (Provenance.BLENDED, "Blended transition"),
+                (Provenance.ESTUARY_TRANSITION, "Estuary transition (reduced-trust)"),
+            ]
+        },
+        "artifacts": artifacts,
+        "artifact_count": len(artifacts),
+    }
+
+    out_path = cfg.out_dir / "guidance_manifest.json"
+    write_json(out_path, manifest)
+    log.info("Guidance manifest written: %s (%d artifacts)", out_path, len(artifacts))
+    return out_path
 
 
 def write_io_manifest(out_dir: Path, report: dict[str, Any]) -> tuple[Path, Path]:
@@ -890,6 +2090,13 @@ class BathyConfig:
     river_use_nhdarea: bool = True
     river_nhdarea_layer: str = "nhdarea_clip"
     river_ocean_keep_dist_m: float = 0.0  # allow ocean-connected water near flowlines (tidal mouths)
+
+    # Estuary transition zone — reduced-trust handoff between river and SDB
+    estuary_transition_m: float = 500.0     # buffer (m) from ocean domain into river channel that defines the transition
+    estuary_max_weight: float = 0.25        # max river guidance weight allowed in estuary transition (0..1)
+    estuary_width_ratio_thresh: float = 3.0  # local width / median width ratio that triggers estuary classification
+    estuary_connect_dist_m: float = 200.0   # max distance (m) from ocean to keep estuary detections (filters inland false positives)
+
     # River depth inference priors / anchors (passed through to xs_infer_bathy_raster.py)
     river_prior_mode: str = "powerlaw"  # powerlaw | multivariate
     river_mv_a0: float = 0.18
@@ -1211,7 +2418,7 @@ def _ensure_waffles_coastline_mask(
             try:
                 if fp.exists():
                     fp.unlink()
-            except Exception:
+            except OSError:
                 log.debug("ignored", exc_info=True)
 
     if (not force) and out_tif_path.exists() and out_tif_path.stat().st_size > 0:
@@ -1813,20 +3020,12 @@ def _reproject_xyz_file(
 
 
 def _parse_aoi_bounds_deg(aoi: str) -> Optional[Tuple[float, float, float, float]]:
-    """Parse AOI string 'w/e/s/n' into float bounds (degrees)."""
-    try:
-        parts = [p.strip() for p in str(aoi).split('/') if p.strip()]
-        if len(parts) != 4:
-            return None
-        w, e, s, n = map(float, parts)
-        # Normalize if user passes reversed bounds.
-        if e < w:
-            w, e = e, w
-        if n < s:
-            s, n = n, s
-        return (w, e, s, n)
-    except Exception:
-        return None
+    """Parse AOI string 'w/e/s/n' into ``(W, E, S, N)`` float bounds (degrees).
+
+    Delegates to :func:`pipeline.aoi.parse_aoi_wesn`.
+    """
+    from pipeline.aoi import parse_aoi_wesn
+    return parse_aoi_wesn(aoi)
 
 
 def fetch_cudem_soundings_via_dlim(
@@ -1993,7 +3192,7 @@ def fetch_cudem_soundings_via_dlim(
             try:
                 if out_xyz.exists() and out_xyz.stat().st_size == 0:
                     out_xyz.unlink()
-            except Exception:
+            except OSError:
                 log.debug("ignored", exc_info=True)
             log.warning("%sException fetching %s via dlim: %s", prefix, src, str(e))
             report["outputs"].append({
@@ -2574,6 +3773,46 @@ def _run_river_skeleton(
     except Exception:
         log.debug("ignored", exc_info=True)
 
+    # Step 2b: Clip estuary pixels from the channel mask.
+    # The river module must not produce values where channelized-flow assumptions
+    # break down (tidal, backwater, wide estuarine geometry).  Auto-detect the
+    # estuary boundary from ocean proximity + hydraulic indicators and zero those
+    # pixels in the channel mask before skeleton/XS runs.
+    try:
+        _n_est, _est_mask_path = _clip_channel_mask_for_estuary(
+            channel_mask_tif,
+            cfg,
+            ocean_mask_path=ocean_mask,
+            report=report,
+        )
+        if _est_mask_path is not None:
+            report.setdefault("river", {}).setdefault("outputs", {})["estuary_clip_mask"] = str(_est_mask_path)
+            # Also clip the mainstem mask — otherwise the XS builder generates
+            # cross-sections in the estuary zone where the channel mask has been
+            # removed but the mainstem mask still extends.
+            try:
+                mainstem_mask_tif = Path(channel_mask_tif).parent / "mainstem_mask.tif"
+                if mainstem_mask_tif.exists() and _est_mask_path is not None:
+                    import rasterio as _rio_est
+                    with _rio_est.open(_est_mask_path) as ec:
+                        est_arr = ec.read(1)
+                    with _rio_est.open(mainstem_mask_tif) as ms:
+                        ms_arr = ms.read(1)
+                        ms_prof = ms.profile.copy()
+                    n_ms_before = int((ms_arr > 0).sum())
+                    ms_arr[est_arr > 0] = 0
+                    n_ms_after = int((ms_arr > 0).sum())
+                    if n_ms_before > n_ms_after:
+                        ms_prof.update(dtype="uint8", nodata=0)
+                        with _rio_est.open(mainstem_mask_tif, "w", **ms_prof) as dst:
+                            dst.write(ms_arr.astype("uint8"), 1)
+                        log.info("[ESTUARY-CLIP] Also clipped mainstem mask: %d → %d pixels (%d removed)",
+                                 n_ms_before, n_ms_after, n_ms_before - n_ms_after)
+            except Exception:
+                log.debug("[ESTUARY-CLIP] Mainstem mask clipping failed", exc_info=True)
+    except Exception:
+        log.warning("[RIVER] Estuary clipping failed; continuing with full channel mask.", exc_info=True)
+
 
     # Step 3: Skeleton bathymetry (distance-transform, no cross-sections)
     log.info("[RIVER] Step 3: Inferring bathymetry (channel skeleton)...")
@@ -2692,7 +3931,8 @@ def _run_river_skeleton(
                 log.info("[RIVER] Soundings/channel receipt copied to: %s", receipt_dst)
             else:
                 log.warning(
-                    f"[RIVER] Expected receipt was not created after copy: {receipt_dst}"
+                    "[RIVER] Expected receipt was not created after copy: %s",
+                    receipt_dst,
                 )
         else:
             log.warning("[RIVER] Soundings/channel receipt not found: %s", receipt_src)
@@ -2909,6 +4149,20 @@ def _run_river_xs(
             cfg.river_domain_mask_for_fusion = Path(channel_mask_tif)
         except Exception:
             log.debug("ignored", exc_info=True)
+
+    # Step 2b: Clip estuary pixels from channel mask (same as skeleton path)
+    if channel_mask_tif.exists():
+        try:
+            _n_est, _est_mask_path = _clip_channel_mask_for_estuary(
+                channel_mask_tif,
+                cfg,
+                ocean_mask_path=ocean_mask,
+                report=report,
+            )
+            if _est_mask_path is not None:
+                report.setdefault("river", {}).setdefault("outputs", {})["estuary_clip_mask"] = str(_est_mask_path)
+        except Exception:
+            log.warning("[RIVER] Estuary clipping failed; continuing with full channel mask.", exc_info=True)
 
 
     # Step 3: infer bathymetry (raster + optional GPKG)
@@ -3401,7 +4655,7 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
 
             try:
                 cfg.river_domain_mask_for_fusion = Path(channel_mask_tif)
-            except Exception:
+            except OSError:
                 log.debug("ignored", exc_info=True)
 
         return channel_mask_tif, open_water_mask_tif, mainstem_mask_tif
@@ -3471,6 +4725,19 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
             log.error("[RIVER] Hybrid requires a valid channel mask, but it was not created: %s", str(channel_mask_tif))
             report["river"]["status"] = "failed"
             return None
+
+        # Step 2b: Clip estuary from channel mask (hybrid path)
+        try:
+            _n_est, _est_mask_path = _clip_channel_mask_for_estuary(
+                channel_mask_tif,
+                cfg,
+                ocean_mask_path=cfg.waffles_ocean_mask,
+                report=report,
+            )
+            if _est_mask_path is not None:
+                report.setdefault("river", {}).setdefault("outputs", {})["estuary_clip_mask"] = str(_est_mask_path)
+        except Exception:
+            log.warning("[RIVER] Estuary clipping failed; continuing with full channel mask.", exc_info=True)
 
         # If the mainstem mask is empty/missing, we can still run XS builder (largest component),
         # but XS will not be injected into the final hybrid raster; warn loudly.
@@ -3655,7 +4922,7 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
                 if _fallback_soundings:
                     cfg.river_soundings = _fallback_soundings
                     log.info("[RIVER] XS inference: using extra_xyz fallback as soundings anchors (n=%d)", len(_fallback_soundings))
-            except Exception:
+            except OSError:
                 log.debug("ignored", exc_info=True)
 
         # If soundings are available, generate a single cached subset ONCE and reuse it for BOTH
@@ -3868,7 +5135,7 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
                 st = str(cfg.river_soundings_calib_stat or "").strip()
                 if st:
                     cmd.append(f"--calib-stat={st}")
-            except Exception:
+            except OSError:
                 log.debug("ignored", exc_info=True)
         else:
             # No validated subset — fall back to raw soundings (original behaviour).
@@ -3909,17 +5176,31 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
             if xs_mainstem_meta_json.exists():
                 import json as _json_audit
                 _meta_audit = _json_audit.loads(xs_mainstem_meta_json.read_text(encoding="utf-8"))
-                # xs_infer_bathy_raster writes 'soundings_n_matched' or 'calib_xs_matched' depending on version.
+                _constraints = _meta_audit.get("constraints", {}) if isinstance(_meta_audit, dict) else {}
                 _snd_matched = int(
                     _meta_audit.get("soundings_n_matched",
                     _meta_audit.get("calib_xs_matched",
-                    _meta_audit.get("n_soundings_matched", 0))) or 0
+                    _meta_audit.get("n_soundings_matched",
+                    _constraints.get("soundings_total_matched", 0)))) or 0
                 )
             # Also check the accounting JSON for per-XS soundings_n.
             if _snd_matched == 0 and xs_mainstem_acct_json.exists():
                 import json as _json_audit2
                 _acct_audit = _json_audit2.loads(xs_mainstem_acct_json.read_text(encoding="utf-8"))
-                _snd_matched = int(_acct_audit.get("soundings_n_matched", 0) or 0)
+                _snd_matched = int(
+                    _acct_audit.get("soundings_n_matched",
+                    _acct_audit.get("n_soundings_calib_applied",
+                    _acct_audit.get("soundings_total_matched", 0))) or 0
+                )
+            # Fallback: the xs_infer logger explicitly reports "Matched XS: <n>".
+            # Use that as an audit signal so we do not emit a misleading 0-calibration
+            # warning when the JSON receipts are missing, stale, or written under an older key.
+            if _snd_matched == 0:
+                import re as _re_audit
+                _tails = "\n".join([str(out or ""), str(err or "")])
+                _m = _re_audit.search(r"Matched XS:\s*(\d+)", _tails)
+                if _m:
+                    _snd_matched = int(_m.group(1) or 0)
             if _snd_provided and _snd_matched == 0 and rc == 0:
                 log.warning(
                     "[RIVER][SOUNDINGS] AUDIT WARNING: soundings were provided (%s) but 0 XS "
@@ -3985,7 +5266,7 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
                 ab = Path(cfg.river_authoritative_bed)
                 if ab.exists():
                     cmd.append(f"--authoritative-bed-raster={ab}")
-            except Exception:
+            except OSError:
                 log.debug("ignored", exc_info=True)
 
         # Junction / confluence handling
@@ -4062,6 +5343,31 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
     report["river"]["status"] = "success"
     log.info("[RIVER] Success: %s", bed_tif)
 
+    # Mask the final river bed raster with the clipped channel mask.
+    # The skeleton's Gaussian smoothing and XS interpolation can extend
+    # slightly beyond the channel mask boundary, creating thin strips of
+    # river data in the estuary zone.  Re-masking ensures the river output
+    # strictly respects the clipped channel domain.
+    try:
+        if channel_mask_tif is not None and Path(channel_mask_tif).exists() and Path(bed_tif).exists():
+            import rasterio as _rio_mask
+            with _rio_mask.open(channel_mask_tif) as cm:
+                ch_arr = cm.read(1)
+            with _rio_mask.open(bed_tif) as bt:
+                bed_arr = bt.read(1).astype("float32")
+                bed_prof = bt.profile.copy()
+                bed_nod = bt.nodata if bt.nodata is not None else float(cfg.river_nodata)
+            outside_channel = (ch_arr == 0)
+            n_masked = int((np.isfinite(bed_arr) & (bed_arr != bed_nod) & outside_channel).sum())
+            if n_masked > 0:
+                bed_arr[outside_channel] = bed_nod
+                bed_prof.update(dtype="float32")
+                with _rio_mask.open(bed_tif, "w", **bed_prof) as dst:
+                    dst.write(bed_arr, 1)
+                log.info("[RIVER] Post-mask: removed %d bed-elevation pixels outside clipped channel mask", n_masked)
+    except Exception:
+        log.debug("[RIVER] Post-mask failed", exc_info=True)
+
     # Capture explicit XS constraint meta + accounting (no guessing).
     try:
         import json as _json
@@ -4097,7 +5403,7 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
                 mp2 = Path(channel_mask_tif)
                 if mp2.exists():
                     _maskp = mp2
-            except Exception:
+            except OSError:
                 log.debug("ignored", exc_info=True)
         if _maskp is not None:
             nval = cfg.river_nodata
@@ -4183,8 +5489,24 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
         {
             "depth_terrain": str(out_depth),
             "bottom_elevation": str(out_bed),
+            "bottom_elevation_internal_helper": str(out_bed),
         }
     )
+
+    try:
+        guidance_outputs = _write_river_guidance_artifacts(
+            cfg,
+            bed_tif=Path(out_bed),
+            depth_tif=Path(out_depth),
+            channel_mask_tif=(Path(channel_mask_tif) if channel_mask_tif is not None else None),
+            river_dir=river_dir,
+            report=report,
+        )
+        report.setdefault("river", {}).setdefault("outputs", {}).update({
+            k: v for k, v in guidance_outputs.items() if v
+        })
+    except Exception:
+        log.debug("Failed to write river guidance artifacts; continuing.", exc_info=True)
 
     _build_constraint_summary(cfg, report)
 
@@ -4612,6 +5934,23 @@ def fuse(cfg: BathyConfig, sdb_raster: Optional[Path], river_raster: Optional[Pa
 
 
 
+        # Apply river guidance artifacts as downstream fusion controls.
+        try:
+            river_outputs = report.get('river', {}).get('outputs', {}) if isinstance(report.get('river', {}), dict) else {}
+            _apply_river_guidance_to_fused_output(
+                Path(out_depth),
+                river_path=Path(river_fuse_path) if river_fuse_path else None,
+                sdb_path=Path(sdb_fuse_path) if sdb_fuse_path else None,
+                provenance_path=Path(out_prov) if out_prov else None,
+                river_outputs=river_outputs,
+                report=report,
+                estuary_max_weight=float(cfg.estuary_max_weight),
+            )
+        except Exception as _river_guidance_e:
+            report.setdefault('fusion', {}).setdefault('guidance_controls', {})['river_guidance_applied'] = False
+            report['fusion']['guidance_controls']['error'] = str(_river_guidance_e)
+            log.debug('river guidance fusion controls failed; keeping base fused output', exc_info=True)
+
         # ------------------------------------------------------------------
         # Enforce authoritative XYZ constraints in the final fused raster.
         # This is a hard "burn-in": at pixels containing authoritative soundings,
@@ -4695,6 +6034,25 @@ def fuse(cfg: BathyConfig, sdb_raster: Optional[Path], river_raster: Optional[Pa
             report.setdefault('fusion', {}).setdefault('constraints', {})['xyz_burned_into_final'] = False
             report['fusion']['constraints']['xyz_burn_error'] = str(_burn_e)
 
+        # --- Residual correction: smooth the fused output toward authoritative XYZ ---
+        # After all fusion and exact burn-in, apply a Gaussian-smoothed residual
+        # correction that gently pulls the prediction surface toward measured depths
+        # in the gaps between exact-overwrite pixels.
+        try:
+            support_points = _load_river_authoritative_support_points(cfg)
+            if support_points is not None and len(support_points) >= 20:
+                rc_stats = _apply_residual_correction(
+                    Path(out_depth),
+                    support_points,
+                    sigma_m=1000.0,
+                    max_correction_m=8.0,
+                    min_points=20,
+                    label="FUSED_RESIDUAL",
+                )
+                report.setdefault("fusion", {})["residual_correction"] = rc_stats
+        except Exception:
+            log.debug("Optional residual correction on fused output failed", exc_info=True)
+
         return Path(out_depth)
 
     except Exception as e:
@@ -4728,8 +6086,82 @@ def fuse(cfg: BathyConfig, sdb_raster: Optional[Path], river_raster: Optional[Pa
         return out_depth
 
 
+def _load_yaml_config(config_paths: "List[str]") -> "Dict[str, Any]":
+    """Load and merge YAML config files (later files override earlier ones).
+
+    Returns a flat dict of argparse-compatible key=value pairs by flattening
+    the nested YAML sections.  Section keys are prefixed to avoid collisions
+    (e.g., ``estuary.max_weight`` becomes ``estuary_max_weight``).
+    """
+    import yaml  # PyYAML — available in most scientific Python environments
+
+    # Map from YAML section.key to argparse dest name
+    _SECTION_PREFIX = {
+        "core": "",
+        "tiling": "",
+        "model_bank": "sdb_",
+        "sentinel2": "",
+        "icesat2": "",
+        "training": "",
+        "prediction": "",
+        "river_network": "river_",
+        "river_method": "river_",
+        "river_priors": "river_",
+        "estuary": "estuary_",
+        "fusion": "fusion_",
+    }
+    # Special mappings where YAML key != argparse dest
+    _KEY_MAP = {
+        "model_bank.enabled": "sdb_model_bank_enabled",
+        "model_bank.bank": "sdb_model_bank",
+        "model_bank.max_samples": "sdb_bank_max_samples",
+        "model_bank.seed": "sdb_bank_seed",
+        "model_bank.retrain_min_new": "sdb_bank_retrain_min_new",
+        "estuary.transition_m": "estuary_transition_m",
+        "estuary.max_weight": "estuary_max_weight",
+        "estuary.width_ratio_thresh": "estuary_width_ratio_thresh",
+        "estuary.connect_dist_m": "estuary_connect_dist_m",
+        "river_network.dem_auto": "river_dem_auto",
+        "river_network.dem_source": "river_dem_source",
+        "river_network.dem_res_m": "river_dem_res_m",
+        "river_method.method": "river_method",
+        "core.sdb_mode": "sdb_mode",
+        "core.convert_sdb_to_navd88": "convert_sdb_to_navd88",
+    }
+
+    merged: Dict[str, Any] = {}
+    for cp in config_paths:
+        p = Path(cp)
+        if not p.exists():
+            log.warning("[CONFIG] Config file not found: %s", cp)
+            continue
+        with open(p, "r", encoding="utf-8") as f:
+            doc = yaml.safe_load(f) or {}
+        if not isinstance(doc, dict):
+            continue
+        for section, values in doc.items():
+            if not isinstance(values, dict):
+                continue
+            prefix = _SECTION_PREFIX.get(section, section + "_")
+            for key, val in values.items():
+                full_key = f"{section}.{key}"
+                dest = _KEY_MAP.get(full_key)
+                if dest is None:
+                    dest = f"{prefix}{key}" if prefix else key
+                merged[dest] = val
+        log.info("[CONFIG] Loaded: %s (%d values)", cp, sum(1 for s in doc.values() if isinstance(s, dict) for _ in s))
+    return merged
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Unified Coastal + River Bathymetry Pipeline", conflict_handler="resolve")
+
+    # --- Config file (Level 2 interface) ---
+    p.add_argument("--config", dest="config_files", action="append", default=[],
+                   help="YAML config file(s). May be specified multiple times; later files override earlier. "
+                        "CLI args always override config file values. "
+                        "Example: --config=config/default.yaml --config=config/us_east_coast.yaml")
+
     p.add_argument("--aoi", required=True, help="AOI W/E/S/N")
     p.add_argument("--start", dest="start_date", required=True)
     p.add_argument("--end", dest="end_date", required=True)
@@ -5029,6 +6461,18 @@ def parse_args() -> argparse.Namespace:
                help="Layer name in river_network.gpkg containing NHDArea polygons (default nhdarea_clip).")
     p.add_argument("--river-ocean-keep-dist-m", dest="river_ocean_keep_dist_m", type=float, default=0.0,
                help="Allow ocean-connected water within this distance (m) of flowlines when building the river channel mask. Useful for tidal river mouths/estuaries where the mainstem is classified as ocean water. 0 disables.")
+    p.add_argument("--estuary-transition-m", dest="estuary_transition_m", type=float, default=500.0,
+               help="Ocean-connectivity distance (m) used to filter inland false-positive estuary detections. "
+                    "Estuary pixels detected by width-ratio or low-slope must also be within this distance of the ocean to be clipped. 0 disables.")
+    p.add_argument("--estuary-max-weight", dest="estuary_max_weight", type=float, default=0.25,
+               help="Maximum river guidance weight (0..1) allowed in the estuary transition zone. "
+                    "Lower values make the transition more conservative (less river influence near coast). Default 0.25.")
+    p.add_argument("--estuary-width-ratio-thresh", dest="estuary_width_ratio_thresh", type=float, default=3.0,
+               help="Width ratio threshold for estuary detection. Channel pixels wider than this multiple "
+                    "of the median channel width are classified as estuarine widening. Default 3.0.")
+    p.add_argument("--estuary-connect-dist-m", dest="estuary_connect_dist_m", type=float, default=200.0,
+               help="Max distance (m) from ocean boundary to retain estuary detections. "
+                    "Prevents inland low-slope reaches from being falsely classified as estuary. Default 200.")
     p.add_argument("--river-shape-exp", type=float, default=0.5,
                help="Depth profile exponent for skeleton method (0.5 ~ U-shape; 1.0 ~ V-shape).")
     p.add_argument("--river-dmax-min-m", type=float, default=0.5, help="Clamp minimum Dmax prior (meters).")
@@ -5371,6 +6815,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--strict", action="store_true", default=False,
                    help="Fail the run if contract tests or output sanity checks fail.")
 
+    # --- Apply YAML config defaults before parsing CLI ---
+    # Parse only --config first (without erroring on unknown args)
+    pre_args, _ = p.parse_known_args()
+    config_files = getattr(pre_args, "config_files", []) or []
+    if config_files:
+        try:
+            yaml_defaults = _load_yaml_config(config_files)
+            if yaml_defaults:
+                # Set argparse defaults from config — CLI args will override
+                p.set_defaults(**{k: v for k, v in yaml_defaults.items()
+                                  if hasattr(pre_args, k) or k in p._option_string_actions
+                                  or any(k == a.dest for a in p._actions)})
+        except Exception as e:
+            log.warning("[CONFIG] Failed to load YAML config: %s", e)
+
     return p.parse_args()
 
 
@@ -5426,7 +6885,7 @@ def _apply_output_retention_policy(cfg, log, report, final_path=None, final_for_
                         keep_abs.add(pp if pp.is_absolute() else (out_dir / pp).resolve())
                     except Exception:
                         continue
-            except Exception:
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
                 continue
 
     # Also keep io_manifest outputs if present (explicit list)
@@ -5463,7 +6922,7 @@ def _apply_output_retention_policy(cfg, log, report, final_path=None, final_for_
                 if Path(pth).exists():
                     final_ok = True
                     break
-            except Exception:
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
                 continue
 
     # Fall back to final paths passed in
@@ -5852,7 +7311,7 @@ def _reproject_final_outputs(cfg, final, report, sdb_raster, river_raster, fatal
                                         report.setdefault("outputs", {})["river_bottom_edge_tapered"] = str(deliverable)
                         except Exception:
                             log.debug("ignored", exc_info=True)
-            except Exception:
+            except OSError:
                 log.debug("ignored", exc_info=True)
 
         # Optional: combined bottom elevation (NAVD88) for river + SDB where possible.
@@ -6029,7 +7488,7 @@ def _run_seam_comparisons(args, cfg, report, run_id, final, final_for_user, repo
             # Update report on disk to include seam results
             try:
                 write_json(report_path, report)
-            except Exception:
+            except OSError:
                 log.debug("ignored", exc_info=True)
             log.info("Seam comparisons written: %s", out_seam_json)
     except Exception:
@@ -6323,7 +7782,7 @@ def main() -> int:
     run_id = None
     try:
         from datetime import datetime, timezone
-        from logging_config import add_file_handler, start_flight_recorder
+        from logging_config import add_file_handler, install_screen_log, start_flight_recorder
 
         # Deterministic-enough run id for log grouping
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -6332,7 +7791,11 @@ def main() -> int:
         out_dir = Path(getattr(args, 'out_dir', 'output'))
         (out_dir / "run_logs").mkdir(parents=True, exist_ok=True)
 
-        # Per-run text log
+        # Console-mirror text log (best file to share for exact terminal output)
+        screen_log_path = install_screen_log(out_dir / "run_logs" / f"screen_{run_id}.log")
+        log.info("[RUN] Screen log: %s", screen_log_path)
+
+        # Per-run logger file
         add_file_handler(out_dir / "run_logs" / f"run_{run_id}.log", level=logging.INFO)
 
         # Structured flight recorder JSONL
@@ -6461,7 +7924,7 @@ def main() -> int:
             # Pre-create common ones to avoid spurious ENOENT warnings.
             try:
                 ensure_dir(cudem_cache_dir / "tnm")
-            except Exception:
+            except OSError:
                 log.debug("ignored", exc_info=True)
             os.environ["CUDEM_CACHE"] = str(cudem_cache_dir)
             log.info("[CUDEM_CACHE] Using pipeline-scoped CUDEM cache: %s", cudem_cache_dir)
@@ -6469,7 +7932,7 @@ def main() -> int:
             ensure_dir(Path(_cc))
             try:
                 ensure_dir(Path(_cc) / "tnm")
-            except Exception:
+            except OSError:
                 log.debug("ignored", exc_info=True)
             log.info("[CUDEM_CACHE] Using existing CUDEM_CACHE: %s", _cc)
     except Exception as e:
@@ -7008,6 +8471,16 @@ def main() -> int:
 
     report_path = cfg.out_dir / "bathy_report.json"
     write_json(report_path, report)
+
+    # --- Unified Guidance Manifest ---
+    # Single machine-readable inventory of all guidance artifacts, their roles,
+    # domain classes, and the fusion policy applied.  Downstream CUDEM tile
+    # builders consume this to understand what the run produced.
+    try:
+        _write_guidance_manifest(cfg, report)
+    except Exception:
+        log.debug("Optional guidance manifest write failed", exc_info=True)
+
     # Explicit IO manifest (paths observed in report + executed commands; no guessing)
     try:
         io_json, io_md = write_io_manifest(cfg.out_dir, report)

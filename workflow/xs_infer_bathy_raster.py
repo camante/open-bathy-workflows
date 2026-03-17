@@ -60,6 +60,7 @@ Use --no-swot-use-for-slope if you want observed stage to shift bed elevations b
 longitudinal WSE-profile slope fit.
 """
 
+from __future__ import annotations
 
 import argparse
 import json as _json
@@ -90,13 +91,36 @@ try:
 except Exception:  # pragma: no cover
     WSEFitConfig = None
     fit_wse_profile = None
-import geopandas as gpd
-import rasterio
-from rasterio.transform import rowcol
-from rasterio.features import rasterize
-from shapely.geometry import Point, mapping
-from shapely.ops import unary_union, linemerge
-from pyproj import CRS, Transformer
+try:
+    import geopandas as gpd
+except Exception:  # pragma: no cover - optional in lightweight test environments
+    gpd = None  # type: ignore
+
+try:
+    import rasterio
+except Exception:  # pragma: no cover - optional in lightweight test environments
+    rasterio = None  # type: ignore
+
+try:
+    from rasterio.features import rasterize
+except Exception:  # pragma: no cover - optional in lightweight test environments
+    rasterize = None  # type: ignore
+
+try:
+    from shapely.geometry import Point, mapping
+    from shapely.ops import unary_union, linemerge
+except Exception:  # pragma: no cover - optional in lightweight test environments
+    Point = None  # type: ignore
+    unary_union = None  # type: ignore
+    linemerge = None  # type: ignore
+    def mapping(obj):  # type: ignore
+        return obj
+
+try:
+    from pyproj import CRS, Transformer
+except Exception:  # pragma: no cover - optional in lightweight test environments
+    CRS = None  # type: ignore
+    Transformer = None  # type: ignore
 
 log = logging.getLogger("xs_infer_bathy")
 

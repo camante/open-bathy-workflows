@@ -15,6 +15,11 @@ import numpy as np
 import pandas as pd
 import rasterio
 from pyproj import Transformer
+try:
+    from pyproj.exceptions import ProjError
+except (ImportError, AttributeError):
+    class ProjError(Exception):
+        pass
 
 from plot_utils import lazy_pyplot
 plt = None  # lazy-loaded when plots are enabled
@@ -24,6 +29,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.cluster import KMeans
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.linear_model import LinearRegression
+from sklearn.isotonic import IsotonicRegression
 
 # --- Physics-based SDB (Kim et al. 2024) ---
 PHYSICS_AVAILABLE = False
@@ -33,9 +39,8 @@ try:
     PHYSICS_AVAILABLE = True
 except ImportError as e:
     _physics_import_error = f"ImportError: {e}"
-except Exception as e:
-    # Catch any other errors (syntax, missing dependencies, etc.)
-    # log is not defined yet at import time; store error and emit it later
+except (AttributeError, OSError, SyntaxError) as e:
+    # Catch common non-ImportError module load failures without masking arbitrary runtime errors.
     _physics_import_error = f"{type(e).__name__}: {e}"
 
 S2_OPTICS_AVAILABLE = False
@@ -72,7 +77,7 @@ def stratified_train_test_split(df, target_col='depth_m', test_size=0.2, seed=42
         test_df = test_df.drop(columns=['stratify_bin'])
         return train_df.index.to_numpy(), test_df.index.to_numpy()
 
-    except Exception as e:
+    except (ValueError, TypeError) as e:
         log.warning("Stratification failed (%s). Falling back to random split.", e)
         tr, te = train_test_split(df.index.to_numpy(), test_size=test_size, random_state=seed)
         return tr, te
@@ -244,21 +249,85 @@ def add_s2_optical_features(df, l_inf: dict = None, eps: float = 1e-6):
     return out
 
 
+_WATER_CLASS_BRIGHTNESS_PROFILES = {
+    "clear_ocean": {"max_blue": 0.25, "max_brightness": 0.18},
+    "ocean": {"max_blue": 0.25, "max_brightness": 0.18},
+    "clear": {"max_blue": 0.25, "max_brightness": 0.18},
+    "mixed": {"max_blue": 0.28, "max_brightness": 0.20},
+    "coastal": {"max_blue": 0.28, "max_brightness": 0.20},
+    "turbid": {"max_blue": 0.32, "max_brightness": 0.24},
+    "inland": {"max_blue": 0.32, "max_brightness": 0.24},
+}
+
+
+def _normalize_water_class_label(wc: Any) -> str:
+    label = str(wc or "clear_ocean").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "mixed_water": "mixed",
+        "mixed_waters": "mixed",
+        "coastal_mixed": "mixed",
+        "clearwater": "clear_ocean",
+        "clear_water": "clear_ocean",
+        "open_ocean": "clear_ocean",
+        "turbid_inland": "turbid",
+        "turbid_coastal": "turbid",
+    }
+    return aliases.get(label, label)
+
+
+
+def _resolve_brightness_filter_profile(wc: Any) -> Dict[str, float]:
+    label = _normalize_water_class_label(wc)
+    return dict(_WATER_CLASS_BRIGHTNESS_PROFILES.get(label, _WATER_CLASS_BRIGHTNESS_PROFILES["clear_ocean"]))
+
+
+
 def apply_s2_brightness_depth_filter(df, *args, **kwargs):
     import numpy as _np
     if df is None or df.empty:
         return df
 
-    max_blue = kwargs.get("max_blue", None)
-    max_brightness = kwargs.get("max_brightness", None)
+    water_class = kwargs.get("water_class", kwargs.get("wc", "clear_ocean"))
+    profile = _resolve_brightness_filter_profile(water_class)
+    max_blue = kwargs.get("max_blue", profile.get("max_blue"))
+    max_brightness = kwargs.get("max_brightness", profile.get("max_brightness"))
+    allow_bright_shallow_pixels = bool(kwargs.get("allow_bright_shallow_pixels", False))
+    bright_shallow_nir_max = float(kwargs.get("bright_shallow_nir_max", 0.03))
 
     m = _np.ones(len(df), dtype=bool)
+
+    b08 = None
+    if "B08" in df.columns:
+        b08 = pd.to_numeric(df["B08"], errors="coerce").to_numpy(_np.float32)
+
     if max_blue is not None and "B02" in df.columns:
-        m &= (df["B02"].to_numpy(_np.float32) <= float(max_blue))
+        blue = pd.to_numeric(df["B02"], errors="coerce").to_numpy(_np.float32)
+        keep_blue = _np.isfinite(blue) & (blue <= float(max_blue))
+        if allow_bright_shallow_pixels and b08 is not None:
+            keep_blue |= (_np.isfinite(b08) & (b08 <= bright_shallow_nir_max))
+        m &= keep_blue
 
     if max_brightness is not None and all(c in df.columns for c in ["B02", "B03", "B04"]):
-        rgb_mean = (df["B02"].to_numpy(_np.float32) + df["B03"].to_numpy(_np.float32) + df["B04"].to_numpy(_np.float32)) / 3.0
-        m &= (rgb_mean <= float(max_brightness))
+        b02 = pd.to_numeric(df["B02"], errors="coerce").to_numpy(_np.float32)
+        b03 = pd.to_numeric(df["B03"], errors="coerce").to_numpy(_np.float32)
+        b04 = pd.to_numeric(df["B04"], errors="coerce").to_numpy(_np.float32)
+        rgb_mean = (b02 + b03 + b04) / 3.0
+        keep_brightness = _np.isfinite(rgb_mean) & (rgb_mean <= float(max_brightness))
+        if allow_bright_shallow_pixels and b08 is not None:
+            keep_brightness |= (_np.isfinite(b08) & (b08 <= bright_shallow_nir_max))
+        m &= keep_brightness
+
+    dropped = int(len(df) - int(_np.count_nonzero(m)))
+    if dropped > 0:
+        log.info(
+            "[QC] S2 brightness/depth filter (%s) dropped %s / %s points (max_blue=%s, max_brightness=%s, bright_shallow_escape=%s).",
+            _normalize_water_class_label(water_class),
+            dropped,
+            len(df),
+            max_blue,
+            max_brightness,
+            allow_bright_shallow_pixels,
+        )
 
     return df.loc[m].copy()
 
@@ -285,6 +354,23 @@ def apply_stumpf_residual_filter(
         return df
     if "stumpf_idx" not in df.columns or "depth_m" not in df.columns:
         return df
+
+    # Treat extra_xyz/survey-style soundings as authoritative bathymetric
+    # anchors. They may live in turbid or optically weak water where the
+    # Stumpf relationship is expected to fail; dropping them because they do
+    # not fit a simple optical residual model creates exactly the shallow-bias
+    # failure mode we want to avoid.
+    protected_mask = np.zeros(len(df), dtype=bool)
+    source_col = "source_norm" if "source_norm" in df.columns else ("source" if "source" in df.columns else None)
+    if source_col is not None:
+        try:
+            src = df[source_col].astype(str).str.lower()
+            protected_mask = (
+                src.str.startswith("extra_xyz") |
+                src.str.contains("hydronos|ehydro|survey|sonar|lidar|bag|sound", regex=True)
+            ).to_numpy(dtype=bool)
+        except Exception:
+            protected_mask = np.zeros(len(df), dtype=bool)
 
     stumpf = pd.to_numeric(df["stumpf_idx"], errors="coerce").to_numpy(dtype="float64")
     depth = pd.to_numeric(df["depth_m"], errors="coerce").to_numpy(dtype="float64")
@@ -322,7 +408,7 @@ def apply_stumpf_residual_filter(
         try:
             km = KMeans(n_clusters=k, random_state=random_state, n_init=10).fit(Z_fit)
             clusters = km.labels_.astype(int)
-        except Exception:
+        except ValueError:
             clusters = np.zeros_like(clusters)
 
     X_fit = stumpf[m_fit].reshape(-1, 1)
@@ -349,7 +435,7 @@ def apply_stumpf_residual_filter(
         )
         try:
             ransac.fit(Xc, yc)
-        except Exception:
+        except ValueError:
             continue
 
         inliers = getattr(ransac, "inlier_mask_", None)
@@ -367,56 +453,518 @@ def apply_stumpf_residual_filter(
         n_drop_c = int(np.count_nonzero(drop_c))
         if n_drop_c > 0:
             df_idx = idx_fit[sel][drop_c]
+            if protected_mask.any():
+                keepable = ~protected_mask[df_idx]
+                protected_n = int(np.count_nonzero(~keepable))
+                if protected_n > 0:
+                    log.info(
+                        "[QC] Preserving %d authoritative extra_xyz/survey points that exceeded the Stumpf residual threshold.",
+                        protected_n,
+                    )
+                df_idx = df_idx[keepable]
+            if df_idx.size == 0:
+                continue
             keep[df_idx] = False
-            dropped_total += n_drop_c
-            dropped_by_cluster.append((ci, n_drop_c, thr, sigma, int(np.count_nonzero(sel))))
+            dropped_total += int(df_idx.size)
+            dropped_by_cluster.append((ci, int(df_idx.size), thr, sigma, int(np.count_nonzero(sel))))
 
     if dropped_total > 0:
         try:
             d_drop = depth_pd[~keep & m_valid]
             d_keep = depth_pd[keep & m_valid]
             log.info(
-                f"[QC] Stumpf residual filter dropped {dropped_total} / {len(df)} "
-                f"({100.0*dropped_total/len(df):.1f}%). "
-                f"Depth keep p50/p95={np.nanpercentile(d_keep,50):.2f}/{np.nanpercentile(d_keep,95):.2f} m; "
-                f"dropped p50/p95={np.nanpercentile(d_drop,50):.2f}/{np.nanpercentile(d_drop,95):.2f} m."
+                "[QC] Stumpf residual filter dropped %d / %d (%.1f%%). Depth keep p50/p95=%.2f/%.2f m; dropped p50/p95=%.2f/%.2f m.",
+                dropped_total, len(df), 100.0*dropped_total/max(len(df),1), np.nanpercentile(d_keep,50), np.nanpercentile(d_keep,95), np.nanpercentile(d_drop,50), np.nanpercentile(d_drop,95),
             )
-        except Exception:
+        except (ValueError, IndexError, FloatingPointError):
             log.info("Stumpf residual filter dropped %s outliers.", dropped_total)
         return df.loc[keep].reset_index(drop=True)
 
     return df
 
+
+_LOCAL_APPLY_S2_BRIGHTNESS_DEPTH_FILTER = apply_s2_brightness_depth_filter
+_LOCAL_APPLY_STUMPF_RESIDUAL_FILTER = apply_stumpf_residual_filter
+
+
 def _resolve_s2_optics_module():
     import sys
-    import importlib
-    if "s2_optics" in sys.modules:
-        return sys.modules["s2_optics"]
+    import importlib.util
+    from pathlib import Path as _Path
+
+    local_path = (_Path(__file__).resolve().parent / "s2_optics.py").resolve()
+    if not local_path.exists():
+        log.error("Required local s2_optics.py not found at %s", local_path)
+        return None
+
+    existing = sys.modules.get("s2_optics")
+    if existing is not None:
+        existing_file = getattr(existing, "__file__", None)
+        if existing_file and _Path(existing_file).resolve() == local_path:
+            return existing
+
+    spec = importlib.util.spec_from_file_location("s2_optics", str(local_path))
+    if spec is None or spec.loader is None:
+        log.error("Could not create import spec for local s2_optics module at %s", local_path)
+        return None
+
+    module = importlib.util.module_from_spec(spec)
     try:
-        return importlib.import_module("s2_optics")
-    except Exception:
-        log.debug("ignored", exc_info=True)
-    for k, v in list(sys.modules.items()):
-        if k.startswith("s2_optics_dyn_"):
-            return v
-    return None
+        spec.loader.exec_module(module)
+    except (ImportError, OSError, SyntaxError, AttributeError, ValueError):
+        log.exception("Failed to import local s2_optics module from %s", local_path)
+        return None
+
+    sys.modules["s2_optics"] = module
+    return module
+
 
 def _bind_s2_optics_functions():
-    global S2_OPTICS_AVAILABLE
-    global apply_stumpf_residual_filter, apply_s2_brightness_depth_filter
+    global S2_OPTICS_AVAILABLE, apply_stumpf_residual_filter, apply_s2_brightness_depth_filter
 
     mod = _resolve_s2_optics_module()
     if mod is None:
         S2_OPTICS_AVAILABLE = False
         return False
 
+    missing = []
+    brightness_fn = getattr(mod, "apply_s2_brightness_depth_filter", None)
+    if brightness_fn is None:
+        brightness_fn = _LOCAL_APPLY_S2_BRIGHTNESS_DEPTH_FILTER
+        missing.append("apply_s2_brightness_depth_filter")
+
+    stumpf_fn = getattr(mod, "apply_stumpf_residual_filter", None)
+    if stumpf_fn is None:
+        stumpf_fn = _LOCAL_APPLY_STUMPF_RESIDUAL_FILTER
+        missing.append("apply_stumpf_residual_filter")
+
+    apply_s2_brightness_depth_filter = brightness_fn
+    apply_stumpf_residual_filter = stumpf_fn
+    S2_OPTICS_AVAILABLE = True
+
+    if missing:
+        log.warning(
+            "Local s2_optics module imported from %s but is missing %s; using train.py fallback implementations for those helpers.",
+            getattr(mod, "__file__", "unknown"),
+            ", ".join(missing),
+        )
+    else:
+        log.info("Using local s2_optics module: %s", getattr(mod, "__file__", "unknown"))
+    return True
+
+
+def _infer_local_metric_epsg(lon: float, lat: float) -> int:
+    zone = int((float(lon) + 180.0) / 6.0) + 1
+    zone = max(1, min(zone, 60))
+    return (32600 if float(lat) >= 0.0 else 32700) + zone
+
+
+def _validate_physics_guidance_settings(guidance: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(guidance or {})
+    float_fields = [
+        "support_score", "depth_span_m", "correction_alpha", "residual_clip_m",
+        "stumpf_envelope_m", "min_doa", "hard_optical_margin_frac", "max_train_point_dist_m",
+    ]
+    int_fields = ["n_points", "unique_tracks", "trusted_halo_px", "min_support_neighbors"]
+    for key in float_fields:
+        try:
+            normalized[key] = float(normalized.get(key, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            normalized[key] = 0.0
+    for key in int_fields:
+        try:
+            normalized[key] = int(normalized.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            normalized[key] = 0
+    normalized["low_support"] = bool(normalized.get("low_support", False))
+    cof = normalized.get("core_optical_features", [])
+    normalized["core_optical_features"] = [str(v) for v in cof] if isinstance(cof, (list, tuple)) else []
+    pts = normalized.get("support_points_lonlat", [])
+    clean_pts = []
+    if isinstance(pts, (list, tuple)):
+        for item in pts:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                continue
+            try:
+                lon = float(item[0]); lat = float(item[1])
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(lon) and np.isfinite(lat):
+                clean_pts.append([lon, lat])
+    normalized["support_points_lonlat"] = clean_pts
+    return normalized
+
+
+def _resolve_depth_source_family(source_name: Optional[str]) -> str:
+    src = str(source_name or "").strip().lower()
+    if not src:
+        return ""
+    if "combined" in src:
+        return "combined"
+    if "physics" in src or "kd" in src:
+        return "physics"
+    if "rmse" in src or "support" in src:
+        return "rmse"
+    if "training_p95" in src or "p95" in src:
+        return "training_p95"
+    return src
+
+
+def _compute_physics_guidance_settings(df_tr: pd.DataFrame) -> Dict[str, Any]:
+    """Derive conservative guidance settings from the retained training rows."""
+    out: Dict[str, Any] = {
+        "support_score": 0.0,
+        "low_support": True,
+        "n_points": 0,
+        "unique_tracks": 0,
+        "depth_span_m": 0.0,
+        "correction_alpha": 0.08,
+        "residual_clip_m": 0.12,
+        "anchor_support_good": False,
+        "anchor_fraction": 0.0,
+        "baseline_source": "stumpf_depth",
+        "stumpf_envelope_m": 0.18,
+        "min_doa": 0.992,
+        "hard_optical_margin_frac": 0.012,
+        "max_train_point_dist_m": 125.0,
+        "min_support_neighbors": 2,
+        "trusted_halo_px": 192,
+        "core_optical_features": ["stumpf_idx", "stumpf_depth", "brightness", "B02", "B03", "B04", "B08"],
+        "support_points_lonlat": [],
+    }
+    if df_tr is None or df_tr.empty:
+        return out
+
+    depth = np.abs(pd.to_numeric(df_tr.get("depth_m"), errors="coerce").to_numpy(dtype=np.float32))
+    finite_depth = depth[np.isfinite(depth)]
+    out["n_points"] = int(finite_depth.size)
+    if finite_depth.size:
+        out["depth_span_m"] = float(np.nanpercentile(finite_depth, 95) - np.nanpercentile(finite_depth, 5))
+
+    if "track_id" in df_tr.columns:
+        out["unique_tracks"] = int(pd.Series(df_tr["track_id"]).astype(str).nunique(dropna=True))
+    elif "granule" in df_tr.columns and "beam" in df_tr.columns:
+        tracks = df_tr[["granule", "beam"]].astype(str).agg("|".join, axis=1)
+        out["unique_tracks"] = int(tracks.nunique(dropna=True))
+    elif "source" in df_tr.columns:
+        out["unique_tracks"] = int(pd.Series(df_tr["source"]).astype(str).nunique(dropna=True))
+
+    stumpf_depth = pd.to_numeric(df_tr.get("stumpf_depth"), errors="coerce").to_numpy(dtype=np.float32) if "stumpf_depth" in df_tr.columns else np.full(len(df_tr), np.nan, dtype=np.float32)
+    stumpf_idx = pd.to_numeric(df_tr.get("stumpf_idx"), errors="coerce").to_numpy(dtype=np.float32) if "stumpf_idx" in df_tr.columns else np.full(len(df_tr), np.nan, dtype=np.float32)
+
+    paired = np.isfinite(depth) & np.isfinite(stumpf_depth)
+    if np.any(paired):
+        residual = depth[paired] - stumpf_depth[paired]
+        out["residual_clip_m"] = float(np.clip(np.nanpercentile(np.abs(residual), 90), 0.10, 0.50))
+        out["stumpf_envelope_m"] = float(np.clip(np.nanpercentile(np.abs(residual), 95), 0.15, 0.60))
+        out["stumpf_support_min_m"] = float(np.nanpercentile(stumpf_depth[paired], 1))
+        out["stumpf_support_max_m"] = float(np.nanpercentile(stumpf_depth[paired], 99))
+    else:
+        finite_sd = stumpf_depth[np.isfinite(stumpf_depth)]
+        if finite_sd.size:
+            out["stumpf_support_min_m"] = float(np.nanpercentile(finite_sd, 1))
+            out["stumpf_support_max_m"] = float(np.nanpercentile(finite_sd, 99))
+
+    finite_si = stumpf_idx[np.isfinite(stumpf_idx)]
+    if finite_si.size:
+        out["stumpf_idx_support_min"] = float(np.nanpercentile(finite_si, 1))
+        out["stumpf_idx_support_max"] = float(np.nanpercentile(finite_si, 99))
+
+    source_series = None
+    if "source_norm" in df_tr.columns:
+        source_series = df_tr["source_norm"].astype(str).str.lower()
+    elif "source" in df_tr.columns:
+        source_series = df_tr["source"].astype(str).str.lower()
+
+    anchor_support_good = False
+    if source_series is not None and len(source_series):
+        anchor_mask = source_series.str.startswith("extra_xyz") | source_series.str.contains("hydronos|ehydro|survey|sonar|lidar|bag|sound", regex=True)
+        out["anchor_fraction"] = float(anchor_mask.mean())
+        anchor_support_good = bool(out["anchor_fraction"] >= 0.70 and out["n_points"] >= 1200 and out["depth_span_m"] >= 4.0)
+        out["anchor_support_good"] = anchor_support_good
+        if not anchor_support_good:
+            log.info("[ANCHOR] anchor_support_good=False: fraction=%.3f (need>=0.70) n=%d (need>=1200) span=%.1f (need>=4.0) sources=%s",
+                     out["anchor_fraction"], out["n_points"], out["depth_span_m"],
+                     dict(source_series.value_counts().head(5)))
+    else:
+        log.info("[ANCHOR] No source_series available (source_norm=%s source=%s cols=%s)",
+                 "source_norm" in df_tr.columns, "source" in df_tr.columns,
+                 list(df_tr.columns)[:10])
+
+    # Depth-based fallback: if we have very dense, deep data but source
+    # labels are missing or mangled, infer anchor_support_good from data
+    # characteristics alone.  Dense deep data (>5000 pts, >15m span) is
+    # extremely unlikely to come from ATL alone.
+    if not anchor_support_good and out["n_points"] >= 5000 and out["depth_span_m"] >= 15.0:
+        anchor_support_good = True
+        out["anchor_support_good"] = True
+        out["anchor_support_good_source"] = "depth_fallback"
+        log.info("[ANCHOR] anchor_support_good=True via depth fallback: n=%d span=%.1fm "
+                 "(dense deep data unlikely from ATL alone)", out["n_points"], out["depth_span_m"])
+
+    n_score = min(1.0, out["n_points"] / 600.0)
+    track_score = min(1.0, out["unique_tracks"] / 6.0)
+    depth_score = min(1.0, out["depth_span_m"] / 3.0)
+    support_score = 0.45 * n_score + 0.30 * track_score + 0.25 * depth_score
+    out["support_score"] = float(support_score)
+    low_support = bool((out["n_points"] < 400) or (out["unique_tracks"] < 4) or (out["depth_span_m"] < 1.5) or (support_score < 0.70))
+    if anchor_support_good:
+        low_support = False
+    out["low_support"] = low_support
+    if anchor_support_good:
+        # Dense authoritative XYZ data (hydronos, ehydro, etc.) is ground truth.
+        # The RF should be allowed to fully correct the Stumpf baseline — not
+        # limited to ±0.75m corrections.  The Stumpf ratio is still a valuable
+        # input feature, but it should not constrain the final prediction when
+        # high-quality measured depths are available for training.
+        out["correction_alpha"] = 1.0   # Full RF correction (was 0.18)
+        out["residual_clip_m"] = 15.0   # Allow corrections up to 15m (was 0.75)
+        out["stumpf_envelope_m"] = 20.0 # Wide envelope (was 1.0)
+        out["min_doa"] = 0.965 if out["n_points"] >= 5000 else 0.975
+        out["hard_optical_margin_frac"] = 0.005
+        out["max_train_point_dist_m"] = 2000.0 if out["n_points"] >= 5000 else 1000.0
+        out["min_support_neighbors"] = 1
+        out["trusted_halo_px"] = 64
+    else:
+        out["correction_alpha"] = 0.05 if low_support else 0.12
+        out["min_doa"] = 0.995 if low_support else 0.985
+        out["hard_optical_margin_frac"] = 0.008 if low_support else 0.015
+        out["max_train_point_dist_m"] = 100.0 if low_support else 250.0
+        out["min_support_neighbors"] = 3 if low_support else 2
+        out["trusted_halo_px"] = 256 if low_support else 160
+
+    lon_col = None
+    lat_col = None
+    if "longitude" in df_tr.columns and "latitude" in df_tr.columns:
+        lon_col, lat_col = "longitude", "latitude"
+    elif "lon" in df_tr.columns and "lat" in df_tr.columns:
+        lon_col, lat_col = "lon", "lat"
+
+    if lon_col is not None and lat_col is not None:
+        ll = df_tr[[lon_col, lat_col]].copy().rename(columns={lon_col: "longitude", lat_col: "latitude"})
+        ll["longitude"] = pd.to_numeric(ll["longitude"], errors="coerce")
+        ll["latitude"] = pd.to_numeric(ll["latitude"], errors="coerce")
+        ll = ll[np.isfinite(ll["longitude"]) & np.isfinite(ll["latitude"])]
+        if len(ll):
+            max_keep = 50000 if anchor_support_good else 10000
+            ll = _spatially_thin_lonlat_dataframe(ll, max_keep=max_keep, anchor_support_good=anchor_support_good)
+            out["support_points_lonlat"] = ll[["longitude", "latitude"]].to_numpy(dtype=float).tolist()
+
+    return _validate_physics_guidance_settings(out)
+
+
+
+
+def _spatially_thin_lonlat_dataframe(ll: pd.DataFrame, max_keep: int, *, anchor_support_good: bool = False) -> pd.DataFrame:
+    """Deterministically thin support points in metric space for tile-stable support gating.
+
+    For dense authoritative-support runs, keep a much richer support cloud so the
+    downstream CUDEM guidance gate reflects real survey support rather than a
+    sparse, over-thinned proxy.
+    """
+    if anchor_support_good:
+        try:
+            max_keep = max(int(max_keep), 50000)
+        except Exception:
+            max_keep = 50000
+    if ll is None or ll.empty or len(ll) <= max_keep:
+        return ll
+    work = ll[["longitude", "latitude"]].copy()
+    work["longitude"] = pd.to_numeric(work["longitude"], errors="coerce")
+    work["latitude"] = pd.to_numeric(work["latitude"], errors="coerce")
+    work = work[np.isfinite(work["longitude"]) & np.isfinite(work["latitude"])]
+    work = work.drop_duplicates().sort_values(["longitude", "latitude"]).reset_index(drop=True)
+    if len(work) <= max_keep:
+        return work
+
+    lon0 = float(work["longitude"].median())
+    lat0 = float(work["latitude"].median())
+    epsg = _infer_local_metric_epsg(lon0, lat0)
     try:
-        apply_s2_brightness_depth_filter = getattr(mod, 'apply_s2_brightness_depth_filter', apply_s2_brightness_depth_filter)
-        S2_OPTICS_AVAILABLE = True
-        return True
-    except Exception:
-        S2_OPTICS_AVAILABLE = False
-        return False
+        tfm = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
+        xs, ys = tfm.transform(work["longitude"].to_numpy(dtype=float), work["latitude"].to_numpy(dtype=float))
+    except ProjError:
+        log.warning("Metric thinning projection failed for EPSG:%s; falling back to geographic thinning.", epsg, exc_info=True)
+        xs = work["longitude"].to_numpy(dtype=float)
+        ys = work["latitude"].to_numpy(dtype=float)
+
+    metric = work.copy()
+    metric["_x"] = xs
+    metric["_y"] = ys
+    metric = metric[np.isfinite(metric["_x"]) & np.isfinite(metric["_y"])].reset_index(drop=True)
+    if len(metric) <= max_keep:
+        return metric[["longitude", "latitude"]]
+
+    x0 = float(metric["_x"].min())
+    y0 = float(metric["_y"].min())
+    x_span = max(float(metric["_x"].max() - x0), 1e-6)
+    y_span = max(float(metric["_y"].max() - y0), 1e-6)
+    area = x_span * y_span
+    cell = max((area / float(max_keep)) ** 0.5, 1.0)
+
+    thinned = metric
+    for _ in range(8):
+        gx = np.floor((metric["_x"].to_numpy(dtype=float) - x0) / cell).astype(np.int64)
+        gy = np.floor((metric["_y"].to_numpy(dtype=float) - y0) / cell).astype(np.int64)
+        thinned = metric.assign(_gx=gx, _gy=gy).drop_duplicates(subset=["_gx", "_gy"], keep="first")
+        if len(thinned) <= max_keep:
+            break
+        cell *= 1.25
+
+    thinned = thinned.sort_values(["longitude", "latitude"]).reset_index(drop=True)
+    if len(thinned) > max_keep:
+        thinned = thinned.iloc[:max_keep].reset_index(drop=True)
+    return thinned[["longitude", "latitude"]]
+
+def _tighten_guidance_for_unrepresentative_spatial_holdout(guidance_settings: Dict[str, Any], spatial_status: Dict[str, Any]) -> Dict[str, Any]:
+    out = _validate_physics_guidance_settings(guidance_settings)
+    if not isinstance(spatial_status, dict):
+        return out
+    ok = bool(spatial_status.get("ok", False))
+    reason = str(spatial_status.get("reason", "")).lower()
+    if (not ok) or ("unrepresentative" in reason) or ("no_representative" in reason):
+        # Dense authoritative-anchor runs can still justify broader prediction
+        # support even when a representative spatial holdout cannot be formed.
+        if bool(out.get("anchor_support_good", False)) and int(out.get("n_points", 0)) >= 5000:
+            out["low_support"] = False
+            out["correction_alpha"] = 1.0
+            out["residual_clip_m"] = 15.0
+            out["stumpf_envelope_m"] = 20.0
+            out["min_doa"] = min(float(out.get("min_doa", 0.975)), 0.975)
+            out["max_train_point_dist_m"] = max(float(out.get("max_train_point_dist_m", 350.0)), 2000.0)
+            out["min_support_neighbors"] = 1
+            out["hard_optical_margin_frac"] = min(float(out.get("hard_optical_margin_frac", 0.008)), 0.008)
+            out["trusted_halo_px"] = min(int(out.get("trusted_halo_px", 160)), 128)
+        else:
+            out["low_support"] = True
+            out["correction_alpha"] = min(float(out.get("correction_alpha", 0.08)), 0.05)
+            out["residual_clip_m"] = min(float(out.get("residual_clip_m", 0.12)), 0.12)
+            out["stumpf_envelope_m"] = min(float(out.get("stumpf_envelope_m", 0.18)), 0.18)
+            out["min_doa"] = max(float(out.get("min_doa", 0.992)), 0.997)
+            out["max_train_point_dist_m"] = min(float(out.get("max_train_point_dist_m", 125.0)), 100.0)
+            out["min_support_neighbors"] = max(int(out.get("min_support_neighbors", 2)), 3)
+            out["hard_optical_margin_frac"] = min(float(out.get("hard_optical_margin_frac", 0.012)), 0.008)
+            out["trusted_halo_px"] = max(int(out.get("trusted_halo_px", 192)), 256)
+    return _validate_physics_guidance_settings(out)
+
+class PhysicsGuidedResidualModel:
+    """Wrapper that preserves residual-mode internals while exposing magnitude predictions.
+
+    The wrapper is persisted with joblib and later loaded by predict.py. During
+    unpickling, Python may probe for ``__setstate__`` before instance state has
+    been restored, so attribute delegation must remain safe even when
+    ``base_model`` is not yet present on ``self.__dict__``.
+    """
+
+    def __init__(self, base_model: RandomForestRegressor, feature_columns: List[str], guidance_settings: Dict[str, Any]) -> None:
+        self.base_model = base_model
+        self.feature_columns = list(feature_columns)
+        self.guidance_settings = _validate_physics_guidance_settings(guidance_settings)
+        self._stumpf_depth_idx = self.feature_columns.index("stumpf_depth") if "stumpf_depth" in self.feature_columns else None
+
+    def __getstate__(self) -> Dict[str, Any]:
+        return {
+            "base_model": self.base_model,
+            "feature_columns": list(self.feature_columns),
+            "guidance_settings": dict(self.guidance_settings),
+            "_stumpf_depth_idx": self._stumpf_depth_idx,
+        }
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        feature_columns = list(state.get("feature_columns", []) or [])
+        guidance_settings = _validate_physics_guidance_settings(state.get("guidance_settings", {}))
+        self.base_model = state.get("base_model")
+        self.feature_columns = feature_columns
+        self.guidance_settings = guidance_settings
+        stumpf_idx = state.get("_stumpf_depth_idx")
+        if stumpf_idx is None:
+            stumpf_idx = feature_columns.index("stumpf_depth") if "stumpf_depth" in feature_columns else None
+        self._stumpf_depth_idx = stumpf_idx
+
+    @property
+    def estimators_(self):
+        return self.base_model.estimators_
+
+    @property
+    def feature_importances_(self):
+        return self.base_model.feature_importances_
+
+    @property
+    def n_features_in_(self):
+        return self.base_model.n_features_in_
+
+    def predict_residual(self, X: np.ndarray) -> np.ndarray:
+        return np.asarray(self.base_model.predict(X), dtype=np.float32)
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        X = np.asarray(X)
+        # When dense authoritative XYZ data trained the model, bypass the
+        # Stumpf residual architecture entirely.  The Stumpf blue/green ratio
+        # is fundamentally wrong in turbid channels (low ratio = interpreted
+        # as shallow, but channels are actually deep).  The RF learned the
+        # correct depth-to-spectral relationship from ground truth — let it
+        # predict directly without the wrong baseline constraining it.
+        if self.guidance_settings.get("anchor_support_good", False):
+            return np.maximum(self.predict_residual(X), 0.0).astype(np.float32)
+        if self._stumpf_depth_idx is None or X.ndim != 2 or self._stumpf_depth_idx >= X.shape[1]:
+            return np.maximum(self.predict_residual(X), 0.0).astype(np.float32)
+        stumpf_base = np.maximum(X[:, self._stumpf_depth_idx].astype(np.float32), 0.0)
+        residual = self.predict_residual(X)
+        correction_alpha = float(np.clip(self.guidance_settings.get("correction_alpha", 0.35), 0.0, 1.0))
+        residual_clip_m = float(max(self.guidance_settings.get("residual_clip_m", 0.5), 0.05))
+        stumpf_envelope_m = float(max(self.guidance_settings.get("stumpf_envelope_m", residual_clip_m), residual_clip_m, 0.10))
+        residual = np.clip(residual, -residual_clip_m, residual_clip_m)
+        guided = stumpf_base + (correction_alpha * residual)
+        guided = np.clip(guided, np.maximum(stumpf_base - stumpf_envelope_m, 0.0), stumpf_base + stumpf_envelope_m)
+        return np.maximum(guided, 0.0).astype(np.float32)
+
+    def __getattr__(self, name: str):
+        if name == "base_model":
+            raise AttributeError(name)
+        base_model = object.__getattribute__(self, "__dict__").get("base_model")
+        if base_model is None:
+            raise AttributeError(name)
+        return getattr(base_model, name)
+
+
+def _predict_physics_guided_magnitude(
+    rf: RandomForestRegressor,
+    df_eval: pd.DataFrame,
+    feat_cols: List[str],
+    guidance_settings: Dict[str, Any],
+) -> np.ndarray:
+    if df_eval is None or len(df_eval) == 0:
+        return np.zeros(0, dtype=np.float32)
+    missing = [c for c in feat_cols if c not in df_eval.columns]
+    if missing:
+        raise ValueError(f"Missing feature columns for physics-guided prediction: {missing}")
+    X_eval = df_eval[feat_cols].to_numpy()
+
+    # When anchor_support_good, the RF was trained on absolute depth — predict
+    # directly without the Stumpf residual architecture.
+    if guidance_settings.get("anchor_support_good", False):
+        if hasattr(rf, "predict"):
+            # For PhysicsGuidedResidualModel, predict() already handles anchor bypass
+            pred = np.asarray(rf.predict(X_eval), dtype=np.float32)
+        else:
+            pred = np.asarray(rf.predict(X_eval), dtype=np.float32)
+        return np.maximum(pred, 0.0).astype(np.float32)
+
+    if "stumpf_depth" not in df_eval.columns:
+        raise ValueError("Missing stumpf_depth feature for physics-guided prediction")
+    if hasattr(rf, "predict_residual"):
+        residual = np.asarray(rf.predict_residual(X_eval), dtype=np.float32)
+    else:
+        residual = np.asarray(rf.predict(X_eval), dtype=np.float32)
+    stumpf_base = np.maximum(pd.to_numeric(df_eval["stumpf_depth"], errors="coerce").to_numpy(dtype=np.float32), 0.0)
+    correction_alpha = float(np.clip(guidance_settings.get("correction_alpha", 0.35), 0.0, 1.0))
+    residual_clip_m = float(max(guidance_settings.get("residual_clip_m", 0.5), 0.05))
+    stumpf_envelope_m = float(max(guidance_settings.get("stumpf_envelope_m", residual_clip_m), residual_clip_m, 0.10))
+    residual = np.clip(residual, -residual_clip_m, residual_clip_m)
+    guided = stumpf_base + (correction_alpha * residual)
+    guided = np.clip(guided, np.maximum(stumpf_base - stumpf_envelope_m, 0.0), stumpf_base + stumpf_envelope_m)
+    return np.maximum(guided, 0.0).astype(np.float32)
+
 
 # Use centralized logging - get logger, don't configure root here
 log = logging.getLogger("sdb.train")
@@ -526,11 +1074,33 @@ def choose_s2_variant(best_date: dict, composite: dict, *, rmse_margin: float = 
 # -----------------------------------------------------------------------------
 
 def _to_python_float(val):
+    """Recursively convert metadata payloads to plain Python scalars/containers.
+
+    Historical callers use this helper for numeric metadata, but newer guidance
+    metadata also includes strings, booleans, None, lists, and numpy scalars.
+    Preserve non-numeric leaves instead of forcing everything through float().
+    """
     if isinstance(val, dict):
         return {k: _to_python_float(v) for k, v in val.items()}
+    if isinstance(val, (list, tuple)):
+        return [_to_python_float(v) for v in val]
+    if isinstance(val, np.ndarray):
+        return [_to_python_float(v) for v in val.tolist()]
+    if isinstance(val, (str, bool)) or val is None:
+        return val
+    if isinstance(val, (int, float)):
+        return val
+    if isinstance(val, np.integer):
+        return int(val)
+    if isinstance(val, np.floating):
+        return float(val)
     if hasattr(val, "item"):
-        return val.item()
-    return float(val)
+        item = val.item()
+        return _to_python_float(item)
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return val
 
 def rmse(a: np.ndarray, b: np.ndarray) -> float:
     m = np.isfinite(a) & np.isfinite(b)
@@ -573,7 +1143,7 @@ def _make_depth_bin_edges(
     if max_depth_cap_m is not None:
         try:
             max_ref = min(max_ref, float(max_depth_cap_m))
-        except Exception:
+        except (RuntimeError, ValueError, OSError):
             log.debug("ignored", exc_info=True)
     if (not np.isfinite(max_ref)) or max_ref <= 0:
         return np.array([], dtype="float64")
@@ -643,7 +1213,7 @@ max_depth_bins: int = 30,
     if max_depth_cap_m is not None:
         try:
             max_ref = min(max_ref, float(max_depth_cap_m))
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             log.debug("ignored", exc_info=True)
 
     if not np.isfinite(max_ref) or max_ref <= 0:
@@ -720,7 +1290,7 @@ max_depth_bins: int = 30,
     if max_supported is not None and max_depth_cap_m is not None:
         try:
             max_supported = min(max_supported, float(max_depth_cap_m))
-        except Exception:
+        except (TypeError, ValueError, KeyError):
             log.debug("ignored", exc_info=True)
 
     diag = {
@@ -1102,8 +1672,8 @@ def plot_depth_binning_sanity(
     except Exception:
         try:
             plt.close()
-        except Exception:
-            log.debug("ignored", exc_info=True)
+        except Exception as _exc:
+            log.debug("Suppressed: %s", _exc, exc_info=True)
 
 
 def plot_feature_importance(rf_model, feature_names, out_png):
@@ -1157,14 +1727,14 @@ def _funnel_df_stats(df: pd.DataFrame, stage: str, *, rr: Optional[Any] = None, 
                      hist_max_m: float = 40.0, hist_bin_m: float = 1.0) -> None:
     try:
         n = int(len(df)) if df is not None else 0
-    except Exception:
+    except TypeError:
         n = 0
     if df is None or n == 0:
         log.info("%s: n=0", stage)
         if rr is not None:
             try:
                 rr.add(f"funnel.train.{stage}.n", 0)
-            except Exception:
+            except (AttributeError, TypeError, ValueError):
                 log.debug("ignored", exc_info=True)
         return
 
@@ -1172,7 +1742,7 @@ def _funnel_df_stats(df: pd.DataFrame, stage: str, *, rr: Optional[Any] = None, 
     if depth_col in df.columns:
         try:
             d = pd.to_numeric(df[depth_col], errors="coerce").to_numpy(dtype="float64")
-        except Exception:
+        except (TypeError, ValueError):
             d = None
 
     if d is None:
@@ -1180,8 +1750,8 @@ def _funnel_df_stats(df: pd.DataFrame, stage: str, *, rr: Optional[Any] = None, 
         if rr is not None:
             try:
                 rr.add(f"funnel.train.{stage}.n", n)
-            except Exception:
-                log.debug("ignored", exc_info=True)
+            except Exception as _exc:
+                log.debug("Suppressed: %s", _exc, exc_info=True)
         return
 
     mfin = np.isfinite(d)
@@ -1202,7 +1772,7 @@ def _funnel_df_stats(df: pd.DataFrame, stage: str, *, rr: Optional[Any] = None, 
             dabs = np.abs(d[mfin])
             edges = np.arange(0.0, float(hist_max_m) + float(hist_bin_m), float(hist_bin_m))
             hist, _ = np.histogram(dabs, bins=edges)
-    except Exception:
+    except (ValueError, FloatingPointError):
         hist = None
         edges = None
 
@@ -1214,8 +1784,8 @@ def _funnel_df_stats(df: pd.DataFrame, stage: str, *, rr: Optional[Any] = None, 
             if hist is not None and edges is not None:
                 rr.add_dict(f"funnel.train.{stage}.depth_hist_0_{int(hist_max_m)}_{int(hist_bin_m)}m",
                             {"bins": edges.tolist(), "counts": hist.tolist()})
-        except Exception:
-            log.debug("ignored", exc_info=True)
+        except Exception as _exc:
+            log.debug("Suppressed: %s", _exc, exc_info=True)
 
 def sample_s2_bands_at_points(train_df: pd.DataFrame,
                              s2_paths: Dict[str, str],
@@ -1292,6 +1862,7 @@ def _sanitize_feature_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame
 def _try_reuse_model_bank(
     model_bank_dir, metadata, reason="periodic_retrain_skip",
     extra_meta=None,
+    required_context=None,
 ):
     """Attempt to load and return a previously-trained model from the model bank.
 
@@ -1326,6 +1897,27 @@ def _try_reuse_model_bank(
                 mm = json.load(_f)
         except Exception:
             mm = None
+
+    if required_context:
+        mm_ctx = mm.get("model_bank_partition") if isinstance(mm, dict) else None
+        if not isinstance(mm_ctx, dict):
+            log.warning(
+                "[MODEL_BANK] Refusing reuse from %s: saved model metadata has no model_bank_partition context.",
+                bank_dir_p,
+            )
+            return None
+        mismatch = []
+        for _k, _v in dict(required_context).items():
+            if mm_ctx.get(_k) != _v:
+                mismatch.append((_k, mm_ctx.get(_k), _v))
+        if mismatch:
+            msg = ", ".join(f"{k}: saved={sv!r} current={cv!r}" for k, sv, cv in mismatch[:6])
+            log.warning(
+                "[MODEL_BANK] Refusing reuse from %s due to partition/context mismatch (%s).",
+                bank_dir_p,
+                msg,
+            )
+            return None
 
     bank_meta = {"enabled": True, "reused_model": True, "reuse_reason": reason}
     if extra_meta:
@@ -1377,13 +1969,22 @@ def train_sdb_model(
     model_bank_max_samples: int = 100000,
     model_bank_seed: int = 1337,
     model_bank_retrain_min_new: int = 2000,
+    model_bank_context: Optional[Dict[str, Any]] = None,
+    fallback_registry: Optional[Any] = None,
 ) -> Tuple[RandomForestRegressor, Optional[LinearRegression], pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
 
     log.info("Stage 3: Feature Engineering and Model Training")
     if not S2_OPTICS_AVAILABLE:
         _bind_s2_optics_functions()
     if not S2_OPTICS_AVAILABLE:
-        log.warning("'s2_optics' module not found via lazy import. Using dummy generators.")
+        required_cols = {"B02", "B03", "B04", "B08", "stumpf_idx", "depth_m"}
+        fallback_ok = raster_paths is None and required_cols.issubset(set(train_df.columns))
+        if fallback_ok:
+            log.warning(
+                "Could not bind local s2_optics.py; using internal train.py optical fallback filters for this non-production context."
+            )
+        else:
+            raise ImportError("Could not bind the real local s2_optics module for production training.")
 
     df = train_df.copy()
 
@@ -1466,7 +2067,7 @@ def train_sdb_model(
     # extra_xyz (hydronos, ehydro, etc.) bypasses land and clear-water filters:
     # these are high-quality soundings that may be in turbid/masked zones.
     if "source_norm" in df.columns:
-        m_is_xyz = (df["source_norm"] == "extra_xyz")
+        m_is_xyz = df["source_norm"].astype(str).str.startswith("extra_xyz")
         n_xyz_before = int(m_is_xyz.sum())
         m_env |= m_is_xyz
         if n_xyz_before > 0:
@@ -1525,18 +2126,60 @@ def train_sdb_model(
     _count(df, "after brightness/depth filter")
     _funnel_df_stats(df, "after_brightness_filter", rr=rr)
 
-    df = apply_stumpf_residual_filter(
-        df,
-        enabled=True,
-        residual_threshold_std=2.5,
-        residual_abs_min_m=0.5,
-        min_points=200,
-        min_inliers=100,
-        min_depth_m=0.25,
-        max_depth_m=max_depth_sdb,
-        n_clusters=2,
-        random_state=seed,
-    )
+    # ---------------------------------------------------------------
+    # Should we skip the Stumpf residual filter?
+    # Uses the same 3-criterion check as the model selection:
+    # if the data would trigger physics-only Stumpf, don't filter
+    # out the deeper points that we'll ignore anyway.
+    # ---------------------------------------------------------------
+    _skip_stumpf_filter = False
+    if "depth_m" in df.columns and "stumpf_idx" in df.columns and len(df) > 50:
+        _d_pre = np.abs(pd.to_numeric(df["depth_m"], errors="coerce").dropna().to_numpy())
+        _si_pre = pd.to_numeric(df["stumpf_idx"], errors="coerce").dropna().to_numpy()
+        if len(_d_pre) > 50 and len(_si_pre) > 50:
+            _iqr = float(np.percentile(_d_pre, 75) - np.percentile(_d_pre, 25))
+            _full_range = float(np.max(_d_pre) - np.min(_d_pre))
+            _median_d = float(np.median(_d_pre))
+            _floor = float(np.min(_d_pre))
+            _near_floor_frac = float(np.mean(_d_pre < (_floor + 0.5)))
+
+            # Correlation between stumpf_idx and depth
+            _both = np.isfinite(_d_pre[:len(_si_pre)]) & np.isfinite(_si_pre[:len(_d_pre)])
+            _abs_corr = 0.0
+            if np.sum(_both) > 10:
+                _c = np.corrcoef(_si_pre[_both], _d_pre[_both])[0, 1]
+                _abs_corr = abs(_c) if np.isfinite(_c) else 0.0
+
+            skip_reasons = []
+            if _abs_corr < 0.3:
+                skip_reasons.append("|corr|=%.2f < 0.30" % _abs_corr)
+            if _iqr < 1.0 and _full_range > 0 and (_full_range / max(_iqr, 0.01)) > 5.0:
+                skip_reasons.append("IQR=%.2fm, range/IQR=%.1f" % (_iqr, _full_range / max(_iqr, 0.01)))
+            if _near_floor_frac > 0.80 and _median_d < 1.5:
+                skip_reasons.append("near_floor=%.0f%%, median=%.2fm" % (_near_floor_frac * 100, _median_d))
+
+            if skip_reasons:
+                _skip_stumpf_filter = True
+                log.info("[QC] Skipping Stumpf residual filter (physics-only path): %s",
+                         "; ".join(skip_reasons))
+            elif _full_range < 2.0:
+                _skip_stumpf_filter = True
+                log.info("[QC] Skipping Stumpf residual filter: depth_range=%.1fm "
+                         "too narrow to safely remove any points.", _full_range)
+
+    if not _skip_stumpf_filter:
+        df = apply_stumpf_residual_filter(
+            df,
+            enabled=True,
+            residual_threshold_std=2.5,
+            residual_abs_min_m=0.5,
+            min_points=200,
+            min_inliers=100,
+            min_depth_m=0.25,
+            max_depth_m=max_depth_sdb,
+            n_clusters=2,
+            random_state=seed,
+        )
     _count(df, "after stumpf residual filter")
     _funnel_df_stats(df, "after_stumpf_residual_filter", rr=rr)
 
@@ -1546,28 +2189,151 @@ def train_sdb_model(
         "brightness", "B03_B02", "B04_B03", "nbri", "stumpf_idx",
     ]
 
-    stumpf_lr: Optional[LinearRegression] = None
+    stumpf_lr: Optional[Any] = None
     if use_stumpf_depth and "stumpf_idx" in df.columns:
         x = pd.to_numeric(df["stumpf_idx"], errors="coerce").to_numpy(np.float32)
         y_raw = pd.to_numeric(df["depth_m"], errors="coerce").to_numpy(np.float32)
-        # Use positive magnitude for Stumpf LR (consistent with RF training)
         y = np.abs(y_raw)
         m = np.isfinite(x) & np.isfinite(y)
 
         if np.sum(m) >= 20:
             try:
-                stumpf_lr = LinearRegression()
-                stumpf_lr.fit(x[m].reshape(-1, 1), y[m])
+                x_fit = x[m].astype(np.float64)
+                y_fit = y[m].astype(np.float64)
+                corr = np.corrcoef(x_fit, y_fit)[0, 1] if x_fit.size >= 3 else np.nan
+                increasing = bool(not np.isfinite(corr) or corr >= 0.0)
+                x_unique = np.unique(np.round(x_fit, 6))
 
-                all_x = x.reshape(-1, 1)
-                pred = np.full(len(df), np.nan, dtype=np.float32)
-                pred[m] = stumpf_lr.predict(all_x[m]).astype(np.float32)
-                df["stumpf_depth"] = pred
+                # ---------------------------------------------------------------
+                # Decision: ATL-calibrated vs physics-only Stumpf model
+                # ---------------------------------------------------------------
+                # Three independent criteria — ANY one triggers physics-only:
+                #
+                # 1. CORRELATION TEST: |corr(stumpf_idx, depth)| < 0.3
+                #    The optical ratio has no meaningful relationship with
+                #    the ATL depths — regression would learn noise.
+                #
+                # 2. DEPTH DISTRIBUTION SKEW: IQR < 1m AND range/IQR > 5
+                #    Data is dominated by a shallow cluster with sparse
+                #    deeper outliers. Regression would be driven by the
+                #    cluster, not the real depth-reflectance relationship.
+                #
+                # 3. NEAR-FLOOR DOMINANCE: >80% of points within 0.5m of
+                #    the shallowest depth AND median depth < 1.5m.
+                #    Almost all ATL returns are surface noise.
+                # ---------------------------------------------------------------
+                depth_range = float(np.max(y_fit) - np.min(y_fit))
+                depth_std = float(np.std(y_fit))
+                depth_iqr = float(np.percentile(y_fit, 75) - np.percentile(y_fit, 25))
+                depth_median = float(np.median(y_fit))
+                abs_corr = abs(corr) if np.isfinite(corr) else 0.0
 
-                feat_cols.append("stumpf_depth")
-                log.info("Fitted auxiliary stumpf_depth LR model (positive magnitudes).")
+                # Near-floor: fraction of points within 0.5m of the minimum
+                depth_floor = float(np.min(y_fit))
+                near_floor_frac = float(np.mean(y_fit < (depth_floor + 0.5)))
+
+                use_physics_only = False
+                physics_only_reasons = []
+
+                # Criterion 1: weak correlation
+                if abs_corr < 0.3:
+                    use_physics_only = True
+                    physics_only_reasons.append("|corr|=%.2f < 0.30" % abs_corr)
+
+                # Criterion 2: skewed depth distribution
+                if depth_iqr < 1.0 and depth_range > 0 and (depth_range / max(depth_iqr, 0.01)) > 5.0:
+                    use_physics_only = True
+                    physics_only_reasons.append(
+                        "IQR=%.2fm, range/IQR=%.1f > 5" % (depth_iqr, depth_range / max(depth_iqr, 0.01)))
+
+                # Criterion 3: near-floor dominance
+                if near_floor_frac > 0.80 and depth_median < 1.5:
+                    use_physics_only = True
+                    physics_only_reasons.append(
+                        "near_floor=%.0f%%, median=%.2fm" % (near_floor_frac * 100, depth_median))
+
+                if use_physics_only:
+                    log.info("[Stumpf] ATL quality check → PHYSICS-ONLY: %s",
+                             "; ".join(physics_only_reasons))
+                else:
+                    log.info("[Stumpf] ATL quality check → ATL-CALIBRATED "
+                             "(|corr|=%.2f, IQR=%.2fm, near_floor=%.0f%%)",
+                             abs_corr, depth_iqr, near_floor_frac * 100)
+
+                use_isotonic = (not use_physics_only
+                                and x_unique.size >= 10
+                                and depth_range >= 2.0
+                                and depth_std >= 0.5)
+
+                if use_isotonic:
+                    stumpf_lr = IsotonicRegression(increasing=increasing, out_of_bounds="clip")
+                    stumpf_lr.fit(x_fit, y_fit)
+                    pred = np.full(len(df), np.nan, dtype=np.float32)
+                    pred[m] = np.asarray(stumpf_lr.predict(x_fit), dtype=np.float32)
+                    df["stumpf_depth"] = pred
+                    feat_cols.append("stumpf_depth")
+                    log.info("Fitted monotonic stumpf_depth model using IsotonicRegression (increasing=%s).", increasing)
+                else:
+                    if use_physics_only:
+                        # -------------------------------------------------------
+                        # PHYSICS-ONLY STUMPF MODEL (no ATL calibration)
+                        # -------------------------------------------------------
+                        # When training data is shallow-dominated (IQR < 1m),
+                        # the ATL points are mostly near-surface noise. Using
+                        # them to calibrate produces a flat or inverted slope.
+                        #
+                        # Instead, use the Stumpf ratio as a pure physics-based
+                        # relative depth index. The ratio DECREASES with depth
+                        # (blue penetrates deeper than green, so in deeper water
+                        # the green signal drops faster → lower ratio).
+                        #
+                        # depth ≈ physics_max * (si_max - stumpf_idx) / si_range
+                        #
+                        # where si_max = value at shallowest water (shoreline).
+                        # Reference: Stumpf et al. 2003, Lyzenga 1978
+                        # -------------------------------------------------------
+                        si_min = float(np.percentile(x_fit, 2))
+                        si_max = float(np.percentile(x_fit, 98))
+                        si_range = max(si_max - si_min, 0.01)
+
+                        physics_max_depth = max_depth_sdb if max_depth_sdb and max_depth_sdb < 100 else 20.0
+
+                        slope = -physics_max_depth / si_range
+                        intercept = physics_max_depth * si_max / si_range
+
+                        stumpf_lr = LinearRegression()
+                        stumpf_lr.coef_ = np.array([slope])
+                        stumpf_lr.intercept_ = intercept
+
+                        pred = np.full(len(df), np.nan, dtype=np.float32)
+                        pred[m] = np.clip(
+                            intercept + slope * x_fit, 0.0, physics_max_depth
+                        ).astype(np.float32)
+                        df["stumpf_depth"] = pred
+                        feat_cols.append("stumpf_depth")
+                        log.info("[Stumpf PHYSICS] Physics-only model (no ATL calibration): "
+                                 "depth = %.2f + %.2f * stumpf_idx "
+                                 "(si_range=[%.3f, %.3f], physics_max=%.1fm). "
+                                 "Shallow-dominated ATL data bypassed.",
+                                 intercept, slope, si_min, si_max, physics_max_depth)
+                    else:
+                        # Standard linear fit (adequate data quality)
+                        stumpf_lr = LinearRegression()
+                        stumpf_lr.fit(x_fit.reshape(-1, 1), y_fit)
+                        pred = np.full(len(df), np.nan, dtype=np.float32)
+                        pred[m] = stumpf_lr.predict(x_fit.reshape(-1, 1)).astype(np.float32)
+                        df["stumpf_depth"] = pred
+                        feat_cols.append("stumpf_depth")
+                        log.info("Stumpf LR coefficients: depth = %.3f + %.3f * stumpf_idx",
+                                 float(stumpf_lr.intercept_), float(stumpf_lr.coef_[0]))
+                        if depth_range < 2.0 or depth_std < 0.5:
+                            log.info("Fitted linear stumpf_depth model (depth_range=%.1fm, "
+                                     "std=%.2fm too narrow for isotonic).",
+                                     depth_range, depth_std)
+                        else:
+                            log.info("Fitted auxiliary stumpf_depth LR model.")
             except Exception as e:
-                log.warning("Stumpf LR failed: %s", e)
+                log.warning("Stumpf monotonic/LR model failed: %s", e)
 
     df = _sanitize_feature_columns(df, feat_cols + ["depth_m", "sample_weight"])
     _count(df, "after sanitize (inf->nan, coercion)")
@@ -1589,23 +2355,38 @@ def train_sdb_model(
     _funnel_df_stats(df, "after_finite_row_drop", rr=rr)
 
     training_bounds: Dict[str, Dict[str, float]] = {}
+    doa_percentiles = (2.0, 98.0)
+    doa_buffer_frac = 0.03
     for col in feat_cols:
         vals = df[col].to_numpy()
         vals = vals[np.isfinite(vals)]
         if vals.size > 0:
-            p_min, p_max = np.percentile(vals, [0.5, 99.5])
-            buff = (p_max - p_min) * 0.1
+            p_min, p_max = np.percentile(vals, doa_percentiles)
+            buff = max((p_max - p_min) * doa_buffer_frac, 1e-6)
             training_bounds[col] = {"min": float(p_min - buff), "max": float(p_max + buff)}
         else:
             training_bounds[col] = {"min": -9999.0, "max": 9999.0}
 
-    log.info("Calculated Domain of Applicability bounds for %s features.", len(feat_cols))
+    log.info("Calculated conservative Domain of Applicability bounds for %s features.", len(feat_cols))
 
-    doa_weights: Dict[str, float] = {}
-    try:
-        doa_weights = {c: 1.0 / max(len(feat_cols), 1) for c in feat_cols}
-    except Exception:
-        doa_weights = {c: 1.0 / max(len(feat_cols), 1) for c in feat_cols}
+    doa_priority = {
+        "stumpf_depth": 6.0,
+        "stumpf_idx": 4.0,
+        "B04_B03": 3.0,
+        "B03_B02": 3.0,
+        "brightness": 2.0,
+        "B03": 1.5,
+        "B02": 1.5,
+        "B04": 1.2,
+        "B08": 1.0,
+        "log_B03": 1.0,
+        "log_B02": 1.0,
+        "log_B04": 0.8,
+        "log_B08": 0.6,
+        "nbri": 1.5,
+    }
+    weight_sum = float(sum(doa_priority.get(c, 1.0) for c in feat_cols)) or 1.0
+    doa_weights: Dict[str, float] = {c: float(doa_priority.get(c, 1.0) / weight_sum) for c in feat_cols}
 
     metadata: Dict[str, Any] = {
         "feature_columns": feat_cols,
@@ -1619,10 +2400,10 @@ def train_sdb_model(
         "training_bounds": _to_python_float(training_bounds),
         "doa": {
             "mode": "soft_exp",
-            "soft_k_default": 3.0,
-            "threshold_default": 0.90,
+            "soft_k_default": 8.0,
+            "threshold_default": 0.97,
             "weights": _to_python_float(doa_weights),
-            "bounds_method": {"percentiles": [0.5, 99.5], "buffer_frac": 0.10},
+            "bounds_method": {"percentiles": [2.0, 98.0], "buffer_frac": 0.03},
         },
         "water_class": water_class,
         "max_depth_sdb": max_depth_sdb,
@@ -1635,6 +2416,8 @@ def train_sdb_model(
     metadata["min_samples_per_bin"] = int(min_samples_per_bin)
     metadata["max_depth_sdb_auto"] = None
     metadata["max_depth_sdb_auto_diagnostics"] = {}
+    if model_bank_context:
+        metadata["model_bank_partition"] = _to_python_float(dict(model_bank_context))
 
 
     # --- MODEL BANK (bounded reservoir) ---
@@ -1667,6 +2450,7 @@ def train_sdb_model(
                     'max_depth_sdb': float(max_depth_sdb) if max_depth_sdb is not None else None,
                     'linf_enabled': bool(linf_enabled),
                     'linf_estimate': str(linf_estimate),
+                    'partition': dict(model_bank_context or {}),
                 },
                 schema_cols=bank_schema_cols,
             )
@@ -1717,6 +2501,7 @@ def train_sdb_model(
                         "new_since_train": int(new_since_train),
                         "retrain_min_new": int(model_bank_retrain_min_new),
                     },
+                    required_context=model_bank_context,
                 )
                 if result is not None:
                     return result
@@ -1737,6 +2522,7 @@ def train_sdb_model(
                         "min_training_points_for_sdb": int(min_training_points_for_sdb),
                         "n_samples": int(len(df)),
                     },
+                    required_context=model_bank_context,
                 )
                 if result is not None:
                     return result
@@ -1755,36 +2541,47 @@ def train_sdb_model(
 
 
     atl_like = {"atl03", "atl24", "atl_agreed", "atl03+atl24_agree", "atl03_atl24_agree"}
-    df_atl = df[df["source_norm"].isin(atl_like)].copy()
-
-    if df_atl.empty:
-        log.info("No ATL-like sources found. Training solely on non-ATL data.")
-        df_atl = df.copy()
+    df_validation = df.copy()
+    if "source_norm" in df_validation.columns:
+        src_series = df_validation["source_norm"].astype(str).str.lower()
+        val_mask = src_series.str.startswith("extra_xyz") | src_series.isin(atl_like)
+        if bool(val_mask.any()):
+            df_validation = df_validation.loc[val_mask].copy()
+    if df_validation.empty:
+        log.info("Validation candidate set is empty after source filtering. Falling back to full training dataframe.")
+        df_validation = df.copy()
+    metadata.setdefault("validation_support", {})
+    metadata["validation_support"].update({
+        "uses_authoritative_extra_xyz": bool("source_norm" in df_validation.columns and df_validation["source_norm"].astype(str).str.lower().str.startswith("extra_xyz").any()),
+        "uses_atl": bool("source_norm" in df_validation.columns and df_validation["source_norm"].astype(str).str.lower().isin(atl_like).any()),
+        "n_candidates": int(len(df_validation)),
+    })
 
     # --- TRAIN/TEST SPLIT LOGIC ---
     if not spatial_split:
-        log.info("Performing Stratified Random Split (by Depth Quantile)...")
+        log.info("Performing Stratified Random Split (by Depth Quantile) on mixed authoritative+ATL support...")
         idx_tr, idx_te = stratified_train_test_split(
-            df_atl, 
-            target_col='depth_m', 
-            test_size=0.2, 
+            df_validation,
+            target_col='depth_m',
+            test_size=0.2,
             seed=seed
         )
     else:
         # Pick the spatial cluster that best represents the full depth range.
-        log.info("Performing Spatial Split (K-Means Clustering)...")
-        coords = df_atl[["longitude", "latitude"]].to_numpy()
+        log.info("Performing Spatial Split (K-Means Clustering) on mixed authoritative+ATL support...")
+        coords = df_validation[["longitude", "latitude"]].to_numpy()
 
         # Robustness: KMeans can fail (or behave poorly) when sample counts are small.
         # Also, sklearn versions prior to 1.4 may not accept n_init=10.
         do_spatial = coords.shape[0] >= 200
         if not do_spatial:
             log.warning(
-                f"Spatial split requested but too few samples for stable clustering (n={coords.shape[0]}). "
-                "Falling back to stratified random split."
+                "Spatial split requested but too few samples for stable clustering (n=%d). "
+                "Falling back to stratified random split.",
+                coords.shape[0],
             )
             idx_tr, idx_te = stratified_train_test_split(
-                df_atl,
+                df_validation,
                 target_col='depth_m',
                 test_size=0.2,
                 seed=seed
@@ -1800,38 +2597,262 @@ def train_sdb_model(
                 km = KMeans(n_clusters=2, random_state=seed, n_init=10).fit(coords)
         
         if do_spatial:
-            # Analyze clusters to pick a "good" test set (one that isn't just shallow)
-            # We want a test cluster that has a p95 depth similar to the global p95.
-            global_p95 = np.percentile(df_atl['depth_m'], 95)
-            best_k = 0
-            best_score = float('inf')
-            
-            stats_by_k = {}
-            for k in range(int(km.n_clusters)):
-                mask = (km.labels_ == k)
-                n_k = int(np.sum(mask))
-                if n_k < 50:
-                    continue  # Skip tiny clusters
+            # Analyze clusters using positive depth magnitudes. Reject shallow, low-variance,
+            # non-representative holdouts instead of scoring them as meaningful spatial tests.
+            depth_abs_all = np.abs(pd.to_numeric(df_validation['depth_m'], errors='coerce').to_numpy(dtype=float))
+            finite_all = np.isfinite(depth_abs_all)
+            depth_abs_all = depth_abs_all[finite_all]
 
-                d_k = df_atl.loc[df_atl.index[mask], 'depth_m']
-                p95_k = float(np.percentile(d_k, 95))
+            if depth_abs_all.size == 0:
+                log.warning(
+                    "Spatial split requested but no finite depth values were available. "
+                    "Using full ATL set for training and leaving the spatial test set empty."
+                )
+                idx_tr = df_validation.index.to_numpy()
+                idx_te = np.array([], dtype=df_validation.index.dtype)
+                metadata.setdefault('spatial_split_status', {})
+                metadata['spatial_split_status'].update({
+                    'ok': False,
+                    'reason': 'no_finite_depth_values',
+                })
+            else:
+                global_p50 = float(np.percentile(depth_abs_all, 50))
+                global_p95 = float(np.percentile(depth_abs_all, 95))
+                global_span = float(np.nanmax(depth_abs_all) - np.nanmin(depth_abs_all))
+                global_std = float(np.nanstd(depth_abs_all))
+                n_total = int(depth_abs_all.size)
+                min_test_n = max(30, int(round(0.08 * n_total)))
+                min_test_frac = 0.10
+                max_test_frac = 0.60
+                min_depth_span_m = min(max(0.50, 0.25 * global_span), global_span) if global_span > 0 else 0.50
+                min_depth_std_m = max(0.10, 0.20 * global_std)
+                min_test_p95_ratio = 0.85
+                min_train_p95_ratio = 0.85
+                min_test_p50_ratio = 0.75
+                max_test_p50_ratio = 1.25
+                min_train_p50_ratio = 0.75
+                max_train_p50_ratio = 1.25
+                min_test_std_ratio = 0.50 if global_std > 0 else 0.0
+                min_train_std_ratio = 0.50 if global_std > 0 else 0.0
+                max_test_p95_abs_diff_m = max(0.30, 0.20 * global_p95)
+                max_train_p95_abs_diff_m = max(0.30, 0.20 * global_p95)
+                max_test_p50_abs_diff_m = max(0.20, 0.20 * global_p50)
+                max_train_p50_abs_diff_m = max(0.20, 0.20 * global_p50)
+                global_sources = set(df_validation['source_norm'].dropna().astype(str).unique()) if 'source_norm' in df_validation.columns else set()
 
-                # Score: diff in p95 depth (lower is better) so test set spans deep water too
-                score = float(abs(p95_k - global_p95))
-                stats_by_k[k] = {'n': n_k, 'p95': p95_k, 'score': score}
+                best = None
+                candidate_stats = []
+                for k in range(int(km.n_clusters)):
+                    mask = (km.labels_ == k)
+                    n_k = int(np.sum(mask))
+                    if n_k < min_test_n:
+                        continue
 
-                if score < best_score:
-                    best_score = score
-                    best_k = k
+                    test_frac = n_k / max(1, n_total)
+                    if test_frac < min_test_frac or test_frac > max_test_frac:
+                        continue
 
-            p95_best = float(stats_by_k.get(best_k, {}).get('p95', float('nan')))
-            log.info("Spatial Split: Global p95=%.2fm. Selected Cluster %s as Test (p95=%.2fm).", global_p95, best_k, p95_best)
-            
-            idx_te = df_atl.index[km.labels_ == best_k].to_numpy()
-            idx_tr = df_atl.index[km.labels_ != best_k].to_numpy()
+                    d_test = np.abs(pd.to_numeric(
+                        df_validation.loc[df_validation.index[mask], 'depth_m'], errors='coerce'
+                    ).to_numpy(dtype=float))
+                    d_test = d_test[np.isfinite(d_test)]
+                    if d_test.size < min_test_n:
+                        continue
 
-    idx_xyz = df[df["source_norm"].astype(str).str.lower().str.startswith("extra_xyz")].index.to_numpy()
-    final_tr_indices = np.unique(np.concatenate([idx_tr, idx_xyz]))
+                    d_train = np.abs(pd.to_numeric(
+                        df_validation.loc[df_validation.index[~mask], 'depth_m'], errors='coerce'
+                    ).to_numpy(dtype=float))
+                    d_train = d_train[np.isfinite(d_train)]
+                    if d_train.size < min_test_n:
+                        continue
+
+                    test_span = float(np.nanmax(d_test) - np.nanmin(d_test)) if d_test.size else 0.0
+                    test_std = float(np.nanstd(d_test)) if d_test.size else 0.0
+                    train_span = float(np.nanmax(d_train) - np.nanmin(d_train)) if d_train.size else 0.0
+                    train_std = float(np.nanstd(d_train)) if d_train.size else 0.0
+                    test_p50 = float(np.percentile(d_test, 50))
+                    test_p95 = float(np.percentile(d_test, 95))
+                    train_p50 = float(np.percentile(d_train, 50))
+                    train_p95 = float(np.percentile(d_train, 95))
+
+                    test_p95_ratio = (test_p95 / global_p95) if global_p95 > 0 else 1.0
+                    train_p95_ratio = (train_p95 / global_p95) if global_p95 > 0 else 1.0
+                    test_p50_ratio = (test_p50 / global_p50) if global_p50 > 0 else 1.0
+                    train_p50_ratio = (train_p50 / global_p50) if global_p50 > 0 else 1.0
+                    test_std_ratio = (test_std / global_std) if global_std > 0 else 1.0
+                    train_std_ratio = (train_std / global_std) if global_std > 0 else 1.0
+
+                    depth_floor_ok = (
+                        (test_span >= min_depth_span_m)
+                        and (train_span >= min_depth_span_m)
+                        and (test_std >= min_depth_std_m)
+                        and (train_std >= min_depth_std_m)
+                    )
+                    depth_ratio_ok = (
+                        (test_p95_ratio >= min_test_p95_ratio)
+                        and (train_p95_ratio >= min_train_p95_ratio)
+                        and (min_test_p50_ratio <= test_p50_ratio <= max_test_p50_ratio)
+                        and (min_train_p50_ratio <= train_p50_ratio <= max_train_p50_ratio)
+                        and (test_std_ratio >= min_test_std_ratio)
+                        and (train_std_ratio >= min_train_std_ratio)
+                    )
+                    depth_absdiff_ok = (
+                        (abs(test_p95 - global_p95) <= max_test_p95_abs_diff_m)
+                        and (abs(train_p95 - global_p95) <= max_train_p95_abs_diff_m)
+                        and (abs(test_p50 - global_p50) <= max_test_p50_abs_diff_m)
+                        and (abs(train_p50 - global_p50) <= max_train_p50_abs_diff_m)
+                    )
+                    depth_ok = depth_floor_ok and depth_ratio_ok and depth_absdiff_ok
+
+                    reject_reasons = []
+                    if test_span < min_depth_span_m:
+                        reject_reasons.append('test_span_small')
+                    if train_span < min_depth_span_m:
+                        reject_reasons.append('train_span_small')
+                    if test_std < min_depth_std_m:
+                        reject_reasons.append('test_std_small')
+                    if train_std < min_depth_std_m:
+                        reject_reasons.append('train_std_small')
+                    if test_p95_ratio < min_test_p95_ratio:
+                        reject_reasons.append('test_p95_too_shallow')
+                    if train_p95_ratio < min_train_p95_ratio:
+                        reject_reasons.append('train_p95_too_shallow')
+                    if not (min_test_p50_ratio <= test_p50_ratio <= max_test_p50_ratio):
+                        reject_reasons.append('test_p50_unrepresentative')
+                    if not (min_train_p50_ratio <= train_p50_ratio <= max_train_p50_ratio):
+                        reject_reasons.append('train_p50_unrepresentative')
+                    if test_std_ratio < min_test_std_ratio:
+                        reject_reasons.append('test_variance_too_small')
+                    if train_std_ratio < min_train_std_ratio:
+                        reject_reasons.append('train_variance_too_small')
+                    if abs(test_p95 - global_p95) > max_test_p95_abs_diff_m:
+                        reject_reasons.append('test_p95_absdiff_large')
+                    if abs(train_p95 - global_p95) > max_train_p95_abs_diff_m:
+                        reject_reasons.append('train_p95_absdiff_large')
+                    if abs(test_p50 - global_p50) > max_test_p50_abs_diff_m:
+                        reject_reasons.append('test_p50_absdiff_large')
+                    if abs(train_p50 - global_p50) > max_train_p50_abs_diff_m:
+                        reject_reasons.append('train_p50_absdiff_large')
+
+                    if 'source_norm' in df_validation.columns:
+                        test_sources = set(df_validation.loc[df_validation.index[mask], 'source_norm'].dropna().astype(str).unique())
+                        train_sources = set(df_validation.loc[df_validation.index[~mask], 'source_norm'].dropna().astype(str).unique())
+                    else:
+                        test_sources = set()
+                        train_sources = set()
+                    source_overlap = len(test_sources & train_sources)
+                    source_ok = (len(test_sources) > 0 and source_overlap > 0) or (not global_sources)
+
+                    score = (
+                        abs(test_p95 - global_p95)
+                        + 0.50 * abs(test_p50 - global_p50)
+                        + 0.25 * abs(test_frac - 0.20) * max(global_p95, 1.0)
+                    )
+                    if test_span > 0:
+                        score -= 0.10 * min(test_span, global_span)
+                    if test_std > 0:
+                        score -= 0.10 * min(test_std, global_std)
+                    if source_overlap > 0:
+                        score -= 0.05 * min(source_overlap, 3)
+
+                    candidate = {
+                        'cluster': int(k),
+                        'n_test': n_k,
+                        'test_frac': float(test_frac),
+                        'test_p50': test_p50,
+                        'test_p95': test_p95,
+                        'train_p50': train_p50,
+                        'train_p95': train_p95,
+                        'test_span': test_span,
+                        'test_std': test_std,
+                        'train_std': train_std,
+                        'test_p50_ratio': float(test_p50_ratio),
+                        'test_p95_ratio': float(test_p95_ratio),
+                        'train_p50_ratio': float(train_p50_ratio),
+                        'train_p95_ratio': float(train_p95_ratio),
+                        'test_std_ratio': float(test_std_ratio),
+                        'train_std_ratio': float(train_std_ratio),
+                        'depth_ok': bool(depth_ok),
+                        'source_ok': bool(source_ok),
+                        'score': float(score),
+                        'reject_reasons': list(reject_reasons),
+                        'test_sources': sorted(test_sources),
+                        'train_sources': sorted(train_sources),
+                    }
+                    candidate_stats.append(candidate)
+                    log.info(
+                        "Spatial split candidate cluster=%s n_train=%s n_test=%s train_p95=%.2fm test_p95=%.2fm "
+                        "train_p95/global=%.2f test_p95/global=%.2f train_std/global=%.2f test_std/global=%.2f "
+                        "train_sources=%s test_sources=%s depth_ok=%s source_ok=%s score=%.3f reject=%s",
+                        candidate['cluster'],
+                        int(d_train.size),
+                        candidate['n_test'],
+                        candidate['train_p95'],
+                        candidate['test_p95'],
+                        candidate['train_p95_ratio'],
+                        candidate['test_p95_ratio'],
+                        candidate['train_std_ratio'],
+                        candidate['test_std_ratio'],
+                        candidate['train_sources'],
+                        candidate['test_sources'],
+                        candidate['depth_ok'],
+                        candidate['source_ok'],
+                        candidate['score'],
+                        ','.join(candidate['reject_reasons']) if candidate['reject_reasons'] else 'none',
+                    )
+
+                    if depth_ok and source_ok:
+                        if best is None or candidate['score'] < best['score']:
+                            best = candidate
+
+                metadata.setdefault('spatial_split_status', {})
+                metadata['spatial_split_status'].update({
+                    'ok': bool(best is not None),
+                    'min_test_n': int(min_test_n),
+                    'min_depth_span_m': float(min_depth_span_m),
+                    'min_depth_std_m': float(min_depth_std_m),
+                    'min_test_p95_ratio': float(min_test_p95_ratio),
+                    'min_train_p95_ratio': float(min_train_p95_ratio),
+                    'min_test_std_ratio': float(min_test_std_ratio),
+                    'min_train_std_ratio': float(min_train_std_ratio),
+                    'candidate_count': int(len(candidate_stats)),
+                })
+
+                if best is None:
+                    log.warning(
+                        "Spatial split requested, but no representative cluster holdout passed the minimum "
+                        "depth-span/source-overlap tests. Training on the full ATL set and leaving the "
+                        "spatial test set empty rather than reporting a misleading spatial score."
+                    )
+                    idx_tr = df_validation.index.to_numpy()
+                    idx_te = np.array([], dtype=df_validation.index.dtype)
+                    metadata['spatial_split_status']['reason'] = 'no_representative_cluster_holdout'
+                else:
+                    log.info(
+                        "Spatial Split: Global p50=%.2fm p95=%.2fm. Selected Cluster %s as Test "
+                        "(test_p50=%.2fm test_p95=%.2fm; train_p50=%.2fm train_p95=%.2fm).",
+                        global_p50,
+                        global_p95,
+                        best['cluster'],
+                        best['test_p50'],
+                        best['test_p95'],
+                        best['train_p50'],
+                        best['train_p95'],
+                    )
+                    idx_te = df_validation.index[km.labels_ == best['cluster']].to_numpy()
+                    idx_tr = df_validation.index[km.labels_ != best['cluster']].to_numpy()
+                    metadata['spatial_split_status'].update({
+                        'selected_cluster': int(best['cluster']),
+                        'selected_test_n': int(best['n_test']),
+                        'selected_test_p50_m': float(best['test_p50']),
+                        'selected_test_p95_m': float(best['test_p95']),
+                        'selected_test_span_m': float(best['test_span']),
+                        'selected_test_std_m': float(best['test_std']),
+                        'selected_test_sources': list(best['test_sources']),
+                        'selected_train_sources': list(best['train_sources']),
+                    })
+
+    final_tr_indices = np.unique(np.asarray(idx_tr, dtype=df.index.dtype))
 
     df_tr = df.loc[final_tr_indices].copy()
     df_te = df.loc[idx_te].copy()
@@ -1858,6 +2879,24 @@ def train_sdb_model(
     _count(df_te, "final test set")
     _funnel_df_stats(df_tr, "split_train", rr=rr)
     _funnel_df_stats(df_te, "split_test", rr=rr)
+
+    guidance_settings = _compute_physics_guidance_settings(df)
+    if bool(spatial_split):
+        guidance_settings = _tighten_guidance_for_unrepresentative_spatial_holdout(
+            guidance_settings,
+            metadata.get("spatial_split_status", {}),
+        )
+    metadata["physics_guidance"] = _to_python_float(guidance_settings)
+    log.info(
+        "Physics-guided training mode: support_score=%.2f low_support=%s n=%d tracks=%d depth_span=%.2fm correction_alpha=%.2f residual_clip=%.2fm",
+        guidance_settings.get("support_score", 0.0),
+        guidance_settings.get("low_support", True),
+        guidance_settings.get("n_points", 0),
+        guidance_settings.get("unique_tracks", 0),
+        guidance_settings.get("depth_span_m", 0.0),
+        guidance_settings.get("correction_alpha", 0.35),
+        guidance_settings.get("residual_clip_m", 0.5),
+    )
 
     rf = RandomForestRegressor(
         n_estimators=300,
@@ -1921,8 +2960,9 @@ def train_sdb_model(
             vc1 = df_out[source_col_local].value_counts(dropna=False)
             dom1 = float(vc1.iloc[0] / max(1, len(df_out))) if len(vc1) else 0.0
             log.warning(
-                f"Final source quota cannot be satisfied with a single source. "
-                f"Applied target downsampling only: {n0:,} -> {len(df_out):,} rows; dominant source fraction remains {dom1:.3f}."
+                "Final source quota cannot be satisfied with a single source. "
+                "Applied target downsampling only: %s -> %s rows; dominant source fraction remains %.3f.",
+                f"{n0:,}", f"{len(df_out):,}", dom1,
             )
             log.info("Source counts before quota: %s", vc0.to_dict())
             log.info("Source counts after quota: %s", vc1.to_dict())
@@ -1954,8 +2994,9 @@ def train_sdb_model(
             # Refilling would violate the source-fraction invariant.
             if total_capped < target_n:
                 log.warning(
-                    f"Final source quota limits available rows below target: "
-                    f"target={target_n:,}, quota-limited rows={total_capped:,}. Applying strict fraction cap on actual rows."
+                    "Final source quota limits available rows below target: "
+                    "target=%s, quota-limited rows=%s. Applying strict fraction cap on actual rows.",
+                    f"{target_n:,}", f"{total_capped:,}",
                 )
 
             # Second pass enforces max_source_frac on the ACTUAL retained row count (not target_n),
@@ -1989,7 +3030,8 @@ def train_sdb_model(
                 df_out = _df.loc[keep_idx].copy()
                 log.warning(
                     "[TRAIN][QC] Strict actual-row source quota collapsed sample count severely; "
-                    f"falling back to minimal multi-source subset (n={len(df_out)})."
+                    "falling back to minimal multi-source subset (n=%d).",
+                    len(df_out),
                 )
             else:
                 keep_parts = [src_idx[s][:counts[s]] for s in counts if counts[s] > 0]
@@ -1999,8 +3041,10 @@ def train_sdb_model(
         vc1 = df_out[source_col_local].value_counts(dropna=False)
         dom1 = float(vc1.iloc[0] / max(1, len(df_out))) if len(vc1) else 0.0
         log.warning(
-            f"Enforced final source quota (target={target_n:,}, max_source_frac={max_source_frac:.2f}, quota={quota_n:,}): "
-            f"{n0:,} -> {len(df_out):,} rows. Dominant source fraction {dom0:.3f} -> {dom1:.3f}."
+            "Enforced final source quota (target=%s, max_source_frac=%.2f, quota=%s): "
+            "%s -> %s rows. Dominant source fraction %.3f -> %.3f.",
+            f"{target_n:,}", max_source_frac, f"{quota_n:,}",
+            f"{n0:,}", f"{len(df_out):,}", dom0, dom1,
         )
         log.info("Source counts before quota: %s", vc0.to_dict())
         log.info("Source counts after quota: %s", vc1.to_dict())
@@ -2049,9 +3093,54 @@ def train_sdb_model(
     if pct_negative < 0.8:
         log.warning("Only %.1f%% of depths are negative; verify sign convention in source data", pct_negative*100)
 
-    # Model trains on positive depth magnitude; predict.py negates output for final raster.
-    y_train = np.abs(y_train_raw)
-    log.info("Converted depths to positive magnitudes for training: [%.2f, %.2f] m", y_train[np.isfinite(y_train)].min(), y_train[np.isfinite(y_train)].max())
+    # Model uses a physics-first baseline (Stumpf depth) plus a bounded RF residual.
+    y_train_mag = np.abs(y_train_raw)
+    log.info("Converted depths to positive magnitudes for training: [%.2f, %.2f] m", y_train_mag[np.isfinite(y_train_mag)].min(), y_train_mag[np.isfinite(y_train_mag)].max())
+
+    _anchor_good = bool(guidance_settings.get("anchor_support_good", False))
+
+    if _anchor_good:
+        # Dense authoritative XYZ: train RF on ABSOLUTE depth, not Stumpf residual.
+        # The Stumpf baseline is wrong in turbid channels (low blue/green ratio
+        # misinterpreted as shallow).  Training on the residual forces the RF to
+        # fight against the wrong baseline.  Training on absolute depth lets the
+        # RF learn the correct spectral→depth mapping directly from survey data.
+        y_train = y_train_mag.astype(np.float32)
+        metadata["prediction_mode"] = "direct_depth"
+        metadata["residual_clip_m"] = 0.0
+        metadata["residual_target_stats"] = {
+            "min": float(np.nanmin(y_train)),
+            "max": float(np.nanmax(y_train)),
+            "p05": float(np.nanpercentile(y_train, 5)),
+            "p95": float(np.nanpercentile(y_train, 95)),
+        }
+        log.info(
+            "Training RF on DIRECT DEPTH (anchor_support_good): range [%.2f, %.2f] m "
+            "(bypassing Stumpf residual architecture for turbid-water accuracy)",
+            float(np.nanmin(y_train)), float(np.nanmax(y_train)),
+        )
+    else:
+        if "stumpf_depth" not in df_tr_fit.columns:
+            log.error("Physics-guided residual mode requires stumpf_depth feature; training aborted.")
+            raise ValueError("Missing stumpf_depth feature for physics-guided residual training")
+        stumpf_base_train = np.maximum(pd.to_numeric(df_tr_fit["stumpf_depth"], errors="coerce").to_numpy(dtype=np.float32), 0.0)
+        residual_clip_m = float(guidance_settings.get("residual_clip_m", 0.5))
+        y_train = np.clip(y_train_mag - stumpf_base_train, -residual_clip_m, residual_clip_m).astype(np.float32)
+        metadata["prediction_mode"] = "stumpf_residual"
+        metadata["residual_clip_m"] = residual_clip_m
+        metadata["residual_target_stats"] = {
+            "min": float(np.nanmin(y_train)),
+            "max": float(np.nanmax(y_train)),
+            "p05": float(np.nanpercentile(y_train, 5)),
+            "p95": float(np.nanpercentile(y_train, 95)),
+        }
+        log.info(
+            "Training RF on bounded residuals about Stumpf baseline: residual range [%.2f, %.2f] m (clip=±%.2f, alpha=%.2f)",
+            float(np.nanmin(y_train)),
+            float(np.nanmax(y_train)),
+            residual_clip_m,
+            float(guidance_settings.get("correction_alpha", 0.35)),
+        )
 
     # Guardrail: avoid single-source domination
     if 'source' in df_tr_fit.columns or 'source_norm' in df_tr_fit.columns:
@@ -2068,8 +3157,9 @@ def train_sdb_model(
                 metadata['training_qc']['dominant_source_frac'] = float(dom_frac)
                 if dom_frac > 0.90:
                     log.warning(
-                        f"Dominant source '{dom_src}' contributes {dom_frac*100:.1f}% of training rows ({dom_n}/{total_n}). "
-                        "Expect weak generalization / source-specific bias."
+                        "Dominant source '%s' contributes %.1f%% of training rows (%d/%d). "
+                        "Expect weak generalization / source-specific bias.",
+                        dom_src, dom_frac * 100, dom_n, total_n,
                     )
                 # Conservative deterministic cap: only trim if one source dominates AND others exist.
                 max_dom_frac = 0.70
@@ -2086,12 +3176,13 @@ def train_sdb_model(
                         y_train_raw = None
                         w_train = None
                         log.warning(
-                            f"Rebalanced dominant source '{dom_src}' to reduce count domination: "
-                            f"{total_n} -> {len(df_tr_fit)} rows (dominant kept={allowed_dom})."
+                            "Rebalanced dominant source '%s' to reduce count domination: "
+                            "%d -> %d rows (dominant kept=%d).",
+                            dom_src, total_n, len(df_tr_fit), allowed_dom,
                         )
                         metadata['training_qc']['dominant_source_rebalanced'] = True
                         metadata['training_qc']['dominant_source_rebalanced_target_frac'] = float(max_dom_frac)
-        except Exception as _ex:
+        except (TypeError, ValueError, KeyError, RuntimeError) as _ex:
             log.error("Dominance guardrail failed: %s", _ex, exc_info=True)
 
     # Log training data composition by source (single pass)
@@ -2117,8 +3208,8 @@ def train_sdb_model(
             if eff_fracs:
                 metadata.setdefault('training_qc', {})
                 metadata['training_qc']['max_effective_source_influence_frac'] = float(max(eff_fracs))
-        except Exception:
-            log.debug("ignored", exc_info=True)
+        except Exception as _exc:
+            log.debug("Suppressed: %s", _exc, exc_info=True)
 
     rf.fit(X_train, y_train, sample_weight=w_train)
     log.info("RF trained on %s samples. (Test set: %s)", len(df_tr_fit), len(df_te))
@@ -2147,36 +3238,56 @@ def train_sdb_model(
                 )
                 
             log.info(
-                f"Spatial CV complete: RMSE={spatial_cv_summary.rmse_mean:.3f}±{spatial_cv_summary.rmse_std:.3f}m, "
-                f"R²={spatial_cv_summary.r2_mean:.3f}±{spatial_cv_summary.r2_std:.3f}"
+                "Spatial CV complete: RMSE=%3f±%3fm,  R²=%3f±%3f",
+                spatial_cv_summary.rmse_mean, spatial_cv_summary.rmse_std, spatial_cv_summary.r2_mean, spatial_cv_summary.r2_std,
             )
         except ImportError:
             log.debug("spatial_cv module not available")
-        except Exception as e:
+        except (TypeError, ValueError, KeyError, RuntimeError) as e:
             log.warning("Spatial CV failed: %s", e)
+            try:
+                from errors_scientific import record_fallback, FallbackClass
+                record_fallback(fallback_registry, "spatial_cv_failed", FallbackClass.DEGRADED,
+                                stage="training_validation", error=e,
+                                detail="Spatial CV failed; random-split validation remains available.")
+            except (ImportError, AttributeError):
+                log.debug("Fallback registry unavailable for spatial CV failure", exc_info=True)
 
     # --- Training Data Diversity Analysis ---
     diversity_report = None
     try:
         from training_diversity import add_diversity_analysis_to_training
-        diversity_report = add_diversity_analysis_to_training(df, plots_dir, feat_cols)
+        aoi_bounds = None
+        if isinstance(raster_paths, dict):
+            aoi_bounds = raster_paths.get("aoi_bounds") or raster_paths.get("aoi")
+        diversity_report = add_diversity_analysis_to_training(df, plots_dir, feat_cols, aoi_bounds=aoi_bounds)
         if diversity_report and "overall_score" in diversity_report:
-            log.info(f"Data diversity score: {diversity_report['overall_score']*100:.0f}%")
+            log.info("Data diversity score: %.0f%%", diversity_report['overall_score'] * 100)
+            if "temporal_diversity_score" in diversity_report:
+                log.info("Temporal diversity score: %.0f%%", 100.0 * float(diversity_report["temporal_diversity_score"]))
             if diversity_report.get("recommendations"):
-                for rec in diversity_report["recommendations"][:3]:
+                for rec in diversity_report["recommendations"][:4]:
                     log.info("→ %s", rec)
     except ImportError:
         log.debug("training_diversity module not available")
-    except Exception as e:
+    except (TypeError, ValueError, KeyError, OSError) as e:
         log.warning("Diversity analysis failed: %s", e)
+        try:
+            from errors_scientific import record_fallback, FallbackClass
+            record_fallback(fallback_registry, "training_diversity_failed", FallbackClass.SAFE,
+                            stage="training_diagnostics", error=e,
+                            detail="Training diversity diagnostics failed; model training continued.")
+        except (ImportError, AttributeError):
+            log.debug("Fallback registry unavailable for diversity failure", exc_info=True)
 
     if plots_dir:
         plots_dir.mkdir(parents=True, exist_ok=True)
         plot_feature_importance(rf, feat_cols, plots_dir / "Feature_Importance.png")
 
     if not df_te.empty:
-        # RF predicts positive magnitudes; convert to negative for comparison with depth_m
-        df_te["depth_pred_m"] = -np.abs(rf.predict(df_te[feat_cols].to_numpy()).astype(np.float32))
+        # Physics-guided prediction: Stumpf baseline plus bounded RF residual.
+        depth_pred_mag = _predict_physics_guided_magnitude(rf, df_te, feat_cols, guidance_settings)
+        df_te["depth_pred_m"] = -depth_pred_mag.astype(np.float32)
         split_name = "Spatial" if spatial_split else "Random"
         title = f"SDB Accuracy ({split_name} Split)"
         
@@ -2223,8 +3334,8 @@ def train_sdb_model(
                         rr.add("validation.by_source", source_validation)
                     elif hasattr(rr, "data") and isinstance(rr.data, dict):
                         rr.data["validation.by_source"] = source_validation
-                except Exception:
-                    log.debug("ignored", exc_info=True)
+                except Exception as _exc:
+                    log.debug("Suppressed: %s", _exc, exc_info=True)
 
         max_depth_sdb_auto = None
         max_depth_diag = {}
@@ -2298,8 +3409,8 @@ def train_sdb_model(
                     limiting = physics_depth_result.get("limiting_factor", "unknown")
                     
                     log.info(
-                        f"Physics-based depth: Kd(490)={kd_median:.3f} m⁻¹ ({water_type}), "
-                        f"optical limit={phys_max:.1f}m"
+                        "Physics-based depth: Kd(490)=%3f m⁻¹ (%s),  optical limit=%1fm",
+                        kd_median, water_type, phys_max,
                     )
                     
                     # ALWAYS store physics-based max depth when computed
@@ -2309,8 +3420,8 @@ def train_sdb_model(
                     
                     if combined is not None:
                         log.info(
-                            f"Operational depth cap candidate (combined physics+rmse): {combined:.1f}m "
-                            f"(limited by {limiting})"
+                            "Operational depth cap candidate (combined physics+rmse): %1fm  (limited by %s)",
+                            combined, limiting,
                         )
                         metadata["max_depth_sdb_combined"] = float(combined)
                         metadata["max_depth_limiting_factor"] = limiting
@@ -2390,7 +3501,8 @@ def train_sdb_model(
                         else:
                             metadata["physics"]["seagrass_detected"] = False
                         
-                        log.info(f"Bottom endmembers estimated: {list(endmember_result.get('endmembers', {}).keys())}")
+                        log.info("Bottom endmembers estimated: %s",
+                                 list(endmember_result.get('endmembers', {}).keys()))
                     else:
                         log.debug("Endmember estimation skipped: %s", endmember_result.get('reason', 'unknown'))
                         
@@ -2489,21 +3601,37 @@ def train_sdb_model(
             "selected_source": max_depth_source,
         }
         
+        try:
+            guidance_meta = metadata.get("physics_guidance", {}) if isinstance(metadata, dict) else {}
+            final_family = _resolve_depth_source_family(final_depth_source or max_depth_source)
+            if guidance_meta.get("low_support") and training_p95 is not None and final_family not in {"physics", "combined"}:
+                conservative_cap = float(max(training_p95, 0.75))
+                if np.isfinite(conservative_cap) and np.isfinite(float(final_depth)) and conservative_cap < float(final_depth):
+                    log.info(
+                        "Low-support guidance mode: tightening final depth cap from %.2fm to training_p95 %.2fm.",
+                        float(final_depth),
+                        conservative_cap,
+                    )
+                    final_depth = conservative_cap
+                    final_depth_source = "training_p95_low_support_guardrail"
+        except Exception as _exc:
+            log.debug("Suppressed: %s", _exc, exc_info=True)
+
         metadata["max_depth_sdb_final"] = final_depth
         metadata["max_depth_sdb_final_source"] = final_depth_source
         log.info(
-            f"Canonical requested-source depth candidate (max_depth_sdb_final) = "
-            f"{final_depth:.2f}m (source: {final_depth_source}, requested: {max_depth_source})"
+            "Canonical requested-source depth candidate (max_depth_sdb_final) =  %2fm (source: %s, requested: %s)",
+            final_depth, final_depth_source, max_depth_source,
         )
         if combined_max is not None and physics_max is not None and str(max_depth_source).lower() == "physics":
             try:
                 if np.isfinite(float(combined_max)) and np.isfinite(float(final_depth)) and float(combined_max) < float(final_depth):
                     log.info(
-                        f"Note: RMSE-constrained combined/operational cap is {float(combined_max):.2f}m "
-                        f"(< physics candidate {float(final_depth):.2f}m); downstream product code may enforce the stricter cap."
+                        "Note: RMSE-constrained combined/operational cap is %2fm  (< physics candidate %2fm); downstream product code may enforce the stricter cap.",
+                        float(combined_max), float(final_depth),
                     )
-            except Exception:
-                log.debug("ignored", exc_info=True)
+            except Exception as _exc:
+                log.debug("Suppressed: %s", _exc, exc_info=True)
 
         # Add spatial CV results to metadata
         if spatial_cv_summary is not None and spatial_cv_summary.n_folds > 0:
@@ -2550,8 +3678,8 @@ def train_sdb_model(
             rep["train"]["max_depth_sdb_final_source"] = metadata.get("max_depth_sdb_final_source")
             rep["train"]["max_depth_sdb_auto_physics"] = metadata.get("max_depth_sdb_auto_physics")
             rep["train"]["max_depth_options"] = metadata.get("max_depth_options", {})
-        except Exception:
-            log.debug("ignored", exc_info=True)
+        except Exception as _exc:
+            log.debug("Suppressed: %s", _exc, exc_info=True)
         try:
             if df_te is not None and (not df_te.empty) and ("depth_pred_m" in df_te.columns) and ("depth_m" in df_te.columns):
                 _bins = _np.array([0, 5, 10, 15, 20, 30, 50], dtype=float)
@@ -2573,8 +3701,8 @@ def train_sdb_model(
                 rep["train"]["bias_per_depth_bin_m"] = _bias
                 rep["train"]["rmse_per_depth_bin_m"] = _rmse
                 rep["train"]["n_per_depth_bin"] = _counts
-        except Exception:
-            log.debug("ignored", exc_info=True)
+        except Exception as _exc:
+            log.debug("Suppressed: %s", _exc, exc_info=True)
 
         if "depth_m" in df.columns and len(df) > 0:
             d = df["depth_m"].to_numpy(dtype=float)
@@ -2603,16 +3731,16 @@ def train_sdb_model(
                         "bias_vs_mean": (float(_np.mean(_d) - _mean_depth) if (_d.size and _mean_depth is not None) else None),
                     }
                 rep["train"]["source_breakdown"] = _src_stats
-        except Exception:
-            log.debug("ignored", exc_info=True)
+        except Exception as _exc:
+            log.debug("Suppressed: %s", _exc, exc_info=True)
 
         try:
             imps = rf.feature_importances_
             pairs = list(zip(feat_cols, [float(x) for x in imps]))
             pairs.sort(key=lambda x: x[1], reverse=True)
             rep["train"]["feature_importance"] = [{"feature": k, "importance": v} for k, v in pairs[:15]]
-        except Exception:
-            log.debug("ignored", exc_info=True)
+        except Exception as _exc:
+            log.debug("Suppressed: %s", _exc, exc_info=True)
         try:
             top_feats = [p["feature"] for p in rep["train"].get("feature_importance", [])[:8]]
             fstats = {}
@@ -2627,8 +3755,8 @@ def train_sdb_model(
                             "p99": float(_np.percentile(v, 99)),
                         }
             rep["train"]["feature_stats_top"] = fstats
-        except Exception:
-            log.debug("ignored", exc_info=True)
+        except Exception as _exc:
+            log.debug("Suppressed: %s", _exc, exc_info=True)
 
         metadata["train_report"] = rep["train"]
         # Write to diagnostics dir if provided, otherwise fallback to plots_dir parent
@@ -2640,10 +3768,11 @@ def train_sdb_model(
         with open(report_dir / "train_report.json", "w", encoding="utf-8") as f:
             import json as _json
             _json.dump(rep, f, indent=2)
-    except Exception:
-        log.debug("ignored", exc_info=True)
+    except Exception as _exc:
+        log.debug("Suppressed: %s", _exc, exc_info=True)
 
-    return rf, stumpf_lr, df_tr, df_te, metadata
+    rf_out = PhysicsGuidedResidualModel(rf, feat_cols, guidance_settings)
+    return rf_out, stumpf_lr, df_tr, df_te, metadata
 
 
 
@@ -2892,9 +4021,10 @@ def main():
                     "best_date": best_pack,
                     "composite": comp_pack,
                 }
-                log.info(f"[S2-AB] Chosen={ab_summary['chosen']} ({ab_summary['reason']}); "
-                         f"RMSE best={best_pack.get('rmse_m')} comp={comp_pack.get('rmse_m')}; "
-                         f"coh best={best_pack.get('coherence'):.3f} comp={comp_pack.get('coherence'):.3f}")
+                log.info("[S2-AB] Chosen=%s (%s); RMSE best=%s comp=%s; coh best=%.3f comp=%.3f",
+                         ab_summary['chosen'], ab_summary['reason'],
+                         best_pack.get('rmse_m'), comp_pack.get('rmse_m'),
+                         best_pack.get('coherence', 0.0), comp_pack.get('coherence', 0.0))
 
     if chosen is None:
         df = df0.copy()
@@ -2935,7 +4065,7 @@ def main():
     with open(out_dir / "model_meta.json", "w", encoding="utf-8") as f:
         json.dump(chosen["meta"], f, indent=2)
 
-    log.info(f"Model saved to {out_dir} (variant={chosen.get('variant')})")
+    log.info("Model saved to %s (variant=%s)", out_dir, chosen.get('variant'))
 
 
 if __name__ == "__main__":

@@ -1,11 +1,9 @@
-Changes:
-- Refreshed repository documentation to match the current workflow state.
-- Replaced stale version-specific language with current operational behavior and invariant-based guidance.
-- Corrected depth-sign documentation to match the present deliverable convention (negative-down depth rasters).
-- Updated docs to emphasize explicit manifests/reports instead of guessed canonical filenames.
-- Added `CHECKLIST_A_GRADE.md` so repo hygiene and documentation expectations are explicit and testable.
-- Updated seam-stability README files to connect them to the current workflow and manifest-based seam comparisons.
-- Removed committed cache/slop artifacts from the packaged repo tree.
+Patch summary:
+- Build prediction support gate from full retained support and preserve a denser authoritative support cloud.
+- Relax prediction gating for dense authoritative extra_xyz runs (broader support distance, min neighbor 1, lower clear-water threshold).
+- Preserve user-requested sdb_mode when extra_xyz are present; avoid ocean-only auto override.
+- Preserve shallow authoritative points dropped by brightness filter.
+- Raise dense-support adaptive sampling floors to 12k/20k/30k instead of tiny targets.
 
 Recommended commit message:
-  Refresh workflow documentation, add enforceable checklist, and clean packaged repo artifacts
+Relax authoritative-anchored SDB prediction gating and preserve dense support coverage

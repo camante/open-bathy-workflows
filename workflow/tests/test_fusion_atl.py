@@ -99,6 +99,41 @@ class TestSourceFractionGuardrail(unittest.TestCase):
         self.assertIsNotNone(rf)
         self.assertTrue(hasattr(rf, "predict"))
 
+    def test_training_with_raster_paths_does_not_require_s2_optics_helper_exports(self):
+        import train
+        rng = np.random.default_rng(19)
+        n = 320
+        b02 = rng.uniform(0.02, 0.14, n).astype(np.float32)
+        b03 = rng.uniform(0.02, 0.12, n).astype(np.float32)
+        df = pd.DataFrame({
+            "longitude": rng.uniform(-71.0, -70.75, n),
+            "latitude":  rng.uniform(42.75, 43.0, n),
+            "depth_m":   -rng.uniform(0.8, 8.0, n),
+            "B02": b02, "B03": b03,
+            "B04": rng.uniform(0.01, 0.08, n).astype(np.float32),
+            "B08": rng.uniform(0.005, 0.035, n).astype(np.float32),
+            "brightness": (b02 + b03) / 2,
+            "CLEAR_WATER": rng.uniform(0.7, 1.0, n),
+            "LAND": rng.uniform(0.0, 0.2, n),
+            "stumpf_idx": np.log(b02 + 1e-3) / np.log(b03 + 1e-3),
+            "stumpf_depth": rng.uniform(0.8, 8.0, n),
+            "source": "atl03",
+            "sample_weight": np.ones(n),
+        })
+        with tempfile.TemporaryDirectory() as d:
+            rf, _, _, _, meta = train.train_sdb_model(
+                train_df=df,
+                max_depth_sdb=12.0,
+                seed=42,
+                plots_dir=Path(d) / "plots",
+                water_class="mixed",
+                use_stumpf_depth=True,
+                min_training_points_for_sdb=50,
+                raster_paths={"B02": "placeholder.tif"},
+            )
+        self.assertIsNotNone(rf)
+        self.assertTrue(hasattr(rf, "predict"))
+
 
 class TestNodataCollisionGuard(unittest.TestCase):
 

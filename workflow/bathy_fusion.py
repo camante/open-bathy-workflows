@@ -313,8 +313,9 @@ def _validate_crs_compatibility(src_crs, dst_crs, src_name: str = "source", dst_
             if (src_bounds.east < dst_bounds.west or src_bounds.west > dst_bounds.east or
                 src_bounds.north < dst_bounds.south or src_bounds.south > dst_bounds.north):
                 log.warning(
-                    f"[CRS] {src_name} and {dst_name} have non-overlapping areas of use. "
-                    "This may indicate a CRS mismatch."
+                    "[CRS] %s and %s have non-overlapping areas of use. "
+                    "This may indicate a CRS mismatch.",
+                    src_name, dst_name,
                 )
         
         return True
@@ -425,6 +426,23 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
     # Output nodata (use numeric nodata; NaN nodata is fragile in GDAL toolchains)
     nodata_out = float(cfg.nodata or -9999.0)
 
+    def _safe_tiff_blocksize(dim: int, preferred: int = 512) -> int:
+        """Return a GeoTIFF tile size that obeys TIFF/GDAL constraints.
+
+        Tiled GeoTIFF block sizes must be multiples of 16. Some upstream profiles
+        carry block sizes that are valid for the source raster but invalid once we
+        reproject/align to a different width/height. Fail closed here by forcing a
+        sane block size for all fusion outputs.
+        """
+        try:
+            d = int(dim)
+        except Exception:
+            d = int(preferred)
+        d = max(16, d)
+        cand = min(int(preferred), d)
+        cand = max(16, (cand // 16) * 16)
+        return cand or 16
+
     # -------------------------
     # Input sanity checks (prevents fusing optical imagery/masks as 'depth')
     # -------------------------
@@ -450,6 +468,8 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
         count=1,
         compress="deflate",
         tiled=True,
+        blockxsize=_safe_tiff_blocksize(width),
+        blockysize=_safe_tiff_blocksize(height),
         BIGTIFF="IF_SAFER",
     )
 

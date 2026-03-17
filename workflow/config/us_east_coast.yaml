@@ -1,0 +1,44 @@
+# US East Coast regional preset
+#
+# Optimized for variable-clarity nearshore environments with strong seasonal
+# variation.  Summer months preferred for SDB.  Turbidity rejection enabled.
+#
+# Usage:
+#   ./bathy_main.py --config=config/us_east_coast.yaml --aoi=... --start=... --end=...
+
+sentinel2:
+  preferred_months: [6, 7, 8, 9]
+  cloud: 30
+  min_scene_valid_frac: 0.85
+  cw_min: 0.5
+  land_mask_water_val: 0
+  apply_gl_turbidity_reject: true
+  bright_shallow_nir_max: 0.05
+  edge_weight_power: 2.5
+  linf_enabled: true
+  linf_estimate_deepwater: true
+  linf_deepwater_nir_max: 0.06
+  linf_deepwater_bright_max: 0.2
+
+icesat2:
+  water_temp_c: 16.0
+  max_depth_atl03: 20.0
+  min_bottom_photons: 4
+  min_bottom_frac: 0.15
+  atl24_conf_min: 0.9
+
+training:
+  min_training_points_for_sdb: 250
+  spatial_cv: true
+  spatial_cv_strategy: "spatial_cluster"
+  spatial_cv_n_folds: 5
+
+prediction:
+  depth_limit_mode: "optical"
+  optical_depth_factor: 2.3
+  max_depth_hard_cap: 25.0
+  doa_threshold: 0.9
+  doa_soft_k: 3.0
+
+core:
+  sdb_mode: "ocean"

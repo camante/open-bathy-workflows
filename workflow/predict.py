@@ -30,18 +30,28 @@ from rasterio.vrt import WarpedVRT
 from rasterio.enums import Resampling
 from rasterio.windows import Window
 import joblib
+from pyproj import Transformer
+try:
+    from pyproj.exceptions import ProjError
+except (ImportError, AttributeError):
+    class ProjError(Exception):
+        pass
 
 # scipy is optional (keep the module importable even if scipy is absent)
 try:
     from scipy.ndimage import median_filter as _scipy_median_filter
-except Exception:
+except (ImportError, AttributeError, OSError, SyntaxError):
     _scipy_median_filter = None
+try:
+    from scipy.spatial import cKDTree as _cKDTree
+except (ImportError, AttributeError, OSError, SyntaxError):
+    _cKDTree = None
 
 # tqdm is optional
 try:
     from tqdm import tqdm
     _TQDM = tqdm
-except Exception:
+except (ImportError, AttributeError, OSError, SyntaxError):
     _TQDM = None
 
 log = logging.getLogger("sdb.predict")
@@ -62,7 +72,7 @@ def _fmt_phys_scalar(value) -> str:
             # compact fallback for unexpected dict schema
             return json.dumps(value, sort_keys=True)
         return str(value)
-    except Exception:
+    except (TypeError, ValueError):
         return str(value)
 
 
@@ -78,7 +88,7 @@ try:
     ALIGNMENT_AVAILABLE = True
 except ImportError as e:
     _alignment_import_error = f"ImportError: {e}"
-except Exception as e:
+except (AttributeError, OSError, SyntaxError) as e:
     _alignment_import_error = f"{type(e).__name__}: {e}"
     log.error("Alignment module failed to load: %s", _alignment_import_error, exc_info=True)
 
@@ -91,7 +101,7 @@ try:
     PHYSICS_MODULE_AVAILABLE = True
 except ImportError as e:
     _physics_import_error = f"ImportError: {e}"
-except Exception as e:
+except (AttributeError, OSError, SyntaxError) as e:
     _physics_import_error = f"{type(e).__name__}: {e}"
     log.error("Physics module failed to load: %s", _physics_import_error, exc_info=True)
 
@@ -129,6 +139,299 @@ try:
 except ImportError:
     UNCERTAINTY_MODULE_AVAILABLE = False
     UNCERTAINTY_STATUS_MSG = "sdb_uncertainty module not available (tree-std only)"
+
+
+def _core_optical_hard_mask(
+    X_block: np.ndarray,
+    feature_cols: List[str],
+    training_bounds: Dict[str, Dict[str, float]],
+    core_features: List[str],
+    margin_frac: float,
+) -> np.ndarray:
+    """Require core optical features to remain safely inside the observed manifold."""
+    if X_block.size == 0:
+        return np.zeros((0,), dtype=bool)
+    keep = np.ones(X_block.shape[0], dtype=bool)
+    margin_frac = float(max(margin_frac, 0.0))
+    feature_index = {name: i for i, name in enumerate(feature_cols)}
+    for feat in core_features or []:
+        j = feature_index.get(feat)
+        bounds = training_bounds.get(feat) if isinstance(training_bounds, dict) else None
+        if j is None or not bounds:
+            continue
+        try:
+            lo = float(bounds.get("min"))
+            hi = float(bounds.get("max"))
+        except (TypeError, ValueError):
+            continue
+        if not (np.isfinite(lo) and np.isfinite(hi)):
+            continue
+        if hi < lo:
+            lo, hi = hi, lo
+        vals = X_block[:, j]
+        rng = max(hi - lo, 1e-12)
+        inner_lo = lo + margin_frac * rng
+        inner_hi = hi - margin_frac * rng
+        if inner_hi < inner_lo:
+            mid = 0.5 * (lo + hi)
+            inner_lo = mid
+            inner_hi = mid
+        keep &= np.isfinite(vals) & (vals >= inner_lo) & (vals <= inner_hi)
+    return keep
+
+
+def _stumpf_support_mask(
+    X_block: np.ndarray,
+    feature_cols: List[str],
+    training_bounds: Dict[str, Dict[str, float]],
+    guidance_meta: Dict[str, Any],
+) -> np.ndarray:
+    """Conservative support gate for physics-guided prediction.
+
+    This gate is intentionally based on *stumpf_depth* support, not stumpf_idx support.
+    The downstream guidance logic is expressed in depth magnitude space, so falling back
+    to index-space bounds would mix incompatible units and can silently over-reject.
+    """
+    if X_block.size == 0:
+        return np.zeros((0,), dtype=bool)
+    keep = np.ones(X_block.shape[0], dtype=bool)
+    feature_index = {name: i for i, name in enumerate(feature_cols)}
+
+    if "stumpf_depth" not in feature_index:
+        return keep
+
+    feat = "stumpf_depth"
+    bounds = training_bounds.get(feat, {}) if isinstance(training_bounds, dict) else {}
+    support_lo = guidance_meta.get("stumpf_support_min_m", bounds.get("min"))
+    support_hi = guidance_meta.get("stumpf_support_max_m", bounds.get("max"))
+    try:
+        support_lo = float(support_lo)
+        support_hi = float(support_hi)
+    except (TypeError, ValueError):
+        return keep
+    if not (np.isfinite(support_lo) and np.isfinite(support_hi)):
+        return keep
+    if support_hi < support_lo:
+        support_lo, support_hi = support_hi, support_lo
+
+    low_support = bool(guidance_meta.get("low_support", True))
+    envelope = float(guidance_meta.get("stumpf_envelope_m", 0.5))
+    tol = min(envelope, 0.15 if low_support else 0.30)
+
+    vals = X_block[:, feature_index[feat]]
+    keep &= np.isfinite(vals) & (vals >= (support_lo - tol)) & (vals <= (support_hi + tol))
+
+    if "stumpf_idx" in feature_index:
+        try:
+            idx_lo = float(guidance_meta.get("stumpf_idx_support_min", training_bounds.get("stumpf_idx", {}).get("min", -np.inf)))
+            idx_hi = float(guidance_meta.get("stumpf_idx_support_max", training_bounds.get("stumpf_idx", {}).get("max", np.inf)))
+        except (TypeError, ValueError):
+            idx_lo, idx_hi = -np.inf, np.inf
+        if np.isfinite(idx_lo) and np.isfinite(idx_hi):
+            if idx_hi < idx_lo:
+                idx_lo, idx_hi = idx_hi, idx_lo
+            idx_vals = X_block[:, feature_index["stumpf_idx"]]
+            idx_tol = 0.02 if low_support else 0.05
+            idx_rng = max(idx_hi - idx_lo, 1e-12)
+            keep &= np.isfinite(idx_vals) & (idx_vals >= (idx_lo - idx_tol * idx_rng)) & (idx_vals <= (idx_hi + idx_tol * idx_rng))
+
+    if "brightness" in feature_index and isinstance(training_bounds, dict) and "brightness" in training_bounds:
+        bb = training_bounds.get("brightness", {})
+        try:
+            blo = float(bb.get("min"))
+            bhi = float(bb.get("max"))
+        except (TypeError, ValueError):
+            blo = bhi = None
+        if blo is not None and bhi is not None and np.isfinite(blo) and np.isfinite(bhi):
+            vb = X_block[:, feature_index["brightness"]]
+            brng = max(bhi - blo, 1e-12)
+            bright_margin = 0.02 if low_support else 0.05
+            keep &= np.isfinite(vb) & (vb >= (blo - bright_margin * brng)) & (vb <= (bhi + bright_margin * brng))
+
+    return keep
+
+
+def _build_support_kdtree(guidance_meta: Dict[str, Any], raster_crs) -> tuple[Any, Optional[Transformer], float, bool]:
+    pts = guidance_meta.get("support_points_lonlat", []) if isinstance(guidance_meta, dict) else []
+    max_dist = float(guidance_meta.get("max_train_point_dist_m", 0.0) or 0.0)
+    gate_required = bool(max_dist > 0)
+    anchor_support_good = bool(guidance_meta.get("anchor_support_good", False)) if isinstance(guidance_meta, dict) else False
+    if max_dist <= 0 or _cKDTree is None:
+        return None, None, max_dist, gate_required
+    if not pts:
+        log.warning("Support-distance DOA gate requested (max_train_point_dist_m=%.1f m) but no support_points_lonlat were provided.", max_dist)
+        return None, None, max_dist, gate_required
+    try:
+        arr = np.asarray(pts, dtype=np.float64)
+    except (TypeError, ValueError):
+        log.warning("Support-distance DOA gate requested but support_points_lonlat could not be coerced to float; failing closed.")
+        return None, None, max_dist, gate_required
+    if arr.ndim != 2 or arr.shape[1] != 2 or arr.shape[0] == 0:
+        log.warning("Support-distance DOA gate requested but support_points_lonlat are malformed; failing closed.")
+        return None, None, max_dist, gate_required
+    try:
+        tfm = Transformer.from_crs("EPSG:4326", raster_crs, always_xy=True)
+        xs, ys = tfm.transform(arr[:, 0], arr[:, 1])
+    except (ProjError, TypeError, ValueError):
+        log.warning("Failed to transform support points into raster CRS for support-distance DOA gating; failing closed.", exc_info=True)
+        return None, None, max_dist, gate_required
+    xy = np.column_stack([xs, ys])
+    m = np.isfinite(xy).all(axis=1)
+    xy = xy[m]
+    if xy.shape[0] == 0:
+        log.warning("Support-distance DOA gate requested but no finite support points remained after CRS transform; failing closed.")
+        return None, None, max_dist, gate_required
+    try:
+        # Dense authoritative-anchor runs should not fail closed because the
+        # support proxy was thinned too aggressively. Widen the support reach
+        # when the support cloud is still sparse after thinning.
+        if anchor_support_good and xy.shape[0] < 2000:
+            max_dist = max(max_dist, 500.0)
+        if anchor_support_good and xy.shape[0] < 1000:
+            max_dist = max(max_dist, 750.0)
+        return _cKDTree(xy), tfm, max_dist, gate_required
+    except (TypeError, ValueError):
+        log.warning("Failed to build support KDTree for support-distance DOA gating; failing closed.", exc_info=True)
+        return None, None, max_dist, gate_required
+
+
+def _support_distance_metrics(window: Window, valid_mask: np.ndarray, ds_transform, support_tree: Any, max_dist_m: float, gate_required: bool, min_neighbors: int = 1) -> tuple[np.ndarray, np.ndarray]:
+    n = int(valid_mask.sum())
+    if not np.any(valid_mask):
+        return np.ones(n, dtype=bool), np.ones(n, dtype=np.float32)
+    if max_dist_m <= 0:
+        return np.ones(n, dtype=bool), np.ones(n, dtype=np.float32)
+    if support_tree is None:
+        if gate_required:
+            return np.zeros(n, dtype=bool), np.zeros(n, dtype=np.float32)
+        return np.ones(n, dtype=bool), np.ones(n, dtype=np.float32)
+    rows, cols = np.where(valid_mask)
+    abs_rows = rows + int(window.row_off)
+    abs_cols = cols + int(window.col_off)
+    if hasattr(rasterio, "transform") and hasattr(rasterio.transform, "xy"):
+        xs, ys = rasterio.transform.xy(ds_transform, abs_rows, abs_cols, offset="center")
+    else:
+        a = float(getattr(ds_transform, "a", 1.0))
+        e = float(getattr(ds_transform, "e", -1.0))
+        c = float(getattr(ds_transform, "c", 0.0))
+        f = float(getattr(ds_transform, "f", 0.0))
+        xs = c + (abs_cols.astype(np.float64) + 0.5) * a
+        ys = f + (abs_rows.astype(np.float64) + 0.5) * e
+    q = np.column_stack([np.asarray(xs, dtype=np.float64), np.asarray(ys, dtype=np.float64)])
+    k = max(int(min_neighbors), 1)
+    dists, _ = support_tree.query(q, k=k)
+    if k == 1:
+        nearest = np.asarray(dists, dtype=np.float64)
+        kth = nearest
+    else:
+        dists = np.asarray(dists, dtype=np.float64)
+        nearest = dists[:, 0]
+        kth = dists[:, -1]
+    keep = np.isfinite(kth) & (kth <= float(max_dist_m))
+    # Strong decay: full trust near retained support, rapidly decays to zero toward max distance.
+    ratio = np.clip(np.asarray(nearest, dtype=np.float32) / max(float(max_dist_m), 1e-6), 0.0, 1.0)
+    weight = (1.0 - ratio) ** 2
+    weight[~np.isfinite(weight)] = 0.0
+    weight[~keep] = 0.0
+    return keep, weight.astype(np.float32)
+
+
+def _edge_trust_weight(window: Window, valid_mask: np.ndarray, full_shape: tuple[int, int], halo_px: int) -> np.ndarray:
+    n = int(valid_mask.sum())
+    if halo_px <= 0 or not np.any(valid_mask):
+        return np.ones(n, dtype=np.float32)
+    rows, cols = np.where(valid_mask)
+    abs_rows = rows + int(window.row_off)
+    abs_cols = cols + int(window.col_off)
+    h, w = int(full_shape[0]), int(full_shape[1])
+    d_edge = np.minimum.reduce([
+        abs_rows.astype(np.int64),
+        abs_cols.astype(np.int64),
+        (h - 1 - abs_rows).astype(np.int64),
+        (w - 1 - abs_cols).astype(np.int64),
+    ]).astype(np.float32)
+    return np.clip(d_edge / float(max(halo_px, 1)), 0.0, 1.0).astype(np.float32)
+
+
+def _export_sdb_guide_points(
+    depth_path: str,
+    confidence_path: Optional[str],
+    guidance_weight_path: Optional[str],
+    uncertainty_path: Optional[str],
+    out_gpkg: str,
+    *,
+    min_confidence: float = 0.15,
+    max_points: int = 5000,
+) -> None:
+    """Export spatially thinned SDB pseudo-soundings as a GeoPackage.
+
+    Each point carries depth, confidence, guidance_weight, uncertainty, and
+    provenance metadata.  Points are subordinate to authoritative survey data
+    and must be treated as confidence-weighted interpolation guidance only.
+    """
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    NODATA_VAL = -9999.0
+
+    with rasterio.open(depth_path) as ds:
+        depth = ds.read(1).astype("float32")
+        nodata = ds.nodata if ds.nodata is not None else NODATA_VAL
+        valid = np.isfinite(depth) & (depth != nodata)
+        transform = ds.transform
+        crs = ds.crs
+
+    conf = None
+    if confidence_path and os.path.exists(confidence_path):
+        with rasterio.open(confidence_path) as ds:
+            conf = ds.read(1).astype("float32")
+        valid &= np.isfinite(conf) & (conf != NODATA_VAL) & (conf >= min_confidence)
+
+    gw = None
+    if guidance_weight_path and os.path.exists(guidance_weight_path):
+        with rasterio.open(guidance_weight_path) as ds:
+            gw = ds.read(1).astype("float32")
+        valid &= np.isfinite(gw) & (gw != NODATA_VAL) & (gw > 0.05)
+
+    unc = None
+    if uncertainty_path and os.path.exists(uncertainty_path):
+        with rasterio.open(uncertainty_path) as ds:
+            unc = ds.read(1).astype("float32")
+
+    rows, cols = np.where(valid)
+    if rows.size == 0:
+        log.info("No valid SDB pixels above confidence threshold for guide-point export.")
+        return
+
+    # Spatial thinning: subsample to max_points using stride
+    step = max(int(np.sqrt(rows.size / max(max_points, 1))), 1)
+    sel = np.arange(0, rows.size, step, dtype=int)
+    rows, cols = rows[sel], cols[sel]
+
+    xs, ys = rasterio.transform.xy(transform, rows, cols, offset="center")
+    data = {
+        "depth_m": depth[rows, cols].astype("float32"),
+        "artifact_role": ["sdb_guide_point"] * len(rows),
+        "authoritative": [False] * len(rows),
+        "provenance": ["SDB"] * len(rows),
+    }
+    if conf is not None:
+        data["confidence"] = conf[rows, cols].astype("float32")
+    if gw is not None:
+        data["guidance_weight"] = gw[rows, cols].astype("float32")
+    if unc is not None:
+        data["uncertainty_m"] = unc[rows, cols].astype("float32")
+
+    gdf = gpd.GeoDataFrame(
+        data,
+        geometry=[Point(x, y) for x, y in zip(xs, ys)],
+        crs=crs,
+    )
+    out_p = Path(out_gpkg)
+    if out_p.exists():
+        out_p.unlink()
+    gdf.to_file(out_gpkg, driver="GPKG")
+    log.info("Exported %d SDB guide points to %s", len(gdf), out_gpkg)
 
 
 # -----------------------------------------------------------------------------
@@ -205,6 +508,54 @@ def compute_hybrid_prediction(
     return blended_pred.astype(np.float32), blended_unc.astype(np.float32), stumpf_weight.astype(np.float32)
 
 
+def compute_physics_guided_prediction(
+    rf_pred_residual: np.ndarray,
+    rf_std: np.ndarray,
+    stumpf_idx: np.ndarray,
+    stumpf_depth_fitted: np.ndarray,
+    correction_alpha: float,
+    residual_clip_m: float,
+    stumpf_lr_coef: float = None,
+    stumpf_lr_intercept: float = None,
+    physics_params: Optional[Dict[str, Any]] = None,
+    baseline_source: str = "stumpf_depth",
+    stumpf_envelope_m: float = 0.60,
+    support_weight: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Physics-first prediction for guidance-only SDB.
+
+    RF predicts only a bounded residual about a Stumpf/optical baseline so the output
+    preserves monotonic optical ordering in low-support regions.
+    """
+    baseline_source = str(baseline_source or "stumpf_depth").lower()
+    if baseline_source == "stumpf_lr" and stumpf_lr_coef is not None and stumpf_lr_intercept is not None:
+        stumpf_physics = stumpf_lr_intercept + stumpf_lr_coef * stumpf_idx
+        stumpf_physics = np.maximum(stumpf_physics, 0.0)
+    else:
+        stumpf_physics = np.maximum(stumpf_depth_fitted, 0.0)
+
+    correction_alpha = float(np.clip(correction_alpha, 0.0, 1.0))
+    residual_clip_m = float(max(residual_clip_m, 0.05))
+    stumpf_envelope_m = float(max(stumpf_envelope_m, residual_clip_m, 0.10))
+    rf_pred_residual = np.clip(rf_pred_residual, -residual_clip_m, residual_clip_m)
+    if support_weight is None:
+        effective_alpha = np.full(rf_pred_residual.shape, correction_alpha, dtype=np.float32)
+    else:
+        effective_alpha = correction_alpha * np.clip(np.asarray(support_weight, dtype=np.float32), 0.0, 1.0)
+    residual_applied = effective_alpha * rf_pred_residual
+    guided_pred = np.maximum(stumpf_physics + residual_applied, 0.0)
+    guided_pred = np.clip(
+        guided_pred,
+        np.maximum(stumpf_physics - stumpf_envelope_m, 0.0),
+        stumpf_physics + stumpf_envelope_m,
+    )
+
+    baseline_weight = (1.0 - effective_alpha).astype(np.float32)
+    guided_unc = np.maximum(rf_std, 0.10 + 0.25 * np.abs(residual_applied) + 0.10 * baseline_weight)
+    return guided_pred.astype(np.float32), guided_unc.astype(np.float32), baseline_weight.astype(np.float32)
+
+
+
 def compute_comprehensive_uncertainty(
     y_pred: np.ndarray,
     tree_std: np.ndarray,
@@ -256,42 +607,6 @@ def compute_comprehensive_uncertainty(
 # Helpers
 # -----------------------------------------------------------------------------
 
-def estimate_linf_from_rasters(
-    b02: np.ndarray,
-    b03: np.ndarray,
-    b04: np.ndarray,
-    b08: np.ndarray,
-    clear_water: Optional[np.ndarray] = None,
-    *,
-    cw_min: float = 0.5,
-    deepwater_nir_max: float = 0.03,
-    deepwater_bright_max: float = 0.15,
-    percentile: float = 1.0,
-) -> Dict[str, float]:
-    brightness = (b02 + b03 + b04) / 3.0
-    m = (
-        np.isfinite(b08) & (b08 < float(deepwater_nir_max)) &
-        np.isfinite(brightness) & (brightness < float(deepwater_bright_max))
-    )
-    if clear_water is not None:
-        m &= np.isfinite(clear_water) & (clear_water >= float(cw_min))
-
-    if np.count_nonzero(m) < 1000:
-        return {}
-
-    out = {}
-    for name, arr in [("B02", b02), ("B03", b03), ("B04", b04), ("B08", b08)]:
-        v = arr[m]
-        v = v[np.isfinite(v)]
-        if v.size == 0:
-            return {}
-        out[name] = float(np.percentile(v, float(percentile)))
-
-    for k in out:
-        if out[k] < 0:
-            out[k] = 0.0
-    return out
-
 
 def _compute_features_block(
     b02: np.ndarray, b03: np.ndarray, b04: np.ndarray, b08: np.ndarray, brightness: np.ndarray,
@@ -323,9 +638,15 @@ def _compute_features_block(
     }
 
     if stumpf_lr_model is not None:
-        flat = stumpf_idx.reshape(-1, 1)
+        flat = stumpf_idx.ravel()
         flat = np.nan_to_num(flat, nan=0.0)
-        pred_depth = stumpf_lr_model.predict(flat)
+        # IsotonicRegression expects 1D; LinearRegression expects 2D
+        if hasattr(stumpf_lr_model, "increasing"):
+            # IsotonicRegression
+            pred_depth = stumpf_lr_model.predict(flat)
+        else:
+            # LinearRegression or similar
+            pred_depth = stumpf_lr_model.predict(flat.reshape(-1, 1)).ravel()
         features["stumpf_depth"] = pred_depth.reshape(stumpf_idx.shape)
 
     return features
@@ -374,6 +695,20 @@ def _normalize_linf_constants(d):
 
 
 def _get_max_depth_from_meta(meta: Dict[str, Any], default: float = 20.0) -> Tuple[float, str]:
+    def _source_family(name: Any) -> str:
+        src = str(name or "").strip().lower()
+        if not src:
+            return ""
+        if "combined" in src:
+            return "combined"
+        if "physics" in src or "kd" in src:
+            return "physics"
+        if "rmse" in src or "support" in src:
+            return "rmse"
+        if "training_p95" in src or "p95" in src:
+            return "training_p95"
+        return src
+
     def _try_float(v) -> Optional[float]:
         if v is None:
             return None
@@ -387,10 +722,31 @@ def _get_max_depth_from_meta(meta: Dict[str, Any], default: float = 20.0) -> Tup
             return None
         return fv
 
+    def _lookup(candidates):
+        for k in candidates:
+            fv = _try_float(meta.get(k))
+            if fv is not None:
+                return fv, k
+        return None
+
     for k in ("max_depth_sdb_final", "max_depth_sdb"):
         fv = _try_float(meta.get(k))
         if fv is not None:
             return fv, k
+
+    final_source = meta.get("max_depth_sdb_final_source")
+    opts = meta.get("max_depth_options") if isinstance(meta, dict) else {}
+    selected_source = opts.get("selected_source") if isinstance(opts, dict) else None
+    family = _source_family(final_source or selected_source)
+
+    family_order = {
+        "physics": ["max_depth_sdb_auto_physics", "max_depth_sdb_combined", "max_depth_sdb_auto"],
+        "combined": ["max_depth_sdb_combined", "max_depth_sdb_auto_physics", "max_depth_sdb_auto"],
+        "rmse": ["max_depth_sdb_auto", "max_depth_sdb_combined", "max_depth_sdb_auto_physics"],
+    }
+    found = _lookup(family_order.get(family, []))
+    if found is not None:
+        return found
 
     diag = meta.get("max_depth_sdb_auto_diagnostics")
     if isinstance(diag, dict):
@@ -409,7 +765,9 @@ def _get_max_depth_from_meta(meta: Dict[str, Any], default: float = 20.0) -> Tup
         if fv is not None:
             return fv, k
 
-    for k in (
+    found = _lookup([
+        "max_depth_sdb_combined",
+        "max_depth_sdb_auto_physics",
         "max_depth_sdb_auto_m",
         "max_depth_sdb_auto",
         "auto_max_sdb_depth_m",
@@ -418,10 +776,9 @@ def _get_max_depth_from_meta(meta: Dict[str, Any], default: float = 20.0) -> Tup
         "max_depth_auto",
         "max_depth_sdb_m",
         "max_depth",
-    ):
-        fv = _try_float(meta.get(k))
-        if fv is not None:
-            return fv, k
+    ])
+    if found is not None:
+        return found
 
     return float(default), "default"
 
@@ -484,11 +841,16 @@ def predict_scene(
     stumpf_lr_intercept = None
     if stumpf_lr is not None:
         try:
-            stumpf_lr_coef = float(stumpf_lr.coef_[0])
-            stumpf_lr_intercept = float(stumpf_lr.intercept_)
-            log.info("Stumpf LR: depth = %.3f + %.3f * stumpf_idx", stumpf_lr_intercept, stumpf_lr_coef)
-        except Exception as e:
-            log.warning("Could not extract Stumpf LR coefficients: %s", e)
+            if hasattr(stumpf_lr, "coef_") and hasattr(stumpf_lr, "intercept_"):
+                stumpf_lr_coef = float(stumpf_lr.coef_[0])
+                stumpf_lr_intercept = float(stumpf_lr.intercept_)
+                log.info("Stumpf LR: depth = %.3f + %.3f * stumpf_idx", stumpf_lr_intercept, stumpf_lr_coef)
+            elif stumpf_lr.__class__.__name__ == "IsotonicRegression":
+                log.info("Using monotonic Stumpf baseline model (IsotonicRegression); linear coefficients are not applicable.")
+            else:
+                log.info("Using non-linear Stumpf baseline model (%s); linear coefficients are not applicable.", stumpf_lr.__class__.__name__)
+        except (AttributeError, TypeError, ValueError, IndexError) as e:
+            log.warning("Could not inspect Stumpf baseline model: %s", e)
 
     with open(meta_json_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
@@ -496,7 +858,7 @@ def predict_scene(
 
     physics_params = meta.get("physics", {})
     if physics_params:
-        log.info(f"Loaded physics params: SZA={physics_params.get('sun_zenith_deg', 'N/A')}°")
+        log.info("Loaded physics params: SZA=%s°", physics_params.get('sun_zenith_deg', 'N/A'))
         if physics_params.get("kd_corrected"):
             log.info("Geometry-corrected Kd=%s", _fmt_phys_scalar(physics_params.get('kd_corrected')))
         if physics_params.get("seagrass_detected"):
@@ -510,7 +872,7 @@ def predict_scene(
         try:
             doa_weights = {str(k): float(v) for k, v in meta_weights.items()}
             log.info("Loaded DOA weights from metadata (%s features).", len(doa_weights))
-        except Exception:
+        except (TypeError, ValueError):
             doa_weights = {}
 
     if not doa_weights:
@@ -520,14 +882,37 @@ def predict_scene(
                 doa_weights = {c: float(w) for c, w in zip(feature_cols, importances)}
             else:
                 doa_weights = {c: 1.0 for c in feature_cols}
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             doa_weights = {c: 1.0 for c in feature_cols}
+
+    doa_meta = meta.get("doa", {}) if isinstance(meta, dict) else {}
+    try:
+        if "threshold_default" in doa_meta:
+            doa_threshold = float(doa_meta["threshold_default"])
+    except (TypeError, ValueError):
+        pass
+    try:
+        if "soft_k_default" in doa_meta:
+            doa_soft_k = float(doa_meta["soft_k_default"])
+    except (TypeError, ValueError):
+        pass
+
+    model_tier = int(meta.get("model_tier", 1)) if isinstance(meta, dict) else 1
+    if model_tier >= 2:
+        log.info("[Tier %d] DOA relaxed: threshold=%.2f, soft_k=%.1f",
+                 model_tier, doa_threshold, doa_soft_k)
 
     max_depth_training, max_depth_src = _get_max_depth_from_meta(meta, default=20.0)
 
-    actual_training_depth = meta.get("depth_stats_m", {}).get("max")
-    if actual_training_depth is None:
-        actual_training_depth = meta.get("training_bounds", {}).get("stumpf_depth", {}).get("max", max_depth_training)
+    depth_stats = meta.get("depth_stats_m", {})
+    if not isinstance(depth_stats, dict) or not depth_stats:
+        depth_stats = (meta.get("train_report", {}) or {}).get("depth_stats_m", {})
+    if not isinstance(depth_stats, dict):
+        depth_stats = {}
+    actual_training_depth_min = depth_stats.get("min")
+    actual_training_depth_max = depth_stats.get("max")
+    if actual_training_depth_max is None:
+        actual_training_depth_max = meta.get("training_bounds", {}).get("stumpf_depth", {}).get("max", max_depth_training)
 
     if depth_limit_mode == "none":
         max_depth = max_depth_hard_cap
@@ -536,8 +921,10 @@ def predict_scene(
         max_depth = max_depth_hard_cap
         log.info("Depth limit mode=%s: using Kd-based per-pixel limit (factor=%s)", depth_limit_mode, optical_depth_factor)
         log.info("Max depth limit from metadata: %.2fm (source=%s)", max_depth_training, max_depth_src)
-        if actual_training_depth:
-            log.info("Actual training data depth range: 0 - %.2fm", actual_training_depth)
+        if actual_training_depth_max is not None:
+            if actual_training_depth_min is None:
+                actual_training_depth_min = 0.0
+            log.info("Actual training data depth range: %.2f - %.2fm", float(actual_training_depth_min), float(actual_training_depth_max))
     else:
         max_depth = max_depth_training
         log.info("Depth limit mode=%s: max_depth_sdb = %.2fm (source=%s)", depth_limit_mode, max_depth, max_depth_src)
@@ -561,8 +948,8 @@ def predict_scene(
             try:
                 if any(float(v) != 0 for v in linf_raw.values()):
                     log.warning("linf_enabled=False but NON-ZERO L∞ constants are present in metadata; ignoring.")
-            except Exception:
-                log.debug("ignored", exc_info=True)  # linf_raw check failed
+            except Exception as _exc:
+                log.debug("Suppressed: %s", _exc, exc_info=True)
         log.info("L_inf disabled; using zeros.")
 
     training_bounds = meta.get("training_bounds", {})
@@ -604,6 +991,9 @@ def predict_scene(
     doa_path = str(Path(out_path).with_name(Path(out_path).stem + "_doa_score.tif")) if write_doa_score else None
     conf_path = str(Path(out_path).with_name(Path(out_path).stem + "_confidence.tif")) if write_confidence else None
     prov_path = str(Path(out_path).with_name(Path(out_path).stem + "_provenance.tif")) if write_provenance else None
+    guidance_weight_path = str(Path(out_path).with_name(Path(out_path).stem + "_guidance_weight.tif"))
+    trusted_interior_path = str(Path(out_path).with_name(Path(out_path).stem + "_trusted_interior.tif"))
+    admissibility_path = str(Path(out_path).with_name(Path(out_path).stem + "_admissibility.tif"))
 
     if min_confidence_threshold > 0.0 and not write_confidence:
         log.warning(
@@ -639,8 +1029,9 @@ def predict_scene(
         land_mask_path = str(land_mask_path)
         if not os.path.exists(land_mask_path):
             log.warning(
-                f"[PREDICT][MASK] land mask missing: {land_mask_path}. "
-                "Creating aligned all-water fallback mask (water=0)."
+                "[PREDICT][MASK] land mask missing: %s. "
+                "Creating aligned all-water fallback mask (water=0).",
+                land_mask_path,
             )
             _dst_dir = os.path.dirname(land_mask_path)
             if _dst_dir:
@@ -668,24 +1059,52 @@ def predict_scene(
             dst_doa = stack.enter_context(rasterio.open(doa_path, "w", **profile)) if doa_path else None
 
             dst_conf = stack.enter_context(rasterio.open(conf_path, "w", **profile)) if conf_path else None
+            dst_guidance = stack.enter_context(rasterio.open(guidance_weight_path, "w", **profile))
+            trusted_profile = profile.copy()
+            trusted_profile.update(dtype=rasterio.uint8, nodata=0)
+            dst_trusted = stack.enter_context(rasterio.open(trusted_interior_path, "w", **trusted_profile))
+            admiss_profile = profile.copy()
+            admiss_profile.update(dtype=rasterio.uint8, nodata=0)
+            dst_admiss = stack.enter_context(rasterio.open(admissibility_path, "w", **admiss_profile))
             prov_profile = profile.copy()
             prov_profile.update(dtype=rasterio.uint8, nodata=0)
             dst_prov = stack.enter_context(rasterio.open(prov_path, "w", **prov_profile)) if prov_path else None
 
-            dst_depth.update_tags(UNITS="meters", CONVENTION="negative-down", MAX_DEPTH_SDB=str(max_depth))
-            dst_unc.update_tags(UNITS="meters", DESC="1-Sigma Uncertainty", MAX_DEPTH_SDB=str(max_depth))
+            dst_depth.update_tags(UNITS="meters", CONVENTION="negative-down", MAX_DEPTH_SDB=str(max_depth), ROLE="interpolation_guidance", AUTHORITATIVE="false", CUDEM_INTENT="guidance_only", USE_NOTE="Non-authoritative guidance surface for interpolation in unsupported gaps.")
+            dst_unc.update_tags(UNITS="meters", DESC="1-Sigma Uncertainty", MAX_DEPTH_SDB=str(max_depth), ROLE="interpolation_guidance", AUTHORITATIVE="false", CUDEM_INTENT="guidance_only")
             if dst_doa is not None:
-                dst_doa.update_tags(UNITS="unitless", DESC="Weighted Domain of Applicability score (0..1)")
+                dst_doa.update_tags(UNITS="unitless", DESC="Weighted Domain of Applicability score (0..1)", ROLE="interpolation_guidance", CUDEM_INTENT="guidance_only")
             if dst_conf is not None:
                 dst_conf.update_tags(
                     UNITS="unitless",
                     DESC="Per-pixel guidance confidence (0=low/nodata, 1=high): DOA x optical_quality x uncertainty_quality",
+                    ROLE="interpolation_guidance", AUTHORITATIVE="false", CUDEM_INTENT="guidance_only",
                     MIN_CONFIDENCE_THRESHOLD=str(min_confidence_threshold),
                 )
+            dst_guidance.update_tags(UNITS="unitless", DESC="Guidance weight for interpolation use (0..1): support_distance x AOI_interior x baseline_weight", ROLE="interpolation_guidance", AUTHORITATIVE="false", CUDEM_INTENT="guidance_only")
+            dst_trusted.update_tags(DESC="Trusted interior mask for interpolation use (1=trusted interior, 0=edge/unsupported)", ROLE="interpolation_guidance", AUTHORITATIVE="false", CUDEM_INTENT="guidance_only")
+            dst_admiss.update_tags(DESC="SDB admissibility mask: 1=optical domain where SDB guidance is valid (water, not cloud/land/deep), 0=inadmissible", ROLE="interpolation_guidance", AUTHORITATIVE="false", CUDEM_INTENT="guidance_only")
             if dst_prov is not None:
                 dst_prov.update_tags(
                     DESC="Provenance code: 0=nodata/masked, 1=predicted",
+                    ROLE="interpolation_guidance", AUTHORITATIVE="false", CUDEM_INTENT="guidance_only",
                 )
+
+            guidance_meta_global = meta.get("physics_guidance", {}) if isinstance(meta, dict) else {}
+            support_tree, _support_tfm, max_support_dist_m, support_gate_required = _build_support_kdtree(guidance_meta_global, srcs["B02"].crs)
+            min_support_neighbors = max(int(guidance_meta_global.get("min_support_neighbors", 1) or 1), 1)
+            trusted_halo_px = int(guidance_meta_global.get("trusted_halo_px", 128) or 128)
+            anchor_support_good = bool(guidance_meta_global.get("anchor_support_good", False))
+            if anchor_support_good:
+                min_support_neighbors = 1
+                trusted_halo_px = min(trusted_halo_px, 96) if trusted_halo_px > 0 else 96
+                if cw_min is not None:
+                    cw_min = min(float(cw_min), 0.35)
+            if support_tree is not None and max_support_dist_m > 0:
+                log.info("Using CUDEM guidance support gate: max_train_point_dist_m=%.1f m, min_support_neighbors=%d (%d support pts)", max_support_dist_m, min_support_neighbors, support_tree.n)
+            elif support_gate_required:
+                log.warning("CUDEM support-distance DOA gate is active but no usable support tree was built; prediction will fail closed for unsupported pixels.")
+            log.info("CUDEM alignment: outputs are guidance-only and non-authoritative; use guidance_weight/trusted_interior to control interpolation influence.")
 
             windows = [
                 Window(c, r, min(tile_size, width - c), min(tile_size, height - r))
@@ -717,7 +1136,7 @@ def predict_scene(
 
             it = windows
             if _TQDM is not None:
-                it = _TQDM(windows, desc="Inference", unit="tile")
+                it = _TQDM(windows, desc="Inference", unit="tile", disable=not sys.stderr.isatty(), leave=False)
 
             for window in it:
                 b02 = srcs["B02"].read(1, window=window).astype(np.float32)
@@ -760,6 +1179,9 @@ def predict_scene(
                 out_unc_block = np.full(b02.shape, NODATA_VAL, dtype=np.float32)
                 doa_score_block = np.full(b02.shape, NODATA_VAL, dtype=np.float32) if dst_doa else None
                 confidence_block = np.full(b02.shape, NODATA_VAL, dtype=np.float32) if dst_conf else None
+                guidance_block = np.full(b02.shape, NODATA_VAL, dtype=np.float32)
+                trusted_block = np.zeros(b02.shape, dtype=np.uint8)
+                admiss_block = np.zeros(b02.shape, dtype=np.uint8)
                 provenance_block = np.zeros(b02.shape, dtype=np.uint8) if dst_prov else None
 
                 if np.any(valid_mask):
@@ -775,6 +1197,12 @@ def predict_scene(
 
                         domain_mask_local = np.ones(X_block.shape[0], dtype=bool)
                         doa_score_local = np.ones(X_block.shape[0], dtype=np.float32)
+                        support_weight_local = np.ones(X_block.shape[0], dtype=np.float32)
+                        edge_weight_local = np.ones(X_block.shape[0], dtype=np.float32)
+                        guidance_meta = meta.get("physics_guidance", {}) if isinstance(meta, dict) else {}
+                        strict_min_doa = float(max(doa_threshold, guidance_meta.get("min_doa", doa_threshold)))
+                        core_optical_features = guidance_meta.get("core_optical_features", ["stumpf_idx", "stumpf_depth", "brightness", "B02", "B03", "B04", "B08"])
+                        hard_optical_margin_frac = float(guidance_meta.get("hard_optical_margin_frac", 0.05))
 
                         if enable_doa and training_bounds:
                             num = np.zeros(X_block.shape[0], dtype=np.float32)
@@ -806,7 +1234,31 @@ def predict_scene(
 
                             if den > 0:
                                 doa_score_local = num / den
-                                domain_mask_local = (doa_score_local >= np.float32(doa_threshold))
+                                domain_mask_local = (doa_score_local >= np.float32(strict_min_doa))
+                                hard_optical_mask = _core_optical_hard_mask(
+                                    X_block,
+                                    feature_cols,
+                                    training_bounds,
+                                    list(core_optical_features),
+                                    hard_optical_margin_frac,
+                                )
+                                support_mask = _stumpf_support_mask(
+                                    X_block,
+                                    feature_cols,
+                                    training_bounds,
+                                    guidance_meta,
+                                )
+                                distance_mask, support_weight_local = _support_distance_metrics(
+                                    window,
+                                    valid_mask,
+                                    srcs["B02"].transform,
+                                    support_tree,
+                                    max_support_dist_m,
+                                    support_gate_required,
+                                    min_neighbors=min_support_neighbors,
+                                )
+                                edge_weight_local = _edge_trust_weight(window, valid_mask, (height, width), trusted_halo_px)
+                                domain_mask_local &= hard_optical_mask & support_mask & distance_mask
 
                                 doa_valid_total += int(X_block.shape[0])
                                 doa_pass_total += int(domain_mask_local.sum())
@@ -831,7 +1283,16 @@ def predict_scene(
 
                         if np.any(domain_mask_local):
                             X_domain = X_block[domain_mask_local]
-                            y_pred_domain = rf_model.predict(X_domain).astype(np.float32)
+                            actual_training_max = meta.get("depth_stats_m", {}).get("max", 3.8) or 3.8
+                            prediction_mode = str(meta.get("prediction_mode", "stumpf_residual")).lower()
+                            correction_alpha = float(guidance_meta.get("correction_alpha", 0.35))
+                            residual_clip_m = float(meta.get("residual_clip_m", guidance_meta.get("residual_clip_m", 0.5)))
+                            baseline_source = str(guidance_meta.get("baseline_source", "stumpf_depth"))
+                            stumpf_envelope_m = float(guidance_meta.get("stumpf_envelope_m", max(residual_clip_m, 0.3)))
+                            if prediction_mode == "stumpf_residual" and hasattr(rf_model, "predict_residual"):
+                                y_pred_domain = np.asarray(rf_model.predict_residual(X_domain), dtype=np.float32)
+                            else:
+                                y_pred_domain = rf_model.predict(X_domain).astype(np.float32)
 
                             # tree std
                             tree_preds = np.zeros((len(rf_model.estimators_), len(X_domain)), dtype=np.float32)
@@ -851,26 +1312,54 @@ def predict_scene(
                             stumpf_depth_col = feature_cols.index("stumpf_depth") if "stumpf_depth" in feature_cols else None
                             stumpf_idx_col = feature_cols.index("stumpf_idx") if "stumpf_idx" in feature_cols else None
 
-                            actual_training_max = meta.get("depth_stats_m", {}).get("max", 3.8) or 3.8
-
-                            if hybrid_mode and stumpf_depth_col is not None and stumpf_idx_col is not None:
+                            if stumpf_depth_col is not None and stumpf_idx_col is not None:
                                 stumpf_depth_domain = np.maximum(X_domain[:, stumpf_depth_col], 0.0)
                                 stumpf_idx_domain = X_domain[:, stumpf_idx_col]
 
-                                y_pred_domain, y_unc_hybrid, blend_weight = compute_hybrid_prediction(
-                                    rf_pred=y_pred_domain,
-                                    rf_std=y_std_domain,
-                                    stumpf_idx=stumpf_idx_domain,
-                                    stumpf_depth_fitted=stumpf_depth_domain,
-                                    actual_training_max=float(actual_training_max),
-                                    stumpf_lr_coef=stumpf_lr_coef,
-                                    stumpf_lr_intercept=stumpf_lr_intercept,
-                                    physics_params=physics_params,
-                                )
+                                if prediction_mode == "stumpf_residual":
+                                    support_domain = None
+                                    try:
+                                        support_domain = (support_weight_local[domain_mask_local] * edge_weight_local[domain_mask_local]).astype(np.float32)
+                                    except Exception:
+                                        support_domain = None
+                                    y_pred_domain, y_unc_hybrid, blend_weight = compute_physics_guided_prediction(
+                                        rf_pred_residual=y_pred_domain,
+                                        rf_std=y_std_domain,
+                                        stumpf_idx=stumpf_idx_domain,
+                                        stumpf_depth_fitted=stumpf_depth_domain,
+                                        correction_alpha=correction_alpha,
+                                        residual_clip_m=residual_clip_m,
+                                        stumpf_lr_coef=stumpf_lr_coef,
+                                        stumpf_lr_intercept=stumpf_lr_intercept,
+                                        physics_params=physics_params,
+                                        baseline_source=baseline_source,
+                                        stumpf_envelope_m=stumpf_envelope_m,
+                                        support_weight=support_domain,
+                                    )
+                                elif hybrid_mode:
+                                    y_pred_domain, y_unc_hybrid, blend_weight = compute_hybrid_prediction(
+                                        rf_pred=y_pred_domain,
+                                        rf_std=y_std_domain,
+                                        stumpf_idx=stumpf_idx_domain,
+                                        stumpf_depth_fitted=stumpf_depth_domain,
+                                        actual_training_max=float(actual_training_max),
+                                        stumpf_lr_coef=stumpf_lr_coef,
+                                        stumpf_lr_intercept=stumpf_lr_intercept,
+                                        physics_params=physics_params,
+                                    )
+                                else:
+                                    y_unc_hybrid = None
                             else:
                                 y_unc_hybrid = None
 
                             # apply limits
+                            if stumpf_depth_col is not None and model_tier < 2:
+                                stumpf_support = np.maximum(X_domain[:, stumpf_depth_col], 0.0)
+                                y_pred_domain = np.clip(
+                                    y_pred_domain,
+                                    np.maximum(stumpf_support - stumpf_envelope_m, 0.0),
+                                    stumpf_support + stumpf_envelope_m,
+                                )
                             if depth_limit_mode == "optical":
                                 optical_max_depth = optical_depth_factor / np.maximum(kd_est, 0.02)
                                 optical_max_depth = np.minimum(optical_max_depth, max_depth_hard_cap)
@@ -930,11 +1419,35 @@ def predict_scene(
                                 optical_q_domain = optical_q_valid[domain_mask_local]
                                 doa_q_domain = doa_score_local[domain_mask_local]
                                 unc_q_domain = (1.0 / (1.0 + y_unc_domain / 1.5)).astype(np.float32)
-                                conf_domain = doa_q_domain * optical_q_domain * unc_q_domain
+                                support_q_domain = np.ones_like(doa_q_domain, dtype=np.float32)
+                                try:
+                                    support_q_domain = (support_weight_local[domain_mask_local] * edge_weight_local[domain_mask_local]).astype(np.float32)
+                                except Exception as _exc:
+                                    log.debug("Suppressed exception: %s", _exc)
+                                conf_domain = doa_q_domain * optical_q_domain * unc_q_domain * support_q_domain
 
                                 conf_pixels = np.full(int(np.sum(valid_mask)), NODATA_VAL, dtype=np.float32)
                                 conf_pixels[domain_mask_local] = np.where(good, conf_domain, NODATA_VAL)
                                 confidence_block[valid_mask] = conf_pixels
+
+                            guidance_pixels = np.full(int(np.sum(valid_mask)), NODATA_VAL, dtype=np.float32)
+                            trusted_pixels = np.zeros(int(np.sum(valid_mask)), dtype=np.uint8)
+                            try:
+                                support_q_domain = (support_weight_local[domain_mask_local] * edge_weight_local[domain_mask_local]).astype(np.float32)
+                            except Exception:
+                                support_q_domain = np.ones(int(domain_mask_local.sum()), dtype=np.float32)
+                            guidance_domain = np.clip(blend_weight * support_q_domain, 0.0, 1.0).astype(np.float32)
+                            guidance_pixels[domain_mask_local] = np.where(good, guidance_domain, NODATA_VAL)
+                            trusted_domain = (guidance_domain >= 0.85).astype(np.uint8)
+                            trusted_pixels[domain_mask_local] = np.where(good, trusted_domain, 0).astype(np.uint8)
+                            guidance_block[valid_mask] = guidance_pixels
+                            trusted_block[valid_mask] = trusted_pixels
+
+                            # Admissibility: marks the optical domain where SDB guidance is valid.
+                            # A pixel is admissible if it passed all masks (valid_mask) AND DOA.
+                            admiss_pixels = np.zeros(int(np.sum(valid_mask)), dtype=np.uint8)
+                            admiss_pixels[domain_mask_local] = np.where(good, np.uint8(1), np.uint8(0))
+                            admiss_block[valid_mask] = admiss_pixels
 
                     except Exception:
                         log.exception("Prediction failed on tile")
@@ -949,6 +1462,9 @@ def predict_scene(
                             doa_score_block[bad] = NODATA_VAL
                         if confidence_block is not None:
                             confidence_block[bad] = NODATA_VAL
+                        guidance_block[bad] = NODATA_VAL
+                        trusted_block[bad] = 0
+                        admiss_block[bad] = 0
                         if provenance_block is not None:
                             provenance_block[bad] = 0
 
@@ -965,6 +1481,11 @@ def predict_scene(
                         if doa_score_block is not None:
                             doa_score_block[low_conf] = NODATA_VAL
                         confidence_block[low_conf] = NODATA_VAL
+                        guidance_block[low_conf] = NODATA_VAL
+                        trusted_block[low_conf] = 0
+                        # Note: admissibility is NOT zeroed by confidence threshold —
+                        # the pixel is still in the admissible optical domain, just low
+                        # confidence.  Downstream can decide whether to use it.
                         if provenance_block is not None:
                             provenance_block[low_conf] = 0
 
@@ -979,6 +1500,9 @@ def predict_scene(
                     dst_doa.write(np.ascontiguousarray(doa_score_block, dtype=np.float32), 1, window=window)
                 if dst_conf is not None and confidence_block is not None:
                     dst_conf.write(np.ascontiguousarray(confidence_block, dtype=np.float32), 1, window=window)
+                dst_guidance.write(np.ascontiguousarray(guidance_block, dtype=np.float32), 1, window=window)
+                dst_trusted.write(np.ascontiguousarray(trusted_block, dtype=np.uint8), 1, window=window)
+                dst_admiss.write(np.ascontiguousarray(admiss_block, dtype=np.uint8), 1, window=window)
                 if dst_prov is not None and provenance_block is not None:
                     dst_prov.write(np.ascontiguousarray(provenance_block, dtype=np.uint8), 1, window=window)
 
@@ -993,6 +1517,51 @@ def predict_scene(
         log.info("  Passed DOA:        %10d  (%4.1f%%)", funnel['doa_pass'], 100*funnel['doa_pass']/total)
         log.info("  Final predicted:   %10d  (%4.1f%%)", funnel['predicted'], 100*funnel['predicted']/total)
 
+        # --- SDB Prediction Acceptance Ledger ---
+        # Machine-readable diagnostic explaining exactly where pixels were
+        # accepted or rejected.  Downstream QA tools consume this to identify
+        # coverage problems.
+        try:
+            ledger = {
+                "schema": "sdb_acceptance_ledger_v1",
+                "funnel": {k: int(v) for k, v in funnel.items()},
+                "rejection_gates": {
+                    "not_finite": int(funnel["pixels_total"] - funnel["finite_optical"]),
+                    "clear_water_mask": int(funnel["finite_optical"] - funnel["cw_pass"]),
+                    "land_mask": int(funnel["cw_pass"] - funnel["land_pass"]),
+                    "doa_rejection": int(funnel["base_valid"] - funnel["doa_pass"]),
+                    "support_distance_or_depth_limit": int(funnel["doa_pass"] - funnel["predicted"]),
+                },
+                "acceptance_rate": float(funnel["predicted"]) / max(float(funnel["pixels_total"]), 1.0),
+                "water_acceptance_rate": float(funnel["predicted"]) / max(float(funnel["land_pass"]), 1.0),
+                "support_gate": {
+                    "max_train_point_dist_m": float(max_support_dist_m) if max_support_dist_m else 0.0,
+                    "min_support_neighbors": int(min_support_neighbors),
+                    "n_support_points": int(support_tree.n) if support_tree is not None else 0,
+                    "anchor_support_good": bool(anchor_support_good),
+                },
+                "optical_limits": {
+                    "depth_limit_mode": str(depth_limit_mode),
+                    "max_depth_training_m": float(max_depth_training) if max_depth_training else None,
+                    "max_depth_hard_cap": float(max_depth_hard_cap) if max_depth_hard_cap else None,
+                    "cw_min": float(cw_min) if cw_min is not None else None,
+                },
+            }
+            if doa_valid_total > 0:
+                ledger["doa_stats"] = {
+                    "valid_pixels": int(doa_valid_total),
+                    "pass": int(doa_pass_total),
+                    "reject": int(doa_reject_total),
+                    "reject_rate": float(doa_reject_total) / max(float(doa_valid_total), 1.0),
+                }
+            ledger_path = Path(str(out_path)).with_name(Path(str(out_path)).stem + "_acceptance_ledger.json")
+            import json as _json_ledger
+            with open(ledger_path, "w") as _lf:
+                _json_ledger.dump(ledger, _lf, indent=2, default=str)
+            log.info("Acceptance ledger: %s", ledger_path)
+        except Exception as _ledger_e:
+            log.warning("Failed to write acceptance ledger: %s", _ledger_e)
+
         if funnel['predicted'] == 0:
             log.error("Zero pixels predicted. Possible causes: "
                       "cw_min too high; land mask masking water; missing S2 data; DOA rejecting everything (try --no-doa)")
@@ -1003,6 +1572,9 @@ def predict_scene(
             log.info("Confidence raster: %s", conf_path)
             if min_confidence_threshold > 0:
                 log.info("Applied min_confidence_threshold=%.2f — cells below this are nodata in depth raster", min_confidence_threshold)
+        log.info("Guidance-weight raster: %s", guidance_weight_path)
+        log.info("Trusted-interior raster: %s", trusted_interior_path)
+        log.info("Admissibility raster: %s", admissibility_path)
         if prov_path:
             log.info("Provenance raster: %s  (0=nodata, 1=predicted)", prov_path)
 
@@ -1012,17 +1584,47 @@ def predict_scene(
             report_dir.mkdir(parents=True, exist_ok=True)
             rep = {"predict": {"funnel": funnel, "high_unc_threshold_m": float(high_unc_threshold),
                                "confidence_path": conf_path, "provenance_path": prov_path,
+                               "guidance_weight_path": guidance_weight_path, "trusted_interior_path": trusted_interior_path,
+                               "admissibility_path": admissibility_path,
+                               "cudem_guidance_only": True, "authoritative": False,
                                "min_confidence_threshold": min_confidence_threshold}}
             with open(report_dir / "predict_report.json", "w", encoding="utf-8") as f:
                 json.dump(rep, f, indent=2)
-        except Exception:
+        except OSError:
             log.debug("Failed to write predict_report.json", exc_info=True)
+
+        # -------------------------------------------------------------------
+        # Sparse guide-point export (guidance-producer alignment)
+        #
+        # Emit spatially thinned pseudo-soundings from the SDB prediction as a
+        # GeoPackage.  Each point carries depth, confidence, guidance_weight,
+        # uncertainty, and provenance so downstream DEM interpolation can treat
+        # them as confidence-weighted sparse constraints — NOT wall-to-wall
+        # raster truth.  Points are subordinate to authoritative survey data.
+        # -------------------------------------------------------------------
+        guide_points_path = str(Path(out_path).with_name(Path(out_path).stem + "_guide_points.gpkg"))
+        try:
+            _export_sdb_guide_points(
+                depth_path=out_path,
+                confidence_path=conf_path,
+                guidance_weight_path=guidance_weight_path,
+                uncertainty_path=out_unc_path,
+                out_gpkg=guide_points_path,
+                min_confidence=max(float(min_confidence_threshold), 0.15),
+                max_points=5000,
+            )
+            rep.setdefault("predict", {})["guide_points_path"] = guide_points_path
+            log.info("SDB guide points exported: %s", guide_points_path)
+        except Exception:
+            log.debug("SDB guide-point export skipped (optional dependency missing or no valid pixels)", exc_info=True)
 
     finally:
         for s in srcs.values():
             try:
-                s.close()
-            except Exception:
+                close_fn = getattr(s, "close", None)
+                if callable(close_fn):
+                    close_fn()
+            except (OSError, AttributeError):
                 log.debug("ignored", exc_info=True)  # close error
 
     log.info("Finished. Depth: %s", out_path)
@@ -1034,7 +1636,7 @@ def reproject_to_nad83(src_path: str, dst_path: str):
     log.info("Reprojecting with: %s", cmd)
     try:
         run_cmd(shlex.split(cmd), check=True)
-    except Exception:
+    except (OSError, subprocess.CalledProcessError):
         log.warning("gdalwarp failed.")
 
 
@@ -1116,7 +1718,7 @@ if __name__ == "__main__":
     try:
         from logging_config import setup_logging
         setup_logging()
-    except Exception:
+    except (ImportError, OSError, ValueError):
         import logging
         logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     sys.exit(main())

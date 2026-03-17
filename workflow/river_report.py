@@ -88,7 +88,6 @@ class RiverReport:
                 self.data["duration_seconds"] = (end - start).total_seconds()
             except (ValueError, TypeError) as e:
                 log.debug("Could not calculate duration: %s", e)
-                pass
         
         self.data["status"] = status
         
@@ -352,7 +351,6 @@ def create_inference_metadata(
                         }
                 except (ValueError, IndexError) as e:
                     log.debug("Could not compute raster statistics: %s", e)
-                    pass
         except Exception as e:
             log.warning("[RIVER REPORT] Could not read raster stats: %s", e)
     

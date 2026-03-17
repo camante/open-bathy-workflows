@@ -20,6 +20,7 @@ import time
 import calendar
 import json
 import hashlib
+import warnings
 
 # -----------------------------------------------------------------------------
 # Optional exact-match caching utilities (cache_utils.py)
@@ -59,19 +60,67 @@ def _safe_rint_to_uint8(arr: np.ndarray, fill: int = 0) -> np.ndarray:
         v = np.clip(v, 0, 255).astype(np.uint8)
         out[m] = v
     return out
+
+
+def _nanmean_stack_no_warn(stack: np.ndarray) -> np.ndarray:
+    """Mean across axis=0 without noisy all-NaN RuntimeWarnings."""
+    valid = np.isfinite(stack)
+    den = valid.sum(axis=0)
+    num = np.where(valid, stack, 0.0).sum(axis=0, dtype=np.float64)
+    out = np.full(stack.shape[1:], np.nan, dtype=np.float32)
+    np.divide(num, den, out=out, where=den > 0)
+    return out.astype(np.float32)
+
+
+def _nanmedian_stack_no_warn(stack: np.ndarray) -> np.ndarray:
+    """Median across axis=0 without cluttering logs for expected all-NaN slices."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        out = np.nanmedian(stack, axis=0)
+    return np.asarray(out, dtype=np.float32)
+
+
+def apply_s2_brightness_depth_filter(df, *args, **kwargs):
+    """Production-facing helper exported for train.py binding.
+
+    Delegates to train.py's maintained implementation to avoid interface drift
+    without duplicating QC logic here. Imported lazily to avoid module cycles at
+    import time.
+    """
+    from train import _LOCAL_APPLY_S2_BRIGHTNESS_DEPTH_FILTER as _impl
+    return _impl(df, *args, **kwargs)
+
+
+def apply_stumpf_residual_filter(df, *args, **kwargs):
+    """Production-facing helper exported for train.py binding."""
+    from train import _LOCAL_APPLY_STUMPF_RESIDUAL_FILTER as _impl
+    return _impl(df, *args, **kwargs)
 import requests
 from requests.exceptions import HTTPError, RequestException
 
-import rasterio
-from rasterio.transform import from_bounds
-from rasterio.enums import Resampling
-from rasterio.warp import reproject
+try:
+    import rasterio
+    from rasterio.transform import from_bounds
+    from rasterio.enums import Resampling
+    from rasterio.warp import reproject
+except Exception:  # pragma: no cover - optional in lightweight test environments
+    rasterio = None  # type: ignore
+    from_bounds = None  # type: ignore
+    Resampling = None  # type: ignore
+    reproject = None  # type: ignore
 
 from scipy.ndimage import binary_dilation, distance_transform_edt
 
-from shapely.geometry import shape, box, Polygon, MultiPolygon
-from shapely.ops import unary_union
-from pyproj import Geod, Transformer
+try:
+    from shapely.geometry import shape, box, Polygon, MultiPolygon
+    from shapely.ops import unary_union
+except Exception:  # pragma: no cover - optional in lightweight test environments
+    shape = box = Polygon = MultiPolygon = unary_union = None  # type: ignore
+
+try:
+    from pyproj import Geod, Transformer
+except Exception:  # pragma: no cover - optional in lightweight test environments
+    Geod = Transformer = None  # type: ignore
 
 # -------------------------
 # Logging
@@ -87,7 +136,7 @@ BANDS = ["B02", "B03", "B04", "B08", "SCL"]
 
 # SCL codes to treat as bad / masked out
 SCL_BAD = {0, 3, 8, 9, 10, 11}
-GEOD = Geod(ellps="WGS84")
+GEOD = Geod(ellps="WGS84") if callable(Geod) else None
 
 # -------------------------
 # Data model
@@ -111,13 +160,9 @@ class Scene:
 # Parsing helpers
 # -------------------------
 def parse_aoi(aoi_str: str) -> Tuple[float, float, float, float]:
-    parts = re.split(r"[,\s/]+", aoi_str.strip())
-    if len(parts) != 4:
-        raise ValueError("AOI must be W/E/S/N (e.g. -78/-77.75/25.5/25.75)")
-    w, e, s, n = map(float, parts)
-    if not (w < e and s < n):
-        raise ValueError("AOI must satisfy W<E and S<N")
-    return w, e, s, n
+    """Parse ``"W/E/S/N"`` → ``(W, E, S, N)``.  Delegates to :func:`pipeline.aoi.parse_aoi_wesn`."""
+    from pipeline.aoi import parse_aoi_wesn
+    return parse_aoi_wesn(aoi_str, strict=True)
 
 # -------------------------
 # Cache key helpers (AOI + time frame)
@@ -1378,7 +1423,7 @@ def mosaic_tiles(
             den = np.sum(wstack, axis=0)
             out[b] = np.where(den > 0, num / den, np.nan).astype(np.float32)
         else:
-            out[b] = np.nanmean(stack, axis=0).astype(np.float32)
+            out[b] = _nanmean_stack_no_warn(stack)
 
     # SCL: choose tile with max weight at each pixel
     scl_stack = np.stack([mosaics_by_tile[t]["SCL"].astype(np.float32) for t in tiles], axis=0)
@@ -1394,7 +1439,7 @@ def mosaic_tiles(
 
         out["SCL"] = np.where(np.isfinite(scl_out), np.rint(scl_out), np.nan).astype(np.float32)
     else:
-        scl_med = np.nanmedian(scl_stack, axis=0)
+        scl_med = _nanmedian_stack_no_warn(scl_stack)
         out["SCL"] = np.where(np.isfinite(scl_med), np.rint(scl_med), np.nan).astype(np.float32)
 
     return out
@@ -1735,8 +1780,9 @@ def build_weighted_shared_date_composite(
             diff_info.append(f"  code_fp: stored={stored_code_fp!r} (new code ignores this)")
         
         log.warning(
-            f"[S2] Cache mismatch in {out_dir}: have_key={str(have_key)[:12]} want_key={str(want_key)[:12]} "
-            f"(full keys in meta). Rebuilding (purging old outputs)."
+            "[S2] Cache mismatch in %s: have_key=%s want_key=%s "
+            "(full keys in meta). Rebuilding (purging old outputs).",
+            out_dir, str(have_key)[:12], str(want_key)[:12],
         )
         if diff_info:
             log.warning("Cache key differences:\n" + "\n".join(diff_info[:15]))  # Limit to first 15
@@ -1810,8 +1856,8 @@ def build_weighted_shared_date_composite(
         tiles = sorted(items_by_tile.keys())
         kept = sum(len(v) for v in items_by_tile.values())
         log.info(
-            f"[S2] Candidate build done: tiles={len(tiles)} kept_items={kept} "
-            f"dropped_cloud={dropped_cloud} dropped_dt={dropped_dt} dropped_geom={dropped_geom} dropped_tile={dropped_tile}"
+            "[S2] Candidate build done: tiles=%s kept_items=%s  dropped_cloud=%s dropped_dt=%s dropped_geom=%s dropped_tile=%s",
+            len(tiles), kept, dropped_cloud, dropped_dt, dropped_geom, dropped_tile,
         )
 
         if not tiles:
@@ -1847,8 +1893,9 @@ def build_weighted_shared_date_composite(
             shared_strict = set.intersection(*dt_sets) if dt_sets else set()
             if len(shared_strict) < MIN_STRICT_DATES:
                 log.warning(
-                    f"[S2] STRICT shared-date selection produced only {len(shared_strict)} dates "
-                    f"(<{MIN_STRICT_DATES}). Falling back to RELAXED (union) shared-date selection."
+                    "[S2] STRICT shared-date selection produced only %d dates "
+                    "(<%d). Falling back to RELAXED (union) shared-date selection.",
+                    len(shared_strict), MIN_STRICT_DATES,
                 )
                 shared = set.union(*dt_sets) if dt_sets else set()
                 shared_mode_used = "relaxed"
@@ -1868,7 +1915,8 @@ def build_weighted_shared_date_composite(
             )
 
         log.info(
-            f"[S2] Shared-date selection: requested={req_mode} used={shared_mode_used} candidates={len(shared)}"
+            "[S2] Shared-date selection: requested=%s used=%s candidates=%s",
+            req_mode, shared_mode_used, len(shared),
         )
         # rank by weighted cloud (month filtering at ranking stage)
         ranked = []
@@ -1909,7 +1957,7 @@ def build_weighted_shared_date_composite(
         log.info(" idx  w_cloud%%  tiles_present  DATE_KEY")
         log.info(" ---  --------  -------------  ------------------------")
         for i, (score, dt, present) in enumerate(ranked[:min(20, len(ranked))], 1):
-            log.info(f" {i:3d}  {score:8.2f}  {','.join(present):13s}  {dt}")
+            log.info(" %3d  %8.2f  %-13s  %s", i, score, ','.join(present), dt)
         log.info("")
 
         # Setup cache dir
@@ -2141,7 +2189,7 @@ def build_weighted_shared_date_composite(
 
             outliers = [k for k in keys0 if triggers_map.get(k)]
             if outliers:
-                log.info(f"Initial outliers detected ({len(outliers)}): {', '.join(outliers)}")
+                log.info("Initial outliers detected (%d): %s", len(outliers), ', '.join(outliers))
                 for k in outliers:
                     log.info("- %s triggers: %s", k, "; ".join(triggers_map[k]))
             else:
@@ -2226,7 +2274,9 @@ def build_weighted_shared_date_composite(
         stack_dates = list(selected_dates)
         if single_best_date and selected_dates:
             stack_dates = [selected_dates[0]]
-            log.info(f"SINGLE BEST DATE MODE: Using only {selected_dates[0]} (score={date_metrics.get(selected_dates[0], {}).get('score', 'N/A'):.3f})")
+            best_score = date_metrics.get(selected_dates[0], {}).get('score', 'N/A')
+            log.info("SINGLE BEST DATE MODE: Using only %s (score=%.3f)",
+                     selected_dates[0], float(best_score) if best_score != 'N/A' else 0.0)
         elif int(temporal_median_k) > 0:
             stack_dates = stack_dates[: int(temporal_median_k)]
             log.info("Temporal median using best K dates: K=%s of %s", int(temporal_median_k), len(selected_dates))
@@ -2290,8 +2340,8 @@ def build_weighted_shared_date_composite(
 
         final: Dict[str, np.ndarray] = {}
         for b in ["B02", "B03", "B04", "B08"]:
-            final[b] = np.nanmedian(np.stack(stacks[b], axis=0), axis=0).astype(np.float32)
-        scl_final = np.nanmedian(np.stack(stacks["SCL"], axis=0), axis=0)
+            final[b] = _nanmedian_stack_no_warn(np.stack(stacks[b], axis=0))
+        scl_final = _nanmedian_stack_no_warn(np.stack(stacks["SCL"], axis=0))
         final["SCL"] = np.where(np.isfinite(scl_final), np.rint(scl_final), np.nan).astype(np.float32)
 
         # Optional: Hedley-style sun-glint correction (cheap when it helps).
@@ -2323,9 +2373,10 @@ def build_weighted_shared_date_composite(
                         final[b] = v
                     glint_meta_comp = meta_g
                     if meta_g.get("status") == "applied":
-                        log.info(f"Applied Hedley correction to {vis_bands} using {meta_g.get('n_samples')} samples (nir_min={meta_g.get('nir_min')})")
+                        log.info("Applied Hedley correction to %s using %s samples (nir_min=%s)",
+                                 vis_bands, meta_g.get('n_samples'), meta_g.get('nir_min'))
                     else:
-                        log.info(f"Skipped glint correction: {meta_g.get('reason')}")
+                        log.info("Skipped glint correction: %s", meta_g.get('reason'))
             except Exception as exc:
                 glint_meta_comp = {"enabled": True, "status": "skipped", "reason": f"exception: {exc}"}
                 log.warning("Glint correction failed; continuing without it: %s", exc)
@@ -2392,9 +2443,10 @@ def build_weighted_shared_date_composite(
                                 mos_best[b] = v
                             glint_meta_best = meta_b
                             if meta_b.get("status") == "applied":
-                                log.info(f"Best-date glint correction applied to {vis_bands} using {meta_b.get('n_samples')} samples")
+                                log.info("Best-date glint correction applied to %s using %s samples",
+                                         vis_bands, meta_b.get('n_samples'))
                             else:
-                                log.info(f"Best-date glint correction skipped: {meta_b.get('reason')}")
+                                log.info("Best-date glint correction skipped: %s", meta_b.get('reason'))
                     except Exception as exc3:
                         glint_meta_best = {"enabled": True, "status": "skipped", "reason": f"exception: {exc3}"}
                         log.warning("Best-date glint correction failed; continuing without it: %s", exc3)

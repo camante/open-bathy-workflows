@@ -340,6 +340,10 @@ class Provenance:
     BLENDED: int = 6
     EXTRAPOLATED: int = 7
     
+    # Domain-class codes (8-9 range)
+    ESTUARY_TRANSITION: int = 8
+    ESTUARY_CONFLICT: int = 9
+    
     # Gap-fill specific codes (10-19 range)
     GAPFILL_PRIOR_ONLY: int = 10
     GAPFILL_CORRECTED: int = 11
@@ -359,6 +363,9 @@ class Provenance:
             5: "Averaged (multiple sources)",
             6: "Blended (tapered transition)",
             7: "Extrapolated (physics-based)",
+            # Domain-class codes
+            8: "Estuary transition (reduced-trust handoff zone)",
+            9: "Estuary conflict (river/SDB disagree; guidance suppressed)",
             # Gap-fill codes
             10: "Gap-fill: Prior only (no HQ nearby)",
             11: "Gap-fill: Prior + residual correction",

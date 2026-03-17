@@ -30,15 +30,30 @@ log = logging.getLogger(__name__)
 def estimate_memory_requirement_gb(width: int, height: int, n_features: int = 14, dtype_bytes: int = 4, overhead_factor: float = 3.0) -> float:
     """Rough in-memory requirement estimate for standard (non-chunked) prediction.
 
-    This is a heuristic used for auto-enabling chunked prediction. It assumes
-    n_features float32 arrays plus temporary buffers (overhead_factor).
+    Delegates to :func:`chunked_processing.estimate_memory_requirement_gb` when
+    available, falling back to a simple heuristic otherwise.  The canonical
+    memory-estimation logic lives in ``chunked_processing.py``; this wrapper
+    preserves the legacy (width, height, n_features) call signature used by
+    ``sdb_main.py``.
     """
     try:
-        n_pix = int(width) * int(height)
-        bytes_needed = float(n_pix) * float(n_features) * float(dtype_bytes) * float(overhead_factor)
-        return bytes_needed / 1e9
+        from chunked_processing import estimate_memory_requirement_gb as _canonical
+        import numpy as np
+        return _canonical(
+            height=int(height),
+            width=int(width),
+            n_bands=int(n_features),
+            dtype=np.dtype(f"f{dtype_bytes}"),
+            n_arrays=int(overhead_factor),
+        )
     except Exception:
-        return 0.0
+        # Fallback: simple heuristic if chunked_processing is unavailable
+        try:
+            n_pix = int(width) * int(height)
+            bytes_needed = float(n_pix) * float(n_features) * float(dtype_bytes) * float(overhead_factor)
+            return bytes_needed / 1e9
+        except Exception:
+            return 0.0
 
 
 try:

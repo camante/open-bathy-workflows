@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import sys
+import json
 import unittest
 import tempfile
 import shutil
@@ -10,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import tifffile
+from sklearn.isotonic import IsotonicRegression
 
 from conftest import (
     _install_mocks, build_synthetic_scene, build_training_df,
@@ -96,6 +98,39 @@ class TestTrainSdbModel(unittest.TestCase):
         self.assertTrue(np.all(preds >= 0),
                         f"RF predictions should be positive magnitudes; got min={preds.min():.3f}")
 
+    def test_rf_wrapper_roundtrips_through_joblib(self):
+        import joblib
+        rf, _, _, _, meta = self._train()
+        model_path = self._session / "rf_wrapper_roundtrip.pkl"
+        joblib.dump(rf, model_path)
+        loaded = joblib.load(model_path)
+
+        b02 = self.training_df["B02"].values.astype(np.float32)
+        b03 = self.training_df["B03"].values.astype(np.float32)
+        b04 = self.training_df["B04"].values.astype(np.float32)
+        b08 = self.training_df["B08"].values.astype(np.float32)
+        brt = self.training_df["brightness"].values.astype(np.float32)
+        feat_map = {
+            "B02": b02, "B03": b03, "B04": b04, "B08": b08,
+            "log_B02": np.log(b02+1e-3), "log_B03": np.log(b03+1e-3),
+            "log_B04": np.log(b04+1e-3), "log_B08": np.log(b08+1e-3),
+            "brightness": brt,
+            "B03_B02": b03/(b02+1e-6), "B04_B03": b04/(b03+1e-6),
+            "nbri": (b08-b03)/(b08+b03+1e-6),
+            "stumpf_idx": self.training_df["stumpf_idx"].values,
+            "stumpf_depth": self.training_df["stumpf_depth"].values,
+        }
+        X = np.column_stack([feat_map[c] for c in meta["feature_columns"]]).astype(np.float32)
+        preds = loaded.predict(X)
+        residual = loaded.predict_residual(X)
+
+        self.assertEqual(preds.shape[0], X.shape[0])
+        self.assertEqual(residual.shape[0], X.shape[0])
+        self.assertTrue(np.all(np.isfinite(preds)))
+        self.assertTrue(np.all(np.isfinite(residual)))
+        self.assertTrue(np.all(preds >= 0),
+                        f"Loaded RF wrapper predictions should be positive magnitudes; got min={preds.min():.3f}")
+
     def test_input_depths_are_negative(self):
         self.assertTrue(np.all(self.training_df["depth_m"] < 0),
                         "Training fixture must use negative-down depths")
@@ -104,6 +139,15 @@ class TestTrainSdbModel(unittest.TestCase):
         _, _, _, _, meta = self._train()
         depth_keys = [k for k in meta if "max_depth" in k]
         self.assertGreater(len(depth_keys), 0)
+
+    def test_train_report_written_to_explicit_diagnostics_dir(self):
+        diag_dir = self._session / "diag_report_out"
+        self._train(diagnostics_dir=diag_dir)
+        report_path = diag_dir / "train_report.json"
+        self.assertTrue(report_path.exists(), "train_report.json should be written to diagnostics_dir")
+        payload = json.loads(report_path.read_text())
+        self.assertIn("train", payload)
+        self.assertIn("max_depth_sdb_auto_m", payload["train"])
 
     def test_too_few_points_does_not_raise(self):
         tiny = pd.DataFrame({
@@ -212,6 +256,52 @@ class TestPredictScene(unittest.TestCase):
             predict.predict_scene(**kw)
         self.assertTrue(any("min_confidence_threshold" in m for m in cm.output),
                         "Expected warning about threshold having no effect")
+
+    def test_support_neighbor_gate_blocks_singleton_support(self):
+        import predict
+        meta_path = self.model_dir / "model_meta.json"
+        original = meta_path.read_text()
+        try:
+            meta = json.loads(original)
+            meta["physics_guidance"] = {
+                "max_train_point_dist_m": 1.0e6,
+                "min_support_neighbors": 3,
+                "support_points_lonlat": [[-81.0, 25.0]],
+                "trusted_halo_px": 32,
+                "low_support": True,
+            }
+            meta_path.write_text(json.dumps(meta, indent=2))
+
+            out = self._session / "d_singleton_support.tif"
+            kw = _predict_kwargs(self.scene_paths, self.model_dir, out,
+                                 write_confidence=False, write_provenance=False)
+            predict.predict_scene(**kw)
+            arr = tifffile.imread(str(out)).astype(np.float32)
+            valid = np.isfinite(arr) & (arr != -9999.0)
+            self.assertEqual(int(valid.sum()), 0,
+                             "A singleton support point must not open broad prediction coverage when min_support_neighbors=3")
+        finally:
+            meta_path.write_text(original)
+
+    def test_isotonic_stumpf_model_does_not_emit_linear_coeff_warning(self):
+        import logging
+        import joblib
+        import predict
+
+        iso_model = IsotonicRegression(increasing=True, out_of_bounds="clip")
+        stumpf_idx = np.linspace(0.8, 1.6, 64).astype(np.float32)
+        depths = np.linspace(1.0, 8.0, 64).astype(np.float32)
+        iso_model.fit(stumpf_idx, depths)
+        joblib.dump(iso_model, self.model_dir / "stumpf_lr.pkl")
+
+        out = self._session / "d_isotonic.tif"
+        kw = _predict_kwargs(self.scene_paths, self.model_dir, out,
+                             write_confidence=False, write_provenance=False)
+        with self.assertLogs("sdb.predict", level=logging.INFO) as cm:
+            predict.predict_scene(**kw)
+        logs = "\n".join(cm.output)
+        self.assertIn("IsotonicRegression", logs)
+        self.assertNotIn("Could not extract Stumpf LR coefficients", logs)
 
 
 class TestPredictChunked(unittest.TestCase):

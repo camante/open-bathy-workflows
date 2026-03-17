@@ -169,13 +169,23 @@ def _clip_raster_to_mask_reproject(
 
 
 def _gaussian_smooth_masked(data: "np.ndarray", valid: "np.ndarray", sigma_px: float) -> "np.ndarray":
-    """Gaussian smooth with nodata masking using the standard weighted approach."""
+    """Gaussian smooth with nodata masking using the standard weighted approach.
+
+    Caps sigma_px to prevent enormous kernel sizes that cause OOM/hangs on large rasters.
+    """
     from scipy.ndimage import gaussian_filter
     import numpy as np
 
     sigma_px = float(max(0.0, sigma_px))
     if sigma_px == 0.0:
         return data.astype("float32", copy=False)
+
+    # Safety cap: very large sigma relative to raster size creates enormous kernels
+    # that can hang or OOM. Cap at 1/4 of the smaller dimension.
+    max_dim = min(data.shape[0], data.shape[1])
+    sigma_cap = max(max_dim / 4.0, 1.0)
+    if sigma_px > sigma_cap:
+        sigma_px = sigma_cap
 
     w = valid.astype("float32")
     data0 = np.where(valid, data.astype("float32"), 0.0).astype("float32")
@@ -779,6 +789,22 @@ def warp_raster_to_srs(
     if gdalwarp is None:
         log.error("gdalwarp not found; cannot reproject %s", in_raster)
         return None
+
+    # Avoid pointless same-CRS reprojection and duplicated filenames like
+    # *_epsg4269_epsg4269.tif. Returning the original path is safer than
+    # creating a second derived copy with identical spatial reference.
+    try:
+        import rasterio
+        from pyproj import CRS as _PyProjCRS
+        with rasterio.open(in_raster) as src:
+            src_crs = src.crs
+        if src_crs is not None and _PyProjCRS.from_user_input(src_crs) == _PyProjCRS.from_user_input(dst_srs):
+            if write_depth_metadata:
+                apply_depth_metadata(in_raster)
+            return Path(in_raster)
+    except Exception:
+        log.debug("same-CRS warp short-circuit check failed", exc_info=True)
+
     if out_raster.exists() and out_raster.stat().st_size > 0:
         if reuse_existing and _raster_has_valid_pixels(out_raster):
             if write_depth_metadata:

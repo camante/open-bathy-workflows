@@ -811,7 +811,7 @@ def adaptive_spatial_sample(
         if sampling_config.detect_transects:
             log.info("Detecting linear transects...")
             coarse_df['is_transect'] = detect_transects(c_points)
-            log.info(f"Detected {int(coarse_df['is_transect'].sum())} transect points")
+            log.info("Detected %d transect points", int(coarse_df['is_transect'].sum()))
         else:
             coarse_df['is_transect'] = False
 
@@ -835,23 +835,26 @@ def adaptive_spatial_sample(
         if sampling_config.detect_transects:
             log.info("Detecting linear transects...")
             df['is_transect'] = detect_transects(points)
-            log.info(f"Detected {int(df['is_transect'].sum())} transect points")
+            log.info("Detected %d transect points", int(df['is_transect'].sum()))
         else:
             df['is_transect'] = False
 
         working_df = df
     
     log.info("Complexity distribution:")
-    log.info(f"  High (>{sampling_config.high_complexity_threshold}): "
-            f"{(complexity_scores > sampling_config.high_complexity_threshold).sum()} points")
+    log.info("  High (>%s): %d points",
+            sampling_config.high_complexity_threshold,
+            (complexity_scores > sampling_config.high_complexity_threshold).sum())
     
     medium_count = ((complexity_scores >= sampling_config.low_complexity_threshold) & 
                     (complexity_scores <= sampling_config.high_complexity_threshold)).sum()
-    log.info(f"  Medium ({sampling_config.low_complexity_threshold}-{sampling_config.high_complexity_threshold}): "
-            f"{medium_count} points")
+    log.info("  Medium (%s-%s): %d points",
+            sampling_config.low_complexity_threshold,
+            sampling_config.high_complexity_threshold, medium_count)
     
-    log.info(f"  Low (<{sampling_config.low_complexity_threshold}): "
-            f"{(complexity_scores < sampling_config.low_complexity_threshold).sum()} points")
+    log.info("  Low (<%s): %d points",
+            sampling_config.low_complexity_threshold,
+            (complexity_scores < sampling_config.low_complexity_threshold).sum())
     
     # (Transect flags already set above)
     
@@ -881,9 +884,9 @@ def adaptive_spatial_sample(
     tier3_df = working_df[tier3_mask].copy()
     
     log.info("Tier distribution:")
-    log.info(f"  Tier 1 (High accuracy): {len(tier1_df):,} points from {tier1_df['source'].nunique()} sources")
-    log.info(f"  Tier 2 (Medium accuracy): {len(tier2_df):,} points from {tier2_df['source'].nunique()} sources")
-    log.info(f"  Tier 3 (Gap fillers): {len(tier3_df):,} points from {tier3_df['source'].nunique()} sources")
+    log.info("  Tier 1 (High accuracy): %d points from %d sources", len(tier1_df), tier1_df['source'].nunique())
+    log.info("  Tier 2 (Medium accuracy): %d points from %d sources", len(tier2_df), tier2_df['source'].nunique())
+    log.info("  Tier 3 (Gap fillers): %d points from %d sources", len(tier3_df), tier3_df['source'].nunique())
     
     # -------------------------------------------------------------------------
     # 3.1: Process Tier 1 (Preserve aggressively)
@@ -1000,8 +1003,8 @@ def adaptive_spatial_sample(
                 before_n = len(source_df)
                 source_df = source_df[pre_keep].copy()
                 log.info(
-                    f"  {source}: {before_n:,} gap points → pre-thin to {len(source_df):,} "
-                    f"(cell={cell_m:.1f} m, cap={max_keep:,}; target retention: {source_config.retention_target*100:.0f}%)"
+                    "  %s: %s gap points → pre-thin to %s  (cell=%1f m, cap=%s; target retention: %0f%)",
+                    source, f"{before_n:,}", f"{len(source_df):,}", cell_m, f"{max_keep:,}", source_config.retention_target*100,
                 )
             else:
                 log.info("  %s: %s gap points (target retention: %.0f%%)", source, format(len(source_df), ","), source_config.retention_target*100)
@@ -1054,8 +1057,8 @@ def adaptive_spatial_sample(
                 before_n = len(source_df)
                 source_df = source_df[pre_keep].copy()
                 log.info(
-                    f"  {source}: {before_n:,} gap points → pre-thin to {len(source_df):,} "
-                    f"(cell={cell_m:.1f} m, cap={max_keep:,}; target retention: {source_config.retention_target*100:.0f}%)"
+                    "  %s: %s gap points → pre-thin to %s  (cell=%1f m, cap=%s; target retention: %0f%)",
+                    source, f"{before_n:,}", f"{len(source_df):,}", cell_m, f"{max_keep:,}", source_config.retention_target*100,
                 )
             else:
                 log.info("  %s: %s gap points (target retention: %.0f%%)", source, format(len(source_df), ","), source_config.retention_target*100)
@@ -1118,6 +1121,30 @@ def adaptive_spatial_sample(
         tier_vals = pd.to_numeric(result_df.get('tier', 3), errors='coerce').fillna(3).astype(int).to_numpy()
         keep_idx: list[int] = []
 
+        # Reserve a small, deterministic floor per source before tier-priority
+        # filling so mixed-source runs do not collapse to all Tier-1 XYZ.
+        # This protects ATL24/ATL03 participation for shallow-water calibration
+        # and keeps spatial validation from becoming source-degenerate.
+        per_source_floor = int(max(0, getattr(sampling_config, 'min_points_per_source', 50)))
+        if per_source_floor > 0 and 'source_key' in result_df.columns:
+            source_keys = result_df['source_key'].astype(str)
+            reserved: list[int] = []
+            for source_key, src_df in result_df.groupby(source_keys, sort=False):
+                idx = src_df.index.to_numpy(dtype=int)
+                if idx.size == 0:
+                    continue
+                take_n = int(min(idx.size, per_source_floor))
+                if take_n <= 0:
+                    continue
+                ord_idx = idx[np.argsort(priority[idx])[::-1]]
+                reserved.extend(ord_idx[:take_n].tolist())
+            if reserved:
+                keep_idx.extend(sorted(set(reserved)))
+                log.info(
+                    "Reserved per-source floor before global cap: %d points across %d sources",
+                    len(keep_idx), int(source_keys.nunique()),
+                )
+
         for tier_id in (1, 2, 3):
             idx = np.where(tier_vals == tier_id)[0]
             if idx.size == 0:
@@ -1125,6 +1152,12 @@ def adaptive_spatial_sample(
             if len(keep_idx) >= target_n:
                 break
             remaining = target_n - len(keep_idx)
+            if remaining <= 0:
+                break
+            if keep_idx:
+                idx = np.array([i for i in idx if i not in set(keep_idx)], dtype=int)
+                if idx.size == 0:
+                    continue
             if idx.size <= remaining:
                 keep_idx.extend(idx.tolist())
             else:

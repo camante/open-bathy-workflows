@@ -759,9 +759,8 @@ def predict_sdb_with_uncertainty(
     }
     
     log.info(
-        f"[SDB] Prediction complete: mode={mode}, "
-        f"depth={metadata['depth_stats']['mean']:.1f}m (mean), "
-        f"uncertainty={metadata['uncertainty_stats']['median']:.2f}m (median 1-sigma)"
+        "[SDB] Prediction complete: mode=%s,  depth=%1fm (mean),  uncertainty=%2fm (median 1-sigma)",
+        mode, metadata['depth_stats']['mean'], metadata['uncertainty_stats']['median'],
     )
     
     # Log dominant uncertainty sources
@@ -1061,6 +1060,8 @@ if __name__ == "__main__":
     
     log.info("Results saved to %s", args.output_dir)
     log.info("Mode: %s", prediction.mode)
-    log.info(f"Depth range: {prediction.metadata['depth_stats']['min']:.1f} - {prediction.metadata['depth_stats']['max']:.1f} m")
-    log.info(f"Mean uncertainty: {prediction.metadata['uncertainty_stats']['mean']:.2f} m")
-    log.info(f"High confidence fraction: {prediction.metadata['confidence_stats']['high_confidence_fraction']*100:.1f}%")
+    log.info("Depth range: %.1f - %.1f m",
+             prediction.metadata['depth_stats']['min'], prediction.metadata['depth_stats']['max'])
+    log.info("Mean uncertainty: %.2f m", prediction.metadata['uncertainty_stats']['mean'])
+    log.info("High confidence fraction: %.1f%%",
+             prediction.metadata['confidence_stats']['high_confidence_fraction'] * 100)

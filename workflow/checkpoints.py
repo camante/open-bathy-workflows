@@ -251,8 +251,8 @@ class PipelineCheckpoint:
                             1 for s in self._state.stages.values() if s.completed
                         )
                         log.info(
-                            f"[CHECKPOINT] Loaded existing checkpoint: "
-                            f"{n_completed} stages completed"
+                            "[CHECKPOINT] Loaded existing checkpoint:  %s stages completed",
+                            n_completed,
                         )
                     else:
                         log.info(
@@ -326,7 +326,8 @@ class PipelineCheckpoint:
             for name, path in stage_data.artifacts.items():
                 if path and not Path(path).exists():
                     log.info(
-                        f"[CHECKPOINT] Stage {stage_key} artifact missing: {name}={path}"
+                        "[CHECKPOINT] Stage %s artifact missing: %s=%s",
+                        stage_key, name, path,
                     )
                     return False
             
@@ -368,8 +369,8 @@ class PipelineCheckpoint:
             self._state.stages[stage_key] = checkpoint
             
             log.info(
-                f"[CHECKPOINT] Stage complete: {stage_key} "
-                f"(artifacts: {list(checkpoint.artifacts.keys())})"
+                "[CHECKPOINT] Stage complete: %s  (artifacts: %s)",
+                stage_key, list(checkpoint.artifacts.keys()),
             )
             
             if self.auto_save:

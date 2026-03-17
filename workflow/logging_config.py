@@ -40,6 +40,43 @@ from typing import Optional, Union
 log = logging.getLogger("logging_config")
 
 
+class _TeeStream:
+    """Mirror writes to the original stream and a log file."""
+
+    def __init__(self, primary, mirror_fp):
+        self._primary = primary
+        self._mirror_fp = mirror_fp
+
+    def write(self, data):
+        self._primary.write(data)
+        self._mirror_fp.write(data)
+        return len(data)
+
+    def flush(self):
+        self._primary.flush()
+        self._mirror_fp.flush()
+
+    def close(self):
+        try:
+            self.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        try:
+            return self._primary.isatty()
+        except Exception:
+            return False
+
+    def fileno(self):
+        return self._primary.fileno()
+
+    @property
+    def encoding(self):
+        return getattr(self._primary, "encoding", None)
+
+
+
 class _RunContextFilter(logging.Filter):
     """Inject run_id/step into LogRecord (safe defaults if not configured)."""
 
@@ -95,6 +132,7 @@ class _FlightRecorderHandler(logging.Handler):
 
 # Global state to prevent double-initialization
 _LOGGING_INITIALIZED: bool = False
+_SCREEN_LOG_STATE = None  # dict with original streams, tee streams, and file handle
 
 
 # Standard format matching original sdb_main.py
@@ -285,3 +323,81 @@ INFO = logging.INFO
 WARNING = logging.WARNING
 ERROR = logging.ERROR
 CRITICAL = logging.CRITICAL
+
+
+def restore_screen_log() -> None:
+    """Restore original stdout/stderr and close the mirror file if installed."""
+    global _SCREEN_LOG_STATE
+    state = _SCREEN_LOG_STATE
+    if not state:
+        return
+
+    sys.stdout = state["stdout_original"]
+    sys.stderr = state["stderr_original"]
+
+    root = logging.getLogger()
+    for handler in root.handlers:
+        if isinstance(handler, logging.StreamHandler):
+            stream = getattr(handler, "stream", None)
+            if stream is state["stdout_tee"]:
+                handler.setStream(state["stdout_original"])
+            elif stream is state["stderr_tee"]:
+                handler.setStream(state["stderr_original"])
+
+    try:
+        state["mirror_fp"].flush()
+        state["mirror_fp"].close()
+    except Exception:
+        pass
+
+    _SCREEN_LOG_STATE = None
+
+
+def install_screen_log(log_file: Union[str, Path], mode: str = "a") -> Path:
+    """Mirror everything written to stdout/stderr into a plain-text log file.
+
+    This captures console logging, progress bars, warnings, and incidental prints so
+    the saved file matches what the user saw on screen as closely as possible.
+    Reinstalling the screen log is idempotent: any prior mirror is restored first.
+    """
+    global _SCREEN_LOG_STATE
+
+    # Avoid stacking tee streams across reruns or nested entrypoints.
+    restore_screen_log()
+
+    log_path = Path(log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    mirror_fp = open(log_path, mode, encoding="utf-8", buffering=1)
+
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    stdout_tee = _TeeStream(original_stdout, mirror_fp)
+    stderr_tee = _TeeStream(original_stderr, mirror_fp)
+    sys.stdout = stdout_tee
+    sys.stderr = stderr_tee
+
+    root = logging.getLogger()
+    for handler in root.handlers:
+        if isinstance(handler, logging.StreamHandler):
+            stream = getattr(handler, "stream", None)
+            if stream is original_stdout:
+                handler.setStream(stdout_tee)
+            elif stream is original_stderr:
+                handler.setStream(stderr_tee)
+
+    _SCREEN_LOG_STATE = {
+        "stdout_original": original_stdout,
+        "stderr_original": original_stderr,
+        "stdout_tee": stdout_tee,
+        "stderr_tee": stderr_tee,
+        "mirror_fp": mirror_fp,
+        "path": log_path,
+    }
+
+    try:
+        import atexit
+        atexit.register(restore_screen_log)
+    except Exception:
+        pass
+
+    return log_path

@@ -602,13 +602,9 @@ def try_arcgis_nhdarea_polygons(
 
 
 def _parse_aoi(aoi_str: str) -> Tuple[float, float, float, float]:
-    parts = aoi_str.strip().split("/")
-    if len(parts) != 4:
-        raise ValueError("AOI must be 'lonmin/lonmax/latmin/latmax'")
-    lonmin, lonmax, latmin, latmax = map(float, parts)
-    if lonmin >= lonmax or latmin >= latmax:
-        raise ValueError("Invalid AOI ordering; expected lonmin<lonmax and latmin<latmax.")
-    return lonmin, lonmax, latmin, latmax
+    """Parse ``"W/E/S/N"`` → ``(W, E, S, N)``.  Delegates to :func:`pipeline.aoi.parse_aoi_wesn`."""
+    from pipeline.aoi import parse_aoi_wesn
+    return parse_aoi_wesn(aoi_str, strict=True)
 
 
 def _auto_utm_epsg_from_lonlat(lon: float, lat: float) -> int:

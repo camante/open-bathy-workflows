@@ -441,7 +441,6 @@ def load_test_context_from_run(output_dir: Path) -> Dict[str, Any]:
             context["fused_df"] = pd.read_csv(fused_csv)
         except Exception as e:
             log.warning("Failed to load fused CSV: %s", e)
-            pass
     
     # Load run report
     run_report_path = output_dir / "run_report.json"
@@ -451,7 +450,6 @@ def load_test_context_from_run(output_dir: Path) -> Dict[str, Any]:
                 context["run_report"] = json.load(f)
         except Exception as e:
             log.warning("Failed to load run report: %s", e)
-            pass
     
     # Check if XYZ was provided (look for extra_xyz in inputs)
     if context.get("run_report"):

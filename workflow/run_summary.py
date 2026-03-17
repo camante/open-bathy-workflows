@@ -14,7 +14,7 @@ from __future__ import annotations
 
 
 import logging
-from typing import Any, Dict, Optional, Callable
+from typing import Any, Dict, Optional, Callable, Union
 
 log = logging.getLogger(__name__)
 
@@ -52,7 +52,7 @@ def print_human_run_summary(stats: Dict[str, Any], log_fn: Optional[Callable[[st
             try:
                 log_fn(line)
                 return
-            except Exception:
+            except (TypeError, ValueError, RuntimeError):
                 # Fall back to stdout if logger fails for any reason.
                 log.debug("ignored", exc_info=True)
         log.info(line)
@@ -66,13 +66,13 @@ def print_human_run_summary(stats: Dict[str, Any], log_fn: Optional[Callable[[st
     def fmt_int(x):
         try:
             return f"{int(x):,}"
-        except Exception:
+        except (TypeError, ValueError):
             return "n/a"
 
     def fmt_float(x, nd=2):
         try:
             return f"{float(x):.{nd}f}"
-        except Exception:
+        except (TypeError, ValueError):
             return "n/a"
 
     def fmt_bool(x):
@@ -222,7 +222,7 @@ from typing import List, Tuple
 def _load_json(path: Path) -> dict:
     try:
         return json.loads(path.read_text(errors='ignore'))
-    except Exception:
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return {}
 
 
@@ -243,6 +243,7 @@ def summarize_flight_recorder(fr_path: Path) -> Dict[str, Any]:
     step_starts: Dict[str, Dict[str, Any]] = {}
     # subprocess start keyed by an incrementing index if no pid
     sp_starts: List[Dict[str, Any]] = []
+    last_ts = None
 
     def _inc(d: Dict[str, int], k: str) -> None:
         d[k] = int(d.get(k, 0)) + 1
@@ -253,8 +254,9 @@ def summarize_flight_recorder(fr_path: Path) -> Dict[str, Any]:
                 continue
             try:
                 obj = json.loads(line)
-            except Exception:
+            except (json.JSONDecodeError, TypeError, ValueError):
                 continue
+            last_ts = obj.get("ts") or last_ts
             kind = obj.get("kind")
             if kind == "log":
                 lvl = str(obj.get("level", "UNKNOWN"))
@@ -315,15 +317,31 @@ def summarize_flight_recorder(fr_path: Path) -> Dict[str, Any]:
                     "end_ts": obj.get("ts"),
                     "rc": obj.get("rc"),
                 })
-    except Exception:
+    except (OSError, TypeError, ValueError):
         log.debug("ignored", exc_info=True)
+
+    if summary.get("run", {}).get("start_ts") and not summary.get("run", {}).get("end_ts") and last_ts is not None:
+        summary["run"]["end_ts"] = last_ts
 
     # Sort steps by elapsed desc if available
     try:
         summary["steps"].sort(key=lambda x: (x.get("elapsed_s") is None, -(float(x.get("elapsed_s") or 0.0))))
-    except Exception:
+    except (TypeError, ValueError):
         log.debug('step sort failed', exc_info=True)
     return summary
+
+
+def _argv_flag(argv: List[Any], name: str) -> Optional[str]:
+    try:
+        parts = [str(x) for x in (argv or [])]
+        for i, part in enumerate(parts):
+            if part == name and i + 1 < len(parts):
+                return parts[i + 1]
+            if part.startswith(name + "="):
+                return part.split("=", 1)[1]
+    except Exception:
+        log.debug("ignored", exc_info=True)
+    return None
 
 
 def _discover_stats(out_dir: Path, run_id: str) -> Dict[str, Any]:
@@ -420,13 +438,21 @@ def _summarize_outputs_and_policy(stats: dict) -> str:
     return "\n".join(lines)
 
 
-def build_scientific_summary(stats: Dict[str, Any]) -> str:
+def build_scientific_summary(stats: Dict[str, Any], fr_summary: Optional[Dict[str, Any]] = None) -> str:
     """Scientific summary: what was inferred, where, and key validity signals."""
     lines = []
     lines.append("# Run scientific summary")
     # Try to read known fields defensively
     aoi = stats.get("aoi") or stats.get("args", {}).get("aoi")
     tw = stats.get("time_window") or stats.get("args", {}).get("time_window") or {}
+    run_argv = ((fr_summary or {}).get("run") or {}).get("argv") or []
+    if aoi is None:
+        aoi = _argv_flag(run_argv, "--aoi")
+    if not isinstance(tw, dict) or not tw:
+        tw = {
+            "start": _argv_flag(run_argv, "--start"),
+            "end": _argv_flag(run_argv, "--end"),
+        }
     lines.append(f"- AOI: {aoi if aoi is not None else 'n/a'}")
     if isinstance(tw, dict):
         lines.append(f"- time window: {tw.get('start','n/a')} → {tw.get('end','n/a')}")
@@ -496,7 +522,7 @@ def build_human_like_summary(stats: Dict[str, Any], fr_summary: Dict[str, Any]) 
     try:
         # total time as sum of step_end elapsed
         took = sum(float(s.get("elapsed_s") or 0.0) for s in steps) if steps else None
-    except Exception:
+    except (TypeError, ValueError):
         took = None
     lines = []
     lines.append("What happened in this run")
@@ -546,7 +572,7 @@ def write_run_summary_files(out_dir: Union[str, Path], run_id: str, stats: Optio
     paths["technical_md"] = p_tech
 
     p_sci = log_dir / f"run_summary_scientific_{run_id}.md"
-    p_sci.write_text(build_scientific_summary(stats), encoding="utf-8")
+    p_sci.write_text(build_scientific_summary(stats, fr_summary), encoding="utf-8")
     paths["scientific_md"] = p_sci
 
     p_human = log_dir / f"run_summary_human_{run_id}.txt"

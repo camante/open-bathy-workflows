@@ -1,0 +1,147 @@
+# open-bathy-workflows default configuration
+# 
+# This file sets defaults for all pipeline parameters.  Override any value
+# via CLI flags (CLI always wins) or by creating a region-specific preset.
+#
+# Usage:
+#   ./bathy_main.py --config=config/default.yaml --aoi=... --start=... --end=...
+#
+# Sections correspond to pipeline stages.  Only parameters you want to change
+# need to appear in your override config — missing keys use defaults below.
+
+# --- Core operational parameters (Level 1: production interface) ---
+core:
+  methods: "sdb,river,fuse"
+  priority: "sdb"
+  cloud: 70
+  icesat: "all_atl"
+  sdb_mode: "all_sdb"
+  align_mode: "median"
+  working_srs: "auto"
+  working_vcrs_epsg: 5703
+  final_out_srs: "EPSG:4269"
+  convert_sdb_to_navd88: false
+
+# --- Tile / seam policy ---
+tiling:
+  buff: 0.0
+  tile_edge_taper_enabled: true
+  tile_edge_taper_km: 2.0
+  tile_edge_smooth_sigma_km: 10.0
+  tile_edge_metrics_band_km: 2.0
+
+# --- SDB model bank (cross-tile consistency) ---
+model_bank:
+  enabled: true
+  bank: "auto"
+  max_samples: 100000
+  seed: 1337
+  retrain_min_new: 2000
+
+# --- Sentinel-2 / optical ---
+sentinel2:
+  s2_scene_limit: 10
+  min_scene_valid_frac: 0.9
+  preferred_months: []
+  edge_weight_power: 2.0
+  temporal_median_k: 8
+  mask_bright_pixels: 0.25
+  allow_bright_shallow_pixels: false
+  bright_shallow_nir_max: 0.03
+  apply_gl_turbidity_reject: false
+  cw_min: null
+  land_mask_type: "auto"
+  land_mask_water_val: null
+  land_mask_invert: false
+  land_mask_threshold: 0.5
+  linf_enabled: false
+  linf_estimate_deepwater: false
+  linf_deepwater_nir_max: 0.03
+  linf_deepwater_bright_max: 0.15
+  linf_percentile: 1.0
+
+# --- ICESat-2 ---
+icesat2:
+  atl03_conf_min: 4
+  min_depth_atl03_val: 0.5
+  max_depth_atl03: 15.0
+  refraction: true
+  water_temp_c: 20.0
+  atl24_conf_min: 0.8
+  min_bottom_photons: 5
+  min_bottom_frac: 0.25
+
+# --- Training / validation ---
+training:
+  min_training_points_for_sdb: 10
+  use_stumpf_depth: true
+  seed: 42
+  validate_spatial: true
+  rmse_target_sdb: 1.0
+  depth_bin_m: 1.0
+  spatial_cv: false
+  spatial_cv_strategy: "spatial_cluster"
+  spatial_cv_n_folds: 5
+  sampling_target_points: 2000
+  sampling_min_threshold: 3000
+  sampling_max_gap_m: 100.0
+
+# --- Prediction ---
+prediction:
+  tile_size: 1024
+  s2_smooth_kernel: 3
+  no_doa: false
+  doa_threshold: 0.90
+  doa_soft_k: 3.0
+  depth_limit_mode: "optical"
+  optical_depth_factor: 2.3
+  max_depth_hard_cap: 25.0
+  min_confidence_threshold: 0.0
+
+# --- River: network / domain ---
+river_network:
+  hydrography_source: "arcgis"
+  dem_auto: true
+  dem_source: "tnm:datasets=3"
+  dem_res_m: 10.0
+  channel_buffer_m: 400.0
+  max_channel_width_m: 600.0
+  mainstem_min_order: 5
+  max_mainstem_width_m: 2500.0
+  channel_source: "auto"
+  use_nhdarea: true
+  nhdarea_layer: "nhdarea_clip"
+  ocean_keep_dist_m: 0.0
+
+# --- River: method ---
+river_method:
+  method: "hybrid"
+  shape_exp: 0.5
+  dmax_min_m: 0.5
+  dmax_max_m: 30.0
+  nodata: -9999.0
+  prior_mode: "powerlaw"
+
+# --- River: depth priors ---
+river_priors:
+  mv_a0: 0.18
+  mv_bw: 0.50
+  mv_ba: 0.0
+  mv_bs: -0.10
+  mv_eps_a: 1.0
+  mv_eps_s: 0.0001
+
+# --- Estuary detection ---
+estuary:
+  transition_m: 500.0
+  max_weight: 0.25
+  width_ratio_thresh: 3.0
+  connect_dist_m: 200.0
+
+# --- Fusion ---
+fusion:
+  strategy: "seam_blend"
+  primary_weight: 0.8
+  secondary_weight: 0.2
+  taper_m: 500.0
+  waffles_min_water_fraction: 0.001

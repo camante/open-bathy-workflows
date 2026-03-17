@@ -58,7 +58,7 @@ def run_command(
         if stderr_log_path is not None:
             ensure_dir(Path(stderr_log_path).parent)
             stderr_fh = open(stderr_log_path, "w", buffering=1, encoding="utf-8")
-    except Exception:
+    except OSError:
         stdout_fh = None
         stderr_fh = None
 
@@ -71,7 +71,7 @@ def run_command(
         from flight_recorder import FlightRecorder
 
         _fr = FlightRecorder.global_instance()
-    except Exception:
+    except ImportError:
         _fr = None
 
     if _fr is not None:
@@ -108,7 +108,7 @@ def run_command(
                 log.info("%s%s", pfx, s) if pfx else log.info("%s", s)
             else:
                 log.warning("%s%s", pfx, s) if pfx else log.warning("%s", s)
-        except Exception:
+        except re.error:
             log.warning("%s%s", pfx, s) if pfx else log.warning("%s", s)
 
     def _pump(stream, sink, log_fn, pfx: str, enabled: bool, fh=None):
@@ -120,7 +120,7 @@ def run_command(
                 if fh is not None:
                     try:
                         fh.write(line)
-                    except Exception:
+                    except OSError:
                         # Best effort; never fail the pipeline due to optional logging.
                         log.debug("Optional log write failed", exc_info=True)
                 if enabled:
@@ -131,7 +131,7 @@ def run_command(
         finally:
             try:
                 stream.close()
-            except Exception:
+            except OSError:
                 log.debug("ignored", exc_info=True)
 
     threads: List[threading.Thread] = []
@@ -168,7 +168,7 @@ def run_command(
                 stdout_fh.close()
             if stderr_fh:
                 stderr_fh.close()
-        except Exception:
+        except OSError:
             log.debug("ignored", exc_info=True)
 
     # stdout_lines/stderr_lines include newline characters; match original behavior
@@ -214,7 +214,7 @@ def run_command_stdout_to_file(
     if tmp_path.exists():
         try:
             tmp_path.unlink()
-        except Exception:
+        except OSError:
             log.debug("ignored", exc_info=True)
 
     stderr_fh = None
@@ -222,7 +222,7 @@ def run_command_stdout_to_file(
         try:
             ensure_dir(Path(stderr_log_path).parent)
             stderr_fh = open(stderr_log_path, "w", buffering=1, encoding="utf-8")
-        except Exception:
+        except OSError:
             stderr_fh = None
 
     cmd_str = " ".join(str(c) for c in cmd)
@@ -250,7 +250,7 @@ def run_command_stdout_to_file(
         try:
             if stderr_fh:
                 stderr_fh.close()
-        except Exception:
+        except OSError:
             log.debug("ignored", exc_info=True)
 
     # Caller decides whether tmp_path is valid enough to promote.

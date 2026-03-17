@@ -44,15 +44,24 @@ from datetime import datetime, timezone
 from typing import Optional, Tuple
 
 from deps import try_import, require
+from sdb_context import SDBRunContext
+from train_context import TrainContext
 
 # Optional run reporting (flight recorder)
 try:
     from log_report import RunReport, raster_quickstats, mask_fraction
-except Exception:  # pragma: no cover
+except (ImportError, AttributeError):  # pragma: no cover
     RunReport = None  # type: ignore
     raster_quickstats = None  # type: ignore
     mask_fraction = None  # type: ignore
 
+try:
+    from errors_scientific import FallbackRegistry, FallbackClass, record_fallback
+except (ImportError, AttributeError):  # pragma: no cover
+    FallbackRegistry = None  # type: ignore
+    FallbackClass = None  # type: ignore
+    def record_fallback(*args, **kwargs):
+        return None
 
 import numpy as np
 import pandas as pd
@@ -103,8 +112,187 @@ def _mask_has_ocean_pixels(mask_tif: str, *, water_max: float = 0.5, max_stride:
         if data.size == 0:
             return False
         return bool((data <= water_max).any())
-    except Exception:
+    except (ImportError, AttributeError):
         return True
+
+
+def _coarse_lonlat_cell(lon: float, lat: float, cell_deg: float = 2.0) -> str:
+    """Return a coarse spatial cohort label for model-bank partitioning.
+
+    We intentionally use a *broad* cell so neighboring AOIs can still share a
+    bank, while preventing global cross-region contamination.
+    """
+    try:
+        cell = float(cell_deg)
+        if not np.isfinite(cell) or cell <= 0:
+            cell = 2.0
+        lon0 = int(np.floor(float(lon) / cell) * cell)
+        lat0 = int(np.floor(float(lat) / cell) * cell)
+        lon1 = lon0 + int(round(cell))
+        lat1 = lat0 + int(round(cell))
+        return f"lon{lon0:+03d}_{lon1:+03d}__lat{lat0:+03d}_{lat1:+03d}"
+    except Exception:
+        return "lonlat_unknown"
+
+
+def _build_model_bank_partition_context(args, df_pts=None, base_dir=None):
+    """Return a versioned, locality-aware model-bank partition context.
+
+    This is deliberately broader than a single AOI but much narrower than the old
+    global mix/depth buckets, which allowed unrelated regions to share the same
+    persisted model/state.
+    """
+    base_dir = base_dir if base_dir is not None else getattr(args, "model_bank", None)
+    if not base_dir or df_pts is None or len(df_pts) == 0:
+        return base_dir, None
+
+    n_all = int(len(df_pts))
+    src_ser = df_pts["source"].astype(str).str.lower() if "source" in df_pts.columns else pd.Series(["unknown"] * n_all)
+    n_xyz = int(src_ser.str.startswith("extra_xyz").sum()) if len(src_ser) else 0
+    n_atl = int(src_ser.str.contains("atl", regex=False).sum()) if len(src_ser) else 0
+    xyz_frac = (n_xyz / float(n_all)) if n_all else 0.0
+    atl_frac = (n_atl / float(n_all)) if n_all else 0.0
+    if xyz_frac >= 0.75:
+        mix_bucket = "xyz_dominant"
+    elif xyz_frac >= 0.25:
+        mix_bucket = "xyz_mixed"
+    elif atl_frac >= 0.75:
+        mix_bucket = "atl_dominant"
+    else:
+        mix_bucket = "mixed_other"
+
+    depth_bucket = "unknown"
+    p95 = None
+    if "depth_m" in df_pts.columns:
+        d = pd.to_numeric(df_pts["depth_m"], errors="coerce").to_numpy(dtype=float)
+        d = np.abs(d[np.isfinite(d)])
+        if d.size:
+            p95 = float(np.nanpercentile(d, 95))
+            if p95 <= 12.0:
+                depth_bucket = "shallow"
+            elif p95 <= 25.0:
+                depth_bucket = "mid"
+            else:
+                depth_bucket = "deep"
+
+    try:
+        w, e, s, n = [float(x) for x in str(getattr(args, "aoi")).split("/")[:4]]
+        lon_c = 0.5 * (w + e)
+        lat_c = 0.5 * (s + n)
+    except Exception:
+        lon_c = float("nan")
+        lat_c = float("nan")
+
+    working_srs = str(getattr(args, "working_srs", "auto") or "auto").upper()
+    region_name = str(getattr(args, "region_name", None) or getattr(args, "region", None) or "unknown")
+    locality_tag = _coarse_lonlat_cell(lon_c, lat_c, cell_deg=2.0)
+    partition_version = 2
+    part_key = (
+        f"v{partition_version}__region_{region_name}__grid_{working_srs.replace(':', '')}"
+        f"__cell_{locality_tag}__mix_{mix_bucket}__depth_{depth_bucket}"
+    )
+    part_dir = Path(base_dir) / "partitions" / part_key
+    part_meta = {
+        "partition_version": partition_version,
+        "partition_key": part_key,
+        "region_name": region_name,
+        "working_srs": working_srs,
+        "locality_tag": locality_tag,
+        "mix_bucket": mix_bucket,
+        "depth_bucket": depth_bucket,
+        "xyz_frac": float(xyz_frac),
+        "atl_frac": float(atl_frac),
+        "depth_p95_abs_m": (None if p95 is None else float(p95)),
+        "n": n_all,
+    }
+    return part_dir, part_meta
+
+
+def _count_finite_raster_pixels(path: Path) -> int:
+    try:
+        with rasterio.open(path) as ds:
+            nodata = ds.nodata
+            total = 0
+            sentinels = []
+            try:
+                if nodata is not None and np.isfinite(float(nodata)):
+                    sentinels.append(float(nodata))
+            except (TypeError, ValueError):
+                pass
+            # Defensive fallback for rasters whose nodata tag is missing or lost.
+            sentinels.extend([-9999.0, -99999.0, 3.402823466e+38, -3.402823466e+38])
+            sentinels_arr = np.asarray(sorted(set(sentinels)), dtype=np.float64) if sentinels else np.empty((0,), dtype=np.float64)
+            for _, window in ds.block_windows(1):
+                arr = ds.read(1, window=window, masked=False).astype(np.float64, copy=False)
+                mask = np.isfinite(arr)
+                if sentinels_arr.size:
+                    for sv in sentinels_arr:
+                        mask &= ~np.isclose(arr, sv, rtol=0.0, atol=1e-6)
+                total += int(np.count_nonzero(mask))
+            return int(total)
+    except (OSError, RuntimeError, ValueError, AttributeError):
+        log.debug("Raster finite-count check failed for %s", path, exc_info=True)
+        return -1
+
+
+def _assert_sdb_prediction_is_meaningful(out_tif: Path, dir_rast: Path, *, stage: str) -> None:
+    """Fail closed when SDB output is effectively empty/scientifically unusable."""
+    min_pixels = 500
+    min_fraction_of_base_valid = 0.02
+    rep_path = Path(dir_rast) / "predict_report.json"
+    predicted = None
+    base_valid = None
+    if rep_path.exists():
+        try:
+            rep = json.loads(rep_path.read_text(encoding="utf-8"))
+            funnel = ((rep or {}).get("predict") or {}).get("funnel") or {}
+            predicted = int(funnel.get("predicted")) if funnel.get("predicted") is not None else None
+            base_valid = int(funnel.get("base_valid")) if funnel.get("base_valid") is not None else None
+        except Exception:
+            log.debug("Could not parse %s for SDB output validation.", rep_path, exc_info=True)
+
+    finite_pixels = _count_finite_raster_pixels(out_tif)
+    provenance_pixels = None
+    prov_path = out_tif.with_name(out_tif.stem + "_provenance.tif")
+    if prov_path.exists():
+        try:
+            with rasterio.open(prov_path) as ds:
+                total_pred = 0
+                for _, window in ds.block_windows(1):
+                    arr = ds.read(1, window=window, masked=False)
+                    total_pred += int(np.count_nonzero(arr == 1))
+                provenance_pixels = int(total_pred)
+        except (OSError, ValueError, rasterio.errors.RasterioError):
+            log.debug("Could not count provenance pixels for %s", prov_path, exc_info=True)
+    checks = []
+    if predicted is not None:
+        checks.append((predicted >= min_pixels, f"predicted pixels {predicted} < {min_pixels}"))
+    if base_valid is not None and base_valid > 0 and predicted is not None:
+        frac = float(predicted) / float(base_valid)
+        checks.append((frac >= min_fraction_of_base_valid,
+                       f"predicted/base_valid fraction {frac:.4f} < {min_fraction_of_base_valid:.4f}"))
+    if provenance_pixels is not None:
+        checks.append((provenance_pixels >= min_pixels, f"provenance predicted pixels {provenance_pixels} < {min_pixels}"))
+    if finite_pixels >= 0:
+        checks.append((finite_pixels >= min_pixels, f"finite raster pixels {finite_pixels} < {min_pixels}"))
+
+    failed = [msg for ok, msg in checks if not ok]
+    if failed:
+        msg = f"SDB output degraded at {stage}: " + "; ".join(failed)
+        log.warning(msg)
+        log.warning("[DEGRADED] SDB output has very few valid pixels. "
+                    "Output will be labeled as degraded guidance rather than rejected. "
+                    "This typically means training data was too shallow/sparse for RF "
+                    "to generalize across the AOI. Consider using tier 2 (Stumpf-only) "
+                    "or providing extra_xyz soundings.")
+        # Record degradation instead of crashing
+        try:
+            from errors_scientific import record_fallback, FallbackClass
+            record_fallback(None, "sdb_prediction_sparse", FallbackClass.DEGRADED,
+                          stage=stage, detail=msg)
+        except (ImportError, AttributeError):
+            log.debug("Scientific fallback registry unavailable", exc_info=True)
+        # Do NOT raise — let the pipeline continue with degraded output
 
 
 def _require_sdb_runtime_deps() -> None:
@@ -150,7 +338,7 @@ def detect_active_config_profile(aoi_bbox: list, config_path: str = "sdb_config.
             if (rw <= c_lon <= re) and (rs <= c_lat <= rn):
                 return str(region.get("name", "region"))
         return "defaults" if "defaults" in data else "default"
-    except Exception:
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return "unknown"
 
 
@@ -179,7 +367,7 @@ def apply_sdb_metadata(
         }
         with rasterio.open(raster_path, "r+") as dst:
             dst.update_tags(**tags)
-    except Exception as e:
+    except (OSError, ValueError, rasterio.errors.RasterioError) as e:
         logging.getLogger("sdb_main").warning(f"[VDATUM] Failed to update metadata: {e}")
 
 
@@ -382,7 +570,7 @@ def generate_coastline_mask(target_raster_path, aoi, cache_masks, out_mask_tif, 
             "-O",
             str(base_prefix),
         ]
-        log.info(f"Running: {' '.join(cmd_list)}")
+        log.info("Running: %s", ' '.join(cmd_list))
         try:
             _run_safe(cmd_list)
         except Exception:
@@ -410,16 +598,9 @@ def generate_coastline_mask(target_raster_path, aoi, cache_masks, out_mask_tif, 
     return str(out_mask_tif)
 
 def _setup_file_logging(out_dir: Path):
-    """Add a file handler to the logger for this run."""
-    log_path = out_dir / "run.log"
-    for h in log.handlers[:]:
-        if isinstance(h, logging.FileHandler):
-            log.removeHandler(h)
-
-    fh = logging.FileHandler(str(log_path))
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-    log.addHandler(fh)
+    """Legacy no-op: run logging is initialized under out_dir/run_logs at startup."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return None
 
 def _write_report(out_dir: Path, status: str, **kwargs):
     """Write a JSON run report."""
@@ -433,10 +614,10 @@ def _write_report(out_dir: Path, status: str, **kwargs):
             try:
                 # best-effort: emit artifacts from the assembled kwargs
                 _emit_artifacts_from_report(kwargs or {})
-            except Exception as e:
+            except (OSError, TypeError, ValueError, AttributeError) as e:
                 log.debug("Optional emit failed: %s", e)
             return
-    except Exception:
+    except (OSError, TypeError, ValueError, AttributeError):
         log.debug("ignored", exc_info=True)
 
     report = {
@@ -452,7 +633,7 @@ def _write_report(out_dir: Path, status: str, **kwargs):
         from flight_recorder import emit_artifact_written
         emit_artifact_written(report_path, kind="json", role="sdb_run_report")
         _emit_artifacts_from_report(report)
-    except Exception as e:
+    except (ImportError, AttributeError, OSError, TypeError, ValueError) as e:
         log.debug("Optional flight-recorder emit failed: %s", e)
 
 
@@ -462,7 +643,7 @@ def _emit_artifacts_from_report(report: dict) -> None:
     """Emit artifact_written events for any path-like values in the report."""
     try:
         from flight_recorder import emit_artifact_written
-    except Exception:
+    except (ImportError, AttributeError):
         return
 
     def _walk(x):
@@ -484,14 +665,14 @@ def _rr_add(rr, key: str, value):
     try:
         if rr is not None:
             rr.add(key, value)
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         log.debug("ignored", exc_info=True)
 
 def _rr_artifact(rr, name: str, path: str):
     try:
         if rr is not None and hasattr(rr, "record_artifact"):
             rr.record_artifact(name, str(path))
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         log.debug("ignored", exc_info=True)
 
 def _rr_merge_json(rr, key: str, path: Path):
@@ -504,7 +685,7 @@ def _rr_merge_json(rr, key: str, path: Path):
                 d = json.load(f)
             rr.add_dict(key, d if isinstance(d, dict) else {"value": d})
             _rr_artifact(rr, key.replace(".", "_") + "_json", str(p))
-    except Exception:
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError, ValueError):
         log.debug("ignored", exc_info=True)
 
 def shift_start_back_one_month(start_str: str) -> str:
@@ -581,8 +762,8 @@ def load_config_overrides(aoi_bbox: list, config_path: str = "sdb_config.json") 
         for region in data.get("regions", []):
             rw, rs, re, rn = region["bbox"]
             if (rw <= c_lon <= re) and (rs <= c_lat <= rn):
-                log.info(f"AOI center ({c_lon:.2f}, {c_lat:.2f}) matches region: {region['name']}")
-                log.info(f"Description: {region['description']}")
+                log.info("AOI center (%.2f, %.2f) matches region: %s", c_lon, c_lat, region['name'])
+                log.info("Description: %s", region['description'])
 
                 # Merge region settings ON TOP of defaults
                 config.update(region["settings"])
@@ -647,12 +828,44 @@ def _calc_metrics(df_test):
         "mae": float(mean_absolute_error(y_true, y_pred))
     }
 
+
+
+def _derive_validation_invariants(m_rand: dict, m_spat: dict, spatial_status: Optional[dict] = None) -> dict:
+    """Executable validation guards used for run-reporting and messaging."""
+    spatial_status = spatial_status or {}
+    try:
+        r2_rand = float(m_rand.get("r2", float("nan")))
+    except (TypeError, ValueError, AttributeError):
+        r2_rand = float("nan")
+    try:
+        r2_spat = float(m_spat.get("r2", float("nan")))
+    except (TypeError, ValueError, AttributeError):
+        r2_spat = float("nan")
+    try:
+        n_rand = int(m_rand.get("n", 0) or 0)
+    except (TypeError, ValueError, AttributeError):
+        n_rand = 0
+    try:
+        n_spat = int(m_spat.get("n", 0) or 0)
+    except (TypeError, ValueError, AttributeError):
+        n_spat = 0
+    no_spatial_holdout = bool(spatial_status.get("reason") == "no_representative_cluster_holdout" or n_spat <= 0)
+    negative_validation = bool((np.isfinite(r2_rand) and r2_rand < 0) or (np.isfinite(r2_spat) and r2_spat < 0))
+    weak_spatial_validation = bool(np.isfinite(r2_rand) and np.isfinite(r2_spat) and (r2_spat < 0.2))
+    return {
+        "random_test_available": bool(n_rand > 0),
+        "representative_spatial_holdout": not no_spatial_holdout,
+        "negative_validation_detected": negative_validation,
+        "weak_spatial_validation": weak_spatial_validation,
+        "guidance_only_required": bool(no_spatial_holdout or negative_validation or weak_spatial_validation),
+    }
+
 def evaluate_raster_against_points(
     raster_path: str,
     df_points,
     log_dir: Path,
     plot_dir: Path,
-    prefix: str = "SDB_Raster_vs_ICESat_Test",
+    prefix: str = "SDB_Raster_vs_Validation_Points",
     max_depth: float = None,
 ) -> dict:
     if df_points is None or df_points.empty:
@@ -732,15 +945,15 @@ def evaluate_raster_against_points(
     train.scatter_plot(
         y_true=z_true_m,
         y_pred=z_pred_m,
-        title="Raster vs ICESat-2 Test",
+        title="Raster vs Validation Points",
         out_png=out_png,
         max_depth=max_depth,
-        x_label="ICESat-2 Depth (m)",
+        x_label="Validation Depth (m)",
         y_label="SDB Raster Depth (m)"
     )
 
     metrics = {"all": {"rmse_m": rmse_all, "mae_m": mae_all, "bias_m": bias_all, "r2": r2_all, "n": n_all}, "limited": {"rmse_m": rmse_val, "mae_m": mae_val, "bias_m": bias_val, "r2": r2_val, "n": n_val}, "max_depth_m": (None if max_depth is None else float(max_depth))}
-    with open(log_dir / "eval_metrics_raster_vs_icesat_test.json", "w", encoding="utf-8") as f:
+    with open(log_dir / "eval_metrics_raster_vs_validation_points.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
     return metrics
 
@@ -902,12 +1115,37 @@ def overlap_consistency_diagnostic(
 
 
 def _run_sdb_prediction(
-    args, out_tif, dir_model, dir_rast, run_id, s2_paths, land_mask_out,
-    stumpf_lr, land_mask_type_for_train, land_mask_water_val_for_train,
-    land_mask_invert, land_mask_threshold, chosen_max_depth, rr,
-    dir_data, predict,
+    ctx_or_args, out_tif=None, dir_model=None, dir_rast=None, run_id=None,
+    s2_paths=None, land_mask_out=None,
+    stumpf_lr=None, land_mask_type_for_train=None, land_mask_water_val_for_train=None,
+    land_mask_invert=None, land_mask_threshold=None, chosen_max_depth=None, rr=None,
+    dir_data=None, predict=None,
 ):
-    """Dispatch SDB prediction: chunked or standard path."""
+    """Dispatch SDB prediction: chunked or standard path.
+
+    Accepts either an ``SDBRunContext`` as first arg (new style) or the legacy
+    positional ``args`` namespace (backward compatible).
+    """
+    if isinstance(ctx_or_args, SDBRunContext):
+        ctx = ctx_or_args
+        args = ctx.args
+        out_tif = out_tif or ctx.out_tif
+        dir_model = dir_model or ctx.dir_model
+        dir_rast = dir_rast or ctx.dir_rast
+        run_id = run_id or ctx.run_id
+        s2_paths = s2_paths or ctx.s2_paths
+        land_mask_out = land_mask_out or ctx.land_mask_out
+        stumpf_lr = stumpf_lr if stumpf_lr is not None else ctx.stumpf_lr
+        land_mask_type_for_train = land_mask_type_for_train or ctx.land_mask_type
+        land_mask_water_val_for_train = land_mask_water_val_for_train if land_mask_water_val_for_train is not None else ctx.land_mask_water_val
+        land_mask_invert = land_mask_invert if land_mask_invert is not None else ctx.land_mask_invert
+        land_mask_threshold = land_mask_threshold if land_mask_threshold is not None else ctx.land_mask_threshold
+        chosen_max_depth = chosen_max_depth if chosen_max_depth is not None else ctx.chosen_max_depth
+        rr = rr or ctx.rr
+        dir_data = dir_data or ctx.dir_data
+        predict = predict or ctx.mod_predict
+    else:
+        args = ctx_or_args
     # 9. Prediction
     log.info("Prediction")
 
@@ -921,18 +1159,18 @@ def _run_sdb_prediction(
     elif args.chunked_prediction == "auto":
         # Auto-detect based on memory requirement
         try:
-            from predict_chunked import estimate_memory_requirement_gb
+            from chunked_processing import estimate_memory_requirement_gb
             
             # Get raster dimensions from first band
             import rasterio
             with rasterio.open(s2_paths[list(s2_paths.keys())[0]]) as src:
                 width, height = src.width, src.height
             
-            estimated_gb = estimate_memory_requirement_gb(width, height)
+            estimated_gb = estimate_memory_requirement_gb(height=height, width=width, n_bands=14)
             use_chunked = estimated_gb > args.max_memory_gb
             
             log.info("Memory estimation: %.1f GB (threshold: %s GB)", estimated_gb, args.max_memory_gb)
-            log.info(f"Chunked processing: {'enabled (auto)' if use_chunked else 'disabled (auto)'}")
+            log.info("Chunked processing: %s", 'enabled (auto)' if use_chunked else 'disabled (auto)')
         except Exception as e:
             log.warning("Failed to estimate memory: %s. Using standard prediction.", e)
             use_chunked = False
@@ -981,6 +1219,7 @@ def _run_sdb_prediction(
                 if src_sib.exists():
                     shutil.copy2(src_sib, out_tif.with_name(out_tif.stem + suffix))
             log.info("Chunked prediction complete: %s", out_tif)
+            _assert_sdb_prediction_is_meaningful(out_tif, dir_rast, stage="chunked_prediction")
 
         except ImportError:
             log.error("predict_chunked module not available. Falling back to standard prediction.")
@@ -1020,17 +1259,143 @@ def _run_sdb_prediction(
             write_provenance=True,
             min_confidence_threshold=args.min_confidence_threshold,
         )
+        _assert_sdb_prediction_is_meaningful(out_tif, dir_rast, stage="prediction")
 
 
 
 def _run_sdb_post_processing(
-    args, out_tif, s2_paths, dir_rast, rr, out_root,
-    bbox_wesn, df_test_final, predict,
+    ctx_or_args, out_tif=None, s2_paths=None, dir_rast=None, rr=None, out_root=None,
+    bbox_wesn=None, df_test_final=None, predict=None,
 ):
     """Post-prediction steps: NAVD88 conversion, overlap diagnostic,
     brightness masking, masked RGB, and NAD83 reprojection.
+
+    Accepts either an ``SDBRunContext`` or legacy positional args.
     """
+    if isinstance(ctx_or_args, SDBRunContext):
+        ctx = ctx_or_args
+        args = ctx.args
+        out_tif = out_tif or ctx.out_tif
+        s2_paths = s2_paths or ctx.s2_paths
+        dir_rast = dir_rast or ctx.dir_rast
+        rr = rr or ctx.rr
+        out_root = out_root or ctx.out_root
+        bbox_wesn = bbox_wesn or ctx.bbox_wesn
+        df_test_final = df_test_final if df_test_final is not None else ctx.df_test
+        predict = predict or ctx.mod_predict
+    else:
+        args = ctx_or_args
     import rasterio
+
+    # ------------------------------------------------------------------
+    # Stumpf-as-regularizer: penalize confidence where RF diverges from
+    # the physics-grounded Stumpf baseline (catches RF extrapolation artifacts
+    # that cause tile-boundary seams).
+    # ------------------------------------------------------------------
+    try:
+        conf_tif = Path(str(out_tif)).with_name(Path(str(out_tif)).stem + "_confidence.tif")
+        stumpf_depth_col = "stumpf_depth"
+        if conf_tif.exists() and out_tif and Path(out_tif).exists():
+            # Check if we have a stumpf_lr model (tier 1 with Stumpf baseline)
+            stumpf_lr_path = None
+            if isinstance(ctx_or_args, SDBRunContext) and ctx_or_args.stumpf_lr:
+                stumpf_lr_path = ctx_or_args.dir_model / "stumpf_lr.pkl" if ctx_or_args.dir_model else None
+
+            # Skip Stumpf regularization when dense authoritative XYZ data is
+            # available.  The regularizer penalizes RF predictions that disagree
+            # with the Stumpf baseline — but with dense survey data, the RF is
+            # trained on ground truth and Stumpf is wrong (especially in turbid
+            # channels where the blue/green ratio misinterprets turbidity as
+            # shallow depth).  Applying the regularizer here would revert the
+            # RF's corrections back toward the wrong Stumpf values.
+            _anchor_good = False
+            try:
+                # Get dir_model from context (not a direct parameter of _run_sdb_post_processing)
+                _dir_model = None
+                if isinstance(ctx_or_args, SDBRunContext) and hasattr(ctx_or_args, 'dir_model') and ctx_or_args.dir_model:
+                    _dir_model = ctx_or_args.dir_model
+                _meta_path = (Path(_dir_model) / "model_meta.json") if _dir_model else None
+                if _meta_path and _meta_path.exists():
+                    import json as _json_check
+                    with open(_meta_path) as _mf:
+                        _mm = _json_check.load(_mf)
+                    _gs = _mm.get("guidance_settings", {})
+                    _anchor_good = bool(_gs.get("anchor_support_good", False))
+                    log.info("[Stumpf-regularizer] anchor_support_good=%s (from %s)", _anchor_good, _meta_path)
+                else:
+                    log.info("[Stumpf-regularizer] No model_meta.json found; checking args for extra_xyz.")
+            except Exception as _asg_e:
+                log.warning("[Stumpf-regularizer] model_meta check failed: %s; checking args.", _asg_e)
+
+            # Fallback: if user provided extra_xyz, that IS authoritative data
+            if not _anchor_good:
+                _has_xyz = bool(getattr(args, "extra_xyz", None))
+                if _has_xyz:
+                    _anchor_good = True
+                    log.info("[Stumpf-regularizer] extra_xyz detected in args; treating as anchor_support_good=True.")
+
+            if _anchor_good:
+                log.info("[Stumpf-regularizer] SKIPPED: dense authoritative XYZ data is available; "
+                         "RF corrections are more trustworthy than Stumpf baseline in this regime.")
+            elif stumpf_lr_path and stumpf_lr_path.exists():
+                from sdb_tier import apply_stumpf_regularization
+                import joblib
+                import numpy as _np
+
+                with rasterio.open(str(out_tif)) as ds_rf:
+                    rf_depth = ds_rf.read(1).astype("float64")
+                    rf_profile = ds_rf.profile.copy()
+
+                with rasterio.open(str(conf_tif)) as ds_conf:
+                    conf_arr = ds_conf.read(1).astype("float32")
+                    conf_profile = ds_conf.profile.copy()
+
+                # Reconstruct Stumpf depth from stumpf_idx raster + saved LR
+                stumpf_model = joblib.load(str(stumpf_lr_path))
+                b02_path = s2_paths.get("B02") if s2_paths else None
+                b03_path = s2_paths.get("B03") if s2_paths else None
+
+                if b02_path and b03_path:
+                    with rasterio.open(str(b02_path)) as ds2, rasterio.open(str(b03_path)) as ds3:
+                        b02 = ds2.read(1).astype("float64")
+                        b03 = ds3.read(1).astype("float64")
+
+                    eps = 1e-6
+                    log_b03 = _np.log(_np.maximum(b03, eps))
+                    log_b03 = _np.where(_np.abs(log_b03) < eps, eps, log_b03)
+                    stumpf_idx = _np.log(_np.maximum(b02, eps)) / log_b03
+                    stumpf_idx = _np.clip(stumpf_idx, -10.0, 10.0)
+
+                    finite_mask = _np.isfinite(stumpf_idx)
+                    stumpf_pred = _np.full_like(rf_depth, _np.nan)
+                    if hasattr(stumpf_model, "predict"):
+                        x_flat = stumpf_idx[finite_mask].ravel()
+                        if hasattr(stumpf_model, "increasing"):
+                            # IsotonicRegression
+                            stumpf_pred[finite_mask] = stumpf_model.predict(x_flat)
+                        else:
+                            # LinearRegression
+                            stumpf_pred[finite_mask] = stumpf_model.predict(x_flat.reshape(-1, 1)).ravel()
+
+                    reg_conf, reg_meta = apply_stumpf_regularization(
+                        conf_arr, rf_depth, stumpf_pred, sigma_threshold=2.0)
+
+                    # Apply edge taper for seamless tile blending
+                    from sdb_tier import apply_edge_taper
+                    reg_conf = apply_edge_taper(reg_conf, taper_frac=0.10)
+                    reg_meta["edge_taper_applied"] = True
+
+                    # Write regularized + tapered confidence back
+                    conf_profile.update(dtype="float32")
+                    with rasterio.open(str(conf_tif), "w", **conf_profile) as dst:
+                        dst.write(reg_conf, 1)
+
+                    _rr_add(rr, "sdb.stumpf_regularizer", reg_meta)
+                    log.info("[Stumpf-regularizer] Applied + edge taper: flagged %.1f%% of pixels",
+                             reg_meta.get("frac_flagged", 0) * 100)
+    except Exception:
+        log.warning("[Stumpf-regularizer] Failed; continuing without regularization.", exc_info=True)
+
     # 9a. Optional conversion to bed elevation in NAVD88
     # This converts SDB depth (relative to ~MSL) to bed elevation in NAVD88
     # for consistency with river bathymetry and coastal DEMs.
@@ -1126,7 +1491,9 @@ def _run_sdb_post_processing(
                             ref_depth_col="depth_m",
                         )
                         rr.add_dict("qa.overlap_consistency", res)
-                        log.info(f"{res.get('status')} n_valid={res.get('n_samples_valid')} median_diff={res.get('median_diff_m')} m p90_abs={res.get('p90_abs_diff_m')} m")
+                        log.info("%s n_valid=%s median_diff=%s m p90_abs=%s m",
+                                 res.get('status'), res.get('n_samples_valid'),
+                                 res.get('median_diff_m'), res.get('p90_abs_diff_m'))
         except Exception as e:
             log.warning("Failed to compute overlap consistency diagnostic: %s", e)
 
@@ -1164,6 +1531,11 @@ def _run_sdb_post_processing(
                     log.info("[Post-Process] No pixels masked by brightness gate.")
         except Exception as exc:
             log.warning("[Post-Process] Brightness masking failed: %s", exc)
+
+    # Brightness masking can collapse a marginal prediction to effectively nothing.
+    # Re-check after post-processing so downstream fusion never treats an empty SDB
+    # raster as a successful coastal product.
+    _assert_sdb_prediction_is_meaningful(out_tif, dir_rast, stage="post_brightness_mask")
 
     # --- NEW: Create Masked RGB (Prediction Only) ---
     rgb_full = dir_rast / "RGB_10m.tif"
@@ -1214,11 +1586,32 @@ def _run_sdb_post_processing(
 
 
 def _write_sdb_manifest(
-    args, out_tif, dir_rast, dir_model, dir_logs, dir_plot, run_id,
-    out_root, rr, df_test_final, df_train_final, chosen_max_depth,
-    raster_quickstats,
+    ctx_or_args, out_tif=None, dir_rast=None, dir_model=None, dir_logs=None,
+    dir_plot=None, run_id=None,
+    out_root=None, rr=None, df_test_final=None, df_train_final=None,
+    chosen_max_depth=None, raster_quickstats=None,
 ):
-    """Write the SDB artifact manifest and final reporting."""
+    """Write the SDB artifact manifest and final reporting.
+
+    Accepts either an ``SDBRunContext`` or legacy positional args.
+    """
+    if isinstance(ctx_or_args, SDBRunContext):
+        ctx = ctx_or_args
+        args = ctx.args
+        out_tif = out_tif or ctx.out_tif
+        dir_rast = dir_rast or ctx.dir_rast
+        dir_model = dir_model or ctx.dir_model
+        dir_logs = dir_logs or ctx.dir_logs
+        dir_plot = dir_plot or ctx.dir_plot
+        run_id = run_id or ctx.run_id
+        out_root = out_root or ctx.out_root
+        rr = rr or ctx.rr
+        df_test_final = df_test_final if df_test_final is not None else ctx.df_test
+        df_train_final = df_train_final if df_train_final is not None else ctx.df_train
+        chosen_max_depth = chosen_max_depth if chosen_max_depth is not None else ctx.chosen_max_depth
+        raster_quickstats = raster_quickstats or ctx.raster_quickstats
+    else:
+        args = ctx_or_args
     # -------------------------------------------------------------------------
     # Artifact manifest paths are derived from run_id, not guessed
     # -------------------------------------------------------------------------
@@ -1266,20 +1659,21 @@ def _write_sdb_manifest(
             artifacts["rgb_predict"] = str(rgb_pred.relative_to(out_root))
 
         (out_root / "artifacts_sdb.json").write_text(json.dumps(artifacts, indent=2), encoding="utf-8")
-        log.info(f"Wrote SDB manifest: {out_root / 'artifacts_sdb.json'}")
+        log.info("Wrote SDB manifest: %s", out_root / 'artifacts_sdb.json')
     except Exception as exc:
         log.warning("Failed to write outputs/manifest: %s", exc)
 
     if df_test_final is not None and not df_test_final.empty:
         try:
-            if df_train_final is not None and not df_train_final.empty:
-                df_points_all = pd.concat([df_train_final, df_test_final], ignore_index=True)
-            else:
-                df_points_all = df_test_final
+            eval_points = df_test_final.copy()
+            if "source" in eval_points.columns:
+                log.info("Raster validation holdout sources: %s", eval_points["source"].astype(str).value_counts().to_dict())
+            elif "source_norm" in eval_points.columns:
+                log.info("Raster validation holdout sources: %s", eval_points["source_norm"].astype(str).value_counts().to_dict())
         except Exception:
-            df_points_all = df_test_final
+            eval_points = df_test_final
 
-        evaluate_raster_against_points(str(out_tif), df_points_all, dir_logs, dir_plot, max_depth=chosen_max_depth)
+        evaluate_raster_against_points(str(out_tif), eval_points, dir_logs, dir_plot, max_depth=chosen_max_depth)
 
 
     try:
@@ -1297,23 +1691,47 @@ def _write_sdb_manifest(
             _rr_artifact(rr, "rf_model_pkl", str(dir_model / "rf_model.pkl"))
             if (dir_model / "stumpf_lr.pkl").exists():
                 _rr_artifact(rr, "stumpf_lr_pkl", str(dir_model / "stumpf_lr.pkl"))
+            if fallback_registry is not None:
+                rr.add_dict("scientific_fallbacks", fallback_registry.summary())
 
             rr.write(status="ok")
             log.info("SDB pipeline done")
-    except Exception:
-        log.debug("ignored", exc_info=True)
+    except Exception as _exc:
+        log.debug("Suppressed: %s", _exc, exc_info=True)
 
 
 def _acquire_s2_and_atl_data(
-    args, s2_cache, atl_cache, mask_cache, bbox_wesn, out_root, rr,
-    dir_data, dir_rast, w, e, s, n,
-    s2_optics, atl, bbox_list,
+    ctx_or_args, s2_cache=None, atl_cache=None, mask_cache=None,
+    bbox_wesn=None, out_root=None, rr=None,
+    dir_data=None, dir_rast=None, w=None, e=None, s=None, n=None,
+    s2_optics=None, atl=None, bbox_list=None,
 ):
     """Acquire Sentinel-2 composite and ICESat-2 data with retry logic.
 
     Returns (s2_paths, atl_files_map) on success, or calls sys.exit / returns
     on failure depending on mode.
+
+    Accepts either an ``SDBRunContext`` as first arg (new style) or the legacy
+    positional ``args`` namespace (backward compatible).
     """
+    if isinstance(ctx_or_args, SDBRunContext):
+        ctx = ctx_or_args
+        args = ctx.args
+        s2_cache = s2_cache or ctx.s2_cache
+        atl_cache = atl_cache or ctx.atl_cache
+        mask_cache = mask_cache or ctx.mask_cache
+        bbox_wesn = bbox_wesn or ctx.bbox_wesn
+        out_root = out_root or ctx.out_root
+        rr = rr or ctx.rr
+        dir_data = dir_data or ctx.dir_data
+        dir_rast = dir_rast or ctx.dir_rast
+        if bbox_wesn:
+            w, e, s, n = bbox_wesn
+        bbox_list = bbox_list or ctx.bbox_list
+        s2_optics = s2_optics or ctx.mod_s2_optics
+        atl = atl or ctx.mod_atl
+    else:
+        args = ctx_or_args
     # 3. Data Acquisition
     current_start = args.start
     end_date = args.end
@@ -1403,8 +1821,8 @@ def _acquire_s2_and_atl_data(
                     sig = inspect.signature(s2_optics.build_weighted_shared_date_composite)
                     allowed = set(sig.parameters.keys())
                     s2_kwargs = {k: v for k, v in s2_kwargs.items() if k in allowed}
-                except Exception:
-                    log.debug("ignored", exc_info=True)
+                except Exception as _exc:
+                    log.debug("Suppressed: %s", _exc, exc_info=True)
 
                 s2_paths = s2_optics.build_weighted_shared_date_composite(**s2_kwargs)
 
@@ -1418,8 +1836,8 @@ def _acquire_s2_and_atl_data(
                             if isinstance(v, str) and v:
                                 _rr_artifact(rr, f"s2_{k}".lower(), v)
                         _rr_merge_json(rr, "s2.date_qc", s2_out / "S2_DATE_QC.json")
-                except Exception:
-                    log.debug("ignored", exc_info=True)
+                except Exception as _exc:
+                    log.debug("Suppressed: %s", _exc, exc_info=True)
                 log.info("Composite acquired.")
 
                 if args.cloud_report_only:
@@ -1483,126 +1901,183 @@ def _acquire_s2_and_atl_data(
     return s2_paths, atl_files_map
 
 
+def _filter_extra_xyz_for_sdb(df_xyz_local, args, ctx=None):
+    """Conservative guardrails for extra_xyz in SDB training.
+
+    Module-level function — all state passed explicitly via ``args`` and
+    optional ``ctx`` (SDBRunContext).  No closure capture of outer locals.
+
+    River/XS anchoring is handled separately in bathy_main; here we avoid
+    poisoning SDB with likely bed-elevation soundings mislabeled as depth.
+    """
+    if df_xyz_local is None or len(df_xyz_local) == 0:
+        return df_xyz_local
+    mode = str(getattr(args, "extra_xyz_sdb_mode", "auto") or "auto").lower()
+    if mode == "exclude":
+        log.warning("extra_xyz_sdb_mode=exclude -> excluding extra_xyz from SDB training.")
+        return None
+    if mode == "allow":
+        return df_xyz_local
+
+    guard_max_abs_depth_m = 10.0
+    authoritative_max_abs_depth_m = 60.0
+    authoritative_tags = (
+        "hydronos", "ehydro", "survey", "sonar", "sound", "lidar", "bag",
+        "multibeam", "singlebeam", "mbes", "usace", "usgs", "noaa"
+    )
+    try:
+        _ctx_kd = getattr(ctx, 'kd_max_depth_m', None) if ctx is not None else None
+        physics_cap = float(_ctx_kd) if _ctx_kd is not None else None
+    except (TypeError, ValueError):
+        physics_cap = None
+    try:
+        hard_cap = float(getattr(args, "max_depth_hard_cap", 25.0) or 25.0)
+    except (TypeError, ValueError):
+        hard_cap = 25.0
+    if physics_cap is not None and np.isfinite(physics_cap) and physics_cap > 0:
+        guard_max_abs_depth_m = float(min(max(physics_cap, 10.0), hard_cap))
+
+    def _src_counts(_df):
+        if _df is None or len(_df) == 0 or "source" not in _df.columns:
+            return {}
+        try:
+            vc = _df["source"].astype(str).str.lower().value_counts(dropna=False)
+            return {str(k): int(v) for k, v in vc.to_dict().items()}
+        except Exception:
+            return {}
+
+    try:
+        if "depth_m" not in df_xyz_local.columns:
+            log.warning("extra_xyz missing depth_m; excluding from SDB training in auto mode.")
+            return None
+
+        n_before = int(len(df_xyz_local))
+        d_ser = pd.to_numeric(df_xyz_local["depth_m"], errors="coerce")
+        d_arr = d_ser.to_numpy(dtype=float)
+        finite_mask = np.isfinite(d_arr)
+        n_finite = int(finite_mask.sum())
+        if n_finite == 0:
+            log.warning("extra_xyz has no finite depth_m after coercion; excluding from SDB training.")
+            return None
+
+        df_guard = df_xyz_local.loc[finite_mask].copy()
+        df_guard["depth_m"] = d_arr[finite_mask]
+
+        src_before = _src_counts(df_xyz_local)
+
+        src_series = df_guard.get("source")
+        if src_series is not None:
+            src_norm = src_series.astype(str).str.lower()
+            authoritative_mask = src_norm.str.contains("|".join(authoritative_tags), regex=True)
+            if authoritative_mask.any():
+                auth_cap = float(max(authoritative_max_abs_depth_m, hard_cap))
+                depth_abs = np.abs(df_guard["depth_m"].to_numpy(dtype=float))
+                keep_depth = np.where(
+                    np.asarray(authoritative_mask, dtype=bool),
+                    depth_abs <= auth_cap,
+                    depth_abs <= float(guard_max_abs_depth_m),
+                )
+                log.info(
+                    "[XYZ][SDB] Authoritative extra_xyz detected; using looser depth cap for %d rows "
+                    "(|depth_m|<=%.1f m) and standard cap %.1f m for other rows.",
+                    int(authoritative_mask.sum()), auth_cap, float(guard_max_abs_depth_m),
+                )
+            else:
+                keep_depth = np.abs(df_guard["depth_m"].to_numpy(dtype=float)) <= float(guard_max_abs_depth_m)
+        else:
+            keep_depth = np.abs(df_guard["depth_m"].to_numpy(dtype=float)) <= float(guard_max_abs_depth_m)
+        df_guard = df_guard.loc[np.asarray(keep_depth, dtype=bool)].copy()
+        if df_guard.empty:
+            log.warning(
+                "[XYZ][SDB] Auto guard removed all extra_xyz rows for SDB training after depth sanity caps.",
+            )
+            return None
+
+        d = df_guard["depth_m"].to_numpy(dtype=float)
+        pct_pos = float((d > 0).mean()) if d.size else 0.0
+        med = float(np.nanmedian(d)) if d.size else float("nan")
+        src_text = ""
+        if "source" in df_guard.columns:
+            src_text = " ".join(sorted({str(v).lower() for v in df_guard["source"].dropna().unique()}))
+        suspect_prov = any(k in src_text for k in ("hydronos", "ehydro"))
+        if suspect_prov and pct_pos > 0.02:
+            n_mid = len(df_guard)
+            d_ser2 = pd.to_numeric(df_guard["depth_m"], errors="coerce")
+            neg_mask = (d_ser2 <= 0)
+            neg_mask = neg_mask.fillna(False) if hasattr(neg_mask, "fillna") else pd.Series(False, index=df_guard.index)
+            df_neg = df_guard.loc[np.asarray(neg_mask, dtype=bool)].copy()
+            if len(df_neg) >= 100:
+                log.warning(
+                    "[XYZ][SDB] Auto guard: suspected bed-elev/mixed-sign source (%.1f%% positive; median=%.2f m). "
+                    "Keeping only non-positive rows for SDB training: %d -> %d.",
+                    pct_pos * 100, med, n_mid, len(df_neg),
+                )
+                df_guard = df_neg
+            else:
+                log.warning(
+                    "[XYZ][SDB] Auto guard: suspected bed-elev/mixed-sign source (%.1f%% positive; median=%.2f m). "
+                    "Too few non-positive rows remain; excluding extra_xyz from SDB training.",
+                    pct_pos * 100, med,
+                )
+                return None
+        elif pct_pos > 0.20:
+            log.warning(
+                "[XYZ][SDB] Auto guard warning: extra_xyz has %.1f%% positive depth_m (median=%.2f m) after depth cap. "
+                "Verify depth semantics/sign convention before trusting SDB metrics.",
+                pct_pos * 100, med,
+            )
+
+        src_after = _src_counts(df_guard)
+        cap_mode = "physics-aware" if guard_max_abs_depth_m > 10.0 else "fallback"
+        log.info(
+            "[XYZ][SDB] Guard kept %d/%d extra_xyz rows for SDB training "
+            "(finite depth + source-aware depth sanity caps; standard cap=%g m; %s cap).",
+            len(df_guard), n_before, guard_max_abs_depth_m, cap_mode,
+        )
+        if src_before or src_after:
+            log.info("Guard source breakdown before=%s after=%s", src_before, src_after)
+            hydro_before = sum(v for k, v in src_before.items() if ("hydronos" in k or "ehydro" in k))
+            hydro_after = sum(v for k, v in src_after.items() if ("hydronos" in k or "ehydro" in k))
+            if hydro_before > 0 and hydro_after < hydro_before:
+                log.info("Hydronos/eHydro-like rows reduced by guard: %s -> %s", hydro_before, hydro_after)
+        return df_guard
+
+    except Exception as ex:
+        log.error("Auto guard failed; excluding extra_xyz from SDB training. Reason: %s", ex, exc_info=True)
+        log.debug("Guard exception details", exc_info=True)
+        return None
+
+
 def _run_fusion(
-    args, dir_data, dir_rast, dir_logs, dir_model, dir_plot,
-    s2_paths, df_atl03, df_atl24, out_root, rr,
-    atl, fusion,
+    ctx_or_args, dir_data=None, dir_rast=None, dir_logs=None,
+    dir_model=None, dir_plot=None,
+    s2_paths=None, df_atl03=None, df_atl24=None, out_root=None, rr=None,
+    atl=None, fusion=None,
 ):
     """Fuse ATL03, ATL24, and extra-XYZ training points into a single training DataFrame.
 
     Returns fused_df.
+
+    Accepts either an ``SDBRunContext`` as first arg (new style) or the legacy
+    positional ``args`` namespace (backward compatible).
     """
+    if isinstance(ctx_or_args, SDBRunContext):
+        ctx = ctx_or_args
+        args = ctx.args
+        dir_data = dir_data or ctx.dir_data
+        dir_rast = dir_rast or ctx.dir_rast
+        dir_logs = dir_logs or ctx.dir_logs
+        dir_model = dir_model or ctx.dir_model
+        dir_plot = dir_plot or ctx.dir_plot
+        s2_paths = s2_paths or ctx.s2_paths
+        out_root = out_root or ctx.out_root
+        rr = rr or ctx.rr
+        atl = atl or ctx.mod_atl
+        fusion = fusion or ctx.mod_fusion
+    else:
+        args = ctx_or_args
     # 6. Fusion
     log.info("Fusion & QC")
-    def _filter_extra_xyz_for_sdb(df_xyz_local):
-        """Conservative guardrails for extra_xyz in SDB training.
-        River/XS anchoring is handled separately in bathy_main; here we avoid poisoning SDB
-        with likely bed-elevation soundings mislabeled as depth.
-
-        Safe defaults (auto mode):
-          - fail-closed on guard exceptions (do not silently continue)
-          - require finite numeric depth_m
-          - cap to |depth_m| <= 10 m for SDB training support (nearshore-focused guard)
-          - apply mixed-sign / provenance checks for likely bed-elevation sources
-        """
-        if df_xyz_local is None or len(df_xyz_local) == 0:
-            return df_xyz_local
-        mode = str(getattr(args, "extra_xyz_sdb_mode", "auto") or "auto").lower()
-        if mode == "exclude":
-            log.warning("extra_xyz_sdb_mode=exclude -> excluding extra_xyz from SDB training.")
-            return None
-        if mode == "allow":
-            return df_xyz_local
-
-        guard_max_abs_depth_m = 10.0  # safe default for SDB training support from external XYZ
-
-        def _src_counts(_df):
-            if _df is None or len(_df) == 0 or "source" not in _df.columns:
-                return {}
-            try:
-                vc = _df["source"].astype(str).str.lower().value_counts(dropna=False)
-                return {str(k): int(v) for k, v in vc.to_dict().items()}
-            except Exception:
-                return {}
-
-        try:
-            if "depth_m" not in df_xyz_local.columns:
-                log.warning("extra_xyz missing depth_m; excluding from SDB training in auto mode.")
-                return None
-
-            n_before = int(len(df_xyz_local))
-            d_ser = pd.to_numeric(df_xyz_local["depth_m"], errors="coerce")
-            d_arr = d_ser.to_numpy(dtype=float)
-            finite_mask = np.isfinite(d_arr)
-            n_finite = int(finite_mask.sum())
-            if n_finite == 0:
-                log.warning("extra_xyz has no finite depth_m after coercion; excluding from SDB training.")
-                return None
-
-            df_guard = df_xyz_local.loc[finite_mask].copy()
-            df_guard["depth_m"] = d_arr[finite_mask]
-
-            src_before = _src_counts(df_xyz_local)
-
-            # Default depth-support guard for SDB (keeps nearshore training; avoids deep/offshore domination)
-            keep_depth = np.abs(df_guard["depth_m"].to_numpy(dtype=float)) <= float(guard_max_abs_depth_m)
-            df_guard = df_guard.loc[keep_depth].copy()
-            if df_guard.empty:
-                log.warning(
-                    f"[XYZ][SDB] Auto guard removed all extra_xyz rows for SDB training (|depth_m| <= {guard_max_abs_depth_m:g} m)."
-                )
-                return None
-
-            # Mixed-sign / provenance guard on the already depth-limited set
-            d = df_guard["depth_m"].to_numpy(dtype=float)
-            pct_pos = float((d > 0).mean()) if d.size else 0.0
-            med = float(np.nanmedian(d)) if d.size else float("nan")
-            src_text = ""
-            if "source" in df_guard.columns:
-                src_text = " ".join(sorted({str(v).lower() for v in df_guard["source"].dropna().unique()}))
-            suspect_prov = any(k in src_text for k in ("hydronos", "ehydro"))
-            if suspect_prov and pct_pos > 0.02:
-                n_mid = len(df_guard)
-                d_ser2 = pd.to_numeric(df_guard["depth_m"], errors="coerce")
-                neg_mask = (d_ser2 <= 0)
-                neg_mask = neg_mask.fillna(False) if hasattr(neg_mask, "fillna") else pd.Series(False, index=df_guard.index)
-                df_neg = df_guard.loc[np.asarray(neg_mask, dtype=bool)].copy()
-                if len(df_neg) >= 100:
-                    log.warning(
-                        f"[XYZ][SDB] Auto guard: suspected bed-elev/mixed-sign source ({pct_pos*100:.1f}% positive; median={med:.2f} m). "
-                        f"Keeping only non-positive rows for SDB training: {n_mid} -> {len(df_neg)}."
-                    )
-                    df_guard = df_neg
-                else:
-                    log.warning(
-                        f"[XYZ][SDB] Auto guard: suspected bed-elev/mixed-sign source ({pct_pos*100:.1f}% positive; median={med:.2f} m). "
-                        "Too few non-positive rows remain; excluding extra_xyz from SDB training."
-                    )
-                    return None
-            elif pct_pos > 0.20:
-                log.warning(
-                    f"[XYZ][SDB] Auto guard warning: extra_xyz has {pct_pos*100:.1f}% positive depth_m (median={med:.2f} m) after depth cap. "
-                    "Verify depth semantics/sign convention before trusting SDB metrics."
-                )
-
-            src_after = _src_counts(df_guard)
-            log.info(
-                f"[XYZ][SDB] Guard kept {len(df_guard)}/{n_before} extra_xyz rows for SDB training "
-                f"(finite depth + |depth_m|<={guard_max_abs_depth_m:g} m)."
-            )
-            if src_before or src_after:
-                log.info("Guard source breakdown before=%s after=%s", src_before, src_after)
-                hydro_before = sum(v for k, v in src_before.items() if ("hydronos" in k or "ehydro" in k))
-                hydro_after = sum(v for k, v in src_after.items() if ("hydronos" in k or "ehydro" in k))
-                if hydro_before > 0 and hydro_after < hydro_before:
-                    log.info("Hydronos/eHydro-like rows reduced by guard: %s -> %s", hydro_before, hydro_after)
-            return df_guard
-
-        except Exception as ex:
-            # Fail closed: do not silently keep unguarded extra_xyz in SDB training.
-            log.error("Auto guard failed; excluding extra_xyz from SDB training. Reason: %s", ex, exc_info=True)
-            log.debug("Guard exception details", exc_info=True)
-            return None
 
     df_xyz = None
     if args.extra_xyz:
@@ -1618,7 +2093,8 @@ def _run_fusion(
                 log.warning("Extra XYZ inputs were provided but produced 0 usable points after parsing/filtering.")
         except Exception:
             log.warning("Loaded extra XYZ points (stats unavailable).", exc_info=True)
-        df_xyz = _filter_extra_xyz_for_sdb(df_xyz)
+        _ctx_for_guard = ctx_or_args if isinstance(ctx_or_args, SDBRunContext) else None
+        df_xyz = _filter_extra_xyz_for_sdb(df_xyz, args, _ctx_for_guard)
         if df_xyz is None or len(df_xyz) == 0:
             log.warning("No extra_xyz points will be used for SDB training after guardrails.")
 
@@ -1670,8 +2146,9 @@ def _run_fusion(
             df_out = df_in.loc[keep_idx].copy()
             vc_after = df_out["source"].astype(str).value_counts(dropna=False)
             log.warning(
-                f"[TRAIN][PRESAMPLE] Capped per-source rows before S2 sampling at {int(cap_per_source):,}. "
-                f"Total rows {len(df_in):,} -> {len(df_out):,}."
+                "[TRAIN][PRESAMPLE] Capped per-source rows before S2 sampling at %s. "
+                "Total rows %s -> %s.",
+                f"{int(cap_per_source):,}", f"{len(df_in):,}", f"{len(df_out):,}",
             )
             log.info("Source counts before: %s", vc_before.to_dict())
             log.info("Source counts after: %s", vc_after.to_dict())
@@ -1705,13 +2182,16 @@ def main():
     run_id = None
     try:
         from datetime import datetime, timezone
-        from logging_config import add_file_handler, start_flight_recorder
+        from logging_config import add_file_handler, install_screen_log, start_flight_recorder
 
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         run_id = f"sdb_{ts}_{os.getpid()}"
         out_dir = Path(getattr(args, "out_dir", "output"))
-        (out_dir / "run_logs").mkdir(parents=True, exist_ok=True)
-        add_file_handler(out_dir / "run_logs" / f"run_{run_id}.log", level=logging.INFO)
+        run_logs_dir = out_dir / "run_logs"
+        run_logs_dir.mkdir(parents=True, exist_ok=True)
+        screen_log_path = install_screen_log(run_logs_dir / f"screen_{run_id}.log")
+        add_file_handler(run_logs_dir / f"run_{run_id}.log", level=logging.INFO, log_format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        log.info("Screen log: %s", screen_log_path)
         fr_path = start_flight_recorder(out_dir, run_id=run_id)
         if fr_path is not None:
             log.info("Flight recorder: %s", fr_path)
@@ -1761,7 +2241,7 @@ def main():
             )
             progress = checkpoint.get_progress_summary()
             if progress.get("completed_stages"):
-                log.info(f"Resuming from checkpoint: {progress['completed_stages']}")
+                log.info("Resuming from checkpoint: %s", progress['completed_stages'])
         except Exception as e:
             log.warning("Could not initialize: %s", e)
             checkpoint = None
@@ -1777,7 +2257,48 @@ def main():
     try:
         if isinstance(max_depth_arg_raw, str) and max_depth_arg_raw.strip().lower() == "auto":
             auto_max_depth = True
-            max_depth_sdb_product = 20.0
+            # When authoritative XYZ data is available, use its depth range
+            # instead of the 20m default — the XYZ data tells us the actual
+            # depth range that needs to be modeled.
+            _xyz_max = 20.0
+            if hasattr(args, "extra_xyz") and args.extra_xyz:
+                try:
+                    import numpy as _np_ad
+                    _all_depths = []
+                    for _xf in (args.extra_xyz if isinstance(args.extra_xyz, list) else [args.extra_xyz]):
+                        _xp = Path(str(_xf).strip())
+                        if not _xp.exists():
+                            continue
+                        try:
+                            _dat = _np_ad.genfromtxt(str(_xp), dtype="float64", max_rows=500000)
+                            if _dat.ndim == 1:
+                                _dat = _dat.reshape(1, -1)
+                            if _dat.shape[1] >= 3:
+                                _z = _np_ad.abs(_dat[:, 2])
+                                _z = _z[_np_ad.isfinite(_z)]
+                                if len(_z) > 0:
+                                    _all_depths.append(_z)
+                        except Exception:
+                            try:
+                                _dat = _np_ad.genfromtxt(str(_xp), dtype="float64", delimiter=",", max_rows=500000)
+                                if _dat.ndim == 1:
+                                    _dat = _dat.reshape(1, -1)
+                                if _dat.shape[1] >= 3:
+                                    _z = _np_ad.abs(_dat[:, 2])
+                                    _z = _z[_np_ad.isfinite(_z)]
+                                    if len(_z) > 0:
+                                        _all_depths.append(_z)
+                            except Exception:
+                                continue
+                    if _all_depths:
+                        _combined = _np_ad.concatenate(_all_depths)
+                        if len(_combined) > 100:
+                            _xyz_max = float(_np_ad.percentile(_combined, 99))
+                            log.info("[AUTO-DEPTH] XYZ files depth p99=%.1f m (n=%d); using as training depth cap.", _xyz_max, len(_combined))
+                except Exception as _ad_e:
+                    log.warning("[AUTO-DEPTH] Failed to read XYZ depth range: %s; using default 20m cap.", _ad_e)
+            max_depth_sdb_product = max(20.0, min(_xyz_max, 60.0))
+            log.info("[AUTO-DEPTH] max_depth_sdb_product=%.1f m (xyz_max=%.1f m)", max_depth_sdb_product, _xyz_max)
         else:
             max_depth_sdb_product = float(max_depth_arg_raw)
     except Exception:
@@ -1821,6 +2342,9 @@ def main():
             if cli_flag in sys.argv:
                 log.info("   [Override Skipped] User explicitly set %s. Keeping value: %s", cli_flag, getattr(args, key))
             else:
+                if key == "sdb_mode" and getattr(args, "extra_xyz", None):
+                    log.info("   [Override Skipped] extra_xyz provided; keeping user-requested sdb_mode: %s", getattr(args, key))
+                    continue
                 old_val = getattr(args, key)
                 setattr(args, key, value)
                 if old_val != value:
@@ -1951,24 +2475,47 @@ def main():
     _rr_artifact(rr, "dir_plots", str(dir_plot))
     _rr_artifact(rr, "dir_logs", str(dir_logs))
 
+    fallback_registry = FallbackRegistry() if FallbackRegistry is not None else None
+    if rr is not None and fallback_registry is not None:
+        rr.add_dict("scientific_fallbacks", fallback_registry.summary())
 
     cache_root = Path(getattr(args, "cache_root", "cache"))
     atl_cache = cache_root / "icesat2"
     s2_cache = cache_root / "sentinel2"
     mask_cache = cache_root / "masks"
 
+    # --- Build shared run context -------------------------------------------
+    ctx = SDBRunContext.from_args(args, out_root=out_root, run_id=run_id or "", rr=rr)
+    ctx.s2_cache = s2_cache
+    ctx.atl_cache = atl_cache
+    ctx.mask_cache = mask_cache
+    ctx.bbox_wesn = bbox_wesn
+    ctx.bbox_list = bbox_list
+
     for _d in (atl_cache, s2_cache, mask_cache):
         try:
             Path(_d).mkdir(parents=True, exist_ok=True)
-        except Exception:
-            log.debug("ignored", exc_info=True)
+        except Exception as _exc:
+            log.debug("Suppressed: %s", _exc, exc_info=True)
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
     # Model bank (bounded reservoir): accumulate training across AOIs
     # ------------------------------------------------------------------
+    # When dense authoritative XYZ data dominates the training set, the
+    # model bank adds complexity without value — we're training a model
+    # for this specific AOI with this specific survey data, not building
+    # a generalizable predictor.  Disable the bank in this case to reduce
+    # the number of interacting policy gates.
+    _guidance_anchored_mode = False
+    if hasattr(args, "extra_xyz") and args.extra_xyz:
+        _guidance_anchored_mode = True
+        log.info("[SDB] Guidance-anchored mode: dense authoritative XYZ data detected. "
+                 "SDB will operate as an optically-aware interpolant subordinate to survey data, "
+                 "not as a generalizing bathymetric predictor.")
+
     model_bank_dir = None
-    if bool(args.model_bank_enabled):
+    if bool(args.model_bank_enabled) and not _guidance_anchored_mode:
         mb = str(args.model_bank)
         if mb.strip().lower() == 'auto':
             model_bank_dir = cache_root / 'model_bank' / 'sdb_global_v1'
@@ -1991,14 +2538,16 @@ def main():
     log.info("Starting SDB run (mode=%s)", args.sdb_mode)
     log.info("Output Directory: %s", out_root)
 
-    _acq_result = _acquire_s2_and_atl_data(
-        args, s2_cache, atl_cache, mask_cache, bbox_wesn, out_root, rr,
-        dir_data, dir_rast, w, e, s, n,
-        s2_optics, atl, bbox_list,
-    )
+    # Populate ctx with lazy-imported modules
+    ctx.mod_s2_optics = s2_optics
+    ctx.mod_atl = atl
+
+    _acq_result = _acquire_s2_and_atl_data(ctx, s2_optics=s2_optics, atl=atl)
     if _acq_result is None:
         return 0
     s2_paths, atl_files_map = _acq_result
+    ctx.s2_paths = s2_paths
+    ctx.atl_files_map = atl_files_map
 
 
     # 4. Mask Generation
@@ -2051,15 +2600,18 @@ def main():
             rr.add("mask.land_mask_invert", land_mask_invert)
             rr.add("mask.land_mask_type", land_mask_type)
             rr.add("mask.land_mask_threshold", land_mask_threshold)
-        except Exception:
-            log.debug("ignored", exc_info=True)
+        except Exception as _exc:
+            log.debug("Suppressed: %s", _exc, exc_info=True)
 
+
+    atl03_audit = None
+    atl24_audit = None
 
     if atl_files_map["ATL03"]:
         if args.write_atl03_tracks_shp:
             atl.build_atl03_track_lines(atl_files_map["ATL03"], args.aoi, str(dir_data / "ATL03_tracks.shp"))
 
-        df_atl03 = atl.collect_training_points_from_atl03(
+        df_atl03, atl03_audit = atl.collect_training_points_from_atl03(
             atl_files_map["ATL03"], lat_res=0.00005, height_res=0.25, aoi_str=args.aoi,
             atl03_conf_min=args.atl03_conf_min, atl03_bottom_percentile=90.0,
             use_refraction=args.refraction, default_temp_c=args.water_temp_c,
@@ -2078,10 +2630,11 @@ def main():
             cache_code_strict=args.cache_code_strict,
             cache_ignore_code=args.cache_ignore_code,
             rr=rr,
+            return_audit=True,
         )
 
     if atl_files_map["ATL24"]:
-        df_atl24 = atl.collect_training_points_from_atl24(
+        df_atl24, atl24_audit = atl.collect_training_points_from_atl24(
             atl_files_map["ATL24"], aoi_str=args.aoi,
             max_depth_m=MAX_DEPTH_TRAIN_FETCH,
             train_relax_buffer=0.01, limit_train_samples=None, seed=args.seed,
@@ -2096,6 +2649,7 @@ def main():
             cache_code_strict=args.cache_code_strict,
             cache_ignore_code=args.cache_ignore_code,
             rr=rr,
+            return_audit=True,
         )
 
     # Optional: harmonize ATL horizontal CRS before fusion (e.g., WGS84 -> NAD83).
@@ -2105,11 +2659,120 @@ def main():
         df_atl03 = atl.transform_xyz_dataframe_crs(df_atl03, src_srs=args.atl_src_srs, dst_srs=args.atl_dst_srs, logger=log)
         df_atl24 = atl.transform_xyz_dataframe_crs(df_atl24, src_srs=args.atl_src_srs, dst_srs=args.atl_dst_srs, logger=log)
 
+    try:
+        atl_quality_summary, atl_passes_df = atl.summarize_atl_training_quality(
+            df_atl03, df_atl24,
+            min_depth_floor_m=float(args.min_depth_atl03_val),
+            colloc_dist_m=20.0,
+        )
+        atl_quality_json = dir_logs / "atl_training_quality_report.json"
+        atl_quality_csv = dir_logs / "atl_training_quality_tracks.csv"
+        atl_quality_json.write_text(json.dumps(atl_quality_summary, indent=2), encoding="utf-8")
+        if hasattr(atl_passes_df, "to_csv"):
+            atl_passes_df.to_csv(atl_quality_csv, index=False)
+        log.info("[ATL][QUALITY] Wrote summary report: %s", atl_quality_json)
+        log.info("[ATL][QUALITY] Wrote track report: %s", atl_quality_csv)
+        try:
+            xs = atl_quality_summary.get("cross_source", {})
+            log.info(
+                "[ATL][QUALITY] ATL03 accepted=%s tracks=%s near_floor=%.1f%% | ATL24 accepted=%s tracks=%s | collocated_pairs=%s atl03_vs_atl24_rmse=%s m bias=%s m",
+                atl_quality_summary.get("atl03", {}).get("accepted_points", 0),
+                atl_quality_summary.get("atl03", {}).get("unique_tracks", 0),
+                100.0 * float(atl_quality_summary.get("atl03", {}).get("near_floor_fraction") or 0.0),
+                atl_quality_summary.get("atl24", {}).get("accepted_points", 0),
+                atl_quality_summary.get("atl24", {}).get("unique_tracks", 0),
+                xs.get("collocated_pairs", 0),
+                "None" if xs.get("rmse_m") is None else f"{float(xs.get('rmse_m')):.3f}",
+                "None" if xs.get("median_bias_m") is None else f"{float(xs.get('median_bias_m')):.3f}",
+            )
+        except (AttributeError, TypeError, ValueError):
+            log.debug("ATL quality summary logging failed", exc_info=True)
+    except (OSError, TypeError, ValueError):
+        log.warning("[ATL][QUALITY] Failed to build ATL quality report.", exc_info=True)
+
+    try:
+        atl_audit_summary, atl_audit_df = atl.summarize_atl_raw_to_retained_audit(
+            atl03_audit, atl24_audit, df_atl03=df_atl03, df_atl24=df_atl24,
+        )
+        atl_audit_json = dir_logs / "atl_raw_to_retained_audit.json"
+        atl_audit_csv = dir_logs / "atl_raw_to_retained_stages.csv"
+        atl_audit_json.write_text(json.dumps(atl_audit_summary, indent=2), encoding="utf-8")
+        if hasattr(atl_audit_df, "to_csv"):
+            atl_audit_df.to_csv(atl_audit_csv, index=False)
+        log.info("[ATL][AUDIT] Wrote raw-to-retained audit: %s", atl_audit_json)
+        log.info("[ATL][AUDIT] Wrote raw-to-retained stage table: %s", atl_audit_csv)
+        try:
+            cu = atl_audit_summary.get("cudem_framework_assessment", {})
+            log.info(
+                "[ATL][AUDIT] ATL03 retained=%s ATL24 retained=%s | recommended_use=%s | %s",
+                atl_audit_summary.get("atl03", {}).get("retained_points", 0),
+                atl_audit_summary.get("atl24", {}).get("retained_points", 0),
+                cu.get("recommended_use", "unknown"),
+                "; ".join(cu.get("notes", [])[:2]),
+            )
+        except (AttributeError, TypeError, ValueError):
+            log.debug("ATL audit summary logging failed", exc_info=True)
+    except (OSError, TypeError, ValueError):
+        log.warning("[ATL][AUDIT] Failed to build raw-to-retained ATL audit ledger.", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Kd-based ATL reliability filter (pre-fusion)
+    # ------------------------------------------------------------------
+    kd_filter_meta = None
+    kd_max_depth_physics = None
+    try:
+        from kd_estimation import compute_physics_based_max_depth
+        kd_result = compute_physics_based_max_depth(
+            s2_paths, algorithm=getattr(args, "kd_algorithm", "lee2005"),
+            confidence_level=getattr(args, "kd_confidence_level", "moderate"),
+        )
+        kd_490_median = kd_result.get("kd_490_median")
+        kd_max_depth_physics = kd_result.get("physics_max_depth_m")
+        _rr_add(rr, "sdb.kd_estimation", kd_result)
+
+        if kd_490_median is not None:
+            from sdb_tier import filter_atl_by_kd
+            if df_atl03 is not None and len(df_atl03) > 0:
+                df_atl03, kd_meta_03 = filter_atl_by_kd(df_atl03, kd_490_median)
+                _rr_add(rr, "sdb.kd_atl_filter.atl03", kd_meta_03)
+            if df_atl24 is not None and len(df_atl24) > 0:
+                df_atl24, kd_meta_24 = filter_atl_by_kd(df_atl24, kd_490_median)
+                _rr_add(rr, "sdb.kd_atl_filter.atl24", kd_meta_24)
+    except Exception as exc:
+        log.warning("[Kd-ATL] Kd-based ATL filter skipped: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Fusion
+    # ------------------------------------------------------------------
+    ctx.mod_fusion = fusion
+    ctx.kd_max_depth_m = kd_max_depth_physics  # propagate to ctx for _filter_extra_xyz_for_sdb
     fused_df = _run_fusion(
-        args, dir_data, dir_rast, dir_logs, dir_model, dir_plot,
-        s2_paths, df_atl03, df_atl24, out_root, rr,
-        atl, fusion,
+        ctx,
+        s2_paths=s2_paths, df_atl03=df_atl03, df_atl24=df_atl24,
+        fusion=fusion,
     )
+    ctx.fused_df = fused_df
+
+    # ------------------------------------------------------------------
+    # Tier selection (auto-selects RF vs Stumpf-linear vs physics-only)
+    # ------------------------------------------------------------------
+    model_tier = 1
+    tier_quality = None
+    try:
+        from sdb_tier import select_model_tier
+        model_tier, tier_quality = select_model_tier(
+            fused_df,
+            aoi_bounds=bbox_wesn,
+            kd_max_depth_m=kd_max_depth_physics,
+        )
+        _rr_add(rr, "sdb.model_tier", model_tier)
+        _rr_add(rr, "sdb.tier_reason", tier_quality.tier_reason if tier_quality else "unknown")
+    except Exception as exc:
+        log.warning("[Tier] Model tier selection failed, defaulting to tier 1: %s", exc)
+
+    # Store tier in context so downstream stages can adapt behavior
+    ctx.model_tier = model_tier
+    ctx.tier_quality = tier_quality
 
     # ------------------------------------------------------------------
     # Model reuse (regional cache): if a cached model exists, prefer it over retraining.
@@ -2193,8 +2856,8 @@ def main():
             log.warning('No valid training points found after Fusion, and no model is available to predict; skipping SDB for this AOI.')
             try:
                 (out_root / 'SDB_SKIPPED.txt').write_text('SDB skipped: no training points after fusion and no cached model available.\n', encoding='utf-8')
-            except Exception:
-                log.debug("ignored", exc_info=True)
+            except Exception as _exc:
+                log.debug("Suppressed: %s", _exc, exc_info=True)
             if rr is not None:
                 rr.add('sdb.skipped', True)
                 rr.add('sdb.skip_reason', 'no_training_points_no_model')
@@ -2222,55 +2885,11 @@ def main():
             log.warning("Could not compute source counts after S2 sampling.", exc_info=True)
 
         # Partition model bank by source mix and depth regime to avoid cross-regime contamination.
+        model_bank_dir_run = model_bank_dir
+        mb_part = None
         if model_bank_dir is not None:
             try:
-                def _partition_model_bank_dir(base_dir, df_pts):
-                    if base_dir is None or df_pts is None or len(df_pts) == 0:
-                        return base_dir, None
-                    n_all = int(len(df_pts))
-                    src_ser = df_pts["source"].astype(str).str.lower() if "source" in df_pts.columns else pd.Series(["unknown"] * n_all)
-                    n_xyz = int(src_ser.str.startswith("extra_xyz").sum()) if len(src_ser) else 0
-                    n_atl = int(src_ser.str.contains("atl", regex=False).sum()) if len(src_ser) else 0
-                    xyz_frac = (n_xyz / float(n_all)) if n_all else 0.0
-                    atl_frac = (n_atl / float(n_all)) if n_all else 0.0
-                    if xyz_frac >= 0.75:
-                        mix_bucket = "xyz_dominant"
-                    elif xyz_frac >= 0.25:
-                        mix_bucket = "xyz_mixed"
-                    elif atl_frac >= 0.75:
-                        mix_bucket = "atl_dominant"
-                    else:
-                        mix_bucket = "mixed_other"
-                    depth_bucket = "unknown"
-                    if "depth_m" in df_pts.columns:
-                        d = pd.to_numeric(df_pts["depth_m"], errors="coerce").to_numpy(dtype=float)
-                        d = np.abs(d[np.isfinite(d)])
-                        if d.size:
-                            p95 = float(np.nanpercentile(d, 95))
-                            if p95 <= 12.0:
-                                depth_bucket = "shallow"
-                            elif p95 <= 25.0:
-                                depth_bucket = "mid"
-                            else:
-                                depth_bucket = "deep"
-                        else:
-                            p95 = None
-                    else:
-                        p95 = None
-                    part_key = f"mix_{mix_bucket}__depth_{depth_bucket}"
-                    part_dir = Path(base_dir) / "partitions" / part_key
-                    part_meta = {
-                        "partition_key": part_key,
-                        "mix_bucket": mix_bucket,
-                        "depth_bucket": depth_bucket,
-                        "xyz_frac": float(xyz_frac),
-                        "atl_frac": float(atl_frac),
-                        "depth_p95_abs_m": (None if p95 is None else float(p95)),
-                        "n": n_all,
-                    }
-                    return part_dir, part_meta
-
-                model_bank_dir_run, mb_part = _partition_model_bank_dir(model_bank_dir, df_with_s2)
+                model_bank_dir_run, mb_part = _build_model_bank_partition_context(args, df_with_s2, base_dir=model_bank_dir)
                 if model_bank_dir_run is not None and mb_part is not None:
                     model_bank_dir_run.mkdir(parents=True, exist_ok=True)
                     log.info("partitioned dir=%s meta=%s", model_bank_dir_run, mb_part)
@@ -2291,34 +2910,27 @@ def main():
             land_mask_water_val_for_train = int(land_mask_water_val_for_train)
 
 
-        rf, stumpf_lr, df_train_final, df_test_final, model_meta = train.train_sdb_model(
+        tc = TrainContext.from_args(
+            args,
             train_df=df_with_s2,
-            max_depth_sdb=max_depth_sdb_product,
-            seed=args.seed,
-            plots_dir=dir_plot, water_class=args.water_class,
-            use_stumpf_depth=args.use_stumpf_depth,
-            min_training_points_for_sdb=args.min_training_points_for_sdb,
-            spatial_split=False,  # Production model uses stratified random split
-            cw_min=args.cw_min,
-            land_max=args.land_max,
-            land_mask_type=land_mask_type_for_train,
-            land_mask_water_val=land_mask_water_val_for_train,
-            land_mask_invert=land_mask_invert,
-            linf_enabled=args.linf_enabled,
-            linf_estimate=linf_est_mode,
-            linf_deepwater_nir_max=args.linf_deepwater_nir_max,
-            linf_deepwater_bright_max=args.linf_deepwater_bright_max,
-            linf_percentile=args.linf_percentile,
-            rmse_target_sdb=args.rmse_target_sdb,
-            raster_paths=s2_paths,
-            depth_bin_m=float(args.depth_bin_m),
-            depth_binning=str(args.depth_binning),
-            min_samples_per_bin=int(args.min_samples_per_bin),
+            s2_paths=s2_paths,
+            plots_dir=dir_plot,
+            diagnostics_dir=out_root,
+            rr=rr,
             model_bank_dir=model_bank_dir_run,
-            model_bank_enabled=bool(args.model_bank_enabled),
-            model_bank_max_samples=int(args.bank_max_samples),
-            model_bank_seed=int(args.bank_seed),
-            model_bank_retrain_min_new=int(args.bank_retrain_min_new),
+            model_bank_context=mb_part,
+            land_mask_type_override=land_mask_type_for_train,
+            land_mask_water_val_override=land_mask_water_val_for_train,
+            land_mask_invert_override=land_mask_invert,
+            linf_estimate_mode=linf_est_mode,
+        )
+        tc.max_depth_sdb = max_depth_sdb_product
+        tc.spatial_split = False  # Production model uses stratified random split
+
+        _train_kwargs = tc.to_kwargs()
+        _train_kwargs["fallback_registry"] = fallback_registry
+        rf, stumpf_lr, df_train_final, df_test_final, model_meta = train.train_sdb_model(
+            **_train_kwargs
         )
 
         # Model bank periodic retrain policy may intentionally reuse the last trained model,
@@ -2356,8 +2968,95 @@ def main():
             if "training_bounds" in model_meta:
                 del model_meta["training_bounds"]
 
+        # Tier-aware DOA relaxation: when data quality doesn't support
+        # RF (tier >= 2), relax DOA so the Stumpf physics baseline can
+        # predict across the full water area instead of only near tracks.
+        #
+        # CRITICAL: Re-evaluate tier using POST-QC depth stats from the
+        # actual training data, not the pre-QC fused data. The Stumpf
+        # residual filter can drop 30%+ of points and collapse the
+        # effective depth range dramatically (e.g. 11.7m → 1.1m).
+        _tier = getattr(ctx, "model_tier", 1)
+        if _tier == 1 and df_train_final is not None and not df_train_final.empty:
+            try:
+                import numpy as _np
+                _d = df_train_final["depth_m"].to_numpy(dtype=float) if "depth_m" in df_train_final.columns else _np.array([])
+                _d = _np.abs(_d[_np.isfinite(_d)])
+                if len(_d) > 0:
+                    from sdb_tier import TIER1_MIN_DEPTH_RANGE_M, TIER1_MIN_DEPTH_STD_M
+                    _post_qc_range = float(_np.max(_d) - _np.min(_d))
+                    _post_qc_std = float(_np.std(_d))
+                    _post_qc_iqr = float(_np.percentile(_d, 75) - _np.percentile(_d, 25))
+                    _post_qc_median = float(_np.median(_d))
+                    _floor = float(_np.min(_d))
+                    _near_floor_frac = float(_np.mean(_d < (_floor + 0.5)))
+
+                    # Correlation check (if stumpf_idx available)
+                    _abs_corr = None
+                    if "stumpf_idx" in df_train_final.columns:
+                        _si = df_train_final["stumpf_idx"].to_numpy(dtype=float)
+                        _both = _np.isfinite(_si) & _np.isfinite(df_train_final["depth_m"].to_numpy(dtype=float))
+                        if _np.sum(_both) > 10:
+                            _c = _np.corrcoef(_si[_both], _np.abs(df_train_final["depth_m"].to_numpy(dtype=float)[_both]))[0, 1]
+                            _abs_corr = abs(_c) if _np.isfinite(_c) else 0.0
+
+                    log.info("[Post-QC tier check] n=%d, range=%.2fm, std=%.2fm, IQR=%.2fm, "
+                             "median=%.2fm, near_floor=%.0f%%, |corr|=%s",
+                             len(_d), _post_qc_range, _post_qc_std, _post_qc_iqr,
+                             _post_qc_median, _near_floor_frac * 100,
+                             "%.2f" % _abs_corr if _abs_corr is not None else "n/a")
+
+                    downgrade_reasons = []
+                    # Criterion 1: weak correlation
+                    if _abs_corr is not None and _abs_corr < 0.3:
+                        downgrade_reasons.append("|corr|=%.2f < 0.30" % _abs_corr)
+                    # Criterion 2: skewed distribution
+                    if _post_qc_iqr < 1.0 and _post_qc_range > 0 and (_post_qc_range / max(_post_qc_iqr, 0.01)) > 5.0:
+                        downgrade_reasons.append("IQR=%.2fm, range/IQR=%.1f" % (
+                            _post_qc_iqr, _post_qc_range / max(_post_qc_iqr, 0.01)))
+                    # Criterion 3: near-floor dominance
+                    if _near_floor_frac > 0.80 and _post_qc_median < 1.5:
+                        downgrade_reasons.append("near_floor=%.0f%%, median=%.2fm" % (
+                            _near_floor_frac * 100, _post_qc_median))
+                    # Legacy checks
+                    if _post_qc_range < TIER1_MIN_DEPTH_RANGE_M:
+                        downgrade_reasons.append("depth_range=%.1fm < %.1fm" % (
+                            _post_qc_range, TIER1_MIN_DEPTH_RANGE_M))
+                    if _post_qc_std < TIER1_MIN_DEPTH_STD_M:
+                        downgrade_reasons.append("depth_std=%.2fm < %.2fm" % (
+                            _post_qc_std, TIER1_MIN_DEPTH_STD_M))
+
+                    if downgrade_reasons:
+                        _tier = 2
+                        ctx.model_tier = 2
+                        log.warning("[Tier] Post-QC re-evaluation downgrades tier 1 → 2: %s",
+                                    "; ".join(downgrade_reasons))
+                        _rr_add(rr, "sdb.tier_post_qc_downgrade", "; ".join(downgrade_reasons))
+                        _rr_add(rr, "sdb.model_tier_post_qc", 2)
+                else:
+                    log.warning("[Post-QC tier check] No finite depths in df_train_final")
+            except Exception:
+                log.debug("Post-QC tier re-evaluation failed", exc_info=True)
+        elif _tier == 1:
+            log.warning("[Post-QC tier check] Skipped: df_train_final is %s",
+                        "None" if df_train_final is None else "empty")
+
+        if _tier >= 2:
+            log.info("[Tier %d] Relaxing DOA (not disabling): preserving training bounds "
+                     "for soft feature-space gating while relying primarily on physics masks "
+                     "(clear-water, land, optical depth limit).", _tier)
+            doa_cfg = model_meta.get("doa", {})
+            doa_cfg["relaxed_for_tier"] = _tier
+            model_meta["doa"] = doa_cfg
+            _rr_add(rr, "sdb.doa_relaxed_for_tier", _tier)
+
+        # Also inject tier into metadata for predict.py to read
+        model_meta["model_tier"] = _tier
+
         model_meta["max_depth_sdb"] = max_depth_sdb_product
         model_meta["water_class"] = args.water_class
+        if mb_part is not None:
+            model_meta["model_bank_partition"] = dict(mb_part)
         with open(dir_model / "model_meta.json", "w", encoding="utf-8") as f:
             json.dump(model_meta, f, indent=2)
 
@@ -2370,34 +3069,27 @@ def main():
         if args.validate_spatial:
             log.info("Running secondary spatial validation (spatial split)")
 
-            _, _, _, df_test_spatial, model_meta_spatial = train.train_sdb_model(
+            tc_spatial = TrainContext.from_args(
+                args,
                 train_df=df_with_s2,
-                max_depth_sdb=max_depth_sdb_product,
-                seed=args.seed,
-                plots_dir=dir_plot, water_class=args.water_class,
-                use_stumpf_depth=args.use_stumpf_depth,
-                min_training_points_for_sdb=args.min_training_points_for_sdb,
-                spatial_split=True,
-                cw_min=args.cw_min,
-                land_max=args.land_max,
-                land_mask_type=land_mask_type_for_train,
-                land_mask_water_val=land_mask_water_val_for_train,
-                land_mask_invert=land_mask_invert,
-                linf_enabled=args.linf_enabled,
-                linf_estimate=linf_est_mode,
-                linf_deepwater_nir_max=args.linf_deepwater_nir_max,
-                linf_deepwater_bright_max=args.linf_deepwater_bright_max,
-                linf_percentile=args.linf_percentile,
-                rmse_target_sdb=args.rmse_target_sdb,
-                raster_paths=s2_paths,
-                depth_bin_m=float(args.depth_bin_m),
-                depth_binning=str(args.depth_binning),
-                min_samples_per_bin=int(args.min_samples_per_bin),
-                model_bank_enabled=False,
+                s2_paths=s2_paths,
+                plots_dir=dir_plot,
+                diagnostics_dir=dir_logs / "spatial_validation",
                 model_bank_dir=model_bank_dir_run,
-                model_bank_max_samples=int(args.bank_max_samples),
-                model_bank_seed=int(args.bank_seed),
-                model_bank_retrain_min_new=int(args.bank_retrain_min_new),
+                model_bank_context=mb_part,
+                land_mask_type_override=land_mask_type_for_train,
+                land_mask_water_val_override=land_mask_water_val_for_train,
+                land_mask_invert_override=land_mask_invert,
+                linf_estimate_mode=linf_est_mode,
+            )
+            tc_spatial.max_depth_sdb = max_depth_sdb_product
+            tc_spatial.spatial_split = True
+            tc_spatial.model_bank_enabled = False
+
+            _spatial_kwargs = tc_spatial.to_kwargs()
+            _spatial_kwargs["fallback_registry"] = fallback_registry
+            _, _, _, df_test_spatial, model_meta_spatial = train.train_sdb_model(
+                **_spatial_kwargs
             )
 
             src_spat_base = dir_plot / "SDB_Accuracy_Assessment_SpatialSplit.png"
@@ -2435,9 +3127,51 @@ def main():
             src_key = None
 
             def _load_train_report_auto_depth() -> tuple:
+                def _source_family(name):
+                    src = str(name or "").strip().lower()
+                    if not src:
+                        return ""
+                    if "combined" in src:
+                        return "combined"
+                    if "physics" in src or "kd" in src:
+                        return "physics"
+                    if "rmse" in src or "support" in src:
+                        return "rmse"
+                    if "training_p95" in src or "p95" in src:
+                        return "training_p95"
+                    return src
+
+                def _coerce_positive(v):
+                    try:
+                        fv = float(v)
+                    except Exception:
+                        return None
+                    return fv if np.isfinite(fv) and fv > 0 else None
+
+                try:
+                    if isinstance(model_meta, dict):
+                        final_depth = _coerce_positive(model_meta.get("max_depth_sdb_final"))
+                        final_source = model_meta.get("max_depth_sdb_final_source")
+                        if final_depth is not None:
+                            return final_depth, f"model_meta.{final_source or 'max_depth_sdb_final'}"
+                        opts = model_meta.get("max_depth_options") if isinstance(model_meta.get("max_depth_options"), dict) else {}
+                        family = _source_family((opts or {}).get("selected_source") or final_source)
+                        ordered = {
+                            "physics": ("max_depth_sdb_auto_physics", "max_depth_sdb_combined", "max_depth_sdb_auto"),
+                            "combined": ("max_depth_sdb_combined", "max_depth_sdb_auto_physics", "max_depth_sdb_auto"),
+                            "rmse": ("max_depth_sdb_auto", "max_depth_sdb_combined", "max_depth_sdb_auto_physics"),
+                        }.get(family, ("max_depth_sdb_combined", "max_depth_sdb_auto_physics", "max_depth_sdb_auto"))
+                        for key in ordered:
+                            fv = _coerce_positive(model_meta.get(key))
+                            if fv is not None:
+                                return fv, f"model_meta.{key}"
+                except Exception as _exc:
+                    log.debug("Suppressed: %s", _exc, exc_info=True)
+
                 cand_paths = [
-                    dir_logs / "train_report.json",
                     out_root / "train_report.json",
+                    dir_logs / "train_report.json",
+                    dir_logs / "spatial_validation" / "train_report.json",
                     dir_model / "train_report.json",
                 ]
                 for tp in cand_paths:
@@ -2446,38 +3180,70 @@ def main():
                             with open(tp, "r", encoding="utf-8") as f:
                                 trj = json.load(f)
                             tr = trj.get("train", {}) if isinstance(trj, dict) else {}
-                            v = tr.get("max_depth_sdb_auto_m", None)
-                            if v is None:
-                                diag = tr.get("max_depth_sdb_auto_diagnostics", None)
-                                if isinstance(diag, dict):
-                                    dm = diag.get("depths_m", {}) or diag.get("depths", {})
-                                    if isinstance(dm, dict):
-                                        v = dm.get("strict", dm.get("relaxed", None))
-                            if v is None:
-                                return None, None
-                            fv = float(v)
-                            if fv <= 0:
-                                return None, None
-                            return fv, f"{tp.name}:train.max_depth_sdb_auto_m"
+                            final_depth = _coerce_positive(tr.get("max_depth_sdb_final"))
+                            final_source = tr.get("max_depth_sdb_final_source")
+                            if final_depth is not None:
+                                return final_depth, f"{tp.name}:train.{final_source or 'max_depth_sdb_final'}"
+                            opts = tr.get("max_depth_options") if isinstance(tr.get("max_depth_options"), dict) else {}
+                            family = _source_family((opts or {}).get("selected_source") or final_source)
+                            ordered = {
+                                "physics": ("max_depth_sdb_auto_physics", "max_depth_sdb_combined", "max_depth_sdb_auto_m", "max_depth_sdb_auto"),
+                                "combined": ("max_depth_sdb_combined", "max_depth_sdb_auto_physics", "max_depth_sdb_auto_m", "max_depth_sdb_auto"),
+                                "rmse": ("max_depth_sdb_auto_m", "max_depth_sdb_auto", "max_depth_sdb_combined", "max_depth_sdb_auto_physics"),
+                            }.get(family, ("max_depth_sdb_combined", "max_depth_sdb_auto_physics", "max_depth_sdb_auto_m", "max_depth_sdb_auto"))
+                            for key in ordered:
+                                fv = _coerce_positive(tr.get(key))
+                                if fv is not None:
+                                    return fv, f"{tp.name}:train.{key}"
                     except Exception:
                         continue
                 return None, None
 
             if auto_max_depth:
-                fv, src = _load_train_report_auto_depth()
-                if fv is None:
-                    # If auto-depth requested but not found (e.g. training failed or strict mode yielded nothing), 
-                    # fall back to safe default rather than hard crash, but warn loudly.
-                    log.warning("[AUTO-DEPTH] Estimation failed or returned None. Falling back to default max depth.")
-                    chosen_max_depth = max_depth_sdb_product
-                    src_key = "fallback_default"
-                else:
-                    src_key = src
-                    chosen_max_depth = min(float(fv), float(max_depth_sdb_product))
-                    log.info(
-                        f"[AUTO-DEPTH] Final product cap max_depth_sdb={chosen_max_depth:.2f} m "
-                        f"(from {src_key}; rmse_target={float(args.rmse_target_sdb):.2f} m; hard_cap={float(max_depth_sdb_product):.2f} m)."
-                    )
+                # For tier 2 (shallow/degraded data), prefer the physics-based
+                # depth limit over the RMSE-constrained cap. The RMSE cap is
+                # derived from the shallow training data and would artificially
+                # limit the Stumpf physics model to ~2m.
+                _tier = getattr(ctx, "model_tier", 1)
+                if _tier >= 2 and isinstance(model_meta, dict):
+                    _phys = model_meta.get("max_depth_sdb_auto_physics")
+                    if _phys is not None:
+                        try:
+                            _phys_f = float(_phys)
+                            if np.isfinite(_phys_f) and _phys_f > 0:
+                                chosen_max_depth = min(_phys_f, float(max_depth_sdb_product))
+                                src_key = "physics_kd_tier2"
+                                log.info("[AUTO-DEPTH][Tier %d] Using physics Kd limit %.1fm "
+                                         "instead of RMSE-constrained cap (Stumpf model "
+                                         "extrapolates beyond training range).", _tier, chosen_max_depth)
+                        except (ValueError, TypeError):
+                            pass
+
+                if src_key is None:
+                    fv, src = _load_train_report_auto_depth()
+                    if fv is None:
+                        log.warning("[AUTO-DEPTH] Estimation failed or returned None. Falling back to default max depth.")
+                        chosen_max_depth = max_depth_sdb_product
+                        src_key = "fallback_default"
+                    else:
+                        src_key = src
+                        chosen_max_depth = min(float(fv), float(max_depth_sdb_product))
+                        # The TRAINING depth cap (max_depth_sdb_product) is wide
+                        # so the RF sees the full depth range from XYZ data.
+                        # The PREDICTION cap respects the optical limit — S2 optics
+                        # can't distinguish 25m from 35m regardless of training
+                        # data quality.  Deep offshore pixels with uniform spectral
+                        # signatures should not get SDB predictions because the
+                        # model has no optical information to work with there.
+                        _gs = model_meta.get("physics_guidance", {}) if isinstance(model_meta, dict) else {}
+                        if bool(_gs.get("anchor_support_good", False)) or bool(getattr(args, "extra_xyz", None)):
+                            log.info("[AUTO-DEPTH] Anchor mode: training cap=%.1fm, prediction cap=%.1fm "
+                                     "(optical limit constrains predictions; training sees full depth range)",
+                                     float(max_depth_sdb_product), chosen_max_depth)
+                        log.info(
+                            "[AUTO-DEPTH] Final product cap max_depth_sdb=%2f m  (from %s; rmse_target=%2f m; hard_cap=%2f m).",
+                            chosen_max_depth, src_key, float(args.rmse_target_sdb), float(max_depth_sdb_product),
+                        )
             else:
                 src_key = "cli"
 
@@ -2491,13 +3257,15 @@ def main():
                 model_meta["rmse_target_sdb"] = float(args.rmse_target_sdb)
             else:
                 model_meta["max_depth_sdb_source"] = "cli"
+            if mb_part is not None:
+                model_meta["model_bank_partition"] = dict(mb_part)
 
 
             try:
                 with open(dir_model / "model_meta.json", "w", encoding="utf-8") as f:
                     json.dump(model_meta, f, indent=2)
-            except Exception:
-                log.debug("ignored", exc_info=True)
+            except Exception as _exc:
+                log.debug("Suppressed: %s", _exc, exc_info=True)
 
 
             report_lines = [
@@ -2518,18 +3286,45 @@ def main():
                 r2_spat = float(m_spat.get('r2', float('nan')))
                 rmse_rand = float(m_rand.get('rmse', float('nan')))
                 rmse_spat = float(m_spat.get('rmse', float('nan')))
-            except Exception:
+            except (TypeError, ValueError, AttributeError):
                 r2_rand = r2_spat = rmse_rand = rmse_spat = float('nan')
 
             n_rand = int(m_rand.get('n', 0) or 0) if str(m_rand.get('n', 0)).strip() != '' else 0
             n_spat = int(m_spat.get('n', 0) or 0) if str(m_spat.get('n', 0)).strip() != '' else 0
+            spatial_status = model_meta.get('spatial_split_status', {}) if isinstance(model_meta, dict) else {}
+            validation_invariants = _derive_validation_invariants(m_rand, m_spat, spatial_status)
+            if rr is not None:
+                rr.add_dict("scientific.validation_invariants", validation_invariants)
+            if validation_invariants.get("guidance_only_required", False) and fallback_registry is not None:
+                record_fallback(fallback_registry, "guidance_only_validation_gate", FallbackClass.DEGRADED, stage="validation", detail="Validation requires guidance-only interpretation because spatial holdout is missing or held-out skill is weak/negative.")
+
+                # --- Reviewer recommendation #1: automatic product degradation ---
+                # When validation is weak, automatically tighten the product:
+                # 1. Raise min_confidence_threshold to suppress low-confidence pixels
+                # 2. Record that the product should be treated as sparse guidance
+                if isinstance(model_meta, dict):
+                    _prev_thresh = float(getattr(args, "min_confidence_threshold", 0.0))
+                    _auto_thresh = max(_prev_thresh, 0.15)
+                    if _auto_thresh > _prev_thresh:
+                        args.min_confidence_threshold = _auto_thresh
+                        log.info("[AUTO-DEGRADE] Weak validation → raised min_confidence_threshold from %.2f to %.2f "
+                                 "(suppresses patchy low-confidence pixels)", _prev_thresh, _auto_thresh)
+                    model_meta["product_degradation"] = {
+                        "degraded": True,
+                        "reason": "guidance_only_required",
+                        "auto_confidence_threshold": _auto_thresh,
+                        "cudem_use": "sparse_guidance_only",
+                    }
             if n_rand <= 0:
                 report_lines.append("[INSIGHT] Random production split metrics are unavailable (test set size is zero). This commonly happens when the production model was *reused from the model bank* (no new train/test split was generated) or when aggressive filtering removed all held-out points. Rely on spatial validation for this run.")
-            if (np.isfinite(r2_rand) and r2_rand < 0) or (np.isfinite(r2_spat) and r2_spat < 0):
+            if not validation_invariants.get('representative_spatial_holdout', True):
+                report_lines.append("[INSIGHT] No representative spatial holdout could be formed from the retained training data. Treat this run as having insufficient evidence of spatial generalization; output should remain guidance-only.")
+                report_lines.append("[INSIGHT] CUDEM use pattern: treat SDB rasters as interpolation guidance only; rely on guidance_weight/trusted_interior and keep authoritative survey data dominant.")
+            elif validation_invariants.get('negative_validation_detected', False):
                 report_lines.append("[INSIGHT] At least one validation R² is negative: do not treat this model as generalizing well (held-out performance is worse than a mean baseline on that split).")
             elif np.isfinite(rmse_rand) and np.isfinite(rmse_spat) and rmse_spat > rmse_rand * 1.5:
                 report_lines.append("[INSIGHT] Significant drop in Spatial Accuracy detected.")
-            elif np.isfinite(r2_rand) and np.isfinite(r2_spat) and (r2_spat < 0.2):
+            elif validation_invariants.get('weak_spatial_validation', False):
                 report_lines.append("[INSIGHT] Validation metrics remain weak; do not interpret similar random/spatial RMSE as strong generalization.")
             else:
                 report_lines.append("[INSIGHT] Spatial Accuracy is comparable and validation metrics are not obviously pathological.")
@@ -2595,8 +3390,9 @@ def main():
                         rr.add('model_bank.save_gate', {'ok': True, 'reason': model_bank_gate_reason})
                 else:
                     log.warning(
-                        f"[MODEL_BANK] Skip save: validation gate failed ({model_bank_gate_reason}, "
-                        f"basis={model_bank_gate_basis}, R²={model_bank_gate_r2:.3f})."
+                        "[MODEL_BANK] Skip save: validation gate failed (%s, "
+                        "basis=%s, R²=%.3f).",
+                        model_bank_gate_reason, model_bank_gate_basis, model_bank_gate_r2,
                     )
                     if rr is not None:
                         rr.add('model_bank.model_saved', False)
@@ -2652,24 +3448,26 @@ def main():
 
     # Prediction output path (used by prediction, post-processing, and manifest)
     out_tif = dir_rast / f"{run_id}_sdb_depth.tif"
+    ctx.out_tif = out_tif
+    ctx.land_mask_out = land_mask_out
+    ctx.stumpf_lr = stumpf_lr
+    ctx.chosen_max_depth = chosen_max_depth
+    ctx.df_test = df_test_final
+    ctx.df_train = df_train_final
+    ctx.raster_quickstats = raster_quickstats
+    ctx.mod_predict = predict
 
     _run_sdb_prediction(
-        args, out_tif, dir_model, dir_rast, run_id, s2_paths, land_mask_out,
-        stumpf_lr, land_mask_type_for_train, land_mask_water_val_for_train,
-        land_mask_invert, land_mask_threshold, chosen_max_depth, rr,
-        dir_data, predict,
+        ctx,
+        land_mask_type_for_train=land_mask_type_for_train,
+        land_mask_water_val_for_train=land_mask_water_val_for_train,
+        land_mask_invert=land_mask_invert,
+        land_mask_threshold=land_mask_threshold,
     )
 
-    _run_sdb_post_processing(
-        args, out_tif, s2_paths, dir_rast, rr, out_root,
-        bbox_wesn, df_test_final, predict,
-    )
+    _run_sdb_post_processing(ctx, df_test_final=df_test_final)
 
-    _write_sdb_manifest(
-        args, out_tif, dir_rast, dir_model, dir_logs, dir_plot, run_id,
-        out_root, rr, df_test_final, df_train_final, chosen_max_depth,
-        raster_quickstats,
-    )
+    _write_sdb_manifest(ctx)
 
 
 
@@ -2678,6 +3476,10 @@ def parse_args():
         "Modular SDB Pipeline Orchestrator",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
+
+    # Config file support (shared with bathy_main)
+    p.add_argument("--config", dest="config_files", action="append", default=[],
+                   help="YAML config file(s). CLI args override config values.")
 
     # Core
     p.add_argument("--aoi", required=True, help="W/E/S/N (west/east/south/north)")

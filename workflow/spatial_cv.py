@@ -34,6 +34,32 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+
+def _coerce_numeric_matrix(frame_or_array) -> np.ndarray:
+    """Return a float matrix suitable for finite-value checks.
+
+    Mixed-source joins can leave object-dtype feature columns. Coerce values
+    column-wise so spatial CV fails closed on non-numeric values instead of
+    crashing in ``np.isfinite``. Invalid values become NaN and are filtered
+    by the existing finite-value masks.
+    """
+    if isinstance(frame_or_array, pd.DataFrame):
+        coerced = frame_or_array.apply(pd.to_numeric, errors="coerce")
+        return coerced.to_numpy(dtype=float, copy=False)
+    arr = np.asarray(frame_or_array)
+    if np.issubdtype(arr.dtype, np.number):
+        return arr.astype(float, copy=False)
+    return pd.DataFrame(arr).apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float, copy=False)
+
+
+def _coerce_numeric_vector(series_or_array) -> np.ndarray:
+    if isinstance(series_or_array, pd.Series):
+        return pd.to_numeric(series_or_array, errors="coerce").to_numpy(dtype=float, copy=False)
+    arr = np.asarray(series_or_array)
+    if np.issubdtype(arr.dtype, np.number):
+        return arr.astype(float, copy=False)
+    return pd.to_numeric(pd.Series(arr), errors="coerce").to_numpy(dtype=float, copy=False)
+
 # -----------------------------------------------------------------------------
 # Data structures
 # -----------------------------------------------------------------------------
@@ -113,8 +139,8 @@ def create_spatial_blocks(
     np.ndarray
         Block assignment for each row (0 to n_blocks-1)
     """
-    lons = df[lon_col].to_numpy()
-    lats = df[lat_col].to_numpy()
+    lons = pd.to_numeric(df[lon_col], errors="coerce").to_numpy(dtype=float, copy=False)
+    lats = pd.to_numeric(df[lat_col], errors="coerce").to_numpy(dtype=float, copy=False)
     
     lon_min, lon_max = np.nanmin(lons), np.nanmax(lons)
     lat_min, lat_max = np.nanmin(lats), np.nanmax(lats)
@@ -153,7 +179,7 @@ def create_spatial_clusters(
     """
     from sklearn.cluster import KMeans
     
-    coords = df[[lon_col, lat_col]].to_numpy()
+    coords = df[[lon_col, lat_col]].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float, copy=False)
     
     # Handle NaN coordinates
     valid_mask = np.all(np.isfinite(coords), axis=1)
@@ -591,10 +617,10 @@ def run_spatial_cv(
     
     for fold in cv_gen(df, n_folds=n_folds, seed=seed, **cv_kwargs):
         # Prepare data
-        X_train = df.loc[fold.train_indices, feature_cols].to_numpy()
-        y_train = df.loc[fold.train_indices, target_col].to_numpy()
-        X_test = df.loc[fold.test_indices, feature_cols].to_numpy()
-        y_test = df.loc[fold.test_indices, target_col].to_numpy()
+        X_train = _coerce_numeric_matrix(df.loc[fold.train_indices, feature_cols])
+        y_train = _coerce_numeric_vector(df.loc[fold.train_indices, target_col])
+        X_test = _coerce_numeric_matrix(df.loc[fold.test_indices, feature_cols])
+        y_test = _coerce_numeric_vector(df.loc[fold.test_indices, target_col])
         
         # Filter finite values
         train_mask = np.all(np.isfinite(X_train), axis=1) & np.isfinite(y_train)
@@ -642,9 +668,8 @@ def run_spatial_cv(
             all_actuals.extend(y_test.tolist())
         
         log.info(
-            f"[SpatialCV] Fold {fold.fold_id}: RMSE={rmse:.3f}m, R²={r2:.3f}, "
-            f"n_train={len(X_train)}, n_test={len(X_test)}, "
-            f"depth_range=[{result.depth_range[0]:.1f}, {result.depth_range[1]:.1f}]m"
+            "[SpatialCV] Fold %s: RMSE=%3fm, R²=%3f,  n_train=%s, n_test=%s,  depth_range=[%1f, %1f]m",
+            fold.fold_id, rmse, r2, len(X_train), len(X_test), result.depth_range[0], result.depth_range[1],
         )
     
     if not fold_results:
@@ -675,8 +700,8 @@ def run_spatial_cv(
     )
     
     log.info(
-        f"[SpatialCV] Summary: RMSE={summary.rmse_mean:.3f}±{summary.rmse_std:.3f}m, "
-        f"R²={summary.r2_mean:.3f}±{summary.r2_std:.3f}"
+        "[SpatialCV] Summary: RMSE=%3f±%3fm,  R²=%3f±%3f",
+        summary.rmse_mean, summary.rmse_std, summary.r2_mean, summary.r2_std,
     )
     
     return summary
@@ -820,8 +845,8 @@ def train_with_spatial_cv(
     
     # Step 3: Train final model
     log.info("Step 3: Training final model...")
-    X_train = df_train[feature_cols].to_numpy()
-    y_train = df_train[target_col].to_numpy()
+    X_train = _coerce_numeric_matrix(df_train[feature_cols])
+    y_train = _coerce_numeric_vector(df_train[target_col])
     
     # Filter finite
     train_finite = np.all(np.isfinite(X_train), axis=1) & np.isfinite(y_train)
@@ -832,8 +857,8 @@ def train_with_spatial_cv(
     rf.fit(X_train, y_train)
     
     # Predict on test set
-    X_test = df_test[feature_cols].to_numpy()
-    y_test = df_test[target_col].to_numpy()
+    X_test = _coerce_numeric_matrix(df_test[feature_cols])
+    y_test = _coerce_numeric_vector(df_test[target_col])
     test_finite = np.all(np.isfinite(X_test), axis=1) & np.isfinite(y_test)
     
     y_pred = rf.predict(X_test[test_finite])

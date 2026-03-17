@@ -340,8 +340,8 @@ def estimate_kd_from_rasters(
     }
     
     log.info(
-        f"[Kd] Estimated Kd(490)={kd_median:.3f} m⁻¹ ({water_type}), "
-        f"max depth: {depth_limits['conservative']:.1f}-{depth_limits['optimistic']:.1f} m"
+        "[Kd] Estimated Kd(490)=%3f m⁻¹ (%s),  max depth: %1f-%1f m",
+        kd_median, water_type, depth_limits['conservative'], depth_limits['optimistic'],
     )
     
     return result
@@ -494,7 +494,7 @@ def compute_physics_based_max_depth(
         kd_stats = estimate_kd_from_rasters(raster_paths, algorithm=algorithm)
         
         if "error" in kd_stats:
-            log.warning(f"Estimation failed: {kd_stats['error']}")
+            log.warning("Estimation failed: %s", kd_stats['error'])
             result["error"] = kd_stats["error"]
             result["physics_max_depth_m"] = None
         else:
@@ -528,9 +528,8 @@ def compute_physics_based_max_depth(
         result["limiting_factor"] = "physics" if physics_max < rmse_based_max else "rmse"
         
         log.info(
-            f"[Kd] Combined depth limit: {combined_max:.1f} m "
-            f"(physics={physics_max:.1f} m, rmse={rmse_based_max:.1f} m, "
-            f"limited by {result['limiting_factor']})"
+            "[Kd] Combined depth limit: %1f m  (physics=%1f m, rmse=%1f m,  limited by %s)",
+            combined_max, physics_max, rmse_based_max, result['limiting_factor'],
         )
     elif rmse_based_max is not None:
         result["rmse_based_max_depth_m"] = rmse_based_max
