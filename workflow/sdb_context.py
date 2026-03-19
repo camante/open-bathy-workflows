@@ -117,6 +117,7 @@ class SDBRunContext:
 
     # --- Run reporting -------------------------------------------------------
     rr: Any = None  # RunReport or None
+    fallback_registry: Any = None
 
     # -------------------------------------------------------------------------
     # Factory

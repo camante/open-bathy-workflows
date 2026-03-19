@@ -12,6 +12,48 @@ import shutil
 
 from process_utils import run_cmd
 
+
+def convert_raster_vertical_datum(
+    input_tif: Path,
+    output_tif: Path,
+    source_vdatum: str,
+    target_vdatum: str,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[bool, str]:
+    """Convert a raster vertically using CUDEM dlim."""
+    log = logger or logging.getLogger(__name__)
+    dlim_exe = shutil.which("dlim")
+    if dlim_exe is None:
+        msg = "dlim not found on PATH; cannot perform vertical datum transformation"
+        log.warning("%s", msg)
+        return False, msg
+
+    input_tif = Path(input_tif)
+    output_tif = Path(output_tif)
+    if not input_tif.exists():
+        msg = f"Input raster not found: {input_tif}"
+        log.error("%s", msg)
+        return False, msg
+
+    output_tif.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        dlim_exe,
+        "-i", str(input_tif),
+        "-J", str(source_vdatum),
+        "-P", str(target_vdatum),
+        "-O", str(output_tif),
+    ]
+    res = run_cmd(cmd, timeout=600)
+    if res.returncode != 0:
+        msg = f"dlim failed with code {res.returncode}: {res.stderr_tail[:500]}"
+        log.error("%s", msg)
+        return False, msg
+    if not output_tif.exists():
+        msg = f"dlim completed but output not found: {output_tif}"
+        log.error("%s", msg)
+        return False, msg
+    return True, f"Converted {input_tif.name} from {source_vdatum} to {target_vdatum}: {output_tif}"
+
 def convert_sdb_msl_to_navd88(
     input_tif: Path,
     output_tif: Path,
@@ -30,41 +72,11 @@ def convert_sdb_msl_to_navd88(
         elev_NAVD88 = elev_MSL + (NAVD88 - MSL separation)
     """
     log = logger or logging.getLogger(__name__)
-    dlim_exe = shutil.which("dlim")
-    if dlim_exe is None:
-        msg = "dlim not found on PATH; cannot perform vertical datum transformation"
-        log.warning("%s", msg)
-        return False, msg
-
-    input_tif = Path(input_tif)
-    output_tif = Path(output_tif)
-
-    if not input_tif.exists():
-        msg = f"Input raster not found: {input_tif}"
-        log.error("%s", msg)
-        return False, msg
-
-    output_tif.parent.mkdir(parents=True, exist_ok=True)
-
-    cmd = [
-        dlim_exe,
-        "-i", str(input_tif),
-        "-J", source_vdatum,
-        "-P", target_vdatum,
-        "-O", str(output_tif),
-    ]
-
     log.info("Converting SDB from MSL to NAVD88")
-    res = run_cmd(cmd, timeout=600)
-
-    if res.returncode != 0:
-        msg = f"dlim failed with code {res.returncode}: {res.stderr_tail[:500]}"
-        log.error("%s", msg)
-        return False, msg
-
-    if not output_tif.exists():
-        msg = f"dlim completed but output not found: {output_tif}"
-        log.error("%s", msg)
-        return False, msg
-
-    return True, f"Converted {input_tif.name} from MSL to NAVD88: {output_tif}"
+    return convert_raster_vertical_datum(
+        input_tif=input_tif,
+        output_tif=output_tif,
+        source_vdatum=source_vdatum,
+        target_vdatum=target_vdatum,
+        logger=log,
+    )

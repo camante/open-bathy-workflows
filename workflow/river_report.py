@@ -219,7 +219,13 @@ def create_network_metadata(
     if network_gpkg.exists():
         try:
             import geopandas as gpd
-            network = gpd.read_file(network_gpkg)
+            try:
+                layers = gpd.list_layers(network_gpkg)
+                layer_names = [str(v) for v in layers["name"].tolist()] if layers is not None else []
+            except Exception:
+                layer_names = []
+            preferred = next((lyr for lyr in ["rivers_clip", "rivers_aoi", "rivers", "graph_edges"] if lyr in layer_names), None)
+            network = gpd.read_file(network_gpkg, layer=preferred) if preferred is not None else gpd.read_file(network_gpkg)
             
             metadata["statistics"] = {
                 "segments_count": len(network),

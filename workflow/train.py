@@ -367,7 +367,7 @@ def apply_stumpf_residual_filter(
             src = df[source_col].astype(str).str.lower()
             protected_mask = (
                 src.str.startswith("extra_xyz") |
-                src.str.contains("hydronos|ehydro|survey|sonar|lidar|bag|sound", regex=True)
+                src.str.contains("hydronos|ehydro|survey|sonar|lidar|bag|sound|authoritative_base", regex=True)
             ).to_numpy(dtype=bool)
         except Exception:
             protected_mask = np.zeros(len(df), dtype=bool)
@@ -678,7 +678,7 @@ def _compute_physics_guidance_settings(df_tr: pd.DataFrame) -> Dict[str, Any]:
 
     anchor_support_good = False
     if source_series is not None and len(source_series):
-        anchor_mask = source_series.str.startswith("extra_xyz") | source_series.str.contains("hydronos|ehydro|survey|sonar|lidar|bag|sound", regex=True)
+        anchor_mask = source_series.str.startswith("extra_xyz") | source_series.str.contains("hydronos|ehydro|survey|sonar|lidar|bag|sound|authoritative_base", regex=True)
         out["anchor_fraction"] = float(anchor_mask.mean())
         anchor_support_good = bool(out["anchor_fraction"] >= 0.70 and out["n_points"] >= 1200 and out["depth_span_m"] >= 4.0)
         out["anchor_support_good"] = anchor_support_good
@@ -2544,7 +2544,7 @@ def train_sdb_model(
     df_validation = df.copy()
     if "source_norm" in df_validation.columns:
         src_series = df_validation["source_norm"].astype(str).str.lower()
-        val_mask = src_series.str.startswith("extra_xyz") | src_series.isin(atl_like)
+        val_mask = src_series.str.startswith("extra_xyz") | src_series.str.contains("authoritative_base", regex=False) | src_series.isin(atl_like)
         if bool(val_mask.any()):
             df_validation = df_validation.loc[val_mask].copy()
     if df_validation.empty:
@@ -2999,24 +2999,59 @@ def train_sdb_model(
                     f"{target_n:,}", f"{total_capped:,}",
                 )
 
-            # Second pass enforces max_source_frac on the ACTUAL retained row count (not target_n),
-            # because target-based caps alone can still yield >max_source_frac when the quota-limited
-            # pool is much smaller than target_n (e.g., one huge source + tiny minority sources).
-            # Iteratively trim any source exceeding floor(f * total) until stable.
-            # Convergence can require many iterations in extreme dominance cases (e.g., 99:1).
-            # Cost is trivial because the number of sources is small.
-            for _ in range(1000):
-                total_now = int(sum(counts.values()))
-                if total_now <= 0:
-                    break
-                allowed_now = int(np.floor(max_source_frac * total_now))
-                changed = False
-                for s in list(counts.keys()):
-                    if counts[s] > allowed_now:
-                        counts[s] = int(allowed_now)
-                        changed = True
-                if not changed:
-                    break
+            # Second pass can enforce max_source_frac on the ACTUAL retained row count, but only
+            # when doing so does not destroy the fit sample. In guidance-anchored regimes we still want
+            # dense authoritative support to inform optics; collapsing thousands of retained rows down to
+            # a few dozen is scientifically worse than tolerating some remaining source dominance.
+            pre_second_pass_total = int(sum(counts.values()))
+            min_rows_for_strict_actual_cap = int(max(1000, np.floor(0.25 * target_n)))
+
+            sorted_counts = sorted((int(v) for v in counts.values()), reverse=True)
+            dominant_count = int(sorted_counts[0]) if sorted_counts else 0
+            other_count = int(sum(sorted_counts[1:])) if len(sorted_counts) > 1 else 0
+            if max_source_frac >= 1.0:
+                feasible_total_under_actual_cap = pre_second_pass_total
+            elif other_count <= 0:
+                feasible_total_under_actual_cap = 0
+            else:
+                feasible_total_under_actual_cap = int(min(pre_second_pass_total, np.floor(other_count / max(1.0e-9, (1.0 - max_source_frac)))))
+
+            minority_pool_too_small = other_count < max(50, int(np.ceil(0.10 * target_n)))
+            catastrophic_collapse_ratio = (
+                (pre_second_pass_total > 0)
+                and (feasible_total_under_actual_cap / float(pre_second_pass_total) < 0.50)
+            )
+            allow_strict_actual_cap = (
+                pre_second_pass_total >= min_rows_for_strict_actual_cap
+                and feasible_total_under_actual_cap >= min_rows_for_strict_actual_cap
+                and not minority_pool_too_small
+                and not catastrophic_collapse_ratio
+            )
+            if allow_strict_actual_cap:
+                for _ in range(1000):
+                    total_now = int(sum(counts.values()))
+                    if total_now <= 0:
+                        break
+                    allowed_now = int(np.floor(max_source_frac * total_now))
+                    changed = False
+                    for s in list(counts.keys()):
+                        if counts[s] > allowed_now:
+                            counts[s] = int(allowed_now)
+                            changed = True
+                    if not changed:
+                        break
+            else:
+                log.warning(
+                    "Final source quota skipped strict actual-row cap to avoid collapsing the fit set "
+                    "(quota_limited_rows=%s, feasible_total_under_actual_cap=%s, min_rows_for_strict_actual_cap=%s, "
+                    "minority_pool_too_small=%s, catastrophic_collapse_ratio=%s). "
+                    "Keeping target-based capped pool.",
+                    f"{pre_second_pass_total:,}",
+                    f"{feasible_total_under_actual_cap:,}",
+                    f"{min_rows_for_strict_actual_cap:,}",
+                    minority_pool_too_small,
+                    catastrophic_collapse_ratio,
+                )
 
             total_now = int(sum(counts.values()))
             if total_now <= 0:
@@ -3161,20 +3196,25 @@ def train_sdb_model(
                         "Expect weak generalization / source-specific bias.",
                         dom_src, dom_frac * 100, dom_n, total_n,
                     )
-                # Conservative deterministic cap: only trim if one source dominates AND others exist.
+                # Conservative deterministic cap: only trim if one source dominates AND others exist,
+                # *and* doing so will not catastrophically collapse the training set.  In dense
+                # authoritative-support mode we prefer keeping a large, source-dominated but physically
+                # grounded fit set over shrinking the sample to a tiny mixed subset that no longer reflects
+                # the survey-controlled optics regime.
                 max_dom_frac = 0.70
                 if dom_frac > 0.90 and total_n >= 1000:
                     allowed_dom = int(max(100, (max_dom_frac / max(1e-9, 1.0 - max_dom_frac)) * (total_n - dom_n)))
-                    if allowed_dom < dom_n:
+                    other_n = int(total_n - dom_n)
+                    rebalance_total = int(other_n + min(dom_n, allowed_dom))
+                    collapse_ratio = rebalance_total / float(max(1, total_n))
+                    minority_pool_too_small = other_n < max(50, int(np.ceil(0.10 * total_n)))
+                    catastrophic_collapse = rebalance_total < 1000 or collapse_ratio < 0.50
+                    if allowed_dom < dom_n and not minority_pool_too_small and not catastrophic_collapse:
                         dom_idx = df_tr_fit.index[df_tr_fit[source_col] == dom_src].to_numpy()
                         keep_dom = np.random.default_rng(int(seed)).choice(dom_idx, size=allowed_dom, replace=False)
                         keep_other = df_tr_fit.index[df_tr_fit[source_col] != dom_src].to_numpy()
                         keep_idx = np.concatenate([keep_other, keep_dom])
                         df_tr_fit = df_tr_fit.loc[keep_idx].copy()
-                        # refresh arrays after rebalance
-                        X_train = None
-                        y_train_raw = None
-                        w_train = None
                         log.warning(
                             "Rebalanced dominant source '%s' to reduce count domination: "
                             "%d -> %d rows (dominant kept=%d).",
@@ -3182,8 +3222,99 @@ def train_sdb_model(
                         )
                         metadata['training_qc']['dominant_source_rebalanced'] = True
                         metadata['training_qc']['dominant_source_rebalanced_target_frac'] = float(max_dom_frac)
+                    elif allowed_dom < dom_n:
+                        log.warning(
+                            "Skipped dominant-source row rebalance for '%s' to avoid collapsing the fit set "
+                            "(total=%d, dominant=%d, minority=%d, proposed_total=%d, collapse_ratio=%.3f, minority_pool_too_small=%s).",
+                            dom_src,
+                            total_n,
+                            dom_n,
+                            other_n,
+                            rebalance_total,
+                            collapse_ratio,
+                            minority_pool_too_small,
+                        )
+                        metadata['training_qc']['dominant_source_rebalanced'] = False
+                        metadata['training_qc']['dominant_source_rebalance_skipped'] = True
+                        metadata['training_qc']['dominant_source_rebalance_skip_reason'] = 'catastrophic_collapse_or_tiny_minority_pool'
         except (TypeError, ValueError, KeyError, RuntimeError) as _ex:
             log.error("Dominance guardrail failed: %s", _ex, exc_info=True)
+
+    # Refresh arrays after all training-row QC / source-balance adjustments.
+    if not feat_cols:
+        raise ValueError("No training feature columns remain after QC and schema checks")
+    X_train = df_tr_fit.loc[:, feat_cols].to_numpy(dtype=np.float32, copy=True)
+    y_train_raw = pd.to_numeric(df_tr_fit["depth_m"], errors="coerce").to_numpy(dtype=np.float32)
+    w_train = (
+        pd.to_numeric(df_tr_fit["sample_weight"], errors="coerce").to_numpy(dtype=np.float32)
+        if "sample_weight" in df_tr_fit.columns
+        else None
+    )
+
+    if X_train.ndim != 2:
+        raise ValueError(f"Training design matrix must be 2D; got shape={getattr(X_train, 'shape', None)}")
+    if X_train.shape[0] != len(df_tr_fit):
+        raise ValueError(
+            f"Training design matrix row mismatch after QC: X_rows={X_train.shape[0]} df_rows={len(df_tr_fit)}"
+        )
+    if X_train.shape[1] != len(feat_cols):
+        raise ValueError(
+            f"Training design matrix column mismatch after QC: X_cols={X_train.shape[1]} feat_cols={len(feat_cols)}"
+        )
+    if not np.isfinite(X_train).all():
+        bad = int(np.size(X_train) - np.isfinite(X_train).sum())
+        raise ValueError(f"Training design matrix contains {bad} non-finite feature values after QC")
+    if not np.isfinite(y_train_raw).all():
+        bad = int(y_train_raw.size - np.isfinite(y_train_raw).sum())
+        raise ValueError(f"Training target contains {bad} non-finite depth values after QC")
+    if w_train is not None:
+        if w_train.ndim != 1 or w_train.shape[0] != len(df_tr_fit):
+            raise ValueError(
+                f"Sample-weight vector mismatch after QC: shape={getattr(w_train, 'shape', None)} df_rows={len(df_tr_fit)}"
+            )
+        if not np.isfinite(w_train).all():
+            bad = int(w_train.size - np.isfinite(w_train).sum())
+            raise ValueError(f"Sample-weight vector contains {bad} non-finite values after QC")
+
+    if metadata.get("prediction_mode") == "direct_depth":
+        y_train = np.abs(y_train_raw).astype(np.float32)
+        metadata["residual_target_stats"] = {
+            "min": float(np.nanmin(y_train)),
+            "max": float(np.nanmax(y_train)),
+            "p05": float(np.nanpercentile(y_train, 5)),
+            "p95": float(np.nanpercentile(y_train, 95)),
+        }
+        log.info(
+            "Final direct-depth target after QC: n=%d range=[%.2f, %.2f] m",
+            len(y_train),
+            float(np.nanmin(y_train)),
+            float(np.nanmax(y_train)),
+        )
+    else:
+        if "stumpf_depth" not in df_tr_fit.columns:
+            raise ValueError("Missing stumpf_depth feature after final QC for residual training")
+        residual_clip_m = float(metadata.get("residual_clip_m", guidance_settings.get("residual_clip_m", 0.5)))
+        stumpf_base_train = np.maximum(
+            pd.to_numeric(df_tr_fit["stumpf_depth"], errors="coerce").to_numpy(dtype=np.float32),
+            0.0,
+        )
+        if not np.isfinite(stumpf_base_train).all():
+            bad = int(stumpf_base_train.size - np.isfinite(stumpf_base_train).sum())
+            raise ValueError(f"Stumpf baseline contains {bad} non-finite values after QC")
+        y_train = np.clip(np.abs(y_train_raw) - stumpf_base_train, -residual_clip_m, residual_clip_m).astype(np.float32)
+        metadata["residual_target_stats"] = {
+            "min": float(np.nanmin(y_train)),
+            "max": float(np.nanmax(y_train)),
+            "p05": float(np.nanpercentile(y_train, 5)),
+            "p95": float(np.nanpercentile(y_train, 95)),
+        }
+        log.info(
+            "Final residual target after QC: n=%d residual_range=[%.2f, %.2f] m (clip=±%.2f)",
+            len(y_train),
+            float(np.nanmin(y_train)),
+            float(np.nanmax(y_train)),
+            residual_clip_m,
+        )
 
     # Log training data composition by source (single pass)
     if 'source' in df_tr_fit.columns or 'source_norm' in df_tr_fit.columns:

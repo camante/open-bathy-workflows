@@ -63,6 +63,8 @@ longitudinal WSE-profile slope fit.
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import json as _json
 import logging
 import os
@@ -80,6 +82,11 @@ from typing import Optional, Tuple, Dict, List
 import math
 
 import numpy as np
+from xs_interpolation import (
+    _kd_tree,
+    _idw_interpolate_on_mask,
+    _aniso_idw_interpolate_on_mask,
+)
 import pandas as pd
 
 # Ensure GeoPandas remains usable on pandas>=2.0 even if GeoPandas lags.
@@ -88,28 +95,28 @@ import compat_pandas  # noqa: F401
 # Longitudinal WSE profile fitting (stabilizes slope for Manning / multivariate priors)
 try:
     from river_wse import WSEFitConfig, fit_wse_profile
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     WSEFitConfig = None
     fit_wse_profile = None
 try:
     import geopandas as gpd
-except Exception:  # pragma: no cover - optional in lightweight test environments
+except ImportError:  # pragma: no cover - optional in lightweight test environments
     gpd = None  # type: ignore
 
 try:
     import rasterio
-except Exception:  # pragma: no cover - optional in lightweight test environments
+except ImportError:  # pragma: no cover - optional in lightweight test environments
     rasterio = None  # type: ignore
 
 try:
     from rasterio.features import rasterize
-except Exception:  # pragma: no cover - optional in lightweight test environments
+except ImportError:  # pragma: no cover - optional in lightweight test environments
     rasterize = None  # type: ignore
 
 try:
     from shapely.geometry import Point, mapping
     from shapely.ops import unary_union, linemerge
-except Exception:  # pragma: no cover - optional in lightweight test environments
+except ImportError:  # pragma: no cover - optional in lightweight test environments
     Point = None  # type: ignore
     unary_union = None  # type: ignore
     linemerge = None  # type: ignore
@@ -118,7 +125,7 @@ except Exception:  # pragma: no cover - optional in lightweight test environment
 
 try:
     from pyproj import CRS, Transformer
-except Exception:  # pragma: no cover - optional in lightweight test environments
+except ImportError:  # pragma: no cover - optional in lightweight test environments
     CRS = None  # type: ignore
     Transformer = None  # type: ignore
 
@@ -132,7 +139,7 @@ def _union_all(geoms):
     """
     try:
         return geoms.union_all()
-    except Exception:
+    except AttributeError:
         return geoms.unary_union
 if not log.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -169,7 +176,7 @@ except ImportError:
 # Optional module: Manning inversion utilities
 try:
     from manning_inversion import invert_manning_for_depth, estimate_q2_from_drainage_area
-except Exception:
+except ImportError:
     invert_manning_for_depth = None  # type: ignore
     estimate_q2_from_drainage_area = None  # type: ignore
 
@@ -461,14 +468,87 @@ def _default_uncertainty_m(calib_n: int) -> float:
     return 0.5 if calib_n and calib_n > 0 else 1.5
 
 
+def _coerce_truthy_series(series: pd.Series) -> pd.Series:
+    """Return a robust boolean mask for bank-flag style columns.
+
+    GeoPackage / parquet round-trips can surface booleans as bool, int, float,
+    or strings like "true"/"1". XS inference should treat those consistently.
+    """
+    if series is None:
+        return pd.Series(dtype=bool)
+    s = series.copy()
+    if getattr(s, "dtype", None) == bool:
+        return s.fillna(False)
+    if pd.api.types.is_numeric_dtype(s):
+        vals = pd.to_numeric(s, errors="coerce")
+        return vals.fillna(0).astype(float) != 0.0
+    vals = s.astype(str).str.strip().str.lower()
+    return vals.isin({"1", "true", "t", "yes", "y"})
+
+
 def _pick_bank_dists_from_points(xsp: pd.DataFrame) -> Tuple[Optional[float], Optional[float]]:
     left = None
     right = None
-    if "is_bank_left" in xsp.columns and xsp["is_bank_left"].any():
-        left = float(xsp.loc[xsp["is_bank_left"] == True, "dist_m"].iloc[0])
-    if "is_bank_right" in xsp.columns and xsp["is_bank_right"].any():
-        right = float(xsp.loc[xsp["is_bank_right"] == True, "dist_m"].iloc[0])
+    if "is_bank_left" in xsp.columns:
+        left_mask = _coerce_truthy_series(xsp["is_bank_left"])
+        if bool(left_mask.any()):
+            left = float(pd.to_numeric(xsp.loc[left_mask, "dist_m"], errors="coerce").dropna().iloc[0])
+    if "is_bank_right" in xsp.columns:
+        right_mask = _coerce_truthy_series(xsp["is_bank_right"])
+        if bool(right_mask.any()):
+            right = float(pd.to_numeric(xsp.loc[right_mask, "dist_m"], errors="coerce").dropna().iloc[0])
     return left, right
+
+
+def _recover_banks_from_profile_extent(xsp: pd.DataFrame) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """Conservative fallback when explicit bank flags are missing.
+
+    Prefer the *outermost samples with usable elevation* rather than blindly using
+    the first/last profile rows. In many real profiles the edge-most samples have
+    finite dist_m but nodata DEM/topo values, which previously caused otherwise
+    usable XS to be rejected as having missing bank elevations.
+    """
+    if xsp is None or xsp.empty or "dist_m" not in xsp.columns:
+        return None, None, None, None
+    prof = xsp.copy()
+    prof["dist_m"] = pd.to_numeric(prof["dist_m"], errors="coerce")
+    if "z_topo" in prof.columns:
+        prof["z_topo"] = pd.to_numeric(prof["z_topo"], errors="coerce")
+    else:
+        prof["z_topo"] = np.nan
+    if "z_dem" in prof.columns:
+        prof["z_dem"] = pd.to_numeric(prof["z_dem"], errors="coerce")
+    else:
+        prof["z_dem"] = np.nan
+    prof = prof.loc[np.isfinite(prof["dist_m"])]
+    if prof.empty:
+        return None, None, None, None
+    prof = prof.sort_values("dist_m")
+    if len(prof) < 2:
+        return None, None, None, None
+
+    def _row_z(row: pd.Series) -> float:
+        zt = _safe_float(row.get("z_topo", np.nan))
+        if np.isfinite(zt):
+            return zt
+        return _safe_float(row.get("z_dem", np.nan))
+
+    prof["_bank_z_candidate"] = prof.apply(_row_z, axis=1)
+    prof_valid_z = prof.loc[np.isfinite(prof["_bank_z_candidate"])]
+    if len(prof_valid_z) >= 2:
+        left_row = prof_valid_z.iloc[0]
+        right_row = prof_valid_z.iloc[-1]
+    else:
+        left_row = prof.iloc[0]
+        right_row = prof.iloc[-1]
+
+    left = _safe_float(left_row.get("dist_m", np.nan))
+    right = _safe_float(right_row.get("dist_m", np.nan))
+    left_z = _safe_float(left_row.get("_bank_z_candidate", np.nan))
+    right_z = _safe_float(right_row.get("_bank_z_candidate", np.nan))
+    if (not np.isfinite(left)) or (not np.isfinite(right)) or (right <= left):
+        return None, None, None, None
+    return left, right, left_z, right_z
 
 
 def _estimate_wse_from_profile(
@@ -499,6 +579,22 @@ def _estimate_wse_from_profile(
     banks = [b for b in banks if np.isfinite(b)]
     if banks:
         return float(min(banks) - cfg.wse_fallback_drop_m)
+
+    # Last-resort authoritative DEM/topo fallback: use the low quantile of all finite
+    # profile elevations so that an otherwise valid XS is not rejected solely because
+    # center-window samples or explicit bank picks were unavailable.
+    prof_vals = []
+    if "z_dem" in xsp.columns:
+        v = pd.to_numeric(xsp["z_dem"], errors="coerce").to_numpy(dtype="float64")
+        prof_vals.append(v[np.isfinite(v)])
+    if "z_topo" in xsp.columns:
+        v = pd.to_numeric(xsp["z_topo"], errors="coerce").to_numpy(dtype="float64")
+        prof_vals.append(v[np.isfinite(v)])
+    prof_vals = [v for v in prof_vals if v.size]
+    if prof_vals:
+        merged = np.concatenate(prof_vals)
+        if merged.size >= 3:
+            return float(np.quantile(merged, min(max(cfg.wse_quantile, 0.05), 0.25)))
 
     return float("nan")
 
@@ -1489,6 +1585,8 @@ def _uncertainty_for_row(row: pd.Series, cfg: InferConfig) -> float:
     # Base uncertainties
     if src == "soundings":
         base = float(max(0.35, 0.90 / max(1, np.sqrt(max(n, 1)))))
+    elif src == "authoritative_dem":
+        base = float(max(0.40, 1.00 / max(1, np.sqrt(max(n, 1)))))
     elif src == "width_stage":
         base = 1.0
     elif src == "usgs":
@@ -1592,8 +1690,8 @@ def _compute_dmax_geomorphic_envelope(row: pd.Series, cfg: InferConfig) -> Tuple
         return float("nan"), "disabled"
     if cfg.geomorphic_envelope_only_when_no_soundings:
         # if soundings were used anywhere, do not apply envelope as a hard cap
-        if str(row.get("calib_src", "")).lower().strip() == "soundings":
-            return float("nan"), "soundings_calibrated"
+        if str(row.get("calib_src", "")).lower().strip() in {"soundings", "authoritative_dem"}:
+            return float("nan"), "authoritative_calibrated"
     # Reuse the regional curve computation (DA -> depth), but treat as a cap rather than a blend.
     d_rc, w_rc, det = _compute_dmax_regional_curve(row, cfg)
     if not np.isfinite(d_rc):
@@ -1914,7 +2012,7 @@ def _load_soundings_many(
     return gpd.GeoDataFrame(df, geometry="geometry", crs=target_crs)
 
 
-def _write_soundings_subset(path: Path, soundings: gpd.GeoDataFrame) -> None:
+def _write_soundings_subset(path: Path, soundings: gpd.GeoDataFrame) -> Path | None:
     """Write a unified soundings subset for reuse by downstream river steps.
 
     Preferred output is **Parquet** (fast + small). If the target path ends with
@@ -1923,7 +2021,7 @@ def _write_soundings_subset(path: Path, soundings: gpd.GeoDataFrame) -> None:
     Fallback output is GPKG (geometry-preserving) if parquet isn't available.
     """
     if soundings is None or soundings.empty:
-        return
+        return None
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1947,7 +2045,7 @@ def _write_soundings_subset(path: Path, soundings: gpd.GeoDataFrame) -> None:
     out = out[keep].copy()
     out = out[out.geometry.notnull() & (~out.geometry.is_empty)].copy()
     if out.empty:
-        return
+        return None
 
     ext = path.suffix.lower()
 
@@ -1999,13 +2097,14 @@ def _write_soundings_subset(path: Path, soundings: gpd.GeoDataFrame) -> None:
                 raise ValueError("empty after finite filter")
             tbl.to_parquet(path, index=False)
             log.debug("Subset parquet written: %d rows, columns=%s", len(tbl), list(tbl.columns))
-            return
+            return path
         except Exception as e:
             log.warning("Parquet write failed (%s); falling back to GPKG.", e)
             path = path.with_suffix(".gpkg")
 
     # GPKG fallback
     out.to_file(path, driver="GPKG")
+    return path
 
 
 def _soundings_one_line(path: Path, n_out: int, n_in: int, by_src: dict[str, int] | None = None) -> str:
@@ -2016,6 +2115,80 @@ def _soundings_one_line(path: Path, n_out: int, n_in: int, by_src: dict[str, int
             parts.append(f"{k}={int(v):,}")
     src = f" ({', '.join(parts)})" if parts else ""
     return f"{Path(path).name}: n={int(n_out):,} from {int(n_in):,}{src}"
+
+
+def _cap_soundings_for_memory(soundings: gpd.GeoDataFrame, cfg: "InferConfig") -> tuple[gpd.GeoDataFrame, int]:
+    """Apply the configured soundings_max_points cap while preserving source mix when possible."""
+    if soundings is None:
+        return soundings, 0
+    n_in_all = int(len(soundings))
+    max_n = int(cfg.soundings_max_points or 0)
+    if max_n <= 0 or n_in_all <= max_n:
+        return soundings, n_in_all
+
+    seed = int(cfg.soundings_sample_seed or 0)
+    rng = np.random.default_rng(seed)
+    total = int(len(soundings))
+
+    if "_src_file" in soundings.columns:
+        groups = list(soundings.groupby("_src_file", sort=False))
+        sizes = np.array([len(gsrc) for _, gsrc in groups], dtype=np.int64)
+        if sizes.sum() <= max_n:
+            take_counts = sizes.copy()
+        else:
+            raw = (sizes.astype(float) / float(max(total, 1))) * float(max_n)
+            take_counts = np.floor(raw).astype(np.int64)
+            take_counts = np.minimum(take_counts, sizes)
+            remaining = int(max_n - int(take_counts.sum()))
+            if remaining > 0:
+                remainders = raw - take_counts.astype(float)
+                order = np.argsort(-remainders, kind="mergesort")
+                for idx_ord in order:
+                    if remaining <= 0:
+                        break
+                    if take_counts[idx_ord] < sizes[idx_ord]:
+                        take_counts[idx_ord] += 1
+                        remaining -= 1
+        parts = []
+        for (_, gsrc), take in zip(groups, take_counts.tolist()):
+            if take <= 0:
+                continue
+            if len(gsrc) <= take:
+                parts.append(gsrc)
+            else:
+                idx = rng.choice(gsrc.index.values, size=int(take), replace=False)
+                parts.append(gsrc.loc[np.sort(idx)])
+        soundings = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), geometry="geometry", crs=soundings.crs)
+    else:
+        idx = np.sort(rng.choice(soundings.index.values, size=max_n, replace=False))
+        soundings = soundings.loc[idx].copy()
+
+    log.warning(
+        "Downsampled soundings to n=%d (from %d) to avoid OOM (soundings_max_points=%d).",
+        int(len(soundings)), total, int(max_n),
+    )
+    return soundings, n_in_all
+
+
+def _write_soundings_subset_or_fail(
+    soundings: gpd.GeoDataFrame,
+    cfg: "InferConfig",
+    *,
+    require_output: bool = False,
+) -> Path | None:
+    """Write the unified soundings subset and optionally hard-fail if it cannot be produced."""
+    if not cfg.write_soundings_subset:
+        if require_output:
+            raise RuntimeError("--only-write-soundings-subset requires --write-soundings-subset")
+        return None
+
+    requested_path = Path(str(cfg.write_soundings_subset))
+    written_path = _write_soundings_subset(requested_path, soundings)
+    out_path = Path(written_path) if written_path is not None else requested_path
+
+    if require_output and not out_path.exists():
+        raise RuntimeError(f"Soundings subset was not written: {out_path}")
+    return out_path
 
 
 
@@ -2299,7 +2472,10 @@ def _calibrate_dmax_from_soundings(
         z = r.get("_z_m", np.nan)
 
         if np.isfinite(d):
-            depth = float(d)
+            # The bathy workflow commonly carries depth_m as negative-down. XS calibration,
+            # however, expects positive-down depth magnitudes. Normalize here so valid
+            # sounding-backed XS are not discarded merely because the sign convention differs.
+            depth = abs(float(d))
         elif np.isfinite(z):
             depth = float(wse - float(z))
         else:
@@ -2324,6 +2500,78 @@ def _calibrate_dmax_from_soundings(
 
     out = joined.groupby("xs_id")["_depth_from_wse"].agg(calib_n="count", calib_depth_stat=_stat).reset_index()
     return out
+
+
+def _calibrate_dmax_from_authoritative_dem(
+    xs_pts: pd.DataFrame,
+    xs_param: pd.DataFrame,
+    cfg: InferConfig,
+) -> pd.DataFrame:
+    """Derive per-XS bathymetric anchors from the authoritative DEM sampled along XS points.
+
+    The user's authoritative DEM contract is strict: raster cells are measured-only and
+    no-data elsewhere. That means finite z_dem samples inside the bank-to-bank span are
+    legitimate authoritative anchors for XS bathymetry, not just bank elevations.
+    """
+    if xs_pts is None or xs_pts.empty or xs_param is None or xs_param.empty:
+        return pd.DataFrame(columns=["xs_id", "dem_calib_n", "dem_calib_depth_stat"])
+    if "xs_id" not in xs_pts.columns or "xs_id" not in xs_param.columns:
+        return pd.DataFrame(columns=["xs_id", "dem_calib_n", "dem_calib_depth_stat"])
+    if "z_dem" not in xs_pts.columns or "dist_m" not in xs_pts.columns:
+        return pd.DataFrame(columns=["xs_id", "dem_calib_n", "dem_calib_depth_stat"])
+
+    pts = xs_pts[[c for c in ["xs_id", "dist_m", "z_dem"] if c in xs_pts.columns]].copy()
+    pts["dist_m"] = pd.to_numeric(pts["dist_m"], errors="coerce")
+    pts["z_dem"] = pd.to_numeric(pts["z_dem"], errors="coerce")
+    pts = pts[np.isfinite(pts["dist_m"]) & np.isfinite(pts["z_dem"])].copy()
+    if pts.empty:
+        return pd.DataFrame(columns=["xs_id", "dem_calib_n", "dem_calib_depth_stat"])
+
+    xp = xs_param[[c for c in ["xs_id", "bank_left_dist_m", "bank_right_dist_m", "wse_m", "bank_left_z_m", "bank_right_z_m"] if c in xs_param.columns]].copy()
+    for col in ["bank_left_dist_m", "bank_right_dist_m", "wse_m", "bank_left_z_m", "bank_right_z_m"]:
+        if col in xp.columns:
+            xp[col] = pd.to_numeric(xp[col], errors="coerce")
+    merged = pts.merge(xp, on="xs_id", how="inner")
+    if merged.empty:
+        return pd.DataFrame(columns=["xs_id", "dem_calib_n", "dem_calib_depth_stat"])
+
+    left = np.minimum(merged["bank_left_dist_m"].to_numpy(dtype="float64"), merged["bank_right_dist_m"].to_numpy(dtype="float64"))
+    right = np.maximum(merged["bank_left_dist_m"].to_numpy(dtype="float64"), merged["bank_right_dist_m"].to_numpy(dtype="float64"))
+    inside = np.isfinite(left) & np.isfinite(right) & (merged["dist_m"].to_numpy(dtype="float64") >= left) & (merged["dist_m"].to_numpy(dtype="float64") <= right)
+    merged = merged.loc[inside].copy()
+    if merged.empty:
+        return pd.DataFrame(columns=["xs_id", "dem_calib_n", "dem_calib_depth_stat"])
+
+    # Keep only DEM samples that are physically below the XS WSE estimate.
+    merged["_depth_from_dem"] = merged["wse_m"] - merged["z_dem"]
+    merged = merged[np.isfinite(merged["_depth_from_dem"]) & (merged["_depth_from_dem"] >= 0.0)].copy()
+    if merged.empty:
+        return pd.DataFrame(columns=["xs_id", "dem_calib_n", "dem_calib_depth_stat"])
+
+    # Conservative guardrail: measured bed should not exceed the lower bank elevation.
+    bank_min = np.nanmin(
+        np.column_stack([
+            merged["bank_left_z_m"].to_numpy(dtype="float64"),
+            merged["bank_right_z_m"].to_numpy(dtype="float64"),
+        ]),
+        axis=1,
+    )
+    keep = (~np.isfinite(bank_min)) | (merged["z_dem"].to_numpy(dtype="float64") <= (bank_min + 1e-6))
+    merged = merged.loc[keep].copy()
+    if merged.empty:
+        return pd.DataFrame(columns=["xs_id", "dem_calib_n", "dem_calib_depth_stat"])
+
+    def _stat(x: pd.Series) -> float:
+        arr = x.to_numpy(dtype="float64")
+        if arr.size == 0:
+            return np.nan
+        if cfg.calib_stat == "max":
+            return float(np.nanmax(arr))
+        if cfg.calib_stat == "median":
+            return float(np.nanmedian(arr))
+        return float(np.nanquantile(arr, 0.90))
+
+    return merged.groupby("xs_id")["_depth_from_dem"].agg(dem_calib_n="count", dem_calib_depth_stat=_stat).reset_index()
 
 
 # --------------------------------------------------------------------------------------
@@ -2534,304 +2782,6 @@ def _load_channel_mask_raster(
         inside = valid & (~inside)
 
     return inside.astype("uint8")
-def _kd_tree():
-    """
-    Return a (TreeClass, name) using available libs.
-    """
-    try:
-        return cKDTree, "scipy"
-    except Exception:
-        try:
-            return KDTree, "sklearn"
-        except Exception:
-            return None, "none"
-
-
-def _idw_interpolate_on_mask(
-    pts_xy: np.ndarray,
-    pts_val: np.ndarray,
-    q_xy: np.ndarray,
-    k: int = 12,
-    power: float = 2.0,
-    adaptive: bool = False,
-    eps: float = 1e-6,
-    pts_weight: Optional[np.ndarray] = None,
-    pts_group: Optional[np.ndarray] = None,
-    pts_priority: Optional[np.ndarray] = None,
-    priority_delta: float = 0.0,
-    priority_min_spread: float = 1.0,
-) -> np.ndarray:
-    """IDW / adaptive IDW interpolation for query coordinates.
-
-    Memory-stable implementation: computes kNN + weights in chunks and writes results
-    directly into the output vector (avoids allocating full n_query×k arrays).
-    """
-    pts_xy = np.asarray(pts_xy, dtype="float64")
-    pts_val = np.asarray(pts_val, dtype="float64").reshape(-1)
-    q_xy = np.asarray(q_xy, dtype="float64")
-
-    if pts_weight is not None:
-        pts_weight = np.asarray(pts_weight, dtype="float64").reshape(-1)
-        if pts_weight.shape[0] != pts_val.shape[0]:
-            raise ValueError("pts_weight must have same length as pts_val")
-        pts_weight = np.maximum(pts_weight, 0.0)
-
-    Tree, which = _kd_tree()
-    if Tree is None:
-        which = "numpy"
-
-    n_pts = int(len(pts_xy))
-    n_q = int(len(q_xy))
-    if n_pts == 0 or n_q == 0:
-        return np.full((n_q,), np.nan, dtype="float64")
-
-    k_eff = int(min(max(1, int(k)), n_pts))
-    out = np.full((n_q,), np.nan, dtype="float64")
-
-    def _compute_vals_from_knn(d: np.ndarray, idx: np.ndarray) -> np.ndarray:
-        d = np.asarray(d, dtype="float64")
-        idx = np.asarray(idx, dtype="int64")
-        if d.ndim == 1:
-            d = d[:, None]
-            idx = idx[:, None]
-
-        if adaptive:
-            d1 = d[:, 0]
-            dK = d[:, -1]
-            ratio = np.clip(dK / np.maximum(d1, eps), 1.0, 10.0)
-            p = 1.5 + (np.log(ratio) / np.log(10.0)) * (4.0 - 1.5)
-            p = p[:, None]
-            w = 1.0 / (np.power(d + eps, p))
-        else:
-            w = 1.0 / (np.power(d + eps, float(power)))
-
-        if pts_weight is not None:
-            w = w * pts_weight[idx]
-
-        # Confluence guard: when multiple river branches contribute nearby control points,
-        # prefer the highest-priority branch (typically main stem) to avoid circular "bullseye" artifacts.
-        if pts_group is not None and pts_priority is not None:
-            pg = np.asarray(pts_group)
-            pp = np.asarray(pts_priority, dtype="float64").reshape(-1)
-            if pg.shape[0] == pts_val.shape[0] and pp.shape[0] == pts_val.shape[0]:
-                try:
-                    g = pg[idx]
-                    # Ignore missing/unknown groups (factorize may encode NaN as -1).
-                    gv = g.astype("float64", copy=False)
-                    gv[gv < 0] = np.nan
-                    gmin = np.nanmin(gv, axis=1)
-                    gmax = np.nanmax(gv, axis=1)
-                    multi = np.isfinite(gmin) & np.isfinite(gmax) & (gmin != gmax)
-                    p = pp[idx]
-                    pmax = np.nanmax(p, axis=1)
-                    pmin = np.nanmin(p, axis=1)
-                    spread = pmax - pmin
-                    apply = multi & np.isfinite(pmax) & np.isfinite(spread) & (spread >= float(priority_min_spread))
-                    if np.any(apply):
-                        keep = p >= (pmax[:, None] - float(priority_delta))
-                        mask_keep = np.ones_like(w, dtype=bool)
-                        mask_keep[apply, :] = keep[apply, :]
-                        w_f = w * mask_keep
-                        den_f = np.sum(w_f, axis=1)
-                        bad = den_f <= eps
-                        if np.any(bad):
-                            # Fallback to unfiltered weights where filtering would remove all neighbors.
-                            w_f[bad, :] = w[bad, :]
-                        w = w_f
-                except Exception:
-                    log.debug("ignored", exc_info=True)
-
-        v = pts_val[idx]
-        sw = np.sum(w, axis=1)
-        # avoid divide-by-zero
-        good = np.isfinite(sw) & (sw > 0)
-        outv = np.full((idx.shape[0],), np.nan, dtype="float64")
-        outv[good] = np.sum(w[good] * v[good], axis=1) / sw[good]
-        return outv
-
-    # Query neighbors and compute results in chunks (prevents OOM for large n_q).
-    chunk_q = 200000 if which in ("scipy", "sklearn") else 20000
-
-    if which == "scipy":
-        tree = Tree(pts_xy)
-        for i0 in range(0, n_q, chunk_q):
-            q = q_xy[i0 : i0 + chunk_q]
-            try:
-                d_blk, idx_blk = tree.query(q, k=k_eff, workers=-1)
-            except TypeError:
-                d_blk, idx_blk = tree.query(q, k=k_eff)
-            if k_eff == 1:
-                d_blk = np.asarray(d_blk).reshape(-1, 1)
-                idx_blk = np.asarray(idx_blk).reshape(-1, 1)
-            out[i0 : i0 + d_blk.shape[0]] = _compute_vals_from_knn(d_blk, idx_blk)
-
-    elif which == "sklearn":
-        tree = Tree(pts_xy)
-        for i0 in range(0, n_q, chunk_q):
-            q = q_xy[i0 : i0 + chunk_q]
-            d_blk, idx_blk = tree.query(q, k=k_eff, return_distance=True)
-            if k_eff == 1:
-                d_blk = np.asarray(d_blk).reshape(-1, 1)
-                idx_blk = np.asarray(idx_blk).reshape(-1, 1)
-            out[i0 : i0 + d_blk.shape[0]] = _compute_vals_from_knn(d_blk, idx_blk)
-
-    else:
-        # numpy brute-force kNN (chunked)
-        for i0 in range(0, n_q, chunk_q):
-            q = q_xy[i0 : i0 + chunk_q]
-            dx = q[:, None, 0] - pts_xy[None, :, 0]
-            dy = q[:, None, 1] - pts_xy[None, :, 1]
-            dist2 = dx * dx + dy * dy
-
-            idx_k = np.argpartition(dist2, kth=k_eff - 1, axis=1)[:, :k_eff]
-            row = np.arange(idx_k.shape[0])[:, None]
-            dist2_k = dist2[row, idx_k]
-            ord_k = np.argsort(dist2_k, axis=1)
-            idx_sorted = idx_k[row, ord_k]
-            d_sorted = np.sqrt(dist2[row, idx_sorted])
-
-            out[i0 : i0 + idx_sorted.shape[0]] = _compute_vals_from_knn(d_sorted, idx_sorted)
-
-    return out
-
-def _aniso_idw_interpolate_on_mask(
-    pts_xy: np.ndarray,
-    pts_val: np.ndarray,
-    q_xy: np.ndarray,
-    centerline: "LineString",
-    k: int = 12,
-    power: float = 2.0,
-    along_scale_m: float = 500.0,
-    cross_scale_m: float = 30.0,
-    eps: float = 1e-6,
-    pts_weight: Optional[np.ndarray] = None,
-    pts_group: Optional[np.ndarray] = None,
-    pts_priority: Optional[np.ndarray] = None,
-    priority_delta: float = 0.0,
-    priority_min_spread: float = 1.0,
-) -> np.ndarray:
-    """Anisotropic IDW using a centerline as the along-channel axis.
-
-    Effective distance:
-        d_eff = sqrt( (d_along/along_scale)^2 + (d_cross/cross_scale)^2 )
-
-    pts_weight (optional): per-control-point multiplicative weights (>=0) applied
-    to the kernel (useful for emphasizing thalweg points).
-    """
-    if pts_xy.size == 0 or q_xy.size == 0:
-        return np.full((q_xy.shape[0],), np.nan, dtype="float64")
-
-    if pts_weight is not None:
-        pts_weight = np.asarray(pts_weight, dtype="float64").reshape(-1)
-        if pts_weight.shape[0] != len(pts_val):
-            raise ValueError("pts_weight must have same length as pts_val")
-        pts_weight = np.maximum(pts_weight, 0.0)
-
-    along_scale_m = float(max(1e-3, along_scale_m))
-    cross_scale_m = float(max(1e-3, cross_scale_m))
-
-    # Precompute chainage for points
-    try:
-        s_pts = np.array([centerline.project(Point(float(x), float(y))) for x, y in pts_xy], dtype="float64")
-    except Exception:
-        return _idw_interpolate_on_mask(
-            pts_xy, pts_val, q_xy, k=int(k), power=float(power), adaptive=False, eps=eps, pts_weight=pts_weight,
-            pts_group=pts_group,
-            pts_priority=pts_priority,
-            priority_delta=0.0,
-            priority_min_spread=1.0,
-        )
-
-    Tree, which = _kd_tree()
-    if Tree is None:
-        return _idw_interpolate_on_mask(
-            pts_xy, pts_val, q_xy, k=int(k), power=float(power), adaptive=False, eps=eps, pts_weight=pts_weight,
-            pts_group=pts_group,
-            pts_priority=pts_priority,
-            priority_delta=0.0,
-            priority_min_spread=1.0,
-        )
-
-    tree = Tree(pts_xy)
-    n = pts_xy.shape[0]
-    k = int(min(max(1, int(k)), n))
-    cand = int(min(n, max(k, k * 5)))
-
-    out = np.full((q_xy.shape[0],), np.nan, dtype="float64")
-
-    # Query candidate neighbors in manageable chunks to reduce peak memory.
-    chunk = 200000
-    for i0 in range(0, q_xy.shape[0], chunk):
-        q_blk = q_xy[i0 : i0 + chunk]
-        try:
-            d_eu, idx = tree.query(q_blk, k=cand, workers=-1)
-        except TypeError:
-            d_eu, idx = tree.query(q_blk, k=cand)
-        if cand == 1:
-            d_eu = np.asarray(d_eu).reshape(-1, 1)
-            idx = np.asarray(idx).reshape(-1, 1)
-
-        for j in range(q_blk.shape[0]):
-            i = i0 + j
-
-            ids = idx[j]
-            de = d_eu[j].astype("float64")
-            try:
-                s_q = centerline.project(Point(float(q_xy[i, 0]), float(q_xy[i, 1])))
-            except Exception:
-                ids2 = ids[:k]
-                de2 = de[:k]
-                w = 1.0 / (np.maximum(de2, eps) ** float(power))
-                if pts_weight is not None:
-                    w = w * pts_weight[ids2]
-                vv = pts_val[ids2]
-                sw = np.sum(w)
-                out[i] = float(np.sum(w * vv) / sw) if np.isfinite(sw) and sw > 0 else float(np.nan)
-                continue
-        
-            s_p = s_pts[ids]
-            d_along = np.abs(s_q - s_p)
-        
-            rad = de * de - d_along * d_along
-            valid = rad >= 0
-            d_cross = np.zeros_like(de)
-            d_cross[valid] = np.sqrt(rad[valid])
-            d_cross[~valid] = de[~valid]  # Penalize shortcuts
-        
-            d_eff = np.sqrt((d_along / along_scale_m) ** 2 + (d_cross / cross_scale_m) ** 2) + eps
-        
-            order = np.argsort(d_eff)[:k]
-            ids2 = ids[order]
-            d2 = d_eff[order]
-        
-            w = 1.0 / (d2 ** float(power))
-            if pts_weight is not None:
-                w = w * pts_weight[ids2]
-            # Confluence guard: prefer highest-priority branch when multiple groups contribute.
-            if pts_group is not None and pts_priority is not None:
-                try:
-                    g = np.asarray(pts_group)[ids2]
-                    gv = g.astype('float64', copy=False)
-                    gv[gv < 0] = np.nan
-                    gmin = np.nanmin(gv)
-                    gmax = np.nanmax(gv)
-                    if np.isfinite(gmin) and np.isfinite(gmax) and (gmin != gmax):
-                        p = np.asarray(pts_priority, dtype='float64').reshape(-1)[ids2]
-                        pmax = np.nanmax(p)
-                        pmin = np.nanmin(p)
-                        if np.isfinite(pmax) and np.isfinite(pmin) and (pmax - pmin) >= float(priority_min_spread):
-                            keep = p >= (pmax - float(priority_delta))
-                            w_f = w * keep
-                            if np.sum(w_f) > 0:
-                                w = w_f
-                except Exception:
-                    log.debug("ignored", exc_info=True)
-            vv = pts_val[ids2]
-            sw = np.sum(w)
-            out[i] = float(np.sum(w * vv) / sw) if np.isfinite(sw) and sw > 0 else float(np.nan)
-        
-    return out
-
 
 def _build_thalweg_lines_from_points(
     pts_gdf: "gpd.GeoDataFrame",
@@ -4038,6 +3988,51 @@ def _make_mask(arr: np.ndarray, nodata: float) -> np.ndarray:
 # Core inference
 # --------------------------------------------------------------------------------------
 
+
+
+def _write_xs_rejection_receipts(base_path: Path, acct: Dict[str, object], *, reason: str) -> Dict[str, Path]:
+    base_path = Path(base_path)
+    json_path = base_path.with_suffix('.json')
+    csv_path = base_path.with_suffix('.csv')
+    payload = {
+        "schema_version": 1,
+        "reason": str(reason),
+        "dominant_rejection_reason": str(reason),
+        "counts": {k: int(v) if isinstance(v, (int, np.integer)) else v for k, v in acct.items() if str(k).startswith('n_')},
+        "accounting": {k: (int(v) if isinstance(v, (int, np.integer)) else float(v) if isinstance(v, (float, np.floating)) else v) for k, v in acct.items()},
+    }
+    json_path.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+    with csv_path.open('w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['metric', 'value'])
+        writer.writerow(['dominant_rejection_reason', reason])
+        for key, value in sorted(payload['accounting'].items()):
+            writer.writerow([key, value])
+    return {"json": json_path, "csv": csv_path}
+
+
+def _dominant_xs_rejection_reason(acct: Dict[str, object]) -> str:
+    order = [
+        'n_xs_rejected_missing_banks',
+        'n_xs_rejected_bad_width',
+        'n_xs_rejected_bad_wse',
+        'n_xs_missing_points',
+    ]
+    best_key = None
+    best_val = -1
+    for key in order:
+        val = int(acct.get(key, 0) or 0)
+        if val > best_val:
+            best_key = key
+            best_val = val
+    mapping = {
+        'n_xs_rejected_missing_banks': 'missing_bank_picks',
+        'n_xs_rejected_bad_width': 'invalid_width',
+        'n_xs_rejected_bad_wse': 'invalid_wse',
+        'n_xs_missing_points': 'missing_profile_points',
+    }
+    return mapping.get(best_key or '', 'no_valid_cross_sections')
+
 def infer_bathy(
     xs_gpkg: Path,
     out_gpkg: Path,
@@ -4096,6 +4091,39 @@ def infer_bathy(
     if "xs_id" not in xs_lines.columns or "xs_id" not in xs_pts.columns:
         raise RuntimeError("xs_lines/xs_points must have 'xs_id' column (from xs_builder.py).")
 
+    # Fast-path for Pass 1 subset generation used by bathy_main.py.
+    # This path must not depend on downstream XS validity, because its purpose is
+    # precisely to materialize / validate soundings before the full inference run.
+    # Keep it as early as possible so missing-bank / bank-pick issues in XS geometry
+    # cannot prevent subset creation.
+    if cfg.only_write_soundings_subset:
+        if not soundings_path:
+            raise RuntimeError("--only-write-soundings-subset requested but no --soundings were provided.")
+        soundings = _load_soundings_many(
+            soundings_path,
+            target_crs=xs_lines.crs,
+            depth_col=soundings_depth_col,
+            elev_col=soundings_elev_col,
+            x_col=soundings_x_col,
+            y_col=soundings_y_col,
+            soundings_crs=soundings_crs,
+        )
+        if soundings is None or soundings.empty:
+            raise RuntimeError("--only-write-soundings-subset requested but no usable soundings were loaded.")
+        log.info("Loaded soundings: n=%d", int(len(soundings)))
+        soundings, n_in_all = _cap_soundings_for_memory(soundings, cfg)
+        subset_path = _write_soundings_subset_or_fail(soundings, cfg, require_output=True)
+        by_src = None
+        if "_src_file" in soundings.columns:
+            by_src = {}
+            vc = soundings["_src_file"].astype(str).value_counts()
+            for k, v in vc.items():
+                kk = Path(str(k)).stem if str(k) not in ["", "nan", "None"] else "unknown"
+                by_src[kk] = int(v)
+        log.info("%s", _soundings_one_line(Path(subset_path), int(len(soundings)), int(n_in_all), by_src))
+        log.info("--only-write-soundings-subset requested; exiting after subset write.")
+        raise SystemExit(0)
+
     xs_lines = xs_lines.copy()
     xs_lines["xs_len_m"] = xs_lines.geometry.length
 
@@ -4123,6 +4151,12 @@ def infer_bathy(
         "n_prior_clipped_max": 0,
         "n_with_da": 0,
         "n_with_slope": 0,
+        "n_xs_missing_points": 0,
+        "n_xs_bank_flag_recovered": 0,
+        "n_xs_profile_extent_recovered": 0,
+        "n_xs_rejected_missing_banks": 0,
+        "n_xs_rejected_bad_width": 0,
+        "n_xs_rejected_bad_wse": 0,
     }
 
     xs_records = []
@@ -4132,35 +4166,77 @@ def infer_bathy(
         acct["n_xs_total"] = int(acct.get("n_xs_total", 0)) + 1
         xsid = str(xsl["xs_id"])
         if xsid not in grouped.groups:
+            acct["n_xs_missing_points"] = int(acct.get("n_xs_missing_points", 0)) + 1
             continue
 
-        xsp = grouped.get_group(xsid).copy().sort_values("dist_m")
+        xsp = grouped.get_group(xsid).copy()
+        xsp["dist_m"] = pd.to_numeric(xsp.get("dist_m"), errors="coerce")
+        xsp = xsp.loc[np.isfinite(xsp["dist_m"])].sort_values("dist_m")
+        if xsp.empty:
+            acct["n_xs_missing_points"] = int(acct.get("n_xs_missing_points", 0)) + 1
+            continue
         xs_len = float(xsl["xs_len_m"])
 
         bank_left_dist = _safe_float(xsl.get("bank_left_dist_m", np.nan))
         bank_right_dist = _safe_float(xsl.get("bank_right_dist_m", np.nan))
+        left_mask = _coerce_truthy_series(xsp["is_bank_left"]) if "is_bank_left" in xsp.columns else pd.Series(False, index=xsp.index)
+        right_mask = _coerce_truthy_series(xsp["is_bank_right"]) if "is_bank_right" in xsp.columns else pd.Series(False, index=xsp.index)
         if not np.isfinite(bank_left_dist) or not np.isfinite(bank_right_dist):
             bl, br = _pick_bank_dists_from_points(xsp)
-            if not np.isfinite(bank_left_dist):
-                bank_left_dist = bl if bl is not None else np.nan
-            if not np.isfinite(bank_right_dist):
-                bank_right_dist = br if br is not None else np.nan
+            recovered = False
+            if not np.isfinite(bank_left_dist) and bl is not None:
+                bank_left_dist = bl
+                recovered = True
+            if not np.isfinite(bank_right_dist) and br is not None:
+                bank_right_dist = br
+                recovered = True
+            if recovered:
+                acct["n_xs_bank_flag_recovered"] = int(acct.get("n_xs_bank_flag_recovered", 0)) + 1
 
         bank_left_z = _safe_float(xsl.get("bank_left_z_m", np.nan))
         bank_right_z = _safe_float(xsl.get("bank_right_z_m", np.nan))
-        if not np.isfinite(bank_left_z) or not np.isfinite(bank_right_z):
-            if "is_bank_left" in xsp.columns and xsp["is_bank_left"].any():
-                r = xsp.loc[xsp["is_bank_left"] == True].iloc[0]
-                bank_left_z = float(r["z_topo"]) if np.isfinite(r.get("z_topo", np.nan)) else float(r.get("z_dem", np.nan))
-            if "is_bank_right" in xsp.columns and xsp["is_bank_right"].any():
-                r = xsp.loc[xsp["is_bank_right"] == True].iloc[0]
-                bank_right_z = float(r["z_topo"]) if np.isfinite(r.get("z_topo", np.nan)) else float(r.get("z_dem", np.nan))
+        if not np.isfinite(bank_left_z) and bool(left_mask.any()):
+            r = xsp.loc[left_mask].iloc[0]
+            bank_left_z = float(r["z_topo"]) if np.isfinite(r.get("z_topo", np.nan)) else float(r.get("z_dem", np.nan))
+        if not np.isfinite(bank_right_z) and bool(right_mask.any()):
+            r = xsp.loc[right_mask].iloc[0]
+            bank_right_z = float(r["z_topo"]) if np.isfinite(r.get("z_topo", np.nan)) else float(r.get("z_dem", np.nan))
+
+        if (
+            (not np.isfinite(bank_left_dist))
+            or (not np.isfinite(bank_right_dist))
+            or (not np.isfinite(bank_left_z))
+            or (not np.isfinite(bank_right_z))
+        ):
+            fb_l, fb_r, fb_lz, fb_rz = _recover_banks_from_profile_extent(xsp)
+            recovered_profile = False
+            if not np.isfinite(bank_left_dist) and fb_l is not None:
+                bank_left_dist = fb_l
+                recovered_profile = True
+            if not np.isfinite(bank_right_dist) and fb_r is not None:
+                bank_right_dist = fb_r
+                recovered_profile = True
+            if not np.isfinite(bank_left_z) and fb_lz is not None:
+                bank_left_z = fb_lz
+                recovered_profile = True
+            if not np.isfinite(bank_right_z) and fb_rz is not None:
+                bank_right_z = fb_rz
+                recovered_profile = True
+            if recovered_profile:
+                acct["n_xs_profile_extent_recovered"] = int(acct.get("n_xs_profile_extent_recovered", 0)) + 1
 
         if cfg.only_with_banks and (not np.isfinite(bank_left_dist) or not np.isfinite(bank_right_dist)):
+            acct["n_xs_rejected_missing_banks"] = int(acct.get("n_xs_rejected_missing_banks", 0)) + 1
             continue
 
         W = float(abs(bank_right_dist - bank_left_dist)) if (np.isfinite(bank_left_dist) and np.isfinite(bank_right_dist)) else float(np.nan)
+        if (not np.isfinite(W)) or (W <= 0.0):
+            acct["n_xs_rejected_bad_width"] = int(acct.get("n_xs_rejected_bad_width", 0)) + 1
+            continue
         wse = _estimate_wse_from_profile(xsp, xs_len, bank_left_z, bank_right_z, cfg)
+        if not np.isfinite(wse):
+            acct["n_xs_rejected_bad_wse"] = int(acct.get("n_xs_rejected_bad_wse", 0)) + 1
+            continue
         wse_by_xs[xsid] = wse
 
         dmax_prior = _compute_dmax_prior(W, cfg, acct=acct)
@@ -4184,7 +4260,27 @@ def infer_bathy(
 
     xs_param = pd.DataFrame(xs_records)
     if xs_param.empty:
-        raise RuntimeError("No valid cross-sections to process (check bank picks and filters).")
+        dominant_reason = _dominant_xs_rejection_reason(acct)
+        receipt_base = ((out_meta_json if out_meta_json is not None else out_gpkg).with_name("xs_rejection_receipt"))
+        try:
+            receipts = _write_xs_rejection_receipts(receipt_base, acct, reason=dominant_reason)
+            log.error("XS rejection receipts written: json=%s csv=%s", receipts["json"], receipts["csv"])
+        except Exception:
+            log.debug("Failed to write XS rejection receipts", exc_info=True)
+        log.error(
+            "No valid cross-sections to process. dominant_reason=%s rejection_accounting=%s",
+            dominant_reason,
+            {
+                "n_xs_total": int(acct.get("n_xs_total", 0)),
+                "n_xs_missing_points": int(acct.get("n_xs_missing_points", 0)),
+                "n_xs_bank_flag_recovered": int(acct.get("n_xs_bank_flag_recovered", 0)),
+                "n_xs_profile_extent_recovered": int(acct.get("n_xs_profile_extent_recovered", 0)),
+                "n_xs_rejected_missing_banks": int(acct.get("n_xs_rejected_missing_banks", 0)),
+                "n_xs_rejected_bad_width": int(acct.get("n_xs_rejected_bad_width", 0)),
+                "n_xs_rejected_bad_wse": int(acct.get("n_xs_rejected_bad_wse", 0)),
+            },
+        )
+        raise RuntimeError(f"No valid cross-sections to process (dominant_reason={dominant_reason}; check bank picks and filters).")
 
     # XS that survive basic filtering are the effective constraint set.
     acct["n_xs_used"] = int(len(xs_param))
@@ -4691,66 +4787,21 @@ def infer_bathy(
         if soundings is not None and not soundings.empty:
             n_in_all = int(len(soundings))
             log.info("Loaded soundings: n=%d", n_in_all)
-            # Guard against massive point clouds (e.g., Hydronos/eHydro exports).
-            max_n = int(cfg.soundings_max_points or 0)
-            if max_n > 0 and len(soundings) > max_n:
-                seed = int(cfg.soundings_sample_seed or 0)
-                rng = np.random.default_rng(seed)
-                total = int(len(soundings))
-                # Preserve relative source-file composition when possible while
-                # enforcing the requested global cap exactly.
-                if "_src_file" in soundings.columns:
-                    groups = list(soundings.groupby("_src_file", sort=False))
-                    sizes = np.array([len(gsrc) for _, gsrc in groups], dtype=np.int64)
-                    if sizes.sum() <= max_n:
-                        take_counts = sizes.copy()
-                    else:
-                        raw = (sizes.astype(float) / float(max(total, 1))) * float(max_n)
-                        take_counts = np.floor(raw).astype(np.int64)
-                        take_counts = np.minimum(take_counts, sizes)
-                        remaining = int(max_n - int(take_counts.sum()))
-                        if remaining > 0:
-                            remainders = raw - take_counts.astype(float)
-                            order = np.argsort(-remainders, kind="mergesort")
-                            for idx_ord in order:
-                                if remaining <= 0:
-                                    break
-                                if take_counts[idx_ord] < sizes[idx_ord]:
-                                    take_counts[idx_ord] += 1
-                                    remaining -= 1
-                    parts = []
-                    for (src, gsrc), take in zip(groups, take_counts.tolist()):
-                        if take <= 0:
-                            continue
-                        if len(gsrc) <= take:
-                            parts.append(gsrc)
-                        else:
-                            idx = rng.choice(gsrc.index.values, size=int(take), replace=False)
-                            parts.append(gsrc.loc[np.sort(idx)])
-                    soundings = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), geometry="geometry", crs=soundings.crs)
-                else:
-                    idx = np.sort(rng.choice(soundings.index.values, size=max_n, replace=False))
-                    soundings = soundings.loc[idx].copy()
-                log.warning("Downsampled soundings to n=%d (from %d) to avoid OOM (soundings_max_points=%d).",
-                            int(len(soundings)), total, int(max_n))
+            soundings, n_in_all = _cap_soundings_for_memory(soundings, cfg)
 
             # Optional: write the unified (possibly downsampled) set for reuse by downstream steps.
             if cfg.write_soundings_subset:
                 try:
-                    out_path = Path(str(cfg.write_soundings_subset))
-                    _write_soundings_subset(out_path, soundings)
-                    by_src = None
-                    if "_src_file" in soundings.columns:
-                        by_src = {}
-                        vc = soundings["_src_file"].astype(str).value_counts()
-                        for k, v in vc.items():
-                            kk = Path(str(k)).stem if str(k) not in ["", "nan", "None"] else "unknown"
-                            by_src[kk] = int(v)
-                    log.info("%s", _soundings_one_line(out_path, int(len(soundings)), n_in_all, by_src))
-
-                    if cfg.only_write_soundings_subset:
-                        log.info("--only-write-soundings-subset requested; exiting after subset write.")
-                        raise SystemExit(0)
+                    out_path = _write_soundings_subset_or_fail(soundings, cfg)
+                    if out_path is not None:
+                        by_src = None
+                        if "_src_file" in soundings.columns:
+                            by_src = {}
+                            vc = soundings["_src_file"].astype(str).value_counts()
+                            for k, v in vc.items():
+                                kk = Path(str(k)).stem if str(k) not in ["", "nan", "None"] else "unknown"
+                                by_src[kk] = int(v)
+                        log.info("%s", _soundings_one_line(Path(out_path), int(len(soundings)), n_in_all, by_src))
                 except SystemExit:
                     raise
                 except Exception as e:
@@ -4767,6 +4818,17 @@ def infer_bathy(
     xs_param["soundings_n"] = pd.to_numeric(xs_param["calib_n"], errors="coerce").fillna(0).astype("int64")
     xs_param["soundings_dmax_m"] = pd.to_numeric(xs_param["calib_depth_stat"], errors="coerce")
     xs_param = xs_param.drop(columns=["calib_n", "calib_depth_stat"])
+
+    dem_calib_df = _calibrate_dmax_from_authoritative_dem(xs_pts, xs_param, cfg)
+    if not dem_calib_df.empty:
+        xs_param = xs_param.merge(dem_calib_df, on="xs_id", how="left")
+        log.info("Authoritative DEM calibrated XS: %d", int(len(dem_calib_df)))
+    else:
+        xs_param["dem_calib_n"] = np.nan
+        xs_param["dem_calib_depth_stat"] = np.nan
+        log.info("Authoritative DEM calibrated XS: 0")
+    xs_param["dem_calib_n"] = pd.to_numeric(xs_param.get("dem_calib_n"), errors="coerce").fillna(0).astype("int64")
+    xs_param["dem_calib_depth_stat"] = pd.to_numeric(xs_param.get("dem_calib_depth_stat"), errors="coerce")
     # ---- Optional: 1D energy-consistent depth solver (flag-controlled) ----
     # To avoid tile-to-tile discontinuities, treat “soundings present” as
     # “at least one XS has usable soundings after masking/subsetting”, not merely
@@ -4914,7 +4976,14 @@ def infer_bathy(
     xs_param["calib_n"] = 0
     xs_param["dmax_raw_m"] = xs_param["dmax_prior_m"]
 
-    # Apply soundings where available
+    # Apply authoritative measured anchors in descending priority:
+    # extra XYZ / soundings first, then authoritative DEM profile samples.
+    m_dem = xs_param["dem_calib_n"] > 0
+    xs_param.loc[m_dem, "dmax_raw_m"] = xs_param.loc[m_dem, "dem_calib_depth_stat"]
+    xs_param.loc[m_dem, "calib_src"] = "authoritative_dem"
+    xs_param.loc[m_dem, "calib_n"] = xs_param.loc[m_dem, "dem_calib_n"]
+
+    # Optional extra XYZ constraints outrank DEM-derived anchors when present.
     m_snd = xs_param["soundings_n"] > 0
     xs_param.loc[m_snd, "dmax_raw_m"] = xs_param.loc[m_snd, "soundings_dmax_m"]
     xs_param.loc[m_snd, "calib_src"] = "soundings"
@@ -5306,7 +5375,9 @@ def infer_bathy(
             if not np.isfinite(depth):
                 continue
             z_bed = wse - float(depth)
-            bank_min = np.nanmin([p.get('bank_left_z_m', np.nan), p.get('bank_right_z_m', np.nan)])
+            _bank_vals = np.asarray([p.get('bank_left_z_m', np.nan), p.get('bank_right_z_m', np.nan)], dtype='float64')
+            _bank_vals = _bank_vals[np.isfinite(_bank_vals)]
+            bank_min = float(np.min(_bank_vals)) if _bank_vals.size else np.nan
             if np.isfinite(bank_min) and np.isfinite(z_bed):
                 z_bed = min(float(z_bed), float(bank_min) - 0.05)
             pred_rows.append(dict(
@@ -5365,7 +5436,9 @@ def infer_bathy(
             z_bed = wse - depth if np.isfinite(wse) else np.nan
 
             # guardrail: keep bed below lower bank by 5 cm
-            bank_min = np.nanmin([p.get("bank_left_z_m", np.nan), p.get("bank_right_z_m", np.nan)])
+            _bank_vals = np.asarray([p.get("bank_left_z_m", np.nan), p.get("bank_right_z_m", np.nan)], dtype="float64")
+            _bank_vals = _bank_vals[np.isfinite(_bank_vals)]
+            bank_min = float(np.min(_bank_vals)) if _bank_vals.size else np.nan
             if np.isfinite(bank_min) and np.isfinite(z_bed):
                 z_bed = min(z_bed, bank_min - 0.05)
 
@@ -5538,7 +5611,8 @@ def infer_bathy(
                             wse_source = "swot"
 
                         # Constraint level
-                        if snd_used:
+                        dem_used = bool((pd.to_numeric(xs_param.get("dem_calib_n", 0), errors="coerce").fillna(0) > 0).any()) if "dem_calib_n" in xs_param.columns else False
+                        if snd_used or dem_used:
                             level = "CALIBRATED"
                         elif slope_used or da_used:
                             level = "PARTIALLY_CONSTRAINED"
@@ -5549,6 +5623,7 @@ def infer_bathy(
                             "constraints": {
                                 "soundings_used": bool(snd_used),
                                 "soundings_total_matched": int(snd_total),
+                                "authoritative_dem_total_matched": int((pd.to_numeric(xs_param.get("dem_calib_n", 0), errors="coerce").fillna(0) > 0).sum()) if "dem_calib_n" in xs_param.columns else 0,
                                 "drainage_area_used": bool(da_used),
                                 "slope_used": bool(slope_used),
                                 "slope_source": str(slope_source),
@@ -5629,6 +5704,7 @@ def infer_bathy(
             acct["n_width_stage_applied"] = int(vc.get("width_stage", 0))
             acct["n_usgs_applied"] = int(vc.get("usgs", 0))
             acct["n_soundings_calib_applied"] = int(vc.get("soundings", 0))
+            acct["n_authoritative_dem_calib_applied"] = int(vc.get("authoritative_dem", 0))
     except Exception:
         log.debug("ignored", exc_info=True)
 

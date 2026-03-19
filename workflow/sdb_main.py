@@ -131,7 +131,7 @@ def _coarse_lonlat_cell(lon: float, lat: float, cell_deg: float = 2.0) -> str:
         lon1 = lon0 + int(round(cell))
         lat1 = lat0 + int(round(cell))
         return f"lon{lon0:+03d}_{lon1:+03d}__lat{lat0:+03d}_{lat1:+03d}"
-    except Exception:
+    except (TypeError, ValueError, AttributeError, ZeroDivisionError):
         return "lonlat_unknown"
 
 
@@ -179,7 +179,7 @@ def _build_model_bank_partition_context(args, df_pts=None, base_dir=None):
         w, e, s, n = [float(x) for x in str(getattr(args, "aoi")).split("/")[:4]]
         lon_c = 0.5 * (w + e)
         lat_c = 0.5 * (s + n)
-    except Exception:
+    except (TypeError, ValueError, AttributeError):
         lon_c = float("nan")
         lat_c = float("nan")
 
@@ -248,7 +248,7 @@ def _assert_sdb_prediction_is_meaningful(out_tif: Path, dir_rast: Path, *, stage
             funnel = ((rep or {}).get("predict") or {}).get("funnel") or {}
             predicted = int(funnel.get("predicted")) if funnel.get("predicted") is not None else None
             base_valid = int(funnel.get("base_valid")) if funnel.get("base_valid") is not None else None
-        except Exception:
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
             log.debug("Could not parse %s for SDB output validation.", rep_path, exc_info=True)
 
     finite_pixels = _count_finite_raster_pixels(out_tif)
@@ -301,6 +301,7 @@ def _require_sdb_runtime_deps() -> None:
     require(gpd, "geopandas", "Needed for vector I/O/masking in SDB pipeline.")
 
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sdb_guidance import build_sdb_guidance_manifest, write_sdb_guidance_manifest
 
 # Import new improvement modules
 try:
@@ -448,7 +449,7 @@ def _run(cmd: str):
     log.warning("_run() is deprecated. Prefer _run_safe(list_args).")
     try:
         cmd_list = shlex.split(cmd)
-    except Exception as e:
+    except ValueError as e:
         raise RuntimeError(f"[SECURITY] Could not parse command safely (refusing shell=True): {e}")
     return _run_safe(cmd_list)
 
@@ -529,7 +530,7 @@ def generate_coastline_mask(target_raster_path, aoi, cache_masks, out_mask_tif, 
                         out_mask_tif.unlink()
                     else:
                         return str(out_mask_tif)
-            except Exception:
+            except (ImportError, OSError, RuntimeError, ValueError):
                 log.debug("mask cache check failed; will regenerate", exc_info=True)
 
     # 2. Setup Cache and Params
@@ -573,7 +574,7 @@ def generate_coastline_mask(target_raster_path, aoi, cache_masks, out_mask_tif, 
         log.info("Running: %s", ' '.join(cmd_list))
         try:
             _run_safe(cmd_list)
-        except Exception:
+        except (OSError, RuntimeError, ValueError):
             # Fallback check for glob if name varied slightly
             log.debug("ignored", exc_info=True)
         if not base_tif.exists():
@@ -1146,6 +1147,7 @@ def _run_sdb_prediction(
         predict = predict or ctx.mod_predict
     else:
         args = ctx_or_args
+        fallback_registry = None
     # 9. Prediction
     log.info("Prediction")
 
@@ -1171,7 +1173,7 @@ def _run_sdb_prediction(
             
             log.info("Memory estimation: %.1f GB (threshold: %s GB)", estimated_gb, args.max_memory_gb)
             log.info("Chunked processing: %s", 'enabled (auto)' if use_chunked else 'disabled (auto)')
-        except Exception as e:
+        except (ImportError, OSError, ValueError, RuntimeError) as e:
             log.warning("Failed to estimate memory: %s. Using standard prediction.", e)
             use_chunked = False
     
@@ -1224,7 +1226,7 @@ def _run_sdb_prediction(
         except ImportError:
             log.error("predict_chunked module not available. Falling back to standard prediction.")
             use_chunked = False
-        except Exception as e:
+        except (OSError, RuntimeError, ValueError) as e:
             log.error("Chunked processing failed: %s. Falling back to standard prediction.", e, exc_info=True)
             use_chunked = False
     
@@ -1494,7 +1496,7 @@ def _run_sdb_post_processing(
                         log.info("%s n_valid=%s median_diff=%s m p90_abs=%s m",
                                  res.get('status'), res.get('n_samples_valid'),
                                  res.get('median_diff_m'), res.get('p90_abs_diff_m'))
-        except Exception as e:
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError) as e:
             log.warning("Failed to compute overlap consistency diagnostic: %s", e)
 
     if args.mask_bright_pixels is not None and s2_paths and "B02" in s2_paths:
@@ -1529,7 +1531,7 @@ def _run_sdb_post_processing(
                     log.info("[Post-Process] Masked %s pixels (cloud/glint).", mask_count)
                 else:
                     log.info("[Post-Process] No pixels masked by brightness gate.")
-        except Exception as exc:
+        except (OSError, ValueError, TypeError, rasterio.errors.RasterioError) as exc:
             log.warning("[Post-Process] Brightness masking failed: %s", exc)
 
     # Brightness masking can collapse a marginal prediction to effectively nothing.
@@ -1570,7 +1572,7 @@ def _run_sdb_post_processing(
                         dst_rgb.write(g, 2)
                         dst_rgb.write(b, 3)
 
-        except Exception as exc:
+        except (OSError, ValueError, TypeError, rasterio.errors.RasterioError) as exc:
             log.warning("[Post-Process] Failed to create masked RGB: %s", exc)
 
     if not args.skip_nad83:
@@ -1606,6 +1608,7 @@ def _write_sdb_manifest(
         run_id = run_id or ctx.run_id
         out_root = out_root or ctx.out_root
         rr = rr or ctx.rr
+        fallback_registry = getattr(ctx, "fallback_registry", None)
         df_test_final = df_test_final if df_test_final is not None else ctx.df_test
         df_train_final = df_train_final if df_train_final is not None else ctx.df_train
         chosen_max_depth = chosen_max_depth if chosen_max_depth is not None else ctx.chosen_max_depth
@@ -1651,6 +1654,26 @@ def _write_sdb_manifest(
         if prov_tif.exists():
             artifacts["provenance_raster"] = str(prov_tif.relative_to(out_root)) if str(prov_tif).startswith(str(out_root)) else str(prov_tif)
 
+        guidance_manifest = build_sdb_guidance_manifest(out_root=out_root, depth_raster=out_tif, args=args)
+        guidance_artifacts = guidance_manifest.get("artifacts", {})
+        for key in (
+            "guidance_weight_raster",
+            "trusted_interior_raster",
+            "admissibility_raster",
+            "guide_points",
+            "lower_bound_raster",
+            "upper_bound_raster",
+        ):
+            val = guidance_artifacts.get(key)
+            if val:
+                artifacts[key] = val
+        auth_base = guidance_artifacts.get("authoritative_base")
+        if auth_base:
+            artifacts["authoritative_base"] = str(auth_base)
+        auth_auto = guidance_artifacts.get("authoritative_base_auto")
+        if auth_auto:
+            artifacts["authoritative_base_auto"] = auth_auto
+
         rgb = dir_rast / "RGB_10m.tif"
         if rgb.exists():
             artifacts["rgb"] = str(rgb.relative_to(out_root))
@@ -1660,7 +1683,8 @@ def _write_sdb_manifest(
 
         (out_root / "artifacts_sdb.json").write_text(json.dumps(artifacts, indent=2), encoding="utf-8")
         log.info("Wrote SDB manifest: %s", out_root / 'artifacts_sdb.json')
-    except Exception as exc:
+        write_sdb_guidance_manifest(out_root=out_root, depth_raster=out_tif, args=args, logger=log)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
         log.warning("Failed to write outputs/manifest: %s", exc)
 
     if df_test_final is not None and not df_test_final.empty:
@@ -1670,7 +1694,7 @@ def _write_sdb_manifest(
                 log.info("Raster validation holdout sources: %s", eval_points["source"].astype(str).value_counts().to_dict())
             elif "source_norm" in eval_points.columns:
                 log.info("Raster validation holdout sources: %s", eval_points["source_norm"].astype(str).value_counts().to_dict())
-        except Exception:
+        except (TypeError, ValueError, KeyError):
             eval_points = df_test_final
 
         evaluate_raster_against_points(str(out_tif), eval_points, dir_logs, dir_plot, max_depth=chosen_max_depth)
@@ -1696,7 +1720,7 @@ def _write_sdb_manifest(
 
             rr.write(status="ok")
             log.info("SDB pipeline done")
-    except Exception as _exc:
+    except (OSError, ValueError, TypeError, KeyError) as _exc:
         log.debug("Suppressed: %s", _exc, exc_info=True)
 
 
@@ -2081,7 +2105,8 @@ def _run_fusion(
 
     df_xyz = None
     if args.extra_xyz:
-        df_xyz = atl.load_extra_xyz_points(args.extra_xyz, args.extra_xyz_crs, args.aoi)
+        from support_points import load_extra_xyz_points
+        df_xyz = load_extra_xyz_points(args.extra_xyz, args.extra_xyz_crs, args.aoi)
         try:
             n_xyz = 0 if df_xyz is None else len(df_xyz)
             if n_xyz > 0:
@@ -2175,6 +2200,11 @@ def _run_fusion(
 def main():
     import rasterio
     args = parse_args()
+    try:
+        _materialize_authoritative_base_for_sdb(args)
+    except Exception:
+        log.error("[AUTHORITATIVE] Failed to materialize authoritative_base for AOI=%s", getattr(args, "aoi", None), exc_info=True)
+        raise
 
     # ---------------------------------------------------------------------
     # Run-scoped logging + flight recorder
@@ -2465,6 +2495,9 @@ def main():
     _rr_add(rr, "run.args", vars(args))
     _rr_add(rr, "sdb.max_depth.auto.rmse_target_m", float(args.rmse_target_sdb))
     _rr_add(rr, "run.aoi", {"w": w, "e": e, "s": s, "n": n})
+    _rr_add(rr, "run.authoritative_base", {"path": getattr(args, "authoritative_base", None), "auto_enabled": bool(getattr(args, "authoritative_base_auto", True))})
+    if hasattr(args, "_authoritative_base_auto_report"):
+        _rr_add(rr, "run.authoritative_base_auto", getattr(args, "_authoritative_base_auto_report"))
     _rr_add(rr, "config.active_profile", active_profile if active_profile is not None else "unknown")
     _rr_add(rr, "config.overrides_applied", overrides_applied if overrides_applied is not None else [])
 
@@ -2486,6 +2519,7 @@ def main():
 
     # --- Build shared run context -------------------------------------------
     ctx = SDBRunContext.from_args(args, out_root=out_root, run_id=run_id or "", rr=rr)
+    ctx.fallback_registry = fallback_registry
     ctx.s2_cache = s2_cache
     ctx.atl_cache = atl_cache
     ctx.mask_cache = mask_cache
@@ -2495,7 +2529,7 @@ def main():
     for _d in (atl_cache, s2_cache, mask_cache):
         try:
             Path(_d).mkdir(parents=True, exist_ok=True)
-        except Exception as _exc:
+        except (TypeError, ValueError, AttributeError) as _exc:
             log.debug("Suppressed: %s", _exc, exc_info=True)
 
     # ------------------------------------------------------------------
@@ -2560,7 +2594,7 @@ def main():
     else:
         try:
             generate_coastline_mask(s2_paths["B02"], args.aoi, waffles_cache, land_mask_out, args.sdb_mode)
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             log.warning("Mask generation failed (%s).", exc)
 
 
@@ -2575,7 +2609,7 @@ def main():
             with rasterio.open(land_mask_out, "w", **prof) as dst:
                 dst.write(data, 1)
             log.warning("LAND mask missing; created fallback all-water mask: %s", land_mask_out)
-        except Exception as _e:
+        except (OSError, RuntimeError, ValueError, ModuleNotFoundError) as _e:
             log.error("Failed to create fallback LAND mask (%s); cannot proceed.", _e, exc_info=True)
             raise
 
@@ -2798,21 +2832,17 @@ def main():
                 try:
                     with open(meta_p, "r", encoding="utf-8") as f:
                         model_meta = json.load(f)
-                except Exception:
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
                     model_meta = None
-                try:
-                    df_train_final = pd.DataFrame()
-                    df_test_final = pd.DataFrame()
-                except Exception:
-                    df_train_final = None
-                    df_test_final = None
+                df_train_final = pd.DataFrame()
+                df_test_final = pd.DataFrame()
                 log.info("HIT: using cached model from %s", model_cache_dir)
                 if rr is not None:
                     rr.add("model_cache.hit", True)
             else:
                 if rr is not None:
                     rr.add("model_cache.hit", False)
-    except Exception as e:
+    except (OSError, RuntimeError, ValueError, shutil.Error) as e:
         log.warning("Could not use cached model: %s", e)
         if rr is not None:
             rr.add("model_cache.hit", False)
@@ -2836,7 +2866,7 @@ def main():
                     try:
                         with open(meta_p, 'r', encoding='utf-8') as f:
                             model_meta = json.load(f)
-                    except Exception:
+                    except (OSError, ValueError, TypeError, json.JSONDecodeError):
                         model_meta = None
                     log.warning('0 training points; using existing model bank for prediction-only.')
                     if rr is not None:
@@ -2847,7 +2877,7 @@ def main():
                             _rr_artifact(rr, 'stumpf_lr_pkl', str(dir_model / 'stumpf_lr.pkl'))
                 else:
                     log.error('0 training points and model bank has no trained model yet.')
-            except Exception as ex:
+            except (OSError, RuntimeError, ValueError, shutil.Error) as ex:
                 log.error("0 training points and failed to load model bank model: %s", ex, exc_info=True)
         if not cached_model:
             # No valid training points for this AOI and no cached model available.
@@ -2856,7 +2886,7 @@ def main():
             log.warning('No valid training points found after Fusion, and no model is available to predict; skipping SDB for this AOI.')
             try:
                 (out_root / 'SDB_SKIPPED.txt').write_text('SDB skipped: no training points after fusion and no cached model available.\n', encoding='utf-8')
-            except Exception as _exc:
+            except OSError as _exc:
                 log.debug("Suppressed: %s", _exc, exc_info=True)
             if rr is not None:
                 rr.add('sdb.skipped', True)
@@ -3471,6 +3501,65 @@ def main():
 
 
 
+
+
+def _materialize_authoritative_base_for_sdb(args) -> Optional[Path]:
+    """Resolve/auto-build authoritative_base for standalone SDB runs.
+
+    Enabled by default so standalone SDB runs can reuse the same AOI-keyed
+    NOAA/CUDEM authoritative-base cache strategy as bathy_main.
+    """
+    auth_arg = getattr(args, "authoritative_base", None)
+    auto = bool(getattr(args, "authoritative_base_auto", True))
+    auth_path: Optional[Path] = None
+    if auth_arg is not None:
+        auth_txt = str(auth_arg).strip()
+        if auth_txt and auth_txt.lower() in ("auto", "cudem", "auto_cudem"):
+            auto = True
+        elif auth_txt and auth_txt.lower() in ("off", "none", "disable", "disabled"):
+            auto = False
+        elif auth_txt:
+            auth_path = Path(auth_txt).expanduser()
+            if auth_path.exists():
+                auth_path = auth_path.resolve()
+                setattr(args, "authoritative_base", str(auth_path))
+                setattr(args, "_authoritative_base_auto_report", {
+                    "mode": "explicit_path",
+                    "authoritative_base": str(auth_path),
+                    "cache_hit": None,
+                })
+                return auth_path
+            if not auto:
+                log.warning("[AUTHORITATIVE] Provided authoritative_base does not exist: %s", auth_path)
+                setattr(args, "authoritative_base", str(auth_path))
+                return auth_path
+            log.info("[AUTHORITATIVE] Explicit authoritative_base path not found; falling back to auto-materialization for AOI.")
+    if not auto:
+        setattr(args, "authoritative_base", None if auth_path is None else str(auth_path))
+        return auth_path
+    try:
+        from cudem_authoritative import materialize_authoritative_base_for_aoi
+    except Exception as exc:
+        log.error("[AUTHORITATIVE] Failed to import cudem_authoritative auto-builder: %s", exc, exc_info=True)
+        raise
+    build_info = materialize_authoritative_base_for_aoi(
+        aoi=str(getattr(args, "aoi", "") or ""),
+        cache_root=Path(getattr(args, "cache_root", "cache")),
+        tile_index_url=str(getattr(args, "authoritative_base_tile_index_url", "") or ""),
+        spatial_meta_url=str(getattr(args, "authoritative_base_spatial_meta_url", "") or ""),
+        missing_meta_policy=str(getattr(args, "authoritative_base_missing_meta_policy", "skip") or "skip"),
+        tile_url_field=getattr(args, "authoritative_base_tile_url_field", None),
+        force_rebuild=bool(getattr(args, "authoritative_base_force_rebuild", False)),
+        logger=log,
+    )
+    auth_path = Path(build_info["authoritative_base"]).resolve()
+    setattr(args, "authoritative_base", str(auth_path))
+    setattr(args, "_authoritative_base_auto_report", build_info)
+    log.info("[AUTHORITATIVE] %s authoritative_base: %s",
+             "Reused cached" if bool(build_info.get("cache_hit")) else "Materialized",
+             auth_path)
+    return auth_path
+
 def parse_args():
     p = argparse.ArgumentParser(
         "Modular SDB Pipeline Orchestrator",
@@ -3490,6 +3579,24 @@ def parse_args():
     # Caching / reproducibility
     p.add_argument("--cache-root", default="cache",
                    help="Root directory for reusable stage caches (S2/ATL/masks)")
+    p.add_argument("--authoritative-base", default=None,
+                   help="Optional hard-locked measured-constrained raster. Enabled in auto mode by default; pass a path to override, or off/none to disable.")
+    p.add_argument("--authoritative-base-auto", action="store_true", default=True,
+                   help="Automatically build and AOI-cache authoritative_base.tif from NOAA CUDEM tile index + spatial metadata under <cache-root>/authoritative_base/. Enabled by default; use --no-authoritative-base-auto to disable.")
+    p.add_argument("--no-authoritative-base-auto", dest="authoritative_base_auto", action="store_false",
+                   help="Disable automatic AOI-cached authoritative_base materialization for standalone SDB runs.")
+    p.add_argument("--authoritative-base-tile-index-url",
+                   default="https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_2014_8483/tileindex_NCEI_ninth_Topobathy_2014.zip",
+                   help="Tile-index zip URL used when auto-building authoritative_base.")
+    p.add_argument("--authoritative-base-spatial-meta-url",
+                   default="https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_2014_8483/ninth_spatial_meta.zip",
+                   help="Spatial-metadata zip URL used when auto-building authoritative_base.")
+    p.add_argument("--authoritative-base-missing-meta-policy", choices=["skip", "tile_extent", "error"], default="skip",
+                   help="How to handle selected CUDEM tiles with no matching spatial metadata during authoritative-base auto-build.")
+    p.add_argument("--authoritative-base-force-rebuild", action="store_true", default=False,
+                   help="Force rebuild of the cached authoritative-base entry for this AOI/settings.")
+    p.add_argument("--authoritative-base-tile-url-field", default=None,
+                   help="Optional explicit tile-index attribute containing the DEM download URL during authoritative-base auto-build.")
     p.add_argument("--cache-strict", action="store_true", default=True,
                    help="Require exact-match (params+inputs) cache hits; otherwise rebuild.")
     p.add_argument("--no-cache-strict", dest="cache_strict", action="store_false",

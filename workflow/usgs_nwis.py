@@ -41,7 +41,7 @@ def _read_text_cached(url: str, cache_path: Optional[Path], timeout_s: int = 45)
     if cache_path is not None and cache_path.exists():
         try:
             return cache_path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
+        except OSError:
             log.debug("ignored", exc_info=True)
 
     req = urllib.request.Request(
@@ -59,7 +59,7 @@ def _read_text_cached(url: str, cache_path: Optional[Path], timeout_s: int = 45)
         try:
             _ensure_dir(cache_path.parent)
             cache_path.write_text(text, encoding="utf-8")
-        except Exception:
+        except OSError:
             log.debug("ignored", exc_info=True)
 
     # be a polite client
@@ -81,7 +81,7 @@ def _parse_rdb(text: str) -> pd.DataFrame:
     buf = io.StringIO("\n".join(lines))
     try:
         df = pd.read_csv(buf, sep="\t", dtype=str, na_values=["", "NaN", "nan"], keep_default_na=True, skiprows=[1])
-    except Exception:
+    except (pd.errors.ParserError, ValueError):
         # fallback: try without skipping
         buf.seek(0)
         df = pd.read_csv(buf, sep="\t", dtype=str, na_values=["", "NaN", "nan"], keep_default_na=True)
@@ -108,7 +108,7 @@ def fetch_site_locations(
     try:
         text = _read_text_cached(url, cache_path, timeout_s=timeout_s)
         df = _parse_rdb(text)
-    except Exception as e:
+    except (OSError, ValueError) as e:
         log.warning("site fetch failed: %s", e)
         return pd.DataFrame()
 
@@ -152,7 +152,7 @@ def fetch_discharge_measurements(
     try:
         text = _read_text_cached(url, cache_path, timeout_s=timeout_s)
         df = _parse_rdb(text)
-    except Exception as e:
+    except (OSError, ValueError) as e:
         log.warning("measurements fetch failed: %s", e)
         return pd.DataFrame()
 
@@ -275,7 +275,7 @@ def compute_site_a_from_measurements(
                 q_lo_v = float(q.quantile(lo))
                 q_hi_v = float(q.quantile(hi))
                 mask &= q.notna() & (q >= q_lo_v) & (q <= q_hi_v)
-        except Exception:
+        except (TypeError, ValueError):
             q_lo_v = None
             q_hi_v = None
 
@@ -287,7 +287,7 @@ def compute_site_a_from_measurements(
     # Convert mean depth -> approximate max depth under the workflow's trapezoid model.
     try:
         mt = float(mean_to_dmax)
-    except Exception:
+    except (TypeError, ValueError):
         mt = 1.0
     if not (pd.notna(mt) and mt > 0):
         mt = 1.0
@@ -296,7 +296,7 @@ def compute_site_a_from_measurements(
     # a_i = Dmax / W^b
     try:
         bb = float(b)
-    except Exception:
+    except (TypeError, ValueError):
         bb = 0.0
 
     a = dmax / (w2 ** bb)

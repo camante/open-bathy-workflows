@@ -32,7 +32,6 @@ output/
 cache/
 downloads/
 cudem_cache/
-cudem_author/
 run_logs/
 *.jsonl
 

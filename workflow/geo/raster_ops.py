@@ -55,6 +55,86 @@ def _raster_has_valid_pixels(p: Path, max_sample_pixels: int = 250000) -> bool:
         return True
 
 
+def sanitize_raster_values(
+    raster_path: Path,
+    *,
+    nodata: float = -9999.0,
+    min_valid: Optional[float] = None,
+    max_valid: Optional[float] = None,
+    extreme_abs: float = 1.0e20,
+) -> Dict[str, Any]:
+    """Replace non-finite / sentinel-extreme raster values with nodata in place.
+
+    This is a conservative safety net for sparse river outputs and warped deliverables.
+    It does not alter ordinary scientific values; it only clears values that are clearly
+    invalid for operational DEM products (NaN/Inf/float32 max-like sentinels or outside
+    optional broad validity bounds).
+    """
+    stats: Dict[str, Any] = {
+        "path": str(raster_path),
+        "applied": False,
+        "replaced_nonfinite": 0,
+        "replaced_extreme": 0,
+        "replaced_range": 0,
+        "valid_pixels": 0,
+    }
+    try:
+        import numpy as np
+        import rasterio
+    except Exception:
+        return stats
+
+    raster_path = Path(raster_path)
+    if not raster_path.exists():
+        return stats
+
+    tmp = Path(str(raster_path) + '.tmpsanitize.tif')
+    total_nf = total_ext = total_rng = total_valid = 0
+    with rasterio.open(raster_path) as src:
+        profile = src.profile.copy()
+        profile.update(dtype='float32', count=1, nodata=float(nodata), compress='deflate')
+        with rasterio.open(tmp, 'w', **profile) as dst:
+            for _, window in src.block_windows(1):
+                arr = src.read(1, window=window).astype('float32')
+                nonfinite = ~np.isfinite(arr)
+                extreme = np.isfinite(arr) & (np.abs(arr) >= float(extreme_abs))
+                out_of_range = np.zeros(arr.shape, dtype=bool)
+                if min_valid is not None:
+                    out_of_range |= np.isfinite(arr) & (arr < float(min_valid))
+                if max_valid is not None:
+                    out_of_range |= np.isfinite(arr) & (arr > float(max_valid))
+                bad = nonfinite | extreme | out_of_range
+                arr = np.where(bad, float(nodata), arr).astype('float32')
+                valid = np.isfinite(arr) & (arr != float(nodata))
+                total_nf += int(nonfinite.sum())
+                total_ext += int(extreme.sum())
+                total_rng += int(out_of_range.sum())
+                total_valid += int(valid.sum())
+                dst.write(arr, 1, window=window)
+    tmp.replace(raster_path)
+    stats.update({
+        'applied': True,
+        'replaced_nonfinite': total_nf,
+        'replaced_extreme': total_ext,
+        'replaced_range': total_rng,
+        'valid_pixels': total_valid,
+    })
+    return stats
+
+
+def raster_crs_matches(raster_path: Path, expected_srs: str) -> bool:
+    """Return True when raster_path has the expected CRS."""
+    try:
+        import rasterio
+        from pyproj import CRS as _CRS
+        with rasterio.open(raster_path) as ds:
+            if ds.crs is None:
+                return False
+            return _CRS.from_user_input(ds.crs) == _CRS.from_user_input(expected_srs)
+    except Exception:
+        return False
+
+
 def _clip_raster_to_mask(
     raster_path: Path,
     mask_path: Path,
@@ -340,14 +420,26 @@ def _compute_edge_band_metrics_epsg4269(
 
     diff = (data - smooth).astype("float32")
     d = diff[edge]
-    out["edge_diff_to_smooth_mae_m"] = float(np.nanmean(np.abs(d)))
-    out["edge_diff_to_smooth_rmse_m"] = float(np.sqrt(np.nanmean(d * d)))
-    out["edge_diff_to_smooth_p95_m"] = float(np.nanpercentile(np.abs(d), 95))
+    d_finite = d[np.isfinite(d)]
+    out["edge_valid_diff_pixels"] = int(d_finite.size)
+    if d_finite.size >= 5:
+        out["edge_diff_to_smooth_mae_m"] = float(np.mean(np.abs(d_finite)))
+        out["edge_diff_to_smooth_rmse_m"] = float(np.sqrt(np.mean(d_finite * d_finite)))
+        out["edge_diff_to_smooth_p95_m"] = float(np.percentile(np.abs(d_finite), 95))
 
-    # Gradient magnitude RMS in edge band (proxy for seam instability / texture)
-    gy, gx = np.gradient(np.where(valid, data, np.nan))
+    # Gradient magnitude RMS in edge band (proxy for seam instability / texture).
+    # Fill invalid cells with the low-frequency surface before taking gradients so sparse masks
+    # do not emit NaN-only slices or misleading runtime warnings.
+    grad_src = np.where(valid, data, smooth).astype("float32")
+    if not np.all(np.isfinite(grad_src)):
+        grad_src = np.where(np.isfinite(grad_src), grad_src, 0.0).astype("float32")
+    gy, gx = np.gradient(grad_src)
     gmag = np.sqrt(gx * gx + gy * gy).astype("float32")
-    out["edge_grad_rms"] = float(np.nanmean(gmag[edge] * gmag[edge]) ** 0.5)
+    g_edge = gmag[edge]
+    g_edge = g_edge[np.isfinite(g_edge)]
+    out["edge_valid_grad_pixels"] = int(g_edge.size)
+    if g_edge.size >= 5:
+        out["edge_grad_rms"] = float(np.sqrt(np.mean(g_edge * g_edge)))
 
     return out
 

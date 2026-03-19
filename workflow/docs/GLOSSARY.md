@@ -1,0 +1,1 @@
+authoritative_locked: exact hard-control terrain; anchored_interpolation: deterministic fill near hard control; guidance_conditioned_*: fill shaped by subordinate guidance; scaffold_inferred: low-support river scaffold guidance.

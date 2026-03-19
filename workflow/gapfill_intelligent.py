@@ -876,6 +876,8 @@ def gapfill_depth_raster(
     river_mask_raster: Optional[Path] = None,
     bank_elev_raster: Optional[Path] = None,
     xs_params_gpkg: Optional[Union[Path, str]] = None,
+    target_mask_raster: Optional[Path] = None,
+    lock_raster: Optional[Path] = None,
     logger: Optional[logging.Logger] = None
 ) -> Dict[str, Any]:
     """
@@ -893,6 +895,8 @@ def gapfill_depth_raster(
         river_mask_raster: Optional river corridor mask
         bank_elev_raster: Optional bank elevation for constraints
         xs_params_gpkg: Optional XS parameters for river smoothing
+        target_mask_raster: Optional raster mask (1=eligible) limiting which pixels may be corrected
+        lock_raster: Optional raster whose finite pixels are preserved exactly
         logger: Optional logger
         
     Returns:
@@ -920,6 +924,7 @@ def gapfill_depth_raster(
         "pixels_corrected": 0,
         "pixels_prior_only": 0,
         "pixels_bank_constrained": 0,
+        "pixels_locked": 0,
     }
     
     # Load prior
@@ -942,6 +947,24 @@ def gapfill_depth_raster(
     else:
         water = np.isfinite(z_prior)
     
+    # Optional target mask: only these pixels may be corrected.
+    if target_mask_raster and Path(target_mask_raster).exists():
+        tm, _, _ = _read_raster(target_mask_raster)
+        target_mask = (tm == 1) | (tm > 0.5)
+    else:
+        target_mask = water.copy()
+
+    # Optional lock raster: finite pixels are preserved exactly and excluded from correction.
+    if lock_raster and Path(lock_raster).exists():
+        lock_z, _, _ = _read_raster(lock_raster)
+        locked = np.isfinite(lock_z)
+    else:
+        lock_z = None
+        locked = np.zeros_like(water, dtype=bool)
+
+    target_mask &= water
+    target_mask &= ~locked
+
     # Handle no water case
     if not np.any(water):
         logger.warning("[GAPFILL] No water pixels found")
@@ -1004,6 +1027,11 @@ def gapfill_depth_raster(
     sigma_out = prior_sigma.copy()
     prov = np.zeros((h, w), dtype=np.uint8)
     prov[water] = GapfillProvenance.PRIOR_ONLY
+    if lock_z is not None:
+        z_out[locked] = lock_z[locked]
+        sigma_out[locked] = 0.0
+        prov[locked] = GapfillProvenance.MEASURED_EXACT
+        stats["pixels_locked"] = int(np.sum(locked))
     
     # Label connected components
     comp_labels, n_comp = _label_water_components(water)
@@ -1040,7 +1068,9 @@ def gapfill_depth_raster(
             continue
         
         # Get query points (all pixels in component)
-        query_rows, query_cols = np.where(comp_mask)
+        query_rows, query_cols = np.where(comp_mask & target_mask)
+        if len(query_rows) == 0:
+            continue
         query_x, query_y = xy(transform, query_rows, query_cols, offset="center")
         query_xy = np.column_stack([query_x, query_y])
         
@@ -1068,6 +1098,7 @@ def gapfill_depth_raster(
                 bank_elev, _, _ = _read_raster(bank_path)
                 max_bed = bank_elev - cfg.bank_clearance_m
                 violations = np.isfinite(z_out) & np.isfinite(max_bed) & (z_out > max_bed)
+                violations &= ~locked
                 z_out[violations] = max_bed[violations]
                 prov[violations] = GapfillProvenance.BANK_CONSTRAINED
                 stats["pixels_bank_constrained"] = int(np.sum(violations))
@@ -1152,6 +1183,8 @@ def main():
     parser.add_argument("--river-mask", help="River corridor mask")
     parser.add_argument("--bank-elev", help="Bank elevation raster")
     parser.add_argument("--xs-gpkg", help="XS parameters GPKG")
+    parser.add_argument("--target-mask", help="Optional mask raster (1=eligible) limiting which pixels may be corrected")
+    parser.add_argument("--lock-raster", help="Optional raster whose finite pixels remain exact and are not corrected")
     
     parser.add_argument("--method", default="rbf", choices=["rbf", "gp", "idw"])
     parser.add_argument("--rbf-function", default="thin_plate")
@@ -1185,6 +1218,8 @@ def main():
         river_mask_raster=Path(args.river_mask) if args.river_mask else None,
         bank_elev_raster=Path(args.bank_elev) if args.bank_elev else None,
         xs_params_gpkg=Path(args.xs_gpkg) if args.xs_gpkg else None,
+        target_mask_raster=Path(args.target_mask) if args.target_mask else None,
+        lock_raster=Path(args.lock_raster) if args.lock_raster else None,
     )
     
     log.info("Gap-fill complete:")

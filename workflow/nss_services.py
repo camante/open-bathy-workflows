@@ -68,8 +68,9 @@ def cached_get_json(cfg: NSSConfig, url: str) -> Any:
     path = _cache_path(cfg, url)
     if _cache_ok(path, cfg.cache_ttl_days):
         try:
-            return json.load(open(path, "r", encoding="utf-8"))
-        except Exception:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
             log.debug("ignored", exc_info=True)
 
     obj = _http_get_json(url, cfg.timeout_s, cfg.user_agent)
@@ -77,7 +78,7 @@ def cached_get_json(cfg: NSSConfig, url: str) -> Any:
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(obj, f)
-    except Exception:
+    except OSError:
         log.debug("Failed to write cache %s", path)
 
     return obj
@@ -143,7 +144,7 @@ class NSSClient:
                             return obj[k]
                 if isinstance(obj, list):
                     return obj
-            except Exception:
+            except (OSError, ValueError, json.JSONDecodeError):
                 continue
         return []
 
@@ -159,7 +160,7 @@ class NSSClient:
             try:
                 obj = cached_get_json(self.cfg, self._url(p))
                 return obj if isinstance(obj, dict) else {"data": obj}
-            except Exception:
+            except (OSError, ValueError, json.JSONDecodeError):
                 continue
         return {}
 

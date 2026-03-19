@@ -252,3 +252,200 @@ class TestParseAoiBoundsDeg(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSupportDistanceDensityGuidance(unittest.TestCase):
+
+    def setUp(self):
+        import bathy_main
+        self.fn = bathy_main._compute_support_distance_density_guidance
+
+    def test_guidance_influence_increases_with_distance(self):
+        import numpy as np
+        locked = np.zeros((7, 7), dtype=bool)
+        auth = np.full((7, 7), np.nan, dtype=np.float32)
+        locked[3, 3] = True
+        auth[3, 3] = -5.0
+        dist_m, density, influence, nearest = self.fn(
+            locked, auth, pixel_size_m=10.0, support_decay_m=20.0, density_radius_m=20.0
+        )
+        self.assertEqual(float(dist_m[3, 3]), 0.0)
+        self.assertAlmostEqual(float(influence[3, 3]), 0.0, places=6)
+        self.assertGreater(float(influence[0, 0]), float(influence[3, 4]))
+        self.assertTrue(np.isfinite(nearest[0, 0]))
+
+    def test_density_reduces_guidance_influence_for_same_distance(self):
+        import numpy as np
+        locked_sparse = np.zeros((9, 9), dtype=bool)
+        auth_sparse = np.full((9, 9), np.nan, dtype=np.float32)
+        locked_sparse[4, 4] = True
+        auth_sparse[4, 4] = -5.0
+
+        locked_dense = locked_sparse.copy()
+        auth_dense = auth_sparse.copy()
+        locked_dense[4, 3] = True
+        locked_dense[4, 5] = True
+        auth_dense[4, 3] = -5.0
+        auth_dense[4, 5] = -5.0
+
+        _, _, influence_sparse, _ = self.fn(
+            locked_sparse, auth_sparse, pixel_size_m=10.0, support_decay_m=30.0, density_radius_m=30.0
+        )
+        _, _, influence_dense, _ = self.fn(
+            locked_dense, auth_dense, pixel_size_m=10.0, support_decay_m=30.0, density_radius_m=30.0
+        )
+        self.assertLess(float(influence_dense[3, 4]), float(influence_sparse[3, 4]))
+
+
+
+
+class TestRiverAnchorSupportFields(unittest.TestCase):
+
+    def setUp(self):
+        import bathy_main
+        self.fn = bathy_main._compute_river_anchor_support_fields
+
+    def test_scaffold_confidence_increases_away_from_anchor(self):
+        import numpy as np
+        anchor = np.zeros((9, 9), dtype=bool)
+        anchor[4, 4] = True
+        domain = np.ones((9, 9), dtype=bool)
+        guide = np.ones((9, 9), dtype=np.float32)
+        dist_m, density, conf = self.fn(anchor, guide, domain, pixel_size_m=10.0, density_radius_m=20.0, scaffold_transition_m=30.0)
+        self.assertEqual(float(dist_m[4, 4]), 0.0)
+        self.assertAlmostEqual(float(conf[4, 4]), 0.0, places=6)
+        self.assertGreater(float(conf[0, 0]), float(conf[4, 5]))
+        self.assertLess(float(density[0, 0]), float(density[4, 4]))
+
+    def test_dense_anchor_support_reduces_scaffold_confidence(self):
+        import numpy as np
+        domain = np.ones((11, 11), dtype=bool)
+        guide = np.ones((11, 11), dtype=np.float32)
+        sparse = np.zeros((11, 11), dtype=bool)
+        sparse[5, 5] = True
+        dense = sparse.copy()
+        dense[5, 4] = True
+        dense[5, 6] = True
+        _, _, conf_sparse = self.fn(sparse, guide, domain, pixel_size_m=10.0, density_radius_m=30.0, scaffold_transition_m=40.0)
+        _, _, conf_dense = self.fn(dense, guide, domain, pixel_size_m=10.0, density_radius_m=30.0, scaffold_transition_m=40.0)
+        self.assertLess(float(conf_dense[4, 5]), float(conf_sparse[4, 5]))
+
+
+class TestCoastalSdbSupportConfidence(unittest.TestCase):
+
+    def setUp(self):
+        import bathy_main
+        self.fn = bathy_main._compute_coastal_sdb_support_confidence
+
+    def test_confidence_increases_with_optical_stability_and_distance(self):
+        import numpy as np
+        domain = np.ones((7, 7), dtype=bool)
+        gw = np.zeros((7, 7), dtype=np.float32)
+        gw[3, 3] = 1.0
+        ti = np.zeros((7, 7), dtype=np.uint8)
+        ti[3, 3] = 1
+        dist = np.full((7, 7), 500.0, dtype=np.float32)
+        dist[3, 3] = 0.0
+        density = np.zeros((7, 7), dtype=np.float32)
+        conf = self.fn(domain, gw, ti, dist, density, support_transition_m=200.0)
+        self.assertGreater(float(conf[3, 3]), 0.0)
+        self.assertGreater(float(conf[3, 3]), float(conf[0, 0]))
+
+    def test_dense_authoritative_support_reduces_coastal_confidence(self):
+        import numpy as np
+        domain = np.ones((5, 5), dtype=bool)
+        gw = np.ones((5, 5), dtype=np.float32)
+        ti = np.ones((5, 5), dtype=np.uint8)
+        dist = np.full((5, 5), 300.0, dtype=np.float32)
+        sparse_density = np.zeros((5, 5), dtype=np.float32)
+        dense_density = np.full((5, 5), 0.8, dtype=np.float32)
+        conf_sparse = self.fn(domain, gw, ti, dist, sparse_density, support_transition_m=200.0)
+        conf_dense = self.fn(domain, gw, ti, dist, dense_density, support_transition_m=200.0)
+        self.assertLess(float(conf_dense[2, 2]), float(conf_sparse[2, 2]))
+
+class TestAuthoritativePassthroughArgs(unittest.TestCase):
+
+    def setUp(self):
+        import bathy_main
+        self.fn = bathy_main._authoritative_passthrough_args
+
+    def test_sdb_passthrough_uses_existing_authoritative_base(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as td:
+            auth = Path(td) / "authoritative_base.tif"
+            auth.write_bytes(b"x")
+            cfg = SimpleNamespace(authoritative_base=auth, river_authoritative_bed=None)
+            args = self.fn(cfg, for_river=False)
+            self.assertIn(f"--authoritative-base={auth}", args)
+            self.assertIn("--no-authoritative-base-auto", args)
+
+    def test_river_passthrough_prefers_explicit_bed(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as td:
+            auth = Path(td) / "authoritative_base.tif"
+            bed = Path(td) / "river_bed.tif"
+            auth.write_bytes(b"x")
+            bed.write_bytes(b"x")
+            cfg = SimpleNamespace(authoritative_base=auth, river_authoritative_bed=bed)
+            args = self.fn(cfg, for_river=True)
+            self.assertIn(f"--authoritative-bed-raster={bed}", args)
+            self.assertNotIn(f"--authoritative-bed-raster={auth}", args)
+            self.assertIn("--no-authoritative-bed-auto", args)
+
+
+class TestExplicitFinalOutputsManifest(unittest.TestCase):
+
+    def setUp(self):
+        import bathy_main
+        self.fn = bathy_main._write_explicit_final_outputs_manifest
+
+    def test_manifest_records_selected_final_outputs(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = Path(td)
+            native = out_dir / "combined" / "native.tif"
+            user = out_dir / "deliver" / "user.tif"
+            prov = out_dir / "combined" / "prov.tif"
+            native.parent.mkdir(parents=True, exist_ok=True)
+            user.parent.mkdir(parents=True, exist_ok=True)
+            prov.parent.mkdir(parents=True, exist_ok=True)
+            native.write_bytes(b"x")
+            user.write_bytes(b"x")
+            prov.write_bytes(b"x")
+            cfg = SimpleNamespace(out_dir=out_dir, authoritative_base=None)
+            report = {"authoritative_base": {"outputs": {"aligned_authoritative_base": None}}}
+            out_json = self.fn(cfg, report, final_native=native, final_for_user=user, final_provenance=prov)
+            payload = json.loads(Path(out_json).read_text())
+            self.assertEqual(payload["final_depth_native"], str(native))
+            self.assertEqual(payload["final_depth_user"], str(user))
+            self.assertEqual(payload["selected_final_depth"], str(user))
+            self.assertEqual(payload["selected_final_provenance"], str(prov))
+
+
+class TestAuthoritativeCacheReceipt(unittest.TestCase):
+
+    def setUp(self):
+        import bathy_main
+        self.fn = bathy_main._write_authoritative_cache_receipt
+
+    def test_receipt_records_cache_and_passthrough(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = Path(td)
+            report = {
+                "authoritative_base_auto": {
+                    "mode": "auto_cudem",
+                    "cache_key": "abc123",
+                    "cache_hit": True,
+                    "cache_dir": str(out_dir / "cache"),
+                    "authoritative_base": str(out_dir / "authoritative_base.tif"),
+                    "shared_cache_reuse": {"tile_downloads": {"reused_existing": 2}},
+                    "downstream_child_passthrough": {"sdb": {"auto_materialization_disabled": True}},
+                }
+            }
+            cfg = SimpleNamespace(out_dir=out_dir, authoritative_base=None)
+            out_json = self.fn(cfg, report)
+            payload = json.loads(Path(out_json).read_text())
+            self.assertEqual(payload["cache_key"], "abc123")
+            self.assertTrue(payload["cache_hit"])
+            self.assertIn("sdb", payload["downstream_child_passthrough"])

@@ -43,6 +43,7 @@ import os
 import re
 import shlex
 import shutil
+import numpy as np
 from vdatum_utils import convert_sdb_msl_to_navd88
 from process_utils import run_cmd
 
@@ -89,6 +90,8 @@ from geo.raster_ops import (
     apply_depth_metadata,
     apply_elevation_metadata,
     compute_depth_from_bed_and_dem,
+    sanitize_raster_values,
+    raster_crs_matches,
     warp_raster_to_srs,
 )
 
@@ -100,6 +103,113 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
+from authoritative_conditioning import (
+    build_source_aware_candidate_arrays as _ac_build_source_aware_candidate_arrays,
+    compute_support_distance_density_guidance as _ac_compute_support_distance_density_guidance,
+    compute_river_anchor_support_fields as _ac_compute_river_anchor_support_fields,
+    compute_coastal_sdb_support_confidence as _ac_compute_coastal_sdb_support_confidence,
+    support_weighted_condition_arrays as _ac_support_weighted_condition_arrays,
+)
+from authoritative_cli import build_authoritative_passthrough_args as _build_authoritative_passthrough_args
+from authoritative_guidance import build_projected_authoritative_raster as _build_projected_authoritative_raster
+from authoritative_guidance import prepare_authoritative_sdb_training_points as _prepare_authoritative_sdb_training_points
+from authoritative_guidance import prepare_authoritative_river_soundings_points as _prepare_authoritative_river_soundings_points
+from authoritative_support import (
+    prepare_river_support_from_authoritative as _prepare_river_support_from_authoritative,
+    prepare_sdb_guidance_from_authoritative as _prepare_sdb_guidance_from_authoritative,
+)
+from precedence_audit import summarize_precedence_audit as _summarize_precedence_audit, write_precedence_audit as _write_precedence_audit
+from authoritative_cli import record_authoritative_child_passthrough as _record_authoritative_child_passthrough_impl
+from authoritative_materialization import resolve_authoritative_base as _resolve_authoritative_base
+from river_cli import build_river_skeleton_command as _build_river_skeleton_command
+from sdb_cli import build_sdb_command as _build_sdb_command, augment_sdb_command as _augment_sdb_command
+from reporting_coordinator import write_final_reporting_bundle as _write_final_reporting_bundle_impl
+from final_run_stage import execute_final_run_stage as _execute_final_run_stage
+from fusion_helpers import copy_fusion_outputs as _copy_fusion_outputs_impl, resolve_river_domain_mask_for_fusion as _resolve_river_domain_mask_for_fusion_impl
+from support_classes import SUPPORT_CLASS_CODE_TO_NAME
+from provenance_schema import PROVENANCE_CLASS_CODE_TO_NAME
+from final_dem_policy import build_final_dem_policy_dict
+from source_guidance_contract import build_river_source_contract, build_sdb_source_contract, summarize_regime_counts
+from canonical_river_scaffold import (
+    RiverAoiDomains,
+    get_river_aoi_domains,
+    scaffold_cache_hit,
+    scaffold_product_paths,
+    scaffold_products_complete,
+    persist_scaffold_products,
+    cached_scaffold_paths,
+    scaffold_domain_metadata,
+    write_scaffold_manifest,
+)
+from trusted_interior import (
+    build_authoritative_anchor_support,
+    build_soft_guidance_domain,
+    build_river_admissibility,
+    build_trusted_export_region,
+    build_river_trusted_interior,
+    restrict_river_admissibility,
+)
+from sdb_results import finalize_sdb_run as _finalize_sdb_run_impl
+from river_guidance import (
+    apply_guidance_controls_with_reporting as _apply_guidance_controls_with_reporting,
+    write_guidance_artifacts_with_reporting as _write_guidance_artifacts_with_reporting,
+)
+from run_initialization import initialize_run_args as _initialize_run_args, resolve_authoritative_base_args as _resolve_authoritative_base_args
+from fusion_postprocess import ensure_river_contribution as _ensure_river_contribution, burn_authoritative_xyz_into_final as _burn_authoritative_xyz_into_final, apply_residual_correction_with_reporting as _apply_residual_correction_with_reporting
+from river_masking import build_hydraulic_estuary_hint_mask as _rm_build_hydraulic_estuary_hint_mask
+from river_masking import choose_waffles_mask_for_river as _rm_choose_waffles_mask_for_river
+from river_masking import clip_channel_mask_for_estuary as _rm_clip_channel_mask_for_estuary
+from river_masking import count_mask_water_pixels as _rm_count_mask_water_pixels
+from river_masking import determine_effective_methods_from_waffles as _rm_determine_effective_methods_from_waffles
+from river_masking import find_latest_waffles_mask as _rm_find_latest_waffles_mask
+from river_masking import stage_cached_waffles_mask as _rm_stage_cached_waffles_mask
+from river_masking import waffles_water_fraction as _rm_waffles_water_fraction
+from final_reporting import write_authoritative_cache_receipt as _fr_write_authoritative_cache_receipt
+from final_reporting import write_comparison_package as _fr_write_comparison_package
+from final_reporting import write_comparison_summary as _fr_write_comparison_summary
+from final_reporting import write_explicit_final_outputs_manifest as _fr_write_explicit_final_outputs_manifest
+from final_reporting import write_final_dem_selection_receipt as _fr_write_final_dem_selection_receipt
+from provenance_reporting import write_support_provenance_summary as _pr_write_support_provenance_summary
+from final_support_audit import write_final_support_regime_audit as _fsra_write_final_support_regime_audit
+from io_artifacts import build_io_manifest as _io_build_io_manifest
+from io_artifacts import write_guidance_manifest as _io_write_guidance_manifest
+from io_artifacts import write_io_manifest as _io_write_io_manifest
+from io_artifacts import emit_artifacts_from_report as _io_emit_artifacts_from_report
+
+
+
+def _normalize_multi_path_value(value: Any) -> List[str]:
+    """Normalize a multi-path config value into a clean list of file paths.
+
+    Accepts comma-separated strings, lists/tuples/sets, Path-like objects, and
+    tolerates accidental Python-list string reprs like "['/tmp/a.csv']".
+    """
+    parts: List[str] = []
+    if value is None:
+        return parts
+
+    def _append_one(item: Any) -> None:
+        if item is None:
+            return
+        s = str(item).strip()
+        if not s:
+            return
+        for piece in s.split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            piece = piece.strip().strip("[]").strip("\"'").strip()
+            if piece:
+                parts.append(piece)
+
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            _append_one(item)
+    else:
+        _append_one(value)
+
+    return parts
+
 
 def _load_river_authoritative_support_points(cfg: "BathyConfig"):
     """Load authoritative river support points from configured soundings or extra_xyz fallback.
@@ -109,42 +219,53 @@ def _load_river_authoritative_support_points(cfg: "BathyConfig"):
     """
     try:
         import pandas as pd
-        from atl import load_extra_xyz_points
+        from support_points import load_extra_xyz_points
     except ImportError:
         return None
 
     files = []
+    used_river_soundings = False
     try:
         rs = getattr(cfg, "river_soundings", None)
         if rs:
-            # river_soundings is a comma-separated string of file paths
-            for part in str(rs).split(","):
-                part = part.strip()
-                if part:
-                    files.append(part)
+            files.extend(_normalize_multi_path_value(rs))
+            used_river_soundings = bool(files)
         if not files:
             xyz = getattr(cfg, "extra_xyz_files", None)
             if xyz:
-                if isinstance(xyz, str):
-                    for part in xyz.split(","):
-                        part = part.strip()
-                        if part:
-                            files.append(part)
-                else:
-                    files.extend([str(x) for x in xyz if x])
+                files.extend(_normalize_multi_path_value(xyz))
     except (AttributeError, TypeError, ValueError):
         return None
     if not files:
         return None
-    crs = str(getattr(cfg, "extra_xyz_crs", None) or getattr(cfg, "working_srs", None) or "EPSG:4326")
+    if used_river_soundings:
+        crs = str(
+            getattr(cfg, "river_soundings_crs", None)
+            or getattr(cfg, "working_srs", None)
+            or getattr(cfg, "extra_xyz_crs", None)
+            or "EPSG:4326"
+        )
+    else:
+        crs = str(
+            getattr(cfg, "extra_xyz_crs", None)
+            or getattr(cfg, "working_srs", None)
+            or "EPSG:4326"
+        )
     try:
         df = load_extra_xyz_points(files, crs=crs, aoi_str=str(cfg.aoi))
     except (OSError, ValueError, RuntimeError):
         return None
     if df is None or getattr(df, "empty", True):
         return None
+    rename_map = {}
+    if "longitude" in df.columns and "lon" not in df.columns:
+        rename_map["longitude"] = "lon"
+    if "latitude" in df.columns and "lat" not in df.columns:
+        rename_map["latitude"] = "lat"
+    if rename_map:
+        df = df.rename(columns=rename_map)
     keep = [c for c in ("lon", "lat", "depth_m", "source") if c in df.columns]
-    if not keep:
+    if not {"lon", "lat", "depth_m"}.issubset(set(keep)):
         return None
     out = df[keep].copy()
     if "depth_m" in out.columns:
@@ -154,9 +275,130 @@ def _load_river_authoritative_support_points(cfg: "BathyConfig"):
     try:
         src_counts = out["source"].astype(str).value_counts().to_dict() if "source" in out.columns else {}
         log.info("[RIVER][GUIDANCE] Loaded %d authoritative support points for river guidance (sources=%s)", len(out), src_counts)
-    except Exception:
-        log.debug("ignored", exc_info=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        log.debug("Output contract step ignored: %s", exc, exc_info=True)
     return out
+
+
+def _recover_river_depth_from_support(
+    *,
+    cfg: "BathyConfig",
+    depth_tif: Path,
+    bed_tif: Path,
+    channel_mask_tif: Optional[Path],
+    logger: logging.Logger,
+) -> Dict[str, Any]:
+    """Best-effort recovery for degenerate river depth rasters.
+
+    Builds a channel-constrained negative-down depth surface using the existing
+    bed/DEM relationship where finite, then reinforces it with authoritative
+    river support points. When enough support exists, the remaining channel gap
+    is filled by nearest support inside the channel only.
+    """
+    import numpy as np
+    import rasterio
+    from rasterio.features import rasterize
+
+    result = {"recovered": False, "reason": None, "valid_pixels": 0, "support_seed_pixels": 0}
+    try:
+        from pyproj import Transformer
+    except ImportError:
+        result["reason"] = "pyproj_unavailable"
+        return result
+
+    support_points = _load_river_authoritative_support_points(cfg)
+    if support_points is None or getattr(support_points, "empty", True):
+        result["reason"] = "no_authoritative_support_points"
+        return result
+
+    try:
+        import scipy.ndimage as ndi
+    except ImportError:
+        ndi = None
+
+    try:
+        with rasterio.open(depth_tif) as depth_ds, rasterio.open(bed_tif) as bed_ds, rasterio.open(Path(cfg.river_dem)) as dem_ds:
+            if (depth_ds.width, depth_ds.height) != (bed_ds.width, bed_ds.height) or depth_ds.transform != bed_ds.transform:
+                result["reason"] = "bed_depth_grid_mismatch"
+                return result
+            nodata = float(depth_ds.nodata if depth_ds.nodata is not None else getattr(cfg, "river_nodata", -9999.0))
+            depth = depth_ds.read(1).astype("float32")
+            bed = bed_ds.read(1).astype("float32")
+            dem = dem_ds.read(1, out_shape=(depth_ds.height, depth_ds.width), resampling=rasterio.enums.Resampling.bilinear).astype("float32")
+            ch = np.ones_like(depth, dtype=bool)
+            if channel_mask_tif is not None and Path(channel_mask_tif).exists():
+                with rasterio.open(channel_mask_tif) as cm_ds:
+                    cm = cm_ds.read(1, out_shape=(depth_ds.height, depth_ds.width), resampling=rasterio.enums.Resampling.nearest)
+                    ch = cm > 0
+            if dem_ds.nodata is not None:
+                dem[np.isclose(dem, np.float32(dem_ds.nodata))] = np.nan
+            if bed_ds.nodata is not None:
+                bed[np.isclose(bed, np.float32(bed_ds.nodata))] = np.nan
+    
+            base = np.full(depth.shape, np.nan, dtype="float32")
+            base[ch & np.isfinite(bed) & np.isfinite(dem)] = bed[ch & np.isfinite(bed) & np.isfinite(dem)] - dem[ch & np.isfinite(bed) & np.isfinite(dem)]
+    
+            pt = support_points.copy()
+            if "depth_m" not in pt.columns:
+                result["reason"] = "support_missing_depth"
+                return result
+            xcol, ycol = "lon", "lat"
+            transformer = None
+            try:
+                if depth_ds.crs is not None and str(depth_ds.crs).upper() not in {"EPSG:4326", "OGC:CRS84"}:
+                    transformer = Transformer.from_crs("EPSG:4326", depth_ds.crs, always_xy=True)
+            except Exception:
+                transformer = None
+            coords = []
+            for r in pt.itertuples():
+                try:
+                    x = float(getattr(r, xcol))
+                    y = float(getattr(r, ycol))
+                    z = float(getattr(r, "depth_m"))
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if not np.isfinite(x) or not np.isfinite(y) or not np.isfinite(z):
+                    continue
+                if transformer is not None:
+                    x, y = transformer.transform(x, y)
+                if z > 0:
+                    z = -abs(z)
+                coords.append(({"type": "Point", "coordinates": (x, y)}, float(z)))
+            if not coords:
+                result["reason"] = "support_transform_empty"
+                return result
+            seeds = rasterize(coords, out_shape=depth.shape, transform=depth_ds.transform, fill=np.nan, dtype="float32")
+            seeds[~ch] = np.nan
+            result["support_seed_pixels"] = int(np.count_nonzero(np.isfinite(seeds)))
+            recovered = np.where(np.isfinite(base), base, seeds).astype("float32")
+            recovered[~ch] = np.nan
+            if ndi is not None and np.any(np.isfinite(recovered) & ch):
+                valid = np.isfinite(recovered) & ch
+                idx = ndi.distance_transform_edt(~valid, return_distances=False, return_indices=True)
+                recovered = recovered[tuple(idx)]
+                recovered[~ch] = np.nan
+            recovered[np.isfinite(recovered) & (recovered > 0)] = -np.abs(recovered[np.isfinite(recovered) & (recovered > 0)])
+            valid = ch & np.isfinite(recovered)
+            if int(np.count_nonzero(valid)) <= 0:
+                result["reason"] = "recovered_empty"
+                return result
+            span = float(np.nanpercentile(recovered[valid], 99.0) - np.nanpercentile(recovered[valid], 1.0)) if np.count_nonzero(valid) > 1 else 0.0
+            if span < 0.05:
+                result["reason"] = "recovered_near_constant"
+                return result
+    
+            profile = depth_ds.profile.copy()
+            profile.update(dtype="float32", nodata=nodata, compress="DEFLATE", predictor=2)
+            out = np.where(valid, recovered, nodata).astype("float32")
+            with rasterio.open(depth_tif, "w", **profile) as dst:
+                dst.write(out, 1)
+            result.update({"recovered": True, "valid_pixels": int(np.count_nonzero(valid)), "reason": "support_constrained_depth"})
+            logger.warning("[RIVER] Recovered invalid river depth raster using channel-constrained authoritative support (valid=%d, seed_pixels=%d).", result["valid_pixels"], result["support_seed_pixels"])
+            return result
+    except Exception as exc:
+        logger.debug("[RIVER] Support-based depth recovery failed: %s", exc, exc_info=True)
+        result["reason"] = f"recovery_exception:{exc}"
+        return result
 
 
 def _guess_first_existing_field(columns, candidates):
@@ -185,401 +427,10 @@ def _clip_channel_mask_for_estuary(
     ocean_mask_path: "Optional[Path]",
     report: "Dict[str, Any]",
 ) -> "Tuple[int, Optional[Path]]":
-    """Remove estuary pixels from the river channel mask IN-PLACE.
-
-    Returns (n_removed, estuary_mask_path).
-
-    The estuary boundary is auto-detected from two physically-grounded signals:
-
-      1. **Width ratio** — channel pixels where the local width proxy abruptly
-         widens relative to the upstream median (morphometric regime change).
-         This is the primary signal: the actual physical signature of a river
-         entering estuarine regime is that it widens.  Uses the distance-to-bank
-         width proxy already computed by the channel mask grid.
-
-      2. **Low slope** — reaches with slope below ``river_manning_backwater_slope_thresh``
-         (default 1e-4 m/m) indicating tidal/backwater influence.  This is
-         grounded in hydraulic engineering: below ~1e-4 m/m, tidal and
-         backwater effects dominate over gravitational normal-depth flow.
-
-    Both signals require the river network GPKG with NHD attributes (slope,
-    geometry) and the rasterized channel mask.  If neither signal fires, no
-    clipping occurs and the river module runs everywhere in the channel domain.
-
-    The removed pixels are saved as ``estuary_clip_mask.tif`` so that downstream
-    fusion can treat them as SDB-admissible (estuaries where SDB optics may
-    still be useful even though river physics break down).
-    """
-    import numpy as np
-    import rasterio
-    from rasterio.warp import reproject, Resampling
-
-    channel_mask_tif = Path(channel_mask_tif)
-    if not channel_mask_tif.exists():
-        return 0, None
-
-    with rasterio.open(channel_mask_tif) as ds:
-        channel = ds.read(1).astype("uint8")
-        prof = ds.profile.copy()
-        transform = ds.transform
-        crs = ds.crs
-        px_size_m = max(abs(float(transform.a)), abs(float(transform.e)), 1e-6)
-        h, w = ds.height, ds.width
-
-    if not np.any(channel > 0):
-        return 0, None
-
-    estuary_mask = np.zeros_like(channel, dtype=bool)
-    meta = {"signals": {}}
-
-    # --- Signal 1: Width-ratio morphometric detection ---
-    # Where the channel abruptly widens relative to typical upstream width,
-    # the fluvial regime is transitioning to estuarine.  Uses the distance-
-    # transform width proxy on the channel mask itself.
-    try:
-        from scipy.ndimage import distance_transform_edt, label
-        # Compute local width proxy from distance-to-bank within channel
-        chan_bool = (channel > 0)
-        d_bank = distance_transform_edt(chan_bool, sampling=px_size_m).astype("float32")
-        local_width = (2.0 * d_bank).astype("float32")
-
-        # Typical fluvial width: use the 50th percentile of width within the channel
-        # as the "expected" channelized width.  Pixels wider than width_ratio_thresh
-        # times this median are classified as estuarine widening.
-        valid_widths = local_width[chan_bool & (local_width > 0)]
-        if valid_widths.size > 100:
-            width_ratio_thresh = float(getattr(cfg, "estuary_width_ratio_thresh", 3.0) or 3.0)
-            median_width = float(np.median(valid_widths))
-            # Don't fire if the channel is uniformly wide (e.g., a lake)
-            p25 = float(np.percentile(valid_widths, 25))
-            if median_width > 0 and p25 > 0:
-                threshold_width = median_width * width_ratio_thresh
-                width_estuary = chan_bool & (local_width > threshold_width)
-                n_width = int(width_estuary.sum())
-                if n_width > 0:
-                    estuary_mask |= width_estuary
-                    log.info(
-                        "[ESTUARY-CLIP] Width-ratio: %d pixels exceed %.0f m (%.1fx median %.0f m, p25=%.0f m)",
-                        n_width, threshold_width, width_ratio_thresh, median_width, p25,
-                    )
-                meta["signals"]["width_ratio"] = {
-                    "median_width_m": round(float(median_width), 1),
-                    "threshold_width_m": round(float(threshold_width), 1),
-                    "ratio_thresh": float(width_ratio_thresh),
-                    "pixels_flagged": n_width,
-                }
-    except Exception:
-        log.debug("[ESTUARY-CLIP] Width-ratio signal failed", exc_info=True)
-
-    # --- Signal 2: Low slope expands width-ratio detections ---
-    # Low slope alone is NOT sufficient to classify estuary (many inland
-    # reaches have low NHD slope values).  Instead, low-slope reaches that
-    # are NEAR an already-detected width-ratio pixel get included — this
-    # extends the estuary boundary upstream along backwater-prone reaches
-    # connected to the widening zone.
-    try:
-        if np.any(estuary_mask):
-            hydraulic_hint, hydraulic_meta = _build_hydraulic_estuary_hint_mask(
-                cfg=cfg,
-                channel=(channel > 0),
-                transform=transform,
-                crs=crs,
-                px_size_m=px_size_m,
-            )
-            if np.any(hydraulic_hint > 0):
-                from scipy.ndimage import distance_transform_edt as _edt_slope
-                # Only keep low-slope pixels within 1km of a width-ratio detection
-                dist_to_width_det = _edt_slope(~estuary_mask) * px_size_m
-                slope_near_widening = (hydraulic_hint > 0) & (dist_to_width_det <= 1000.0)
-                n_slope_add = int(((~estuary_mask) & slope_near_widening).sum())
-                if n_slope_add > 0:
-                    estuary_mask |= slope_near_widening
-                    log.info(
-                        "[ESTUARY-CLIP] Low-slope extension: %d pixels added near width-ratio detections (backwater=%d reaches)",
-                        n_slope_add, hydraulic_meta.get("backwater_slope_reaches", 0),
-                    )
-            meta["signals"]["low_slope_extension"] = {
-                "backwater_slope_reaches": hydraulic_meta.get("backwater_slope_reaches", 0),
-                "pixels_added": n_slope_add if 'n_slope_add' in dir() else 0,
-                "max_extension_m": 1000.0,
-                "note": "low-slope only extends width-ratio detections, never independent",
-            }
-    except Exception:
-        log.debug("[ESTUARY-CLIP] Low-slope extension failed", exc_info=True)
-
-    # --- Signal 3: Ocean connectivity via flood-fill ---
-    # Keep only estuary pixels that are reachable from the ocean domain by
-    # walking through contiguous detected-estuary pixels.  This replaces a
-    # fixed-distance buffer with a proper topological connectivity test:
-    # if a detected-estuary pixel is connected to the ocean through other
-    # detected-estuary (or ocean) pixels, it stays.  Inland clusters of
-    # low-slope reaches that happen to be near a width-ratio detection but
-    # are NOT connected to the ocean get filtered out.
-    if ocean_mask_path is not None and Path(ocean_mask_path).exists():
-        try:
-            from scipy.ndimage import label as _label, binary_dilation
-            ocean_raw = np.zeros_like(channel, dtype="uint8")
-            with rasterio.open(ocean_mask_path) as om:
-                reproject(
-                    source=rasterio.band(om, 1), destination=ocean_raw,
-                    src_transform=om.transform, src_crs=om.crs,
-                    dst_transform=transform, dst_crs=crs,
-                    resampling=Resampling.nearest,
-                    src_nodata=om.nodata, dst_nodata=255,
-                )
-            ocean_water = (ocean_raw == 0)
-            if np.any(ocean_water) and np.any(estuary_mask):
-                # Build a connectivity domain: estuary detections + ocean pixels.
-                # Then find connected components and keep only those that touch ocean.
-                # First dilate ocean slightly (1 px) to bridge the boundary gap
-                # between the ocean mask and the channel mask edge.
-                ocean_bridge = binary_dilation(ocean_water, iterations=3)
-                connect_domain = estuary_mask | ocean_bridge
-                labeled, n_components = _label(connect_domain)
-                # Find which labels touch ocean
-                ocean_labels = set(np.unique(labeled[ocean_water & (labeled > 0)]))
-                # Keep only estuary pixels whose label is ocean-connected
-                n_before_connect = int(estuary_mask.sum())
-                if ocean_labels:
-                    ocean_connected = np.isin(labeled, list(ocean_labels))
-                    estuary_mask &= ocean_connected
-                else:
-                    # No estuary pixels are connected to ocean at all
-                    estuary_mask[:] = False
-                n_after_connect = int(estuary_mask.sum())
-                if n_before_connect > n_after_connect:
-                    log.info(
-                        "[ESTUARY-CLIP] Ocean flood-fill: trimmed %d disconnected inland pixels (%d components checked, %d ocean-connected)",
-                        n_before_connect - n_after_connect, n_components, len(ocean_labels),
-                    )
-                meta["signals"]["ocean_connectivity"] = {
-                    "method": "flood_fill",
-                    "n_components": int(n_components),
-                    "ocean_connected_components": len(ocean_labels),
-                    "trimmed_inland_pixels": n_before_connect - n_after_connect,
-                }
-                # Dilate the estuary mask by 2 pixels to capture thin edge strips
-                # where the channel meets the ocean mask boundary.  Only keep
-                # dilated pixels that are actually in the channel mask (don't
-                # expand onto land).
-                estuary_dilated = binary_dilation(estuary_mask, iterations=2)
-                n_edge_added = int((estuary_dilated & (channel > 0) & ~estuary_mask).sum())
-                estuary_mask = estuary_dilated & (channel > 0)
-                if n_edge_added > 0:
-                    log.info("[ESTUARY-CLIP] Edge dilation: added %d channel-edge pixels to estuary mask", n_edge_added)
-
-                # Morphological opening (erode then dilate) to remove the thin
-                # rounded artifacts left by the Euclidean-distance low-slope
-                # extension.  The EDT-based 1km buffer creates circular/rounded
-                # edges that don't follow channel geometry.  Opening with a 3px
-                # kernel removes these small protrusions while preserving the
-                # main estuary body.
-                from scipy.ndimage import binary_erosion, binary_opening
-                estuary_opened = binary_opening(estuary_mask, iterations=2)
-                # Re-dilate to recover the main body edges
-                estuary_opened = binary_dilation(estuary_opened, iterations=2) & (channel > 0)
-                n_smoothed = int(estuary_mask.sum() - estuary_opened.sum())
-                if n_smoothed > 0 and estuary_opened.sum() > 0.5 * estuary_mask.sum():
-                    estuary_mask = estuary_opened
-                    log.info("[ESTUARY-CLIP] Morphological opening: removed %d rounded buffer artifact pixels", n_smoothed)
-        except Exception:
-            log.debug("[ESTUARY-CLIP] Ocean connectivity filter failed", exc_info=True)
-
-    n_removed = int(((channel > 0) & estuary_mask).sum())
-    if n_removed == 0:
-        log.info("[ESTUARY-CLIP] No estuary pixels detected in channel mask; no clipping applied.")
-        return 0, None
-
-    # Save the estuary clip mask as a separate raster (for SDB domain expansion)
-    estuary_clip_path = channel_mask_tif.parent / "estuary_clip_mask.tif"
-    prof_u8 = prof.copy()
-    prof_u8.update(dtype="uint8", nodata=0, compress="deflate")
-    with rasterio.open(estuary_clip_path, "w", **prof_u8) as dst:
-        dst.write(estuary_mask.astype("uint8"), 1)
-
-    # Zero out estuary pixels in the channel mask
-    channel[estuary_mask] = 0
-
-    # Erode the channel mask by 2 pixels along the estuary boundary.
-    # The estuary clip mask and channel mask have slightly different pixel-level
-    # geometries at the boundary, leaving 1-2 pixel strips of river data visible
-    # in the estuary zone.  Eroding the channel adjacent to the estuary removes
-    # these ragged edges.
-    try:
-        from scipy.ndimage import binary_erosion as _be, binary_dilation as _bd
-        # Create a mask of pixels that are adjacent to the estuary boundary
-        estuary_border = _bd(estuary_mask, iterations=2) & ~estuary_mask
-        # Remove channel pixels in this border zone
-        border_channel = (channel > 0) & estuary_border
-        n_border_eroded = int(border_channel.sum())
-        if n_border_eroded > 0:
-            channel[border_channel] = 0
-            log.info("[ESTUARY-CLIP] Border erosion: removed %d channel-edge pixels adjacent to estuary boundary", n_border_eroded)
-    except Exception:
-        pass
-
-    prof.update(dtype="uint8", nodata=0)
-    with rasterio.open(channel_mask_tif, "w", **prof) as dst:
-        dst.write(channel.astype("uint8"), 1)
-
-    n_remaining = int((channel > 0).sum())
-    log.info(
-        "[ESTUARY-CLIP] Removed %d estuary pixels from channel mask (%d remaining). Estuary mask: %s",
-        n_removed, n_remaining, estuary_clip_path,
-    )
-    report.setdefault("river", {}).setdefault("estuary_clip", {}).update({
-        "pixels_removed": n_removed,
-        "pixels_remaining": n_remaining,
-        "estuary_clip_mask": str(estuary_clip_path),
-        "method": "width_ratio + low_slope, ocean-connectivity filtered",
-        "signals": meta.get("signals", {}),
-    })
-    return n_removed, estuary_clip_path
-
+    return _rm_clip_channel_mask_for_estuary(channel_mask_tif, cfg, ocean_mask_path=ocean_mask_path, report=report, logger=log)
 
 def _build_hydraulic_estuary_hint_mask(*, cfg: "BathyConfig", channel, transform, crs, px_size_m: float):
-    """Build a conservative hydraulic estuary hint mask aligned to ``channel``.
-
-    This does not attempt full estuary arbitration.  It only marks river-domain
-    pixels that are likely transitioning away from a clean fluvial regime based
-    on already-available hydraulic indicators:
-
-      - distance-to-mouth reach attribute (near-mouth reaches)
-      - low-slope / backwater-prone reach attribute (Manning guard analogue)
-
-    The output is intentionally conservative and only expands a modest distance
-    from flagged reaches into the channel domain.
-    """
-    import numpy as np
-    import pandas as pd
-
-    meta = {
-        "enabled": False,
-        "network_gpkg": None,
-        "rivers_layer": None,
-        "slope_field": None,
-        "dist_to_mouth_field": None,
-        "flagged_reaches": 0,
-        "near_mouth_reaches": 0,
-        "backwater_slope_reaches": 0,
-        "reach_buffer_m": 0.0,
-        "reason": "uninitialized",
-    }
-    out = np.zeros_like(channel, dtype="uint8")
-    if not np.any(channel):
-        meta["reason"] = "empty_channel"
-        return out, meta
-
-    try:
-        import geopandas as gpd
-        from rasterio.features import rasterize
-        from scipy.ndimage import distance_transform_edt
-    except Exception:
-        meta["reason"] = "missing_geo_dependencies"
-        return out, meta
-
-    network_gpkg = Path(cfg.derived_cache_root) / "river" / "work" / "river_network.gpkg"
-    if not network_gpkg.exists():
-        meta["reason"] = "river_network_missing"
-        return out, meta
-    meta["network_gpkg"] = str(network_gpkg)
-
-    try:
-        rivers = gpd.read_file(network_gpkg, layer="rivers_clip")
-        meta["rivers_layer"] = "rivers_clip"
-    except Exception:
-        try:
-            rivers = gpd.read_file(network_gpkg)
-            meta["rivers_layer"] = "<default>"
-        except Exception:
-            meta["reason"] = "river_network_unreadable"
-            return out, meta
-
-    if rivers.empty:
-        meta["reason"] = "river_network_empty"
-        return out, meta
-    if rivers.crs is None:
-        meta["reason"] = "river_network_missing_crs"
-        return out, meta
-    try:
-        if str(rivers.crs) != str(crs):
-            rivers = rivers.to_crs(crs)
-    except Exception:
-        meta["reason"] = "river_network_reproject_failed"
-        return out, meta
-
-    dist_candidates = []
-    dist_cfg = getattr(cfg, "river_manning_dist_to_mouth_field", None)
-    if dist_cfg:
-        dist_candidates.append(str(dist_cfg))
-    dist_candidates.extend([
-        "dist_to_mouth_km", "DIST_TO_MOUTH_KM", "distance_to_mouth_km",
-        "DistanceToMouthKm", "dist_mouth_km",
-    ])
-    slope_candidates = ["slope_mpm", "SLOPE", "slope", "Slope", "gradient", "GRADIENT"]
-
-    dist_field = _guess_first_existing_field(rivers.columns, dist_candidates)
-    slope_field = _guess_first_existing_field(rivers.columns, slope_candidates)
-    meta["dist_to_mouth_field"] = dist_field
-    meta["slope_field"] = slope_field
-
-    near_mouth = np.zeros(len(rivers), dtype=bool)
-    if dist_field is not None:
-        dist_vals = pd.to_numeric(rivers[dist_field], errors="coerce")
-        dist_limit = float(getattr(cfg, "river_manning_dist_to_mouth_km_max", 10.0) or 10.0)
-        near_mouth = np.isfinite(dist_vals) & (dist_vals >= 0.0) & (dist_vals <= dist_limit)
-
-    low_slope = np.zeros(len(rivers), dtype=bool)
-    if slope_field is not None:
-        slope_vals = pd.to_numeric(rivers[slope_field], errors="coerce")
-        slope_limit = float(getattr(cfg, "river_manning_backwater_slope_thresh", 1e-4) or 1e-4)
-        low_slope = np.isfinite(slope_vals) & (slope_vals >= 0.0) & (slope_vals <= slope_limit)
-
-    flagged = near_mouth | low_slope
-    meta["near_mouth_reaches"] = int(np.sum(near_mouth))
-    meta["backwater_slope_reaches"] = int(np.sum(low_slope))
-    meta["flagged_reaches"] = int(np.sum(flagged))
-    if not np.any(flagged):
-        meta["reason"] = "no_hydraulic_reaches_flagged"
-        return out, meta
-
-    geoms = rivers.loc[flagged, "geometry"]
-    geoms = geoms[geoms.notna()]
-    geoms = geoms[~geoms.is_empty]
-    if geoms.empty:
-        meta["reason"] = "flagged_reaches_without_geometry"
-        return out, meta
-
-    line_mask = rasterize(
-        [(geom, 1) for geom in geoms],
-        out_shape=channel.shape,
-        transform=transform,
-        fill=0,
-        dtype="uint8",
-    )
-    if not np.any(line_mask):
-        meta["reason"] = "flagged_reaches_not_on_grid"
-        return out, meta
-
-    reach_buffer_m = max(
-        3.0 * float(px_size_m),
-        min(
-            float(getattr(cfg, "estuary_transition_m", 500.0) or 500.0),
-            max(
-                float(getattr(cfg, "river_channel_buffer_m", 0.0) or 0.0) * 0.5,
-                float(getattr(cfg, "river_max_channel_width_m", 0.0) or 0.0) * 0.5,
-                60.0,
-            ),
-        ),
-    )
-    meta["reach_buffer_m"] = float(reach_buffer_m)
-
-    dist_to_flagged_m = distance_transform_edt(line_mask == 0) * float(px_size_m)
-    out = (channel & (dist_to_flagged_m <= reach_buffer_m)).astype("uint8")
-    meta["enabled"] = bool(np.any(out))
-    meta["reason"] = "ok" if meta["enabled"] else "empty_after_channel_intersection"
-    return out, meta
-
+    return _rm_build_hydraulic_estuary_hint_mask(cfg=cfg, channel=channel, transform=transform, crs=crs, px_size_m=px_size_m, logger=log)
 
 def _write_river_guidance_artifacts(
     cfg: "BathyConfig",
@@ -611,6 +462,8 @@ def _write_river_guidance_artifacts(
         "guide_points": None,
         "authoritative_support": None,
         "authoritative_support_depth": None,
+        "corridor_mask": None,
+        "scaffold_domains": None,
     }
     with rasterio.open(depth_tif) as ds:
         depth = ds.read(1).astype("float32")
@@ -633,12 +486,16 @@ def _write_river_guidance_artifacts(
         support = np.zeros((ds.height, ds.width), dtype="uint8")
         support_depth = np.full((ds.height, ds.width), np.nan, dtype="float32")
         support_used = 0
+        px_x = abs(float(ds.transform.a))
+        px_y = abs(float(ds.transform.e))
+        px_m = max(min(px_x, px_y), 1e-6)
+        edge_buffer_px = max(int(round(float(getattr(cfg, "river_trusted_halo_m", 60.0) or 0.0) / px_m)), 0)
         if support_points is not None and not support_points.empty and {"lon", "lat"}.issubset(set(support_points.columns)):
-            shapes = [((float(r.lon), float(r.lat)), 1) for r in support_points.itertuples() if np.isfinite(r.lon) and np.isfinite(r.lat)]
+            shapes = [({"type": "Point", "coordinates": (float(r.lon), float(r.lat))}, 1) for r in support_points.itertuples() if np.isfinite(r.lon) and np.isfinite(r.lat)]
             depth_shapes = []
             if "depth_m" in support_points.columns:
                 depth_shapes = [
-                    ((float(r.lon), float(r.lat)), float(r.depth_m))
+                    ({"type": "Point", "coordinates": (float(r.lon), float(r.lat))}, float(r.depth_m))
                     for r in support_points.itertuples()
                     if np.isfinite(r.lon) and np.isfinite(r.lat) and np.isfinite(r.depth_m)
                 ]
@@ -655,25 +512,22 @@ def _write_river_guidance_artifacts(
                     dtype="float32",
                 )
                 support_depth[(support <= 0) | (~channel)] = np.nan
-        trusted_interior = support.astype("uint8")
+        # Start with channel-wide guidance weight and then taper it away from
+        # authoritative anchor support. The trusted export / admissibility masks
+        # are derived later from the shared trusted_interior contract helpers.
         guidance_weight = channel.astype("float32")
         if support_used > 0:
             try:
                 from scipy.ndimage import distance_transform_edt
-                px_x = abs(float(ds.transform.a))
-                px_y = abs(float(ds.transform.e))
-                px_m = max(min(px_x, px_y), 1e-6)
                 ramp_m = float(min(max(3.0 * px_m, 30.0), 250.0))
                 dist_px = distance_transform_edt(1 - support)
                 dist_m = dist_px * px_m
                 guidance_weight = np.clip(dist_m / ramp_m, 0.0, 1.0).astype("float32")
                 guidance_weight *= channel.astype("float32")
-                guidance_weight[trusted_interior > 0] = 0.0
-            except Exception:
+                guidance_weight[support > 0] = 0.0
+            except (ImportError, RuntimeError, ValueError):
                 guidance_weight = channel.astype("float32")
-                guidance_weight[trusted_interior > 0] = 0.0
-        admissibility = ((channel) & (~valid | np.isfinite(depth))).astype("uint8")
-        admissibility[~channel] = 0
+                guidance_weight[support > 0] = 0.0
 
         prof_u8 = ds.profile.copy(); prof_u8.update(dtype="uint8", nodata=0, compress="deflate", count=1)
         prof_f32 = ds.profile.copy(); prof_f32.update(dtype="float32", nodata=0.0, compress="deflate", count=1)
@@ -682,26 +536,11 @@ def _write_river_guidance_artifacts(
     gw_path = river_dir / "river_guidance_weight.tif"
     ti_path = river_dir / "river_trusted_interior.tif"
     ad_path = river_dir / "river_admissibility.tif"
+    sg_path = river_dir / "river_soft_guidance_domain.tif"
     sp_path = river_dir / "river_authoritative_support.tif"
     sd_path = river_dir / "river_authoritative_support_depth.tif"
-    with rasterio.open(gw_path, "w", **prof_f32) as dst:
-        dst.write(guidance_weight.astype("float32"), 1)
-    with rasterio.open(ti_path, "w", **prof_u8) as dst:
-        dst.write(trusted_interior.astype("uint8"), 1)
-    with rasterio.open(ad_path, "w", **prof_u8) as dst:
-        dst.write(admissibility.astype("uint8"), 1)
-    with rasterio.open(sp_path, "w", **prof_u8) as dst:
-        dst.write(support.astype("uint8"), 1)
-    with rasterio.open(sd_path, "w", **prof_depth) as dst:
-        dst.write(np.where(np.isfinite(support_depth), support_depth, float(nodata)).astype("float32"), 1)
-
-    artifacts.update({
-        "guidance_weight": str(gw_path),
-        "trusted_interior": str(ti_path),
-        "admissibility": str(ad_path),
-        "authoritative_support": str(sp_path),
-        "authoritative_support_depth": str(sd_path),
-    })
+    cm_path = river_dir / "river_corridor_mask.tif"
+    scaffold_domains_path = river_dir / "river_scaffold_domains.json"
 
     # ---------------------------------------------------------------
     # Estuary transition mask
@@ -758,13 +597,76 @@ def _write_river_guidance_artifacts(
             )
         else:
             log.info("[ESTUARY] No estuary_clip_mask found; transition mask will be empty.")
-    except Exception:
+    except (OSError, ValueError, TypeError, rasterio.errors.RasterioError):
         log.debug("[ESTUARY] Transition mask generation failed; continuing without it.", exc_info=True)
 
     et_path = river_dir / "estuary_transition_mask.tif"
     with rasterio.open(et_path, "w", **prof_u8) as dst:
         dst.write(estuary_transition.astype("uint8"), 1)
     artifacts["estuary_transition"] = str(et_path)
+
+    contract = build_river_source_contract(
+        channel=channel.astype("uint8"),
+        valid_depth=valid,
+        guidance_weight=guidance_weight,
+        authoritative_support=support.astype("uint8"),
+        estuary_transition=estuary_transition.astype("uint8"),
+        edge_buffer_px=edge_buffer_px,
+    )
+    anchor_support = contract["authoritative_anchor_support"]
+    trusted_interior = contract["trusted_interior"]
+    soft_guidance_domain = contract["soft_guidance_domain"]
+    admissibility = contract["admissibility"]
+    regime_class = contract["regime"]
+    guidance_weight = contract["guidance_weight"]
+
+    rc_path = river_dir / "river_regime_class.tif"
+
+    with rasterio.open(gw_path, "w", **prof_f32) as dst:
+        dst.write(guidance_weight.astype("float32"), 1)
+    with rasterio.open(ti_path, "w", **prof_u8) as dst:
+        dst.write(trusted_interior.astype("uint8"), 1)
+    with rasterio.open(ad_path, "w", **prof_u8) as dst:
+        dst.write(admissibility.astype("uint8"), 1)
+    with rasterio.open(sg_path, "w", **prof_u8) as dst:
+        dst.write(soft_guidance_domain.astype("uint8"), 1)
+    with rasterio.open(sp_path, "w", **prof_u8) as dst:
+        dst.write(anchor_support.astype("uint8"), 1)
+    with rasterio.open(sd_path, "w", **prof_depth) as dst:
+        dst.write(np.where(np.isfinite(support_depth), support_depth, float(nodata)).astype("float32"), 1)
+    with rasterio.open(cm_path, "w", **prof_u8) as dst:
+        dst.write(channel.astype("uint8"), 1)
+    with rasterio.open(rc_path, "w", **prof_u8) as dst:
+        dst.write(regime_class.astype("uint8"), 1)
+
+    scaffold_domains = get_river_aoi_domains(
+        str(cfg.aoi),
+        float(getattr(cfg, "river_network_halo_km", 0.0) or 0.0),
+        float(getattr(cfg, "river_trusted_halo_m", 60.0) or 0.0),
+    )
+    scaffold_domains = scaffold_domains.as_dict()
+    scaffold_domains["trusted_halo_px"] = int(edge_buffer_px)
+    write_scaffold_manifest(
+        scaffold_domains_path,
+        domains=get_river_aoi_domains(
+            str(cfg.aoi),
+            float(getattr(cfg, "river_network_halo_km", 0.0) or 0.0),
+            float(getattr(cfg, "river_trusted_halo_m", 60.0) or 60.0),
+        ),
+        extra=scaffold_domains,
+    )
+
+    artifacts.update({
+        "guidance_weight": str(gw_path),
+        "trusted_interior": str(ti_path),
+        "admissibility": str(ad_path),
+        "soft_guidance_domain": str(sg_path),
+        "authoritative_support": str(sp_path),
+        "authoritative_support_depth": str(sd_path),
+        "corridor_mask": str(cm_path),
+        "regime_class": str(rc_path),
+        "scaffold_domains": str(scaffold_domains_path),
+    })
 
     # Sparse guide points sampled from the guidance-weighted raster support.
     try:
@@ -803,7 +705,7 @@ def _write_river_guidance_artifacts(
                 str(k): int(v)
                 for k, v in support_points['source'].astype(str).value_counts().to_dict().items()
             }
-    except Exception:
+    except (TypeError, ValueError, KeyError, AttributeError):
         support_source_counts = {}
 
     report.setdefault('river', {}).setdefault('guidance', {}).update({
@@ -811,10 +713,12 @@ def _write_river_guidance_artifacts(
         'non_authoritative': True,
         'authoritative_support_pixels': int(support_used),
         'authoritative_support_source_counts': support_source_counts,
-        'trusted_interior_definition': 'authoritative-support pixels only',
+        'trusted_interior_definition': 'halo-solve export interior: channel pixels inset from solve-domain edges and excluding estuary transition',
+        'soft_guidance_definition': 'broader trusted-export guidance domain prior to removing authoritative anchor pixels',
         'authoritative_support_depth_definition': 'rasterized trusted support depth used for exact overwrite where available',
-        'guidance_weight_definition': '0 at authoritative support; ramps to 1 away from trusted support within the channel domain',
-        'admissibility_definition': '1 inside river channel domain where river guidance may participate in downstream interpolation',
+        'guidance_weight_definition': '0 outside trusted export interior and at authoritative anchors; ramps upward within the trusted interior away from anchors',
+        'admissibility_definition': '1 inside trusted export interior where valid river guidance exists and no authoritative anchor is present',
+        'low_confidence_continuous_fill_definition': 'continuous backstop fill used only where no stronger support class was available after authoritative and guidance-conditioned filling',
         'estuary_transition_definition': '1 inside river channel domain where ocean-proximity or conservative hydraulic hints (near-mouth / low-slope backwater risk) indicate a reduced-trust handoff zone',
         'estuary_transition_pixels': estuary_px_count,
         'estuary_transition_buffer_m': float(getattr(cfg, 'estuary_transition_m', 500.0) or 500.0),
@@ -822,6 +726,10 @@ def _write_river_guidance_artifacts(
         'estuary_transition_hydraulic_pixels': int(hydraulic_hint_mask.sum()),
         'estuary_transition_hydraulic': hydraulic_hint_meta,
         'bed_surface_is_internal_helper': True,
+        'regime_summary': contract.get('regime_summary', {}),
+        'zone_summary': {k: int(np.sum(v > 0)) for k, v in contract.get('zones', {}).items()},
+        'corridor_mask': str(cm_path),
+        'scaffold_domains': scaffold_domains,
     })
     return artifacts
 
@@ -933,7 +841,7 @@ def _apply_residual_correction(
         weight_smooth = gaussian_filter(weight_field, sigma=sigma_px, mode="constant", cval=0.0)
 
         # Avoid division by zero — where weight is negligible, correction is zero
-        correction = np.where(weight_smooth > 1e-10, resid_smooth / weight_smooth, 0.0).astype("float32")
+        correction = np.divide(resid_smooth, weight_smooth, out=np.zeros_like(resid_smooth, dtype="float64"), where=weight_smooth > 1e-10).astype("float32")
 
         # Cap correction magnitude
         correction = np.clip(correction, -max_correction_m, max_correction_m)
@@ -1371,10 +1279,7 @@ def _river_cache_key_and_manifest(cfg: "BathyConfig") -> tuple[str, Dict[str, An
     """
     soundings: List[Path] = []
     if cfg.river_soundings:
-        for part in str(cfg.river_soundings).split(","):
-            part = part.strip()
-            if part:
-                soundings.append(Path(part))
+        soundings = [Path(part) for part in _normalize_multi_path_value(cfg.river_soundings)]
 
     manifest = {
         "aoi": cfg.aoi,
@@ -1612,264 +1517,19 @@ def _parse_paths_from_command(cmd: str) -> dict[str, list[str]]:
 
 
 def build_io_manifest(report: dict[str, Any]) -> dict[str, Any]:
-    """
-    Build an explicit IO manifest from the *actual* run report and executed commands.
-    This contains only paths observed in the report/commands. No canonical naming assumptions.
-    """
-    manifest: dict[str, Any] = {
-        "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "run_id": report.get("run_id"),
-        "out_dir": report.get("out_dir"),
-        "inputs": [],
-        "outputs": [],
-    }
-
-    # 1) Collect explicit paths from report structure (bathy_report / unified report already store them)
-    collected: list[str] = []
-    _collect_paths_from_obj(report, collected)
-
-    # 2) Collect inputs/outputs from step command lines
-    steps_obj = None
-    try:
-        steps_obj = (report.get("river", {}) or {}).get("steps")
-    except Exception:
-        steps_obj = None
-
-    step_list = []
-    if isinstance(steps_obj, dict):
-        step_list = list(steps_obj.values())
-    elif isinstance(steps_obj, list):
-        step_list = steps_obj
-
-    for step in step_list:
-        cmd = step.get("command") if isinstance(step, dict) else None
-        parsed = _parse_paths_from_command(cmd or "")
-        collected.extend(parsed.get("inputs", []))
-        collected.extend(parsed.get("outputs", []))
-
-    # De-duplicate while preserving order
-    seen = set()
-    uniq = []
-    for p in collected:
-        if p in seen:
-            continue
-        seen.add(p)
-        uniq.append(p)
-
-    # Split into inputs/outputs using explicit report fields where possible
-    # - Anything listed under report["outputs"] or nested "*outputs" dicts -> outputs
-    out_paths: set[str] = set()
-    def _collect_outputs(obj: Any):
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                if k == "outputs" and isinstance(v, dict):
-                    for vv in v.values():
-                        if isinstance(vv, str) and _is_probably_path(vv):
-                            out_paths.add(vv)
-                _collect_outputs(v)
-        elif isinstance(obj, (list, tuple)):
-            for v in obj:
-                _collect_outputs(v)
-    _collect_outputs(report)
-
-    # Also treat explicit step outputs as outputs
-    for step in step_list:
-        cmd = step.get("command") if isinstance(step, dict) else ""
-        parsed = _parse_paths_from_command(cmd or "")
-        for p in parsed.get("outputs", []):
-            out_paths.add(p)
-
-    inputs = []
-    outputs = []
-    for p in uniq:
-        if p in out_paths:
-            outputs.append(p)
-        else:
-            inputs.append(p)
-
-    manifest["inputs"] = inputs
-    manifest["outputs"] = outputs
-    return manifest
-
+    return _io_build_io_manifest(report)
 
 def _write_guidance_manifest(cfg: "BathyConfig", report: "Dict[str, Any]") -> Path:
-    """Write guidance_manifest.json — a single machine-readable inventory of all
-    guidance artifacts produced by this run.
-
-    Downstream CUDEM tile builders consume this to understand:
-      - what guidance artifacts exist and where they are
-      - what domain class each artifact belongs to (fluvial, estuary, coastal_sdb)
-      - whether each artifact is authoritative or guidance-only
-      - what fusion policy was applied
-      - what the estuary detection method and parameters were
-
-    This is the contract between the open-bathy-workflows pipeline and
-    production DEM tiling.
-    """
     from constants import Provenance, PIPELINE_VERSION
-
-    river_outputs = report.get("river", {}).get("outputs", {})
-    river_guidance = report.get("river", {}).get("guidance", {})
-    estuary_clip = report.get("river", {}).get("estuary_clip", {})
-    fusion_controls = report.get("fusion", {}).get("guidance_controls", {})
-    sdb_report = report.get("sdb", {})
-
-    def _artifact(path_str, *, role, domain, authoritative=False, description=""):
-        """Build a single artifact entry."""
-        entry = {
-            "path": str(path_str) if path_str else None,
-            "exists": bool(path_str and Path(path_str).exists()) if path_str else False,
-            "role": role,
-            "domain_class": domain,
-            "authoritative": authoritative,
-        }
-        if description:
-            entry["description"] = description
-        return entry
-
-    artifacts = []
-
-    # --- River guidance artifacts ---
-    for key, role, desc in [
-        ("guidance_weight", "guidance_weight", "0 at authoritative support; ramps to 1 away from trusted support within fluvial channel"),
-        ("trusted_interior", "trusted_interior", "1 at authoritative-support pixels only"),
-        ("admissibility", "admissibility", "1 inside fluvial channel domain where river guidance is valid"),
-        ("guide_points", "guide_points", "Spatially thinned pseudo-soundings with confidence weights"),
-        ("authoritative_support", "authoritative_support", "Rasterized authoritative support mask"),
-        ("authoritative_support_depth", "authoritative_support_depth", "Rasterized authoritative support depth for exact overwrite"),
-    ]:
-        p = river_outputs.get(key)
-        if p:
-            artifacts.append(_artifact(p, role=role, domain="fluvial_core", authoritative=(key == "authoritative_support_depth"), description=desc))
-
-    # Estuary masks
-    et_path = river_outputs.get("estuary_transition")
-    if et_path:
-        artifacts.append(_artifact(et_path, role="estuary_transition_mask", domain="estuary_transition",
-                                   description="1 where river-to-ocean handoff zone; reduced-trust guidance"))
-    ec_path = estuary_clip.get("estuary_clip_mask") or river_outputs.get("estuary_clip_mask")
-    if ec_path:
-        artifacts.append(_artifact(ec_path, role="estuary_clip_mask", domain="estuary_transition",
-                                   description="1 where river channel was clipped (SDB may fill); river physics invalid here"))
-
-    # --- SDB guidance artifacts ---
-    sdb_artifacts = sdb_report.get("artifacts", {})
-    for key, role, desc in [
-        ("depth_raster", "sdb_depth", "SDB depth raster (guidance-only, non-authoritative)"),
-        ("confidence_raster", "sdb_confidence", "Per-pixel SDB confidence"),
-        ("guidance_weight_raster", "sdb_guidance_weight", "SDB guidance weight for interpolation"),
-        ("uncertainty_raster", "sdb_uncertainty", "SDB 1-sigma uncertainty"),
-        ("admissibility_raster", "sdb_admissibility", "SDB optical domain admissibility"),
-        ("provenance_raster", "sdb_provenance", "SDB provenance (0=nodata, 1=predicted)"),
-    ]:
-        p = sdb_artifacts.get(key)
-        if p:
-            artifacts.append(_artifact(p, role=role, domain="coastal_sdb", description=desc))
-
-    # --- Combined / fused artifacts ---
-    combined = report.get("outputs", {})
-    for key, role, desc in [
-        ("depth", "combined_depth", "Fused depth raster (river + SDB + authoritative)"),
-        ("provenance", "combined_provenance", "Provenance code per pixel (see constants.Provenance)"),
-    ]:
-        p = combined.get(key)
-        if p:
-            artifacts.append(_artifact(p, role=role, domain="combined", description=desc))
-
-    manifest = {
-        "schema_version": 1,
-        "pipeline_version": str(PIPELINE_VERSION),
-        "aoi": str(cfg.aoi),
-        "run_id": str(cfg.run_id or ""),
-        "domain_classes": {
-            "fluvial_core": "River channel where channelized-flow assumptions are valid; river guidance is primary",
-            "estuary_transition": "Handoff zone where river physics break down; reduced-trust, SDB may fill",
-            "coastal_sdb": "Open water / coastal domain; SDB guidance is primary",
-            "combined": "Fused output incorporating all sources with domain-aware arbitration",
-        },
-        "fusion_policy": {
-            "authoritative_exact_overwrite": True,
-            "fluvial_core_river_primary": True,
-            "estuary_transition_river_excluded": True,
-            "estuary_sdb_fill_enabled": True,
-            "estuary_max_weight": float(fusion_controls.get("estuary_max_weight", 0.25)),
-            "estuary_detection_method": estuary_clip.get("method", "width_ratio + low_slope"),
-            "estuary_detection_signals": estuary_clip.get("signals", {}),
-        },
-        "provenance_codes": {
-            str(code): desc
-            for code, desc in [
-                (Provenance.NODATA, "NoData"),
-                (Provenance.SDB, "SDB guidance"),
-                (Provenance.RIVER, "River guidance"),
-                (Provenance.MEASURED, "Authoritative measurement"),
-                (Provenance.BLENDED, "Blended transition"),
-                (Provenance.ESTUARY_TRANSITION, "Estuary transition (reduced-trust)"),
-            ]
-        },
-        "artifacts": artifacts,
-        "artifact_count": len(artifacts),
-    }
-
-    out_path = cfg.out_dir / "guidance_manifest.json"
-    write_json(out_path, manifest)
-    log.info("Guidance manifest written: %s (%d artifacts)", out_path, len(artifacts))
+    out_path = _io_write_guidance_manifest(cfg, report, provenance_enum=Provenance, pipeline_version=PIPELINE_VERSION)
+    log.info("Guidance manifest written: %s", out_path)
     return out_path
 
-
 def write_io_manifest(out_dir: Path, report: dict[str, Any]) -> tuple[Path, Path]:
-    """Write io_manifest.json and io_manifest.md into out_dir."""
-    io = build_io_manifest(report)
-    p_json = out_dir / "io_manifest.json"
-    p_md = out_dir / "io_manifest.md"
-
-    # JSON
-    with open(p_json, "w", encoding="utf-8") as f:
-        json.dump(io, f, indent=2, sort_keys=True)
-
-    # MD
-    lines = []
-    lines.append("# IO manifest")
-    lines.append("")
-    lines.append(f"- run_id: `{io.get('run_id')}`")
-    lines.append(f"- out_dir: `{io.get('out_dir')}`")
-    lines.append("")
-    lines.append("## Inputs (explicit paths observed)")
-    for p in io.get("inputs", []):
-        lines.append(f"- `{p}`")
-    lines.append("")
-    lines.append("## Outputs (explicit paths observed)")
-    for p in io.get("outputs", []):
-        lines.append(f"- `{p}`")
-    lines.append("")
-    p_md.write_text("\n".join(lines), encoding="utf-8")
-
-    return p_json, p_md
-
+    return _io_write_io_manifest(out_dir, report)
 
 def _emit_artifacts_from_report(report: dict[str, Any]) -> None:
-    """
-    Best-effort: emit artifact_written events for paths explicitly recorded in the report.
-    This is used only for run summaries/flight recorder; it never guesses filenames.
-    """
-    try:
-        from flight_recorder import emit_artifact_written
-    except Exception:
-        return
-
-    # Emit outputs from report["outputs"] dicts only
-    def _emit_outputs(obj: Any):
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                if k == "outputs" and isinstance(v, dict):
-                    for name, path in v.items():
-                        if isinstance(path, str) and _is_probably_path(path):
-                            emit_artifact_written(Path(path), kind="file", role=str(name))
-                _emit_outputs(v)
-        elif isinstance(obj, (list, tuple)):
-            for v in obj:
-                _emit_outputs(v)
-    _emit_outputs(report)
+    _io_emit_artifacts_from_report(report)
 
 # -----------------------------------------------------------------------------
 
@@ -1949,6 +1609,8 @@ class BathyConfig:
     river_dem_source: str = "tnm:datasets=3"
     river_dem_res_m: float = 10.0
     extra_xyz_crs: str = "EPSG:4326"
+    sdb_authoritative_extra_xyz: Optional[Path] = None
+    river_authoritative_soundings: Optional[Path] = None
 
     # WAFFLES domain-detection gate.
     # Minimum water fraction required for SDB (ocean mask) or river (NHD mask) to be enabled.
@@ -2212,6 +1874,20 @@ class BathyConfig:
     gapfill_enabled: bool = False
     gapfill_hq: Optional[List[str]] = None  # list of HQ point files (x,y,depth)
     gapfill_water_mask: Optional[Path] = None  # optional explicit water mask (1=water)
+    authoritative_base: Optional[Path] = None  # hard-locked measured-constrained raster; only its nodata gaps are eligible for fill
+    authoritative_base_auto: bool = True  # auto-materialize authoritative base from NOAA CUDEM tile index + spatial metadata by default
+    authoritative_base_tile_index_url: str = "https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_2014_8483/tileindex_NCEI_ninth_Topobathy_2014.zip"
+    authoritative_base_spatial_meta_url: str = "https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_2014_8483/ninth_spatial_meta.zip"
+    authoritative_base_missing_meta_policy: str = "skip"
+    authoritative_base_force_rebuild: bool = False
+    authoritative_base_tile_url_field: Optional[str] = None
+    authoritative_support_decay_m: float = 300.0  # e-folding distance controlling how quickly inferred guidance can dominate away from hard control
+    authoritative_support_density_radius_m: float = 250.0  # neighborhood radius used to estimate local authoritative support density
+    coastal_sdb_support_transition_m: float = 600.0  # distance scale controlling when stable optical SDB support can dominate in estuary/nearshore gaps
+    river_anchor_density_radius_m: float = 200.0  # neighborhood radius used to estimate local river anchor density
+    river_scaffold_transition_m: float = 800.0  # distance scale controlling when river guidance becomes scaffold-dominant away from anchors
+    river_network_halo_km: float = 2.0  # halo used to build a more stable river scaffold domain than the clipped export AOI
+    river_trusted_halo_m: float = 60.0  # interior buffer used to suppress edge-sensitive river guidance near solve-domain boundaries
     gapfill_method: str = "rbf"  # rbf | gp | idw
     gapfill_river_smooth_sigma_m: float = 500.0  # along-channel smoothing sigma
     gapfill_prior_sigma_raster: Optional[Path] = None  # optional prior uncertainty raster
@@ -2226,155 +1902,52 @@ class BathyConfig:
 # Helpers
 # -----------------------------------------------------------------------------
 
+def _authoritative_passthrough_args(cfg: "BathyConfig", *, for_river: bool = False) -> List[str]:
+    """Thin wrapper around authoritative_cli helper for child-process passthrough."""
+    return _build_authoritative_passthrough_args(cfg, for_river=for_river, logger=log)
+
+
+def _record_authoritative_child_passthrough(report: Dict[str, Any], stage: str, cmd: List[str]) -> None:
+    """Thin wrapper around authoritative_cli helper for child-process receipts."""
+    _record_authoritative_child_passthrough_impl(report, stage, cmd)
+
+
+def _write_final_reporting_bundle(cfg: "BathyConfig", report: Dict[str, Any], *, final_native: Optional[Path], final_for_user: Optional[Path | str], final_provenance: Optional[Path | str]) -> Path:
+    """Thin wrapper around reporting_coordinator bundle writer."""
+    return _write_final_reporting_bundle_impl(
+        cfg,
+        report,
+        final_native=final_native,
+        final_for_user=final_for_user,
+        final_provenance=final_provenance,
+        write_authoritative_cache_receipt=_write_authoritative_cache_receipt,
+        write_guidance_manifest=_write_guidance_manifest,
+        write_explicit_final_outputs_manifest=_write_explicit_final_outputs_manifest,
+        write_support_provenance_summary=_write_support_provenance_summary,
+        write_final_support_regime_audit=_write_final_support_regime_audit,
+        write_final_dem_selection_receipt=_write_final_dem_selection_receipt,
+        write_comparison_package=_write_comparison_package,
+        logger=log,
+    )
+
+
+def _materialize_authoritative_base_if_requested(cfg: "BathyConfig", args: argparse.Namespace) -> Optional[Path]:
+    """Thin wrapper around authoritative_materialization coordinator."""
+    return _resolve_authoritative_base(cfg, args, logger=log)
+
+
 def _choose_waffles_mask_for_river(cfg: "BathyConfig", report: Dict[str, Any]) -> Optional[Path]:
-    """Choose the *least destructive* WAFFLES mask for clipping river outputs.
-
-    Invariant: never wipe valid river pixels just because an *ocean-only* WAFFLES
-    mask happens to be the newest under cache_root/masks.
-
-    Preference order (explicit only, no guessing):
-      1) Run-scoped domain inference mask (with NHD), if available.
-      2) River report's recorded waffles water mask (from river_domain_mask step).
-
-    Returns None if nothing is available.
-    """
-    # 1) Run-scoped (preferred)
-    for attr in ("waffles_with_nhd_mask", "water_domain_mask_for_final"):
-        try:
-            p = getattr(cfg, attr, None)
-            if p:
-                pp = Path(p)
-                if pp.exists() and pp.stat().st_size > 0:
-                    return pp
-        except Exception:
-            log.debug("ignored", exc_info=True)
-
-    # 2) Report hint
-    try:
-        wm = report.get("river", {}).get("outputs", {}).get("waffles_water_mask", None)
-        if wm:
-            pp = Path(wm)
-            if pp.exists() and pp.stat().st_size > 0:
-                return pp
-    except Exception:
-        log.debug("ignored", exc_info=True)
-
-    return None
+    return _rm_choose_waffles_mask_for_river(cfg, report, logger=log)
 
 def _count_mask_water_pixels(mask_tif: Path, aoi_bounds_wgs84: Tuple[float, float, float, float], *, water_max: float = 0.5) -> Optional[int]:
-    """Count water pixels (mask <= water_max) inside AOI bounds.
-
-    Uses the same nodata=0 collision guard as _waffles_water_fraction: when the
-    raster's nodata value is 0 (or absent), masked=True would erase all water
-    pixels, so we read raw values and exclude the distinct nodata sentinel manually
-    only when it is non-zero.
-
-    Returns None if mask cannot be read.
-    """
-    try:
-        import numpy as np
-        import rasterio
-        from rasterio.windows import from_bounds
-        from pyproj import Transformer
-
-        xmin, xmax, ymin, ymax = aoi_bounds_wgs84
-        with rasterio.open(mask_tif) as ds:
-            if ds.crs and ds.crs.to_epsg() not in (None, 4326):
-                tx = Transformer.from_crs('EPSG:4326', ds.crs, always_xy=True)
-                xmin2, ymin2 = tx.transform(xmin, ymin)
-                xmax2, ymax2 = tx.transform(xmax, ymax)
-                xmin, xmax = min(xmin2, xmax2), max(xmin2, xmax2)
-                ymin, ymax = min(ymin2, ymax2), max(ymin2, ymax2)
-
-            bxmin, bymin, bxmax, bymax = ds.bounds
-            ixmin, ixmax = max(xmin, bxmin), min(xmax, bxmax)
-            iymin, iymax = max(ymin, bymin), min(ymax, bymax)
-            if ixmin >= ixmax or iymin >= iymax:
-                return 0
-
-            win = from_bounds(ixmin, iymin, ixmax, iymax, transform=ds.transform)
-
-            nd = ds.nodata
-            nodata_is_zero = (nd is not None) and (abs(float(nd)) < 0.5)
-            nodata_is_absent = (nd is None)
-
-            if nodata_is_zero or nodata_is_absent:
-                # nodata==0 collision: read raw, count 0-valued pixels as water.
-                arr = ds.read(1, window=win, masked=False)
-                if arr.size == 0:
-                    return 0
-                return int(np.count_nonzero(arr <= water_max))
-            else:
-                # nodata is a distinct sentinel — safe to use masked read.
-                arr = ds.read(1, window=win, masked=True)
-                if arr.size == 0:
-                    return 0
-                water = (arr <= water_max)
-                if hasattr(water, 'filled'):
-                    water = water.filled(False)
-                return int(np.count_nonzero(water))
-    except Exception:
-        return None
-
-
-
+    return _rm_count_mask_water_pixels(mask_tif, aoi_bounds_wgs84, water_max=water_max)
 
 
 def _stage_cached_waffles_mask(src: Path, dst: Path, log: Optional[logging.Logger]=None) -> Path:
-    """Stage a cached WAFFLES mask into a run-scoped directory without regenerating it.
-
-    This creates a symlink when possible (fast, deterministic). Falls back to copying.
-    The returned path is the staged destination (which may already exist).
-    """
-    ensure_dir(dst.parent)
-    try:
-        if dst.exists():
-            return dst
-        # Prefer symlink to avoid copies and ensure exact reuse.
-        try:
-            os.symlink(src, dst)
-            return dst
-        except Exception:
-            shutil.copy2(src, dst)
-            return dst
-    except Exception as e:
-        if log:
-            log.warning("[WAFFLES] Failed to stage cached mask %s -> %s: %s", src, dst, e, exc_info=True)
-        # Best effort: return source so callers can still proceed.
-        return src
+    return _rm_stage_cached_waffles_mask(src, dst, logger=log)
 
 def _find_latest_waffles_mask(cache_root: Path) -> Optional[Path]:
-    """Return the most recently modified waffles coastline mask .tif under cache_root/masks/,
-    or None if no mask files are found.
-
-    Preference order (by filename):
-      1) waffles_coastline_with_nhd*.tif   (NHD-augmented — most complete)
-      2) waffles_coastline_ocean_only*.tif (ocean-only fallback)
-      3) Any other waffles_coastline*.tif
-
-    Within each tier, the most recently modified file wins.
-    """
-    masks_dir = cache_root / "masks"
-    if not masks_dir.is_dir():
-        return None
-
-    def _newest(candidates):
-        existing = [p for p in candidates if p.is_file()]
-        if not existing:
-            return None
-        return max(existing, key=lambda p: p.stat().st_mtime)
-
-    all_masks = list(masks_dir.glob("waffles_coastline*.tif"))
-    if not all_masks:
-        return None
-
-    nhd = _newest([p for p in all_masks if "with_nhd" in p.name])
-    if nhd is not None:
-        return nhd
-    ocean = _newest([p for p in all_masks if "ocean_only" in p.name])
-    if ocean is not None:
-        return ocean
-    return _newest(all_masks)
+    return _rm_find_latest_waffles_mask(cache_root)
 
 def _ensure_waffles_coastline_mask(
     cache_masks: Path,
@@ -2469,196 +2042,10 @@ def _ensure_waffles_coastline_mask(
         f"WAFFLES did not produce expected mask: {out_tif_path}. Existing in {cache_masks}: {existing[:50]}"
     )
 def _waffles_water_fraction(mask_tif: Path, max_stride: int = 8) -> float:
-    """
-    Compute fraction of water pixels in a WAFFLES coastline mask.
-
-    WAFFLES convention: water=0, land=1.
-
-    Two gotchas:
-
-    1) nodata=0 collision:
-       WAFFLES GTiffs frequently carry nodata=0 (the same value as water).  Using
-       rasterio's masked=True or read_masks() treats ALL water pixels as nodata-
-       invalid, returning a fraction of 0.0 even when the mask is correct.
-       Fix: always read raw values with masked=False, apply our own nodata guard only
-       for sentinels that cannot collide with the 0 (water) / 1 (land) encoding.
-
-    2) Early-exit in windowed sampling:
-       The previous windowed approach with a max_samples cap broke out of the loop
-       after filling the budget from the top-left corner of the raster.  For coastal
-       AOIs where ocean is in the south or east portion of the extent, the ocean strip
-       was never sampled and the function returned 0.0 despite real water existing.
-       Fix: read the whole band once (masked=False) then stride-subsample with numpy
-       striding — uniform coverage of the entire raster guaranteed, no early exit.
-
-    Returns 0.0 if raster missing or unreadable.
-    """
-    try:
-        import rasterio
-        import numpy as np
-
-        if mask_tif is None or (not Path(mask_tif).exists()):
-            return 0.0
-
-        with rasterio.open(str(mask_tif)) as ds:
-            nd = ds.nodata
-            # Read raw values — masked=False so nodata=0 never hides water pixels.
-            data = ds.read(1, masked=False)
-
-        h, w = data.shape
-        # Stride-subsample to bound memory: stride=8 → 64× reduction, still covers
-        # every part of the raster so no coastal strip can be missed.
-        stride = max(1, min(max_stride, h // 128, w // 128))
-        data = data[::stride, ::stride]
-
-        # Only exclude nodata when it is a distinct sentinel that cannot collide
-        # with water (0) or land (1).
-        if nd is not None and np.isfinite(float(nd)) and abs(float(nd)) > 0.5:
-            valid = (data != nd)
-        else:
-            # nodata==0 or absent: every in-extent pixel is either water or land.
-            valid = np.ones(data.shape, dtype=bool)
-
-        total = int(np.count_nonzero(valid))
-        if total == 0:
-            return 0.0
-        water = int(np.count_nonzero((data == 0) & valid))
-        return float(water) / float(total)
-    except Exception:
-        log.debug("WAFFLES water fraction check failed.", exc_info=True)
-        return 0.0
-
+    return _rm_waffles_water_fraction(mask_tif, max_stride=max_stride, logger=log)
 
 def _determine_effective_methods_from_waffles(cfg: "BathyConfig", report: Dict[str, Any]) -> Tuple[List[str], Dict[str, Any]]:
-    """
-    Determine which methods to actually run based on WAFFLES masks.
-
-    Policy:
-      - Default requested methods are sdb,river,fuse (but user may request subsets).
-      - Always build two WAFFLES masks (when any water-driven method requested):
-          * ocean-only: want_nhd=false, want_lakes=false
-          * with-nhd:  want_nhd=true,  want_lakes=false
-      - Compute water fractions from these masks.
-      - If ocean-only has ~no water -> skip SDB.
-      - If with-nhd has ~no water -> skip river.
-      - Fuse runs if requested; it becomes pass-through if only one source exists.
-
-    River is treated as the authoritative vertical reference in coastal overlap handling
-    (fusion handles offset calibration + taper when configured).
-    """
-    requested = [m.strip().lower() for m in (cfg.methods or []) if m.strip()]
-    if not requested:
-        requested = ["sdb", "river", "fuse"]
-
-    req_set = set(requested)
-    want_sdb = "sdb" in req_set
-    want_river = "river" in req_set
-    want_fuse = "fuse" in req_set or (want_sdb and want_river)
-
-    # Only do WAFFLES inference if any water-based methods requested.
-    if not (want_sdb or want_river or want_fuse):
-        return requested, {"requested": requested, "effective": requested, "waffles": {}}
-
-    cache_masks_shared = cfg.cache_root.resolve() / "masks"
-    ensure_dir(cache_masks_shared)
-
-    # Reuse WAFFLES coastline masks across runs for the same AOI + resolution + module params.
-    # These masks should not depend on time range, extra_xyz, or run_id.
-    _force_masks = cfg.force_waffles_masks
-    ocean_mask_cache = _ensure_waffles_coastline_mask(
-        cache_masks=cache_masks_shared,
-        aoi=cfg.aoi,
-        inc_arcsec=float(cfg.waffles_inc_arcsec or 1.0),
-        want_nhd=False,
-        want_lakes=False,
-        prefix="waffles_coastline_ocean_only",
-        force=_force_masks,
-    )
-    nhd_mask_cache = _ensure_waffles_coastline_mask(
-        cache_masks=cache_masks_shared,
-        aoi=cfg.aoi,
-        inc_arcsec=float(cfg.waffles_inc_arcsec or 1.0),
-        want_nhd=True,
-        want_lakes=False,
-        prefix="waffles_coastline_with_nhd",
-        force=_force_masks,
-    )
-
-    # Stage into run-scoped derived_cache for easy inspection (symlink/copy), but do not regenerate.
-    cache_masks_run = Path(cfg.derived_cache_root) / "masks"
-    ocean_mask = _stage_cached_waffles_mask(ocean_mask_cache, cache_masks_run / "waffles_coastline_ocean_only.tif", log=logging.getLogger("bathy_main"))
-    nhd_mask = _stage_cached_waffles_mask(nhd_mask_cache, cache_masks_run / "waffles_coastline_with_nhd.tif", log=logging.getLogger("bathy_main"))
-    ocean_frac = _waffles_water_fraction(ocean_mask) if ocean_mask else 0.0
-    nhd_frac = _waffles_water_fraction(nhd_mask) if nhd_mask else 0.0
-
-    _logger = logging.getLogger("bathy_main")
-    if ocean_mask and ocean_frac == 0.0 and want_sdb:
-        _logger.warning(
-            "[DOMAIN] WAFFLES ocean mask has 0%% water (all-land). If the AOI contains ocean/coast, "
-            "the cached mask may be stale or waffles may have failed silently. "
-            "Try --force-waffles-masks to regenerate, or --waffles-min-water-fraction=0 to bypass "
-            "the gate and run SDB regardless. Mask: %s", ocean_mask
-        )
-    if nhd_mask and nhd_frac == 0.0 and want_river:
-        _logger.warning(
-            "[DOMAIN] WAFFLES NHD mask has 0%% water (all-land). If the AOI contains rivers/lakes, "
-            "the cached mask may be stale or waffles may have failed for this AOI. "
-            "Try --force-waffles-masks to regenerate, or --waffles-min-water-fraction=0 to bypass "
-            "the gate and run regardless. Mask: %s", nhd_mask
-        )
-
-    # Threshold gate: skip methods where the domain mask shows no meaningful water.
-    # Use cfg.waffles_min_water_fraction (default 0.001). Set to 0.0 to disable gating.
-    min_frac = float(cfg.waffles_min_water_fraction)
-
-    run_sdb = bool(want_sdb and (ocean_frac >= min_frac))
-    run_river = bool(want_river and (nhd_frac >= min_frac))
-
-    effective: List[str] = []
-    skipped: Dict[str, str] = {}
-
-    if want_sdb:
-        if run_sdb:
-            effective.append("sdb")
-        else:
-            skipped["sdb"] = "no_ocean_water_detected_by_waffles"
-    if want_river:
-        if run_river:
-            effective.append("river")
-        else:
-            skipped["river"] = "no_nhd_water_detected_by_waffles"
-    if want_fuse:
-        # Fuse is only meaningful if we have at least one upstream method effective.
-        if effective:
-            effective.append("fuse")
-        else:
-            skipped["fuse"] = "no_upstream_sources"
-
-    # Stash masks for downstream usage (fusion + final clipping)
-    try:
-        cfg.waffles_ocean_mask = Path(ocean_mask) if ocean_mask else None
-        cfg.waffles_with_nhd_mask = Path(nhd_mask) if nhd_mask else None
-        cfg.ocean_domain_mask_for_fusion = Path(ocean_mask) if ocean_mask else None
-        cfg.water_domain_mask_for_final = Path(nhd_mask) if nhd_mask else None
-    except Exception:
-        log.warning("Failed to stash mask paths on cfg; downstream masking may be incomplete", exc_info=True)
-
-    meta = {
-        "requested": requested,
-        "effective": effective,
-        "skipped": skipped,
-        "waffles": {
-            "ocean_only_mask": str(ocean_mask) if ocean_mask else None,
-            "with_nhd_mask": str(nhd_mask) if nhd_mask else None,
-            "ocean_only_mask_cache": str(ocean_mask_cache) if ocean_mask_cache is not None else None,
-            "with_nhd_mask_cache": str(nhd_mask_cache) if nhd_mask_cache is not None else None,
-            "ocean_water_fraction": ocean_frac,
-            "with_nhd_water_fraction": nhd_frac,
-            "min_water_fraction": min_frac,
-        },
-    }
-    report.setdefault("domain_inference", {}).update(meta)
-    return effective, meta
+    return _rm_determine_effective_methods_from_waffles(cfg, report, logger=logging.getLogger("bathy_main"))
 
 def detect_working_srs(cfg: 'BathyConfig') -> str:
     """Determine the working CRS.
@@ -2684,10 +2071,10 @@ def detect_working_srs(cfg: 'BathyConfig') -> str:
                     with rasterio.open(p) as ds:
                         if ds.crs:
                             return ds.crs.to_string()
-                except Exception:
+                except (OSError, RuntimeError, ValueError, TypeError):
                     continue
-    except Exception:
-        log.debug("ignored", exc_info=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        log.debug("Final domain policy step ignored: %s", exc, exc_info=True)
 
     # Fallback: AOI center UTM zone (WGS84)
     lon, lat = _aoi_center_lonlat(cfg.aoi)
@@ -2707,6 +2094,77 @@ def _compound_srs(horizontal_srs: str, v_epsg: int) -> str:
 
 
 
+
+
+
+def _prepare_authoritative_guidance_inputs(cfg: "BathyConfig", report: Dict[str, Any]) -> None:
+    _prepare_sdb_guidance_from_authoritative(
+        cfg=cfg,
+        report=report,
+        ensure_dir_fn=ensure_dir,
+        hash_key_fn=_hash_key,
+        prepare_points_fn=_prepare_authoritative_sdb_training_points,
+        logger=log,
+    )
+
+
+def _prepare_authoritative_river_soundings(cfg: "BathyConfig", report: Dict[str, Any]) -> None:
+    _prepare_river_support_from_authoritative(
+        cfg=cfg,
+        report=report,
+        ensure_dir_fn=ensure_dir,
+        hash_key_fn=_hash_key,
+        prepare_points_fn=_prepare_authoritative_river_soundings_points,
+        logger=log,
+    )
+
+def _build_tnm_river_dem(cfg: 'BathyConfig', cache_root: Path, report: Dict[str, Any]) -> Optional[Path]:
+    """Build the TNM-based river DEM in working CRS for the current AOI."""
+    fetches_exe = shutil.which("fetches")
+    if fetches_exe is None:
+        raise RuntimeError('fetches_not_found')
+    cache_root = ensure_dir(cache_root)
+    source_dir = ensure_dir(cache_root / "source")
+    cmd = [fetches_exe, f'-R={cfg.aoi}', 'tnm:datasets=3']
+    rc, out, err = run_command(cmd, cwd=source_dir, stream_stdout=False, stream_stderr=False)
+    if rc != 0:
+        raise RuntimeError(f'TNM fetch failed (rc={rc}): {(err or out or "").strip()[:500]}')
+    tif_candidates = sorted(source_dir.rglob('*.tif'))
+    tif_candidates = [p for p in tif_candidates if p.is_file() and p.stat().st_size > 0]
+    if not tif_candidates:
+        report.setdefault('river', {}).setdefault('dem_auto', {}).update({
+            'tnm_source_dir': str(source_dir),
+            'tnm_selected_tiles': [],
+            'tnm_status': 'no_tiles_returned',
+        })
+        return None
+    latest_by_stem = {}
+    for p in tif_candidates:
+        latest_by_stem[p.name] = p
+    selected = list(latest_by_stem.values())
+    vrt = cache_root / f"tnm_river_dem_{_hash_key(cfg.aoi, cfg.working_srs, cfg.river_dem_res_m)}.vrt"
+    out_dem = cache_root / f"tnm_river_dem_{_hash_key(cfg.aoi, cfg.working_srs, cfg.river_dem_res_m)}.tif"
+    vrt_cmd = ['gdalbuildvrt', str(vrt)] + [str(p) for p in selected]
+    rc, out, err = run_command(vrt_cmd, stream_stdout=False, stream_stderr=False)
+    if rc != 0 or not vrt.exists():
+        raise RuntimeError(f'gdalbuildvrt failed for TNM river DEM (rc={rc}): {(err or out or "").strip()[:500]}')
+    warp_cmd = [
+        'gdalwarp', '-overwrite', '-t_srs', str(cfg.working_srs), '-r', 'bilinear',
+        '-tr', str(float(cfg.river_dem_res_m)), str(float(cfg.river_dem_res_m)),
+        '-te_srs', 'EPSG:4326', '-te', *[str(v) for v in str(cfg.aoi).split('/')],
+        '-of', 'GTiff', '-co', 'COMPRESS=DEFLATE', '-co', 'TILED=YES',
+        str(vrt), str(out_dem),
+    ]
+    rc, out, err = run_command(warp_cmd, stream_stdout=False, stream_stderr=False)
+    if rc != 0 or not out_dem.exists():
+        raise RuntimeError(f'gdalwarp failed for TNM river DEM (rc={rc}): {(err or out or "").strip()[:500]}')
+    report.setdefault('river', {}).setdefault('dem_auto', {}).update({
+        'tnm_source_dir': str(source_dir),
+        'tnm_selected_tiles': [str(p) for p in selected],
+        'tnm_vrt': str(vrt),
+    })
+    return out_dem
+
 def ensure_river_dem_auto(cfg: 'BathyConfig', report: Dict[str, Any]) -> Optional[Path]:
     """Auto-download/build a river DEM using CUDEM `fetches` (TNM 1/3 arc-sec) when cfg.river_dem is not provided.
 
@@ -2719,6 +2177,57 @@ def ensure_river_dem_auto(cfg: 'BathyConfig', report: Dict[str, Any]) -> Optiona
     """
     if cfg.river_dem and Path(cfg.river_dem).exists():
         return Path(cfg.river_dem)
+
+    auth_src = getattr(cfg, 'authoritative_base', None)
+    if auth_src and Path(auth_src).exists():
+        try:
+            working_srs = detect_working_srs(cfg)
+            cfg.working_srs = working_srs
+            dem_cache = ensure_dir(Path(cfg.cache_root) / "river_dem")
+            tnm_cache_root = dem_cache / "tnm"
+            out_dem = dem_cache / f"river_dem_authoritative_{_hash_key(cfg.aoi, working_srs, cfg.river_dem_res_m, str(auth_src), 'tnm_gapfill_v1')}.tif"
+            if out_dem.exists() and out_dem.stat().st_size > 0:
+                log.info("[RIVER][DEM] Using cached authoritative river DEM: %s", out_dem)
+                report.setdefault('river', {}).setdefault('dem_auto', {})['source'] = 'authoritative_base'
+                return out_dem
+            fallback_tnm = None
+            if bool(getattr(cfg, 'river_dem_auto', False)):
+                try:
+                    fallback_tnm = _build_tnm_river_dem(cfg, tnm_cache_root, report)
+                    if fallback_tnm is None:
+                        log.info('[RIVER][DEM] TNM fallback returned no overlapping tif tiles for this AOI; using authoritative base only.')
+                except (OSError, RuntimeError, ValueError) as exc:
+                    _msg = str(exc)
+                    if 'no tif files' in _msg or 'no_tiles_returned' in _msg:
+                        log.info('[RIVER][DEM] TNM fallback returned no overlapping tif tiles for this AOI; using authoritative base only.')
+                    else:
+                        log.warning('[RIVER][DEM] TNM fallback build failed while preparing authoritative river DEM gaps: %s', exc)
+                    report.setdefault('river', {}).setdefault('dem_auto', {})['tnm_gapfill_error'] = _msg
+            info = _build_projected_authoritative_raster(
+                Path(auth_src),
+                out_dem,
+                aoi=str(cfg.aoi),
+                dst_crs=working_srs,
+                res_m=float(cfg.river_dem_res_m),
+                fallback_raster=fallback_tnm,
+                logger=log,
+            )
+            report.setdefault('river', {}).setdefault('dem_auto', {})
+            report['river']['dem_auto'].update({
+                'status': 'success',
+                'source': 'authoritative_base',
+                'authoritative_base': str(auth_src),
+                'projected_river_dem': str(out_dem),
+                'finite_cells': int(info.get('finite_cells', 0)),
+                'nodata_cells': int(info.get('nodata_cells', 0)),
+                'tnm_gapfill_used': bool(fallback_tnm),
+                'tnm_gapfill_raster': str(fallback_tnm) if fallback_tnm else None,
+            })
+            log.info('[RIVER][DEM] Using authoritative base as primary river DEM/template%s: %s', ' with TNM gap fill for uncovered cells' if fallback_tnm else '', out_dem)
+            return out_dem
+        except (OSError, RuntimeError, ValueError) as exc:
+            log.warning('[RIVER][DEM] Failed projecting authoritative_base as river DEM; falling back to TNM: %s', exc, exc_info=True)
+            report.setdefault('river', {}).setdefault('dem_auto', {})['authoritative_fallback_error'] = str(exc)
 
     if not cfg.river_dem_auto:
         report.setdefault("river", {})["status"] = "skipped"
@@ -2756,7 +2265,7 @@ def ensure_river_dem_auto(cfg: 'BathyConfig', report: Dict[str, Any]) -> Optiona
         report["river"]["dem_auto"]["fetches_stderr_tail"] = (proc.stderr or "")[-4000:]
         if proc.returncode != 0:
             log.warning("[RIVER][DEM] fetches failed (rc=%s). stderr tail: %s", proc.returncode, report["river"]["dem_auto"]["fetches_stderr_tail"])
-    except Exception as e:
+    except (OSError, RuntimeError, ValueError, TypeError) as e:
         log.warning("[RIVER][DEM] fetches exception: %s", e)
 
     # fetches for tnm typically creates a 'tnm' subdir in cwd; support both.
@@ -2805,7 +2314,7 @@ def ensure_river_dem_auto(cfg: 'BathyConfig', report: Dict[str, Any]) -> Optiona
         cmd_vrt = [gdalbuildvrt, "-overwrite", str(vrt)] + [str(p) for p in keep]
         log.info("[RIVER][DEM] Build VRT: %s", " ".join(cmd_vrt[:6]) + (" ..." if len(cmd_vrt) > 6 else ""))
         run_cmd(cmd_vrt, check=True)
-    except Exception as e:
+    except (OSError, RuntimeError, ValueError) as e:
         log.warning("[RIVER][DEM] gdalbuildvrt failed: %s", e)
         report["river"]["dem_auto"]["status"] = "failed_vrt"
         return None
@@ -2818,7 +2327,7 @@ def ensure_river_dem_auto(cfg: 'BathyConfig', report: Dict[str, Any]) -> Optiona
         xs, ys = t.transform([w, e, w, e], [s, s, n, n])
         minx, maxx = min(xs), max(xs)
         miny, maxy = min(ys), max(ys)
-    except Exception:
+    except (ImportError, RuntimeError, ValueError, TypeError):
         minx = miny = maxx = maxy = None
 
     cmd_warp = [gdalwarp, "-overwrite", "-t_srs", working_srs, "-r", "bilinear",
@@ -2946,8 +2455,8 @@ def _reproject_xyz_file(
             "x_min": float(np.nanmin(xs)), "x_max": float(np.nanmax(xs)),
             "y_min": float(np.nanmin(ys)), "y_max": float(np.nanmax(ys)),
         }
-    except Exception:
-        log.debug("ignored", exc_info=True)
+    except (ValueError, TypeError, RuntimeError) as exc:
+        log.debug("Ignored source XY min/max receipt update: %s", exc, exc_info=True)
 
     def _in_aoi_ratio(xv: np.ndarray, yv: np.ndarray) -> Optional[float]:
         if not aoi_bounds:
@@ -2964,7 +2473,8 @@ def _reproject_xyz_file(
     # Heuristic: degrees-like ranges.
     try:
         src_is_geo = bool(CRS.from_user_input(src_h).is_geographic)
-    except Exception:
+    except (ValueError, TypeError) as exc:
+        log.debug("Unable to determine whether source CRS is geographic: %s", exc)
         src_is_geo = False
 
     swapped = False
@@ -2995,7 +2505,7 @@ def _reproject_xyz_file(
             "x_min": float(np.nanmin(xs_out)), "x_max": float(np.nanmax(xs_out)),
             "y_min": float(np.nanmin(ys_out)), "y_max": float(np.nanmax(ys_out)),
         }
-    except Exception:
+    except (TypeError, ValueError, RuntimeError):
         log.debug("ignored", exc_info=True)
     
     # Write output
@@ -3014,7 +2524,7 @@ def _reproject_xyz_file(
     try:
         receipt_path = out_path.with_suffix(".reproject_receipt.json")
         receipt_path.write_text(_json.dumps(receipt, indent=2, sort_keys=True), encoding="utf-8")
-    except Exception:
+    except (OSError, TypeError, ValueError):
         log.debug("ignored", exc_info=True)
     return out_path
 
@@ -3074,7 +2584,7 @@ def fetch_cudem_soundings_via_dlim(
         try:
             w, e, s, n = [float(x) for x in str(aoi).split("/")]
             lat0 = 0.5 * (s + n)
-        except Exception:
+        except (TypeError, ValueError):
             lat0 = 0.0
         import math
         coslat = max(0.2, abs(math.cos(math.radians(lat0))))
@@ -3188,7 +2698,7 @@ def fetch_cudem_soundings_via_dlim(
                 "command": cmd_str,
             })
 
-        except Exception as e:
+        except (OSError, RuntimeError, TypeError, ValueError) as e:
             try:
                 if out_xyz.exists() and out_xyz.stat().st_size == 0:
                     out_xyz.unlink()
@@ -3226,7 +2736,7 @@ def _append_river_soundings_args(cmd, cfg, *, include_calib_args=True, include_m
         snd = cfg.river_soundings
         if not snd:
             return
-        snd_list = [s.strip() for s in str(snd).split(',') if s.strip()]
+        snd_list = _normalize_multi_path_value(snd)
         if not snd_list:
             return
 
@@ -3491,84 +3001,19 @@ def run_sdb(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
             return None
     script_dir = Path(__file__).parent
 
-    cmd = [
-        sys.executable, "sdb_main.py",
-        f"--aoi={cfg.aoi}",
-        f"--start={cfg.start_date}",
-        f"--end={cfg.end_date}",
-        f"--out-dir={sdb_dir}",
-        f"--cloud={cfg.cloud}",
-        f"--icesat={cfg.icesat}",
-        f"--sdb-mode={cfg.sdb_mode}",
-        f"--cache-root={cfg.cache_root}",
-        f"--align-mode={cfg.align_mode}",
-        f"--working-srs={cfg.working_srs}",
-        f"--working-vcrs-epsg={cfg.working_vcrs_epsg}",
-        # --atl-transform-datum not passed: ATL depths are relative, not geodetic heights.
-    ]
+    cmd = _build_sdb_command(
+        cfg,
+        out_dir=str(sdb_dir),
+        authoritative_passthrough_args=_authoritative_passthrough_args(cfg, for_river=False),
+    )
+    _record_authoritative_child_passthrough(report, "sdb", cmd)
 
-    # Bounded model bank (reservoir) + periodic retrain (DEFAULT)
-    try:
-        if cfg.sdb_model_bank_enabled:
-            cmd.append(f"--model-bank={cfg.sdb_model_bank}")
-            cmd.append(f"--bank-max-samples={cfg.sdb_bank_max_samples}")
-            cmd.append(f"--bank-seed={cfg.sdb_bank_seed}")
-            cmd.append(f"--bank-retrain-min-new={cfg.sdb_bank_retrain_min_new}")
-        else:
-            cmd.append("--no-model-bank")
-    except Exception:
-        log.debug('model bank policy args build failed', exc_info=True)
-
-    # Deprecated regional model cache passthrough (kept for compatibility; disabled by default)
-    try:
-        if cfg.sdb_model_cache_enabled:
-            cmd.append(f"--model-cache-key={cfg.sdb_model_cache_key}")
-        else:
-            cmd.append("--no-model-cache")
-    except Exception:
-        log.debug('model cache policy args build failed', exc_info=True)
-
-    # Forward S2 sun-glint correction flags into SDB, if supported.
-    if cfg.glint_correct:
-        sdb_main_path = (Path(__file__).parent / "sdb_main.py")
-        supports_glint = False
-        try:
-            if sdb_main_path.exists():
-                txt = sdb_main_path.read_text(encoding="utf-8", errors="ignore")
-                supports_glint = ("--glint-correct" in txt) or ("glint_correct" in txt)
-        except Exception:
-            supports_glint = False
-
-        if not supports_glint:
-            log.warning("[SDB][GLINT] --glint-correct requested, but sdb_main.py does not appear to support glint flags; skipping glint passthrough.")
-        else:
-            cmd.append("--glint-correct")
-            cmd.append(f"--glint-nir-band={cfg.glint_nir_band}")
-            cmd.append(f"--glint-vis-bands={cfg.glint_vis_bands}")
-            cmd.append(f"--glint-nir-min-percentile={cfg.glint_nir_min_percentile}")
-            cmd.append(f"--glint-deepwater-b02-max={cfg.glint_deepwater_b02_max}")
-            cmd.append(f"--glint-min-samples={cfg.glint_min_samples}")
-            cmd.append(f"--glint-max-samples={cfg.glint_max_samples}")
-            cmd.append(f"--glint-clip-min={cfg.glint_clip_min}")
-
-    # Forward extra XYZ bathymetry into SDB training/fusion if provided.
-    # cfg.river_soundings is a comma-separated list of files produced by --extra-xyz normalization.
-    if cfg.river_soundings:
-        xyz_list = [p.strip() for p in str(cfg.river_soundings).split(",") if p.strip()]
-        if xyz_list:
-            cmd += ["--extra-xyz"] + xyz_list
-            cmd.append(f"--extra-xyz-crs={cfg.extra_xyz_crs}")
-    
-    # Forward adaptive sampling parameters
-    enable_sampling = cfg.enable_adaptive_sampling
-    if not enable_sampling:
-        # User explicitly disabled it
-        cmd.append("--disable-adaptive-sampling")
-    
-    # Always pass the tuning parameters (even if disabled, sdb_main will ignore them)
-    cmd.append(f"--sampling-target-points={cfg.sampling_target_points}")
-    cmd.append(f"--sampling-min-threshold={cfg.sampling_min_threshold}")
-    cmd.append(f"--sampling-max-gap-m={cfg.sampling_max_gap_m}")
+    cmd = _augment_sdb_command(
+        cfg,
+        cmd,
+        sdb_main_path=str(Path(__file__).parent / "sdb_main.py"),
+        logger=log,
+    )
 
     log.info("[SDB] Command: %s", cmd)
     logs_dir = ensure_dir(cfg.out_dir / "logs")
@@ -3592,17 +3037,7 @@ def run_sdb(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
         log.error("[SDB] Failed with code %d", rc)
         return None
 
-    depth = find_sdb_depth_raster(sdb_dir)
-    if depth is None:
-        log.warning("[SDB] Completed but could not find a depth raster in SDB output tree.")
-        return None
-
-    log.info("[SDB] Depth raster found: %s", depth)
-    try:
-        apply_depth_metadata(Path(depth))
-    except Exception:
-        log.debug("ignored", exc_info=True)
-    return Path(depth).resolve() if not isinstance(depth, Path) else depth.resolve()
+    return _finalize_sdb_run(Path(sdb_dir), report)
 
 
 # -----------------------------------------------------------------------------
@@ -3761,17 +3196,10 @@ def _run_river_skeleton(
 
     log.info("[RIVER] Channel mask built: %s", channel_mask_tif)
 
-    try:
-        report.setdefault("river", {}).setdefault("outputs", {})["river_channel_mask"] = str(channel_mask_tif)
-    except Exception:
-        log.debug("ignored", exc_info=True)
-
+    report.setdefault("river", {}).setdefault("outputs", {})["river_channel_mask"] = str(channel_mask_tif)
 
     # Stash river domain/channel mask for fusion: inside this mask, river should override SDB to avoid tile seams
-    try:
-        cfg.river_domain_mask_for_fusion = Path(channel_mask_tif)
-    except Exception:
-        log.debug("ignored", exc_info=True)
+    cfg.river_domain_mask_for_fusion = Path(channel_mask_tif)
 
     # Step 2b: Clip estuary pixels from the channel mask.
     # The river module must not produce values where channelized-flow assumptions
@@ -3808,9 +3236,9 @@ def _run_river_skeleton(
                             dst.write(ms_arr.astype("uint8"), 1)
                         log.info("[ESTUARY-CLIP] Also clipped mainstem mask: %d → %d pixels (%d removed)",
                                  n_ms_before, n_ms_after, n_ms_before - n_ms_after)
-            except Exception:
+            except (FileNotFoundError, OSError, ValueError, RuntimeError):
                 log.debug("[ESTUARY-CLIP] Mainstem mask clipping failed", exc_info=True)
-    except Exception:
+    except (FileNotFoundError, OSError, ValueError, RuntimeError):
         log.warning("[RIVER] Estuary clipping failed; continuing with full channel mask.", exc_info=True)
 
 
@@ -3818,87 +3246,17 @@ def _run_river_skeleton(
     log.info("[RIVER] Step 3: Inferring bathymetry (channel skeleton)...")
     bed_tif = cached_bed_tif
 
-    cmd = [
-        sys.executable, "river_skeleton_bathy.py",
-        f"--river-gpkg={network_gpkg}",
-        f"--template-raster={cfg.river_dem}",
-        f"--dem={cfg.river_dem}",
-        f"--channel-mask={channel_mask_tif}",
-        f"--out-bed={bed_tif}",
-        f"--shape-exp={cfg.river_shape_exp}",
-        f"--dmax-min-m={cfg.river_dmax_min_m}",
-        f"--dmax-max-m={cfg.river_dmax_max_m}",
-        f"--bed-profile-max-slope={float(cfg.river_bed_profile_max_slope or 0.0)}",
-        f"--bed-profile-max-curv={float(cfg.river_bed_profile_max_curv or 0.0)}",
-        f"--bed-profile-step-m={float(cfg.river_bed_profile_step_m or 25.0)}",
-        f"--bed-profile-strength={float(cfg.river_bed_profile_strength or 0.6)}",
-        f"--bed-profile-power={float(cfg.river_bed_profile_power or 2.0)}",
-        f"--prior-mode={cfg.river_prior_mode}",
-        f"--mv-a0={cfg.river_mv_a0}",
-        f"--mv-bw={cfg.river_mv_bw}",
-        f"--mv-ba={cfg.river_mv_ba}",
-        f"--mv-bs={cfg.river_mv_bs}",
-        f"--mv-eps-a={cfg.river_mv_eps_a}",
-        f"--mv-eps-s={cfg.river_mv_eps_s}",
-        f"--residual-blend-sigma-m={cfg.river_residual_blend_sigma_m}",
-        f"--authoritative-bed-max-dist-m={cfg.river_authoritative_bed_max_dist_m}",
-    ]
-
-    # WSE proxy controls (bank-derived WSE is usually more robust than in-channel DEM sampling)
-    cmd.append(f"--wse-mode={cfg.river_skeleton_wse_mode}")
-    wse_sig = float(cfg.river_skeleton_wse_smooth_sigma_m or 0.0)
-    if wse_sig > 0.0:
-        cmd.append(f"--wse-smooth-sigma-m={wse_sig}")
-    if cfg.river_skeleton_wse_mode.strip().lower() == "bank_profile":
-        cmd.append(f"--wse-profile-step-m={float(cfg.river_skeleton_wse_profile_step_m or 20.0)}")
-        cmd.append(f"--wse-profile-resample-m={float(cfg.river_skeleton_wse_profile_resample_m or 20.0)}")
-        cmd.append(f"--wse-profile-smooth-sigma-m={float(cfg.river_skeleton_wse_profile_smooth_sigma_m or 0.0)}")
-        cmd.append(f"--wse-profile-max-slope={float(cfg.river_skeleton_wse_profile_max_slope or 0.0)}")
-        cmd.append(f"--wse-profile-min-samples={int(cfg.river_skeleton_wse_profile_min_samples or 10)}")
-        cmd.append(f"--wse-profile-max-query-dist-m={float(cfg.river_skeleton_wse_profile_max_query_dist_m or 0.0)}")
-        # Optional: SWOT RiverSP anchoring (vector WSE observations)
-        if cfg.river_swot_riversp:
-            for fp in cfg.river_swot_riversp:
-                cmd.append(f"--swot-riversp={fp}")
-            if cfg.river_swot_wse_field:
-                cmd.append(f"--swot-wse-field={cfg.river_swot_wse_field}")
-            if cfg.river_swot_qual_field:
-                cmd.append(f"--swot-qual-field={cfg.river_swot_qual_field}")
-            cmd.append(f"--swot-max-dist-m={float(cfg.river_swot_max_dist_m or 0.0)}")
-            cmd.append(f"--swot-min-samples={int(cfg.river_swot_min_samples or 0)}")
-            cmd.append(f"--swot-correct-sigma-m={float(cfg.river_swot_correct_sigma_m or 0.0)}")
-            cmd.append(f"--swot-weight={float(cfg.river_swot_weight or 0.0)}")
-            cmd.append(f"--swot-max-correction-m={float(cfg.river_swot_max_correction_m or 0.0)}")
-            cmd.append(f"--swot-wse-offset-m={float(cfg.river_swot_wse_offset_m or 0.0)}")
-
-            cmd.append(f"--swot-offset-mode={str(cfg.river_swot_offset_mode or 'median_mad')}")
-            cmd.append(f"--swot-offset-min-samples={int(cfg.river_swot_offset_min_samples or 0)}")
-            cmd.append(f"--swot-offset-mad-z={float(cfg.river_swot_offset_mad_z or 3.5)}")
-            cmd.append(f"--swot-offset-max-abs-m={float(cfg.river_swot_offset_max_abs_m or 0.0)}")
-
-    # Junction / confluence handling
-    jmode = cfg.river_skeleton_junction_mode.strip().lower()
-    if jmode and jmode != "none":
-        cmd.append(f"--junction-mode={jmode}")
-        cmd.append(f"--junction-buffer-m={cfg.river_skeleton_junction_buffer_m}")
-        cmd.append(f"--junction-degree-min={cfg.river_skeleton_junction_degree_min}")
-        jsig = float(cfg.river_skeleton_junction_smooth_sigma_m or 0.0)
-        if jsig > 0.0:
-            cmd.append(f"--junction-smooth-sigma-m={jsig}")
-        cmd.append(f"--junction-max-width-m={cfg.river_skeleton_junction_max_width_m}")
-
-    # Curvature-driven asymmetry (outer-bank deeper in bends)
-    amode = cfg.river_skeleton_asymmetry_mode.strip().lower()
-    if amode and amode != "none":
-        cmd.append(f"--asymmetry-mode={amode}")
-        cmd.append(f"--asymmetry-strength={cfg.river_skeleton_asymmetry_strength}")
-        cmd.append(f"--asymmetry-curv-ref={cfg.river_skeleton_asymmetry_curv_ref}")
-        cmd.append(f"--asymmetry-max-shift={cfg.river_skeleton_asymmetry_max_shift}")
-        cmd.append(f"--asymmetry-min-width-m={cfg.river_skeleton_asymmetry_min_width_m}")
-        cmd.append(f"--asymmetry-min-curv={cfg.river_skeleton_asymmetry_min_curv}")
-        cmd.append(f"--asymmetry-densify-step-m={cfg.river_skeleton_asymmetry_densify_step_m}")
-    if cfg.river_save_skeleton_debug:
-        cmd.append(f"--debug-dir={work_dir / 'skeleton_debug'}")
+    cmd = _build_river_skeleton_command(
+        cfg,
+        network_gpkg=network_gpkg,
+        template_raster=cfg.river_dem,
+        dem=cfg.river_dem,
+        channel_mask=channel_mask_tif,
+        out_bed=bed_tif,
+        authoritative_passthrough_args=_authoritative_passthrough_args(cfg, for_river=True),
+        debug_dir=(work_dir / 'skeleton_debug') if cfg.river_save_skeleton_debug else None,
+    )
+    _record_authoritative_child_passthrough(report, "river", cmd)
     # Optional: use external soundings (extra XYZ) to refine the skeleton prior and enforce depth anchors
     _append_river_soundings_args(cmd, cfg, include_calib_args=False, include_mode_args=True)
 
@@ -3950,7 +3308,7 @@ def _run_river_skeleton(
                 nodata=cfg.river_nodata,
             )
             report.setdefault("river", {}).setdefault("masking", {})["nhdarea_bed_masked"] = bool(applied)
-        except Exception:
+        except (FileNotFoundError, OSError, RuntimeError, ValueError, TypeError):
             log.debug("ignored", exc_info=True)
 
     # Final safety: ensure river bed raster is nodata outside the river channel mask.
@@ -4147,7 +3505,7 @@ def _run_river_xs(
     else:
         try:
             cfg.river_domain_mask_for_fusion = Path(channel_mask_tif)
-        except Exception:
+        except (FileNotFoundError, OSError, RuntimeError, ValueError, TypeError):
             log.debug("ignored", exc_info=True)
 
     # Step 2b: Clip estuary pixels from channel mask (same as skeleton path)
@@ -4161,8 +3519,9 @@ def _run_river_xs(
             )
             if _est_mask_path is not None:
                 report.setdefault("river", {}).setdefault("outputs", {})["estuary_clip_mask"] = str(_est_mask_path)
-        except Exception:
-            log.warning("[RIVER] Estuary clipping failed; continuing with full channel mask.", exc_info=True)
+        except (OSError, ValueError, RuntimeError, ImportError) as e:
+            report.setdefault("river", {}).setdefault("masking", {})["estuary_clip_warning"] = str(e)
+            log.warning("[RIVER] Estuary clipping failed; continuing with full channel mask: %s", e)
 
 
     # Step 3: infer bathymetry (raster + optional GPKG)
@@ -4411,7 +3770,7 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
     }
     try:
         manifest.write_text(json.dumps(payload, indent=2))
-    except Exception:
+    except (OSError, TypeError, ValueError):
         log.debug("manifest write failed", exc_info=True)
     # Step 1: river network
     log.info("[RIVER] Step 1: Extracting river network...")
@@ -4427,7 +3786,7 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
         if len(_parts) >= 4:
             _vals = [float(_parts[0]), float(_parts[1]), float(_parts[2]), float(_parts[3])]
             aoi_key = '/'.join([f"{v:.6f}" for v in _vals])
-    except Exception:
+    except (TypeError, ValueError):
         log.debug("ignored", exc_info=True)
     prov_key = {
         "aoi": aoi_key,
@@ -4438,48 +3797,151 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
         "river_da_raster": _fingerprint_path(cfg.river_da_raster),
         "river_da_raster_band": int(cfg.river_da_raster_band or 1),
         "river_da_raster_units": str(cfg.river_da_raster_units or "km2"),
+        "river_network_halo_km": float(getattr(cfg, "river_network_halo_km", 0.0) or 0.0),
     }
     prov_hash = hashlib.sha1(json.dumps(prov_key, sort_keys=True).encode("utf-8")).hexdigest()[:12]
     river_network_lock = prov_dir / f"river_network_lock_{prov_hash}.json"
 
 
-    # SECURITY FIX: Use list-based command construction (no shell injection)
-    cmd = [
-        sys.executable, "river_network.py",
-        f"--aoi={cfg.aoi}",
-        f"--cache-dir={raw_hydro_cache}",
-        f"--out-gpkg={network_gpkg}",
-        f"--provenance-lock={river_network_lock}",
-        f"--hydrography-source={cfg.river_hydrography_source}",
-        f"--tnm-dataset={cfg.tnm_dataset}",
-        f"--snap-m={cfg.snap_m}",
-    ]
-    if cfg.tnm_enable:
-        cmd.append("--tnm-enable")
+    scaffold_domains = get_river_aoi_domains(
+        str(cfg.aoi),
+        float(getattr(cfg, "river_network_halo_km", 0.0) or 0.0),
+        float(getattr(cfg, "river_trusted_halo_m", 60.0) or 0.0),
+    )
+    report["river"].setdefault("scaffold_domains", scaffold_domains.as_dict())
 
+    scaffold_cache = cached_scaffold_paths(
+        cache_root=cfg.cache_root,
+        domains=scaffold_domains,
+        hydrography_source=str(cfg.river_hydrography_source),
+        tnm_dataset=str(cfg.tnm_dataset),
+        tnm_enable=bool(cfg.tnm_enable),
+        snap_m=float(cfg.snap_m),
+        da_raster_fingerprint=_fingerprint_path(cfg.river_da_raster),
+        da_raster_band=int(cfg.river_da_raster_band or 1),
+        da_raster_units=str(cfg.river_da_raster_units or "km2"),
+    )
+    scaffold_products = scaffold_product_paths(
+        cache_root=cfg.cache_root,
+        domains=scaffold_domains,
+        hydrography_source=str(cfg.river_hydrography_source),
+        tnm_dataset=str(cfg.tnm_dataset),
+        tnm_enable=bool(cfg.tnm_enable),
+        snap_m=float(cfg.snap_m),
+        da_raster_fingerprint=_fingerprint_path(cfg.river_da_raster),
+        da_raster_band=int(cfg.river_da_raster_band or 1),
+        da_raster_units=str(cfg.river_da_raster_units or "km2"),
+    )
+    scaffold_cache_dir = Path(scaffold_cache["cache_dir"])
+    scaffold_cache_dir.mkdir(parents=True, exist_ok=True)
+    cached_network_gpkg = Path(scaffold_cache["network_gpkg"])
+    scaffold_manifest_path = Path(scaffold_cache["manifest"])
+    report["river"]["scaffold_cache_dir"] = str(scaffold_cache_dir)
 
-    # Optional DA raster fallback (MERIT, etc.) for deterministic DA priors when NHDPlus DA is missing.
-    if cfg.river_da_raster:
-        cmd.append(f"--da-raster={Path(cfg.river_da_raster)}")
-        cmd.append(f"--da-raster-band={int(cfg.river_da_raster_band or 1)}")
-        cmd.append(f"--da-raster-units={str(cfg.river_da_raster_units or 'km2')}")
-    
-        log.info("[RIVER][XS_INFER] Command: %s", " ".join(str(c) for c in cmd))
-    rc, out, err = run_command(cmd, cwd=script_dir, prefix="[RIVER] ")
-    cmd_str = " ".join(str(c) for c in cmd)  # For logging only
-    report["river"]["steps"]["network"] = {
-        "status": "success" if rc == 0 else "failed",
-        "returncode": rc,
-        "command": cmd_str,
-        "stdout_tail": out,
-        "stderr_tail": err,
-    }
+    cache_hit = scaffold_cache_hit(manifest_path=scaffold_manifest_path, expected_network_gpkg=cached_network_gpkg)
+    cmd = None
+    out = err = ""
+    if cache_hit:
+        if network_gpkg.exists():
+            network_gpkg.unlink()
+        shutil.copy2(cached_network_gpkg, network_gpkg)
+        rc = 0
+        report["river"]["steps"]["network"] = {
+            "status": "success",
+            "returncode": 0,
+            "command": "cache_hit",
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "cache_hit": True,
+            "cached_network_gpkg": str(cached_network_gpkg),
+        }
+        log.info("[RIVER] Reusing cached canonical scaffold network: %s", cached_network_gpkg)
+    else:
+        # SECURITY FIX: Use list-based command construction (no shell injection)
+        cmd = [
+            sys.executable, "river_network.py",
+            f"--aoi={scaffold_domains.scaffold_aoi}",
+            f"--cache-dir={raw_hydro_cache}",
+            f"--out-gpkg={cached_network_gpkg}",
+            f"--provenance-lock={river_network_lock}",
+            f"--hydrography-source={cfg.river_hydrography_source}",
+            f"--tnm-dataset={cfg.tnm_dataset}",
+            f"--snap-m={cfg.snap_m}",
+        ]
+        if cfg.tnm_enable:
+            cmd.append("--tnm-enable")
+
+        # Optional DA raster fallback (MERIT, etc.) for deterministic DA priors when NHDPlus DA is missing.
+        if cfg.river_da_raster:
+            cmd.append(f"--da-raster={Path(cfg.river_da_raster)}")
+            cmd.append(f"--da-raster-band={int(cfg.river_da_raster_band or 1)}")
+            cmd.append(f"--da-raster-units={str(cfg.river_da_raster_units or 'km2')}")
+        log.info("[RIVER][NETWORK] Command: %s", " ".join(str(c) for c in cmd))
+        rc, out, err = run_command(cmd, cwd=script_dir, prefix="[RIVER] ")
+        cmd_str = " ".join(str(c) for c in cmd)  # For logging only
+        report["river"]["steps"]["network"] = {
+            "status": "success" if rc == 0 else "failed",
+            "returncode": rc,
+            "command": cmd_str,
+            "stdout_tail": out,
+            "stderr_tail": err,
+            "cache_hit": False,
+            "cached_network_gpkg": str(cached_network_gpkg),
+        }
+        if rc == 0 and cached_network_gpkg.exists():
+            if network_gpkg.exists():
+                network_gpkg.unlink()
+            shutil.copy2(cached_network_gpkg, network_gpkg)
+
+    scaffold_product_meta = {}
+    scaffold_products_status = "missing"
+    if ((cmd is None and cache_hit) or (rc == 0 and cached_network_gpkg.exists())) and cached_network_gpkg.exists():
+        try:
+            if scaffold_products_complete(scaffold_products):
+                scaffold_products_status = "cache_hit"
+                scaffold_product_meta = dict(scaffold_products)
+                for _key in ("stationing_json", "summary_json"):
+                    _path = Path(scaffold_products[_key])
+                    if _path.exists():
+                        try:
+                            scaffold_product_meta[_key.replace("_json", "")] = json.loads(_path.read_text(encoding="utf-8"))
+                        except (OSError, ValueError, TypeError):
+                            pass
+            else:
+                scaffold_product_meta = persist_scaffold_products(network_gpkg=cached_network_gpkg, product_paths=scaffold_products)
+                scaffold_products_status = "created" if scaffold_product_meta else "missing"
+        except (ImportError, OSError, ValueError, TypeError, RuntimeError):
+            log.debug("[RIVER] Failed to persist scaffold-derived products", exc_info=True)
+            scaffold_product_meta = {}
+            scaffold_products_status = "failed"
+
+    try:
+        write_scaffold_manifest(
+            scaffold_manifest_path,
+            domains=scaffold_domains,
+            network_gpkg=str(cached_network_gpkg) if cached_network_gpkg.exists() else None,
+            provenance_lock=str(river_network_lock),
+            extra={
+                "network_status": "success" if ((cmd is None and cache_hit) or (rc == 0 and cached_network_gpkg.exists())) else "failed",
+                "cache_dir": str(scaffold_cache_dir),
+                "cache_hit": bool(cache_hit),
+                "export_network_gpkg": str(network_gpkg) if network_gpkg.exists() else None,
+                "scaffold_products_status": scaffold_products_status,
+                "scaffold_products": scaffold_product_meta,
+            },
+        )
+        report["river"]["scaffold_manifest"] = str(scaffold_manifest_path)
+        if scaffold_product_meta:
+            report["river"]["scaffold_products"] = scaffold_product_meta
+    except (OSError, TypeError, ValueError):
+        log.debug("[RIVER] Failed to write scaffold manifest", exc_info=True)
+
     if rc != 0 or not network_gpkg.exists():
         log.error("[RIVER] Failed to extract river network.")
         report["river"]["status"] = "failed"
         return None
 
-    log.info("[RIVER] Network extracted: %s", network_gpkg)
+    log.info("[RIVER] Network ready: %s", network_gpkg)
 
 
     river_method = cfg.river_method.lower().strip()
@@ -4523,9 +3985,10 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
                 force=False,
             )
             ocean_mask = _stage_cached_waffles_mask(ocean_cache, cache_masks_run / "waffles_coastline_ocean_only.tif", log=log)
-        except Exception as e:
+        except (OSError, RuntimeError, ValueError) as e:
             log.warning("[WAFFLES] Ocean-only mask unavailable; ocean bleed protection degraded: %s", e)
             ocean_mask = None
+            report.setdefault("river", {}).setdefault("masking", {})["ocean_mask_warning"] = str(e)
 
         try:
             nhd_cache = _ensure_waffles_coastline_mask(
@@ -4539,9 +4002,10 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
                 force=False,
             )
             with_nhd_mask = _stage_cached_waffles_mask(nhd_cache, cache_masks_run / "waffles_coastline_with_nhd.tif", log=log)
-        except Exception as e:
+        except (OSError, RuntimeError, ValueError) as e:
             log.warning("[WAFFLES] With-NHD mask unavailable (TNM flaky?): %s. Proceeding with corridor+ArcGIS NHD flowlines + ocean-only mask.", e)
             with_nhd_mask = None
+            report.setdefault("river", {}).setdefault("masking", {})["with_nhd_mask_warning"] = str(e)
 
 
         if cfg.strict:
@@ -4597,7 +4061,7 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
             elif ocean_mask and Path(ocean_mask).exists():
                 wm = ocean_mask
             report.setdefault("river", {}).setdefault("outputs", {})["waffles_water_mask"] = str(wm) if wm else None
-        except Exception:
+        except (OSError, TypeError, ValueError, KeyError):
             log.debug("ignored", exc_info=True)
 
         rc, out, err = run_command(cmd, cwd=script_dir, prefix="[RIVER] ")
@@ -4647,7 +4111,8 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
                 if n_inside <= 0:
                     raise RuntimeError("river_channel_mask has zero inside pixels; river outputs would be all nodata. Fix corridor/NHDArea inputs or AOI.")
                 report.setdefault("river", {}).setdefault("masking", {})["channel_mask_inside_pixels"] = int(n_inside)
-            except Exception as e:
+            except (ImportError, OSError, ValueError, RuntimeError) as e:
+                report.setdefault("river", {}).setdefault("masking", {})["channel_mask_validation_warning"] = str(e)
                 if cfg.strict:
                     log.error("[RIVER] Channel mask validation failed (strict): %s", e)
                     raise
@@ -4712,6 +4177,20 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
         with rasterio.open(out_bed, "w", **prof) as dst:
             dst.write(out.astype(np.float32), 1)
 
+    def _count_valid_pixels(rp: Path, nodata_val: float) -> int:
+        try:
+            import rasterio
+            import numpy as np
+            with rasterio.open(rp) as ds:
+                nod = ds.nodata if ds.nodata is not None else nodata_val
+                total = 0
+                for _, w in ds.block_windows(1):
+                    a = ds.read(1, window=w)
+                    total += int(np.count_nonzero(np.isfinite(a) & (a != nod)))
+                return int(total)
+        except Exception:
+            return -1
+
 
     if river_method == "hybrid":
         log.info("[RIVER] Using HYBRID method: XS(mainstem) + skeleton(elsewhere)")
@@ -4736,8 +4215,9 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
             )
             if _est_mask_path is not None:
                 report.setdefault("river", {}).setdefault("outputs", {})["estuary_clip_mask"] = str(_est_mask_path)
-        except Exception:
-            log.warning("[RIVER] Estuary clipping failed; continuing with full channel mask.", exc_info=True)
+        except (OSError, ValueError, RuntimeError, ImportError) as e:
+            report.setdefault("river", {}).setdefault("masking", {})["estuary_clip_warning"] = str(e)
+            log.warning("[RIVER] Estuary clipping failed; continuing with full channel mask: %s", e)
 
         # If the mainstem mask is empty/missing, we can still run XS builder (largest component),
         # but XS will not be injected into the final hybrid raster; warn loudly.
@@ -4915,13 +4395,20 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
 
         if cfg.river_continuous_buffer_m is not None:
             cmd.append(f"--continuous-buffer-m={cfg.river_continuous_buffer_m}")
-        # Pass authoritative point soundings (e.g., extra_xyz subsets) into XS inference anchoring when available.
-        if (not cfg.river_soundings) and cfg.extra_xyz_files:
+        # Prefer authoritative-base derived point support for river anchoring, then fall back to extra_xyz.
+        if not cfg.river_soundings:
             try:
-                _fallback_soundings = [str(p) for p in (cfg.extra_xyz_files or []) if p]
+                _fallback_soundings = []
+                _auth_soundings = getattr(cfg, 'river_authoritative_soundings', None)
+                if _auth_soundings:
+                    _fallback_soundings.append(str(_auth_soundings))
+                if cfg.extra_xyz_files:
+                    _fallback_soundings.extend([str(p) for p in (cfg.extra_xyz_files or []) if p])
                 if _fallback_soundings:
-                    cfg.river_soundings = _fallback_soundings
-                    log.info("[RIVER] XS inference: using extra_xyz fallback as soundings anchors (n=%d)", len(_fallback_soundings))
+                    cfg.river_soundings = ",".join(str(p) for p in _fallback_soundings)
+                    if _auth_soundings:
+                        cfg.river_soundings_crs = str(getattr(cfg, 'working_srs', None) or cfg.river_soundings_crs or '')
+                    log.info("[RIVER] XS inference: using fallback soundings anchors (authoritative_first=%s, n=%d)", bool(_auth_soundings), len(_fallback_soundings))
             except OSError:
                 log.debug("ignored", exc_info=True)
 
@@ -4951,12 +4438,7 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
                         return {'path': fp, 'size': None, 'mtime': None}
 
                     inp = getattr(cfg_obj, "river_soundings", None)
-                    if inp is None:
-                        files = []
-                    elif isinstance(inp, (list, tuple)):
-                        files = [str(p) for p in inp]
-                    else:
-                        files = [str(inp)]
+                    files = _normalize_multi_path_value(inp)
 
                     info = []
                     for fp in files:
@@ -5162,7 +4644,11 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
                 log.warning("[RIVER] XS mainstem inference failed (rc=%s); hybrid will fall back to skeleton-only. stderr_tail=%s", rc, (err or '').strip()[-500:])
             else:
                 log.warning("[RIVER] XS mainstem inference completed but raster missing; hybrid will fall back to skeleton-only.")
+            report.setdefault("river", {}).setdefault("degraded", {})["xs_mainstem_fallback"] = True
+            report.setdefault("river", {}).setdefault("degraded", {})["reason"] = "hybrid_xs_mainstem_failed_using_skeleton_only"
             bed_xs_tif = None
+        else:
+            report.setdefault("river", {}).setdefault("degraded", {})["xs_mainstem_fallback"] = False
 
         # Note: cfg.river_soundings may already point at the cached subset (preferred).
         # Constraint metadata for the soundings-subset pass is captured further below
@@ -5202,15 +4688,39 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
                 if _m:
                     _snd_matched = int(_m.group(1) or 0)
             if _snd_provided and _snd_matched == 0 and rc == 0:
-                log.warning(
-                    "[RIVER][SOUNDINGS] AUDIT WARNING: soundings were provided (%s) but 0 XS "
-                    "appear to have been calibrated from them. Possible causes: (1) empty parquet "
-                    "subset (check for 'Subset parquet validated: n=0'), (2) CRS mismatch between "
-                    "soundings and XS template, (3) all soundings outside calib_max_dist_m, "
-                    "(4) soundings_path not wired into Pass 2 command. "
-                    "Check [CALIB] lines in the xs_infer_bathy_raster output above.",
-                    cfg.river_soundings,
-                )
+                _in_chan = None
+                _tails = "\n".join([str(out or ""), str(err or "")])
+                try:
+                    import re as _re_audit2
+                    _m_chan = _re_audit2.search(r"Soundings:\s*in_channel_mask=(\d+)", _tails)
+                    if _m_chan:
+                        _in_chan = int(_m_chan.group(1) or 0)
+                except Exception:
+                    log.debug("ignored", exc_info=True)
+                if bed_xs_tif is not None and Path(bed_xs_tif).exists():
+                    if _in_chan is not None:
+                        log.info(
+                            "[RIVER][SOUNDINGS] Soundings subset was wired successfully, but 0 XS were directly calibrated "
+                            "from soundings in this run (soundings_in_channel_mask=%d). The XS solution completed using "
+                            "authoritative DEM/profile banks plus non-sounding priors/constraints.",
+                            _in_chan,
+                        )
+                    else:
+                        log.info(
+                            "[RIVER][SOUNDINGS] Soundings subset was wired successfully, but 0 XS were directly calibrated "
+                            "from soundings in this run. The XS solution completed using authoritative DEM/profile banks "
+                            "plus non-sounding priors/constraints."
+                        )
+                else:
+                    log.warning(
+                        "[RIVER][SOUNDINGS] AUDIT WARNING: soundings were provided (%s) but 0 XS "
+                        "appear to have been calibrated from them. Possible causes: (1) empty parquet "
+                        "subset (check for 'Subset parquet validated: n=0'), (2) CRS mismatch between "
+                        "soundings and XS template, (3) all soundings outside calib_max_dist_m, "
+                        "(4) soundings_path not wired into Pass 2 command. "
+                        "Check [CALIB] lines in the xs_infer_bathy_raster output above.",
+                        cfg.river_soundings,
+                    )
         except Exception:
             log.debug("Post-Pass-2 soundings audit failed; continuing.", exc_info=True)
 
@@ -5232,53 +4742,16 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
         log.info("[RIVER] Step 3c: Inferring bathymetry from skeleton (full network)...")
         bed_skel_tif = work_dir / "river_bed_elev_skeleton_full.tif"
 
-        cmd = [
-            sys.executable, "river_skeleton_bathy.py",
-            f"--river-gpkg={network_gpkg}",
-            f"--template-raster={cfg.river_dem}",
-            f"--dem={cfg.river_dem}",
-            f"--channel-mask={channel_mask_tif}",
-            f"--out-bed={bed_skel_tif}",
-            f"--dmax-min-m={cfg.river_dmax_min_m}",
-            f"--dmax-max-m={cfg.river_dmax_max_m}",
-            f"--shape-exp={cfg.river_shape_exp}",
-            f"--bed-profile-max-slope={cfg.river_bed_profile_max_slope}",
-            f"--bed-profile-max-curv={cfg.river_bed_profile_max_curv}",
-            f"--bed-profile-step-m={cfg.river_bed_profile_step_m}",
-            f"--bed-profile-strength={cfg.river_bed_profile_strength}",
-            f"--bed-profile-power={cfg.river_bed_profile_power}",
-            f"--prior-mode={cfg.river_prior_mode}",
-            f"--mv-a0={cfg.river_mv_a0}",
-            f"--mv-bw={cfg.river_mv_bw}",
-            f"--mv-ba={cfg.river_mv_ba}",
-            f"--mv-bs={cfg.river_mv_bs}",
-            f"--mv-eps-a={cfg.river_mv_eps_a}",
-            f"--mv-eps-s={cfg.river_mv_eps_s}",
-            f"--residual-blend-sigma-m={cfg.river_residual_blend_sigma_m}",
-            f"--authoritative-bed-max-dist-m={cfg.river_authoritative_bed_max_dist_m}",
-            f"--wse-mode={cfg.river_skeleton_wse_mode}",
-            f"--wse-smooth-sigma-m={cfg.river_skeleton_wse_smooth_sigma_m}",
-        ]
-
-        # Optional authoritative bed raster blending
-        if cfg.river_authoritative_bed:
-            try:
-                ab = Path(cfg.river_authoritative_bed)
-                if ab.exists():
-                    cmd.append(f"--authoritative-bed-raster={ab}")
-            except OSError:
-                log.debug("ignored", exc_info=True)
-
-        # Junction / confluence handling
-        jmode = cfg.river_skeleton_junction_mode.strip().lower()
-        if jmode and jmode != "none":
-            cmd.append(f"--junction-mode={jmode}")
-            cmd.append(f"--junction-buffer-m={cfg.river_skeleton_junction_buffer_m}")
-            cmd.append(f"--junction-degree-min={cfg.river_skeleton_junction_degree_min}")
-            jsig = float(cfg.river_skeleton_junction_smooth_sigma_m or 0.0)
-            if jsig > 0.0:
-                cmd.append(f"--junction-smooth-sigma-m={jsig}")
-            cmd.append(f"--junction-max-width-m={cfg.river_skeleton_junction_max_width_m}")
+        cmd = _build_river_skeleton_command(
+            cfg,
+            network_gpkg=network_gpkg,
+            template_raster=cfg.river_dem,
+            dem=cfg.river_dem,
+            channel_mask=channel_mask_tif,
+            out_bed=bed_skel_tif,
+            authoritative_passthrough_args=_authoritative_passthrough_args(cfg, for_river=True),
+        )
+        _record_authoritative_child_passthrough(report, "river_full_network", cmd)
 
         # Curvature-driven asymmetry
         amode = cfg.river_skeleton_asymmetry_mode.strip().lower()
@@ -5314,12 +4787,35 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
         if bed_xs_tif is not None and Path(mainstem_mask_tif).exists():
             _combine_mainstem_xs_and_skeleton(Path(bed_xs_tif), Path(bed_skel_tif), Path(mainstem_mask_tif), Path(bed_tif), Path(cfg.river_dem), nod)
         else:
-            import shutil
             shutil.copy2(str(bed_skel_tif), str(bed_tif))
 
         report.setdefault('river', {}).setdefault('outputs', {})['bed_elev_xs_mainstem'] = str(bed_xs_tif) if bed_xs_tif is not None else None
         report.setdefault('river', {}).setdefault('outputs', {})['bed_elev_skeleton_full'] = str(bed_skel_tif)
         report.setdefault('river', {}).setdefault('outputs', {})['mainstem_mask'] = str(mainstem_mask_tif) if Path(mainstem_mask_tif).exists() else None
+
+        try:
+            hybrid_valid = _count_valid_pixels(Path(bed_tif), nod)
+            skel_valid = _count_valid_pixels(Path(bed_skel_tif), nod)
+            report.setdefault('river', {}).setdefault('hybrid_combine', {}).update({
+                'hybrid_valid_pixels': int(hybrid_valid),
+                'skeleton_valid_pixels': int(skel_valid),
+            })
+            if skel_valid > 0 and hybrid_valid >= 0:
+                min_keep = max(256, int(0.01 * skel_valid))
+                if hybrid_valid < min_keep:
+                    shutil.copy2(str(bed_skel_tif), str(bed_tif))
+                    report.setdefault('river', {}).setdefault('degraded', {})['hybrid_sparse_fallback'] = True
+                    report.setdefault('river', {}).setdefault('degraded', {})['hybrid_sparse_fallback_reason'] = (
+                        f'hybrid_combined_bed_too_sparse:{hybrid_valid}<{min_keep}'
+                    )
+                    log.warning(
+                        '[RIVER] Hybrid combined bed became too sparse after XS injection (%d valid vs skeleton %d); '
+                        'falling back to skeleton-only cached bed.',
+                        hybrid_valid,
+                        skel_valid,
+                    )
+        except Exception:
+            log.debug('[RIVER] Hybrid valid-pixel fallback check failed', exc_info=True)
 
     if river_method == "hybrid":
         # HYBRID handled above (bed_tif already built)
@@ -5340,8 +4836,14 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
             return None
         bed_tif, channel_mask_tif, xs_meta_json, xs_acct_json = result
 
-    report["river"]["status"] = "success"
-    log.info("[RIVER] Success: %s", bed_tif)
+    river_degraded = bool(report.get("river", {}).get("degraded", {}).get("xs_mainstem_fallback", False))
+    report["river"]["status"] = "degraded" if river_degraded else "success"
+    report["river"]["status_family"] = report["river"]["status"]
+    report["river"]["execution_mode"] = "hybrid_skeleton_only_degraded" if river_degraded else "hybrid_full"
+    if river_degraded:
+        log.warning("[RIVER] Success in degraded mode (skeleton-only fallback): %s", bed_tif)
+    else:
+        log.info("[RIVER] Success: %s", bed_tif)
 
     # Mask the final river bed raster with the clipped channel mask.
     # The skeleton's Gaussian smoothing and XS interpolation can extend
@@ -5391,6 +4893,28 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
         report["river"]["status"] = "failed"
         return None
 
+    # Sanitize cached river rasters before any downstream delivery / warping. This strips NaN/Inf,
+    # float32-max sentinels, and obviously impossible extremes that can leak through sparse raster math
+    # or reprojection edge cases and then appear as invalid values in GIS.
+    try:
+        depth_stats = sanitize_raster_values(Path(cached_depth_tif), nodata=cfg.river_nodata, min_valid=-1.0e5, max_valid=1.0e5)
+        bed_stats = sanitize_raster_values(Path(bed_tif), nodata=cfg.river_nodata, min_valid=-1.0e5, max_valid=1.0e5)
+        report.setdefault("river", {}).setdefault("sanitation", {})["cached_depth"] = depth_stats
+        report.setdefault("river", {}).setdefault("sanitation", {})["cached_bed"] = bed_stats
+        log.info(
+            "[RIVER] Sanitized cached rasters: depth(valid=%d nf=%d extreme=%d range=%d) | bed(valid=%d nf=%d extreme=%d range=%d)",
+            int(depth_stats.get("valid_pixels", 0)),
+            int(depth_stats.get("replaced_nonfinite", 0)),
+            int(depth_stats.get("replaced_extreme", 0)),
+            int(depth_stats.get("replaced_range", 0)),
+            int(bed_stats.get("valid_pixels", 0)),
+            int(bed_stats.get("replaced_nonfinite", 0)),
+            int(bed_stats.get("replaced_extreme", 0)),
+            int(bed_stats.get("replaced_range", 0)),
+        )
+    except Exception:
+        log.debug("[RIVER] Cached raster sanitation failed", exc_info=True)
+
     # Final hard guarantee: river outputs (bed + depth) must be nodata outside the river channel domain.
     try:
         _maskp = None
@@ -5425,25 +4949,51 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
                 # If the check fails, skip WAFFLES masking rather than producing an all-nodata product.
                 aoi_bounds = _parse_aoi_bbox(str(cfg.aoi))
                 water_px = _count_mask_water_pixels(wm, aoi_bounds, water_max=0.5)
+                channel_overlap_frac = None
+                try:
+                    import rasterio as _rio
+                    import numpy as _np
+                    with _rio.open(channel_mask_tif) as _cm, _rio.open(wm) as _wm:
+                        _cm_arr = _cm.read(1)
+                        _wm_arr = _wm.read(1, out_shape=(_cm.height, _cm.width), resampling=_rio.enums.Resampling.nearest)
+                        _channel = (_cm_arr == 1)
+                        _overlap = _channel & (_wm_arr == 0)
+                        channel_total = int(_channel.sum())
+                        channel_overlap_frac = float(_overlap.sum() / max(1, channel_total)) if channel_total > 0 else 0.0
+                except Exception:
+                    log.debug('[RIVER] WAFFLES/channel overlap check failed', exc_info=True)
                 if water_px is not None and water_px <= 0:
                     log.warning("[RIVER] Skipping WAFFLES mask (no water pixels in AOI): %s", wm)
+                elif channel_overlap_frac is not None and channel_overlap_frac < 0.10:
+                    log.warning(
+                        "[RIVER] Skipping WAFFLES mask because it overlaps too little of the river corridor "
+                        "(channel_overlap_frac=%.3f). This usually means the selected WAFFLES mask is ocean-only "
+                        "or otherwise unsuitable for inland river delivery: %s",
+                        channel_overlap_frac,
+                        wm,
+                    )
                 else:
                     md_ok = _mask_raster_to_waffles(cached_depth_tif, wm, nodata=-9999.0)
                     mb_ok = _mask_raster_to_waffles(cached_bed_tif, wm, nodata=-9999.0)
                     report.setdefault("river", {}).setdefault("masking", {})["waffles_mask"] = str(wm)
+                    report.setdefault("river", {}).setdefault("masking", {})["waffles_channel_overlap_frac"] = channel_overlap_frac
                     report.setdefault("river", {}).setdefault("masking", {})["masked_depth"] = bool(md_ok)
                     report.setdefault("river", {}).setdefault("masking", {})["masked_bed"] = bool(mb_ok)
     except Exception:
         log.debug("ignored", exc_info=True)
 
-    # Strict safety: river deliverables must contain at least one valid pixel after masking.
+    # Strict safety: river deliverables must contain valid pixels and must not collapse into
+    # a near-constant diagnostic surface. This catches invalid-but-finite outputs that would
+    # otherwise survive nodata checks and appear as unusable rasters downstream.
     try:
         import rasterio
         import numpy as np
 
-        def _has_any_valid(rp: Path, nodata_val: float) -> bool:
+        def _summarize_valid(rp: Path, nodata_val: float) -> dict:
+            stats = {"valid": 0, "min": np.nan, "max": np.nan, "p01": np.nan, "p99": np.nan, "frac_neg": np.nan}
             if not rp.exists():
-                return False
+                return stats
+            vals = []
             with rasterio.open(rp) as ds:
                 nod = ds.nodata
                 if nod is None:
@@ -5452,19 +5002,80 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
                     a = ds.read(1, window=w)
                     m = np.isfinite(a) & (a != nod)
                     if np.any(m):
-                        return True
-            return False
+                        vals.append(a[m].astype("float64"))
+            if not vals:
+                return stats
+            v = np.concatenate(vals)
+            stats["valid"] = int(v.size)
+            stats["min"] = float(np.min(v))
+            stats["max"] = float(np.max(v))
+            stats["p01"] = float(np.percentile(v, 1.0))
+            stats["p99"] = float(np.percentile(v, 99.0))
+            stats["frac_neg"] = float(np.mean(v < 0.0))
+            return stats
 
         nd = cfg.river_nodata
-        if not _has_any_valid(cached_depth_tif, nd):
+        depth_summary = _summarize_valid(cached_depth_tif, nd)
+        bed_summary = _summarize_valid(cached_bed_tif, nd)
+        report.setdefault("river", {}).setdefault("validation", {})["cached_depth_summary"] = depth_summary
+        report.setdefault("river", {}).setdefault("validation", {})["cached_bed_summary"] = bed_summary
+
+        if int(depth_summary.get("valid", 0)) <= 0:
             raise RuntimeError("River depth raster has no valid pixels after masking; outputs would be all nodata.")
-        if not _has_any_valid(cached_bed_tif, nd):
+        if int(bed_summary.get("valid", 0)) <= 0:
             raise RuntimeError("River bed elevation raster has no valid pixels after masking; outputs would be all nodata.")
+        min_depth_valid_from_bed = int(max(1000, 0.05 * int(bed_summary.get("valid", 0))))
+        if int(depth_summary.get("valid", 0)) < min_depth_valid_from_bed:
+            raise RuntimeError(
+                "River depth raster retained far too few valid pixels relative to river bed coverage "
+                f"(depth_valid={int(depth_summary.get('valid', 0))}, bed_valid={int(bed_summary.get('valid', 0))}, "
+                f"min_expected_depth_valid={min_depth_valid_from_bed}). This usually indicates an invalid late masking step."
+            )
+
+        depth_span = float(depth_summary["p99"] - depth_summary["p01"]) if np.isfinite(depth_summary["p99"]) and np.isfinite(depth_summary["p01"]) else np.nan
+        bed_span = float(bed_summary["p99"] - bed_summary["p01"]) if np.isfinite(bed_summary["p99"]) and np.isfinite(bed_summary["p01"]) else np.nan
+        if np.isfinite(depth_span) and depth_span < 0.05:
+            raise RuntimeError(
+                f"River depth raster collapsed to a near-constant surface (p01={depth_summary['p01']:.3f}, p99={depth_summary['p99']:.3f})."
+            )
+        if np.isfinite(bed_span) and bed_span < 0.05:
+            raise RuntimeError(
+                f"River bed raster collapsed to a near-constant surface (p01={bed_summary['p01']:.3f}, p99={bed_summary['p99']:.3f})."
+            )
+        if np.isfinite(depth_summary["frac_neg"]) and depth_summary["frac_neg"] < 0.01 and float(depth_summary["max"]) <= 1.0:
+            raise RuntimeError(
+                f"River depth raster is not behaving like negative-down terrain depth (frac_neg={depth_summary['frac_neg']:.3f}, min={depth_summary['min']:.3f}, max={depth_summary['max']:.3f})."
+            )
+
+        log.info(
+            "[RIVER] Cached raster validation: depth(valid=%d p01=%.3f p99=%.3f frac_neg=%.3f) | bed(valid=%d p01=%.3f p99=%.3f)",
+            int(depth_summary["valid"]), float(depth_summary["p01"]), float(depth_summary["p99"]), float(depth_summary["frac_neg"]),
+            int(bed_summary["valid"]), float(bed_summary["p01"]), float(bed_summary["p99"]),
+        )
     except Exception as e:
-        # Fail closed: producing all-nodata deliverables is worse than aborting.
-        log.error("%s", e)
-        report["river"]["status"] = "failed"
-        raise
+        recovery = _recover_river_depth_from_support(
+            cfg=cfg,
+            depth_tif=Path(cached_depth_tif),
+            bed_tif=Path(cached_bed_tif),
+            channel_mask_tif=(Path(channel_mask_tif) if channel_mask_tif is not None else None),
+            logger=log,
+        )
+        report.setdefault("river", {}).setdefault("recovery", {})["depth_from_support"] = recovery
+        if recovery.get("recovered"):
+            try:
+                depth_summary = _summarize_valid(cached_depth_tif, cfg.river_nodata)
+                report.setdefault("river", {}).setdefault("validation", {})["cached_depth_summary_recovered"] = depth_summary
+                report["river"]["status"] = "degraded"
+                report["river"]["status_family"] = "degraded"
+                report.setdefault("river", {}).setdefault("degraded", {})["depth_recovered_from_support"] = True
+                log.warning("[RIVER] Proceeding in degraded mode after support-based depth recovery.")
+            except Exception:
+                log.debug("[RIVER] Post-recovery validation summary failed", exc_info=True)
+        else:
+            # Fail closed only after recovery was not possible.
+            log.error("%s", e)
+            report["river"]["status"] = "failed"
+            raise
 
     out_depth = river_dir / "river_depth_terrain_patch.tif"
     out_bed = river_dir / "river_bottom_navd88_patch.tif"
@@ -5493,20 +5104,16 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
         }
     )
 
-    try:
-        guidance_outputs = _write_river_guidance_artifacts(
-            cfg,
-            bed_tif=Path(out_bed),
-            depth_tif=Path(out_depth),
-            channel_mask_tif=(Path(channel_mask_tif) if channel_mask_tif is not None else None),
-            river_dir=river_dir,
-            report=report,
-        )
-        report.setdefault("river", {}).setdefault("outputs", {}).update({
-            k: v for k, v in guidance_outputs.items() if v
-        })
-    except Exception:
-        log.debug("Failed to write river guidance artifacts; continuing.", exc_info=True)
+    _write_guidance_artifacts_with_reporting(
+        writer=_write_river_guidance_artifacts,
+        cfg=cfg,
+        out_bed=Path(out_bed),
+        out_depth=Path(out_depth),
+        channel_mask_tif=(Path(channel_mask_tif) if channel_mask_tif is not None else None),
+        river_dir=river_dir,
+        report=report,
+        logger=log,
+    )
 
     _build_constraint_summary(cfg, report)
 
@@ -5515,6 +5122,501 @@ def run_river(cfg: BathyConfig, report: Dict[str, Any]) -> Optional[Path]:
 # -----------------------------------------------------------------------------
 # Fusion
 # -----------------------------------------------------------------------------
+
+def _find_sdb_guidance_artifact(sdb_dir: Path, key: str, suffix: str) -> Optional[Path]:
+    """Resolve an SDB guidance raster from the explicit SDB manifest first, then a deterministic sibling path.
+
+    This keeps the bathy_main side no-guess when the manifest is present, but remains usable with
+    older manifests that only recorded the depth raster.
+    """
+    if not sdb_dir.exists():
+        return None
+    manifest = sdb_dir / "artifacts_sdb.json"
+    if manifest.exists():
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            rel = data.get(key)
+            if isinstance(rel, str) and rel.strip():
+                p = (sdb_dir / rel).resolve() if not os.path.isabs(rel) else Path(rel).resolve()
+                if p.exists():
+                    return p
+            depth_rel = data.get("depth_raster")
+            if isinstance(depth_rel, str) and depth_rel.strip():
+                dp = (sdb_dir / depth_rel).resolve() if not os.path.isabs(depth_rel) else Path(depth_rel).resolve()
+                cand = dp.with_name(dp.stem + suffix + dp.suffix)
+                if cand.exists():
+                    return cand
+        except Exception:
+            log.debug("Failed to resolve SDB guidance artifact %s from manifest", key, exc_info=True)
+    return None
+
+
+def _grid_pixel_size_m(transform, crs, ref_lat_deg: Optional[float] = None) -> float:
+    """Return a representative pixel size in meters for support-distance calculations."""
+    try:
+        dx = abs(float(getattr(transform, "a", 0.0) or 0.0))
+        dy = abs(float(getattr(transform, "e", 0.0) or 0.0))
+    except Exception:
+        dx = dy = 0.0
+    px = max((dx + dy) / 2.0, 0.0)
+    try:
+        is_geographic = bool(getattr(crs, "is_geographic", False))
+    except Exception:
+        is_geographic = False
+    if not is_geographic:
+        return max(px, 1.0)
+    lat = float(ref_lat_deg if ref_lat_deg is not None else 0.0)
+    lat_rad = np.deg2rad(lat)
+    m_per_deg_lat = 111132.92 - 559.82 * np.cos(2.0 * lat_rad) + 1.175 * np.cos(4.0 * lat_rad)
+    m_per_deg_lon = 111412.84 * np.cos(lat_rad) - 93.5 * np.cos(3.0 * lat_rad)
+    dx_m = dx * max(abs(m_per_deg_lon), 1.0)
+    dy_m = dy * max(abs(m_per_deg_lat), 1.0)
+    return max((dx_m + dy_m) / 2.0, 1.0)
+
+
+def _compute_support_distance_density_guidance(
+    locked: np.ndarray,
+    auth: np.ndarray,
+    *,
+    pixel_size_m: float,
+    support_decay_m: float,
+    density_radius_m: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compatibility wrapper around authoritative_conditioning helper."""
+    return _ac_compute_support_distance_density_guidance(
+        locked,
+        auth,
+        pixel_size_m=pixel_size_m,
+        support_decay_m=support_decay_m,
+        density_radius_m=density_radius_m,
+    )
+
+
+def _compute_river_anchor_support_fields(
+    river_anchor: np.ndarray,
+    river_guidance_weight: Optional[np.ndarray],
+    river_domain: np.ndarray,
+    *,
+    pixel_size_m: float,
+    density_radius_m: float,
+    scaffold_transition_m: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compatibility wrapper around authoritative_conditioning helper."""
+    return _ac_compute_river_anchor_support_fields(
+        river_anchor=river_anchor,
+        river_guidance_weight=river_guidance_weight,
+        river_domain=river_domain,
+        pixel_size_m=pixel_size_m,
+        density_radius_m=density_radius_m,
+        scaffold_transition_m=scaffold_transition_m,
+    )
+
+
+def _compute_coastal_sdb_support_confidence(
+    sdb_domain: np.ndarray,
+    sdb_guidance_weight: Optional[np.ndarray],
+    sdb_trusted_interior: Optional[np.ndarray],
+    support_distance_m: np.ndarray,
+    support_density: np.ndarray,
+    *,
+    support_transition_m: float = 600.0,
+) -> np.ndarray:
+    """Compatibility wrapper around authoritative_conditioning helper."""
+    return _ac_compute_coastal_sdb_support_confidence(
+        sdb_domain=sdb_domain,
+        sdb_guidance_weight=sdb_guidance_weight,
+        sdb_trusted_interior=sdb_trusted_interior,
+        support_distance_m=support_distance_m,
+        support_density=support_density,
+        support_transition_m=support_transition_m,
+    )
+
+
+def _support_weighted_condition_arrays(
+    *,
+    candidate: np.ndarray,
+    auth: np.ndarray,
+    sdb_ok: np.ndarray,
+    river_ok: np.ndarray,
+    sdb_gw: Optional[np.ndarray],
+    sdb_ti: Optional[np.ndarray],
+    river_gw: Optional[np.ndarray],
+    river_ti: Optional[np.ndarray],
+    river_support: Optional[np.ndarray],
+    river_support_depth: Optional[np.ndarray],
+    estuary_transition: Optional[np.ndarray] = None,
+    pixel_size_m: float,
+    support_decay_m: float,
+    support_density_radius_m: float,
+    coastal_sdb_support_transition_m: float,
+    river_anchor_density_radius_m: float,
+    river_scaffold_transition_m: float,
+) -> Dict[str, Any]:
+    """Compatibility wrapper around authoritative_conditioning helper."""
+    return _ac_support_weighted_condition_arrays(
+        candidate=candidate,
+        auth=auth,
+        sdb_ok=sdb_ok,
+        river_ok=river_ok,
+        sdb_gw=sdb_gw,
+        sdb_ti=sdb_ti,
+        river_gw=river_gw,
+        river_ti=river_ti,
+        river_support=river_support,
+        river_support_depth=river_support_depth,
+        estuary_transition=estuary_transition,
+        pixel_size_m=pixel_size_m,
+        support_decay_m=support_decay_m,
+        support_density_radius_m=support_density_radius_m,
+        coastal_sdb_support_transition_m=coastal_sdb_support_transition_m,
+        river_anchor_density_radius_m=river_anchor_density_radius_m,
+        river_scaffold_transition_m=river_scaffold_transition_m,
+    )
+
+
+def _build_source_aware_candidate_arrays(
+    *,
+    legacy_candidate: Optional[np.ndarray],
+    sdb_candidate: Optional[np.ndarray],
+    river_candidate: Optional[np.ndarray],
+    sdb_ok: np.ndarray,
+    river_ok: np.ndarray,
+    sdb_guidance_weight: Optional[np.ndarray],
+    sdb_trusted_interior: Optional[np.ndarray],
+    river_guidance_weight: Optional[np.ndarray],
+    river_trusted_interior: Optional[np.ndarray],
+    estuary_transition: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    """Compatibility wrapper around authoritative_conditioning helper."""
+    return _ac_build_source_aware_candidate_arrays(
+        legacy_candidate=legacy_candidate,
+        sdb_candidate=sdb_candidate,
+        river_candidate=river_candidate,
+        sdb_ok=sdb_ok,
+        river_ok=river_ok,
+        sdb_guidance_weight=sdb_guidance_weight,
+        sdb_trusted_interior=sdb_trusted_interior,
+        river_guidance_weight=river_guidance_weight,
+        river_trusted_interior=river_trusted_interior,
+        estuary_transition=estuary_transition,
+    )
+
+
+
+
+def _resolve_existing_output_path(mapping: Any, key: str) -> Optional[Path]:
+    """Resolve a file path from a mapping-like outputs object conservatively."""
+    if not isinstance(mapping, dict):
+        return None
+    cand = mapping.get(key)
+    if not cand:
+        return None
+    try:
+        p = Path(str(cand))
+    except (TypeError, ValueError):
+        return None
+    try:
+        return p if p.exists() else None
+    except OSError:
+        return None
+
+
+def _condition_final_to_authoritative_base(
+    cfg: BathyConfig,
+    candidate_path: Optional[Path],
+    provenance_path: Optional[Path],
+    report: Dict[str, Any],
+) -> tuple[Optional[Path], Optional[Path], Optional[Path], Optional[Path], Optional[Path], Optional[Path]]:
+    """Build a support-aware final surface centered on authoritative_base.
+
+    Policy (v2):
+      - Finite authoritative_base cells are hard-locked.
+      - Only nodata gaps in authoritative_base are eligible for conditioned fill.
+      - SDB admissibility and/or river admissibility identify guidance-conditioned subsets of the gaps.
+      - Gaps outside those guidance domains still receive continuous fallback interpolation from the
+        candidate surface so the final product remains wall-to-wall.
+      - Any residual nodata after conditioning are backstopped with nearest-neighbor fill to enforce
+        a continuous raster while preserving locked authoritative cells.
+
+    Returns:
+      (conditioned_depth, conditioned_provenance, aligned_authoritative, gap_mask, eligible_fill_mask, support_class)
+    """
+    auth_src = getattr(cfg, "authoritative_base", None)
+    if auth_src is None:
+        return candidate_path, provenance_path, None, None, None, None
+    auth_src = Path(auth_src)
+    if not auth_src.exists():
+        log.warning("[AUTHORITATIVE] authoritative_base not found: %s", auth_src)
+        return candidate_path, provenance_path, None, None, None, None
+
+    import rasterio
+    from rasterio.warp import reproject, Resampling
+    import numpy as np
+
+    combined_dir = ensure_dir(cfg.out_dir / "combined")
+    aligned_auth_path = combined_dir / "authoritative_base_aligned.tif"
+    gap_mask_path = combined_dir / "authoritative_gap_mask.tif"
+    eligible_mask_path = combined_dir / "authoritative_eligible_fill_mask.tif"
+    support_class_path = combined_dir / "support_class.tif"
+    regime_class_path = combined_dir / "regime_class.tif"
+    support_distance_path = combined_dir / "support_distance.tif"
+    support_density_path = combined_dir / "support_density.tif"
+    guidance_influence_path = combined_dir / "guidance_influence.tif"
+    source_candidate_path = combined_dir / "bathy_combined_depth_source_aware_candidate.tif"
+    source_candidate_prov_path = combined_dir / "bathy_combined_depth_source_aware_candidate_provenance.tif"
+    coastal_sdb_confidence_path = combined_dir / "coastal_sdb_confidence.tif"
+    river_anchor_distance_path = combined_dir / "river_anchor_distance.tif"
+    river_anchor_density_path = combined_dir / "river_anchor_density.tif"
+    river_scaffold_confidence_path = combined_dir / "river_scaffold_confidence.tif"
+    conditioned_path = combined_dir / "bathy_combined_depth_conditioned.tif"
+    conditioned_prov_path = combined_dir / "bathy_combined_depth_conditioned_provenance.tif"
+    precedence_audit_path = combined_dir / "authoritative_precedence_audit.json"
+
+    river_outputs = report.get("river", {}).get("outputs", {}) if isinstance(report.get("river", {}), dict) else {}
+    river_adm_path = None
+    try:
+        cand = river_outputs.get("admissibility")
+        if cand:
+            p = Path(str(cand))
+            if p.exists():
+                river_adm_path = p
+    except Exception:
+        river_adm_path = None
+
+    sdb_dir = cfg.out_dir / "sdb"
+    sdb_depth_path = find_sdb_depth_raster(sdb_dir)
+    sdb_adm_path = _find_sdb_guidance_artifact(sdb_dir, "admissibility_raster", "_admissibility")
+    sdb_gw_path = _find_sdb_guidance_artifact(sdb_dir, "guidance_weight_raster", "_guidance_weight")
+    sdb_ti_path = _find_sdb_guidance_artifact(sdb_dir, "trusted_interior_raster", "_trusted_interior")
+    river_depth_path = _resolve_existing_output_path(river_outputs, "depth_terrain")
+
+    template_path = None
+    for cand in (candidate_path, sdb_depth_path, river_depth_path, auth_src):
+        if cand is None:
+            continue
+        try:
+            p = Path(cand)
+        except (TypeError, ValueError):
+            continue
+        if p.exists():
+            template_path = p
+            break
+    if template_path is None:
+        return candidate_path, provenance_path, None, None, None, None
+
+    with rasterio.open(template_path) as cand_ds:
+        profile = cand_ds.profile.copy()
+        nodata = cand_ds.nodata
+        if nodata is None:
+            nodata = -9999.0
+
+        def _align(src_path: Optional[Path], *, dtype: str = "float32", nodata_value: float | int = -9999.0, resampling=Resampling.nearest) -> Optional[np.ndarray]:
+            if src_path is None or (not Path(src_path).exists()):
+                return None
+            arr = np.full((cand_ds.height, cand_ds.width), nodata_value, dtype=dtype)
+            with rasterio.open(src_path) as src:
+                reproject(
+                    source=rasterio.band(src, 1),
+                    destination=arr,
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    dst_transform=cand_ds.transform,
+                    dst_crs=cand_ds.crs,
+                    resampling=resampling,
+                    src_nodata=src.nodata,
+                    dst_nodata=nodata_value,
+                )
+            return arr
+
+        auth = _align(auth_src, dtype="float32", nodata_value=np.float32(nodata), resampling=Resampling.nearest)
+        if auth is None:
+            return candidate_path, provenance_path, None, None, None, None
+        auth = auth.astype("float32")
+        auth[np.isclose(auth, np.float32(nodata))] = np.nan
+
+        legacy_candidate = _align(candidate_path, dtype="float32", nodata_value=np.float32(nodata), resampling=Resampling.bilinear)
+        if legacy_candidate is not None:
+            legacy_candidate = legacy_candidate.astype("float32")
+            legacy_candidate[np.isclose(legacy_candidate, np.float32(nodata))] = np.nan
+
+        sdb_candidate = _align(sdb_depth_path, dtype="float32", nodata_value=np.float32(nodata), resampling=Resampling.bilinear)
+        if sdb_candidate is not None:
+            sdb_candidate = sdb_candidate.astype("float32")
+            sdb_candidate[np.isclose(sdb_candidate, np.float32(nodata))] = np.nan
+
+        river_candidate = _align(river_depth_path, dtype="float32", nodata_value=np.float32(nodata), resampling=Resampling.bilinear)
+        if river_candidate is not None:
+            river_candidate = river_candidate.astype("float32")
+            river_candidate[np.isclose(river_candidate, np.float32(nodata))] = np.nan
+
+        sdb_adm = _align(sdb_adm_path, dtype="uint8", nodata_value=0, resampling=Resampling.nearest)
+        river_adm = _align(river_adm_path, dtype="uint8", nodata_value=0, resampling=Resampling.nearest)
+        sdb_gw = _align(sdb_gw_path, dtype="float32", nodata_value=np.nan, resampling=Resampling.bilinear)
+        sdb_ti = _align(sdb_ti_path, dtype="uint8", nodata_value=0, resampling=Resampling.nearest)
+        river_gw_path = _resolve_existing_output_path(river_outputs, "guidance_weight")
+        river_gw = _align(river_gw_path, dtype="float32", nodata_value=np.nan, resampling=Resampling.bilinear)
+        river_ti_path = _resolve_existing_output_path(river_outputs, "trusted_interior")
+        river_estuary_transition_path = _resolve_existing_output_path(river_outputs, "estuary_transition")
+        river_support_path = _resolve_existing_output_path(river_outputs, "authoritative_support")
+        river_support_depth_path = _resolve_existing_output_path(river_outputs, "authoritative_support_depth")
+        river_ti = _align(river_ti_path, dtype="uint8", nodata_value=0, resampling=Resampling.nearest)
+        river_estuary_transition = _align(river_estuary_transition_path, dtype="uint8", nodata_value=0, resampling=Resampling.nearest)
+        river_support = _align(river_support_path, dtype="uint8", nodata_value=0, resampling=Resampling.nearest)
+        river_support_depth = _align(river_support_depth_path, dtype="float32", nodata_value=np.nan, resampling=Resampling.bilinear)
+
+        sdb_ok = (np.asarray(sdb_adm) > 0) if sdb_adm is not None else np.zeros(auth.shape, dtype=bool)
+        river_ok = (np.asarray(river_adm) > 0) if river_adm is not None else np.zeros(auth.shape, dtype=bool)
+        source_candidate = _build_source_aware_candidate_arrays(
+            legacy_candidate=legacy_candidate,
+            sdb_candidate=sdb_candidate,
+            river_candidate=river_candidate,
+            sdb_ok=sdb_ok,
+            river_ok=river_ok,
+            sdb_guidance_weight=sdb_gw,
+            sdb_trusted_interior=sdb_ti,
+            river_guidance_weight=river_gw,
+            river_trusted_interior=river_ti,
+            estuary_transition=river_estuary_transition,
+        )
+        candidate = source_candidate["candidate"].astype("float32")
+        candidate_prov = source_candidate["provenance"].astype("uint8")
+        pixel_size_m = _grid_pixel_size_m(cand_ds.transform, cand_ds.crs, ref_lat_deg=(cfg.tile_bbox[1] + cfg.tile_bbox[3]) / 2.0 if getattr(cfg, "tile_bbox", None) else None)
+        result = _support_weighted_condition_arrays(
+            candidate=candidate,
+            auth=auth,
+            sdb_ok=sdb_ok,
+            river_ok=river_ok,
+            sdb_gw=sdb_gw,
+            sdb_ti=sdb_ti,
+            river_gw=river_gw,
+            river_ti=river_ti,
+            river_support=river_support,
+            river_support_depth=river_support_depth,
+            estuary_transition=river_estuary_transition,
+            pixel_size_m=pixel_size_m,
+            support_decay_m=float(getattr(cfg, "authoritative_support_decay_m", 300.0) or 300.0),
+            support_density_radius_m=float(getattr(cfg, "authoritative_support_density_radius_m", 250.0) or 250.0),
+            coastal_sdb_support_transition_m=float(getattr(cfg, "coastal_sdb_support_transition_m", 600.0) or 600.0),
+            river_anchor_density_radius_m=float(getattr(cfg, "river_anchor_density_radius_m", 200.0) or 200.0),
+            river_scaffold_transition_m=float(getattr(cfg, "river_scaffold_transition_m", 800.0) or 800.0),
+        )
+        locked = result["locked"]
+        gap = result["gap"]
+        eligible = result["eligible"]
+        support = result["support"]
+        regime = result["regime"]
+        support_distance_m = result["support_distance_m"]
+        support_density = result["support_density"]
+        guidance_influence = result["guidance_influence"]
+        coastal_sdb_confidence = result["coastal_sdb_confidence"]
+        river_anchor_distance_m = result["river_anchor_distance_m"]
+        river_anchor_density = result["river_anchor_density"]
+        river_scaffold_confidence = result["river_scaffold_confidence"]
+        conditioned = result["conditioned"]
+        prov_out = result["provenance"]
+        support_note = result["support_note"]
+
+        prof_f32 = profile.copy()
+        prof_f32.update(dtype="float32", nodata=float(nodata), count=1, compress="deflate")
+        prof_u8 = profile.copy()
+        prof_u8.update(dtype="uint8", nodata=0, count=1, compress="deflate")
+
+        def _write(path: Path, arr: np.ndarray, prof: dict):
+            with rasterio.open(path, "w", **prof) as dst:
+                dst.write(arr, 1)
+
+        auth_out = auth.copy()
+        auth_out[~np.isfinite(auth_out)] = np.float32(nodata)
+        cond_out = conditioned.copy()
+        cond_out[~np.isfinite(cond_out)] = np.float32(nodata)
+        gap_u8 = gap.astype("uint8")
+        eligible_u8 = eligible.astype("uint8")
+
+        _write(aligned_auth_path, auth_out.astype("float32"), prof_f32)
+        _write(gap_mask_path, gap_u8, prof_u8)
+        _write(eligible_mask_path, eligible_u8, prof_u8)
+        _write(support_class_path, support.astype("uint8"), prof_u8)
+        _write(regime_class_path, regime.astype("uint8"), prof_u8)
+        _write(source_candidate_path, np.where(np.isfinite(candidate), candidate, np.float32(nodata)).astype("float32"), prof_f32)
+        _write(source_candidate_prov_path, candidate_prov.astype("uint8"), prof_u8)
+        _write(support_distance_path, np.where(np.isfinite(support_distance_m), support_distance_m, np.float32(nodata)).astype("float32"), prof_f32)
+        _write(support_density_path, np.clip(support_density, 0.0, 1.0).astype("float32"), {**prof_f32, "nodata": -9999.0})
+        _write(guidance_influence_path, np.clip(guidance_influence, 0.0, 1.0).astype("float32"), {**prof_f32, "nodata": -9999.0})
+        _write(coastal_sdb_confidence_path, np.clip(coastal_sdb_confidence, 0.0, 1.0).astype("float32"), {**prof_f32, "nodata": -9999.0})
+        _write(river_anchor_distance_path, np.where(np.isfinite(river_anchor_distance_m), river_anchor_distance_m, np.float32(nodata)).astype("float32"), prof_f32)
+        _write(river_anchor_density_path, np.clip(river_anchor_density, 0.0, 1.0).astype("float32"), {**prof_f32, "nodata": -9999.0})
+        _write(river_scaffold_confidence_path, np.clip(river_scaffold_confidence, 0.0, 1.0).astype("float32"), {**prof_f32, "nodata": -9999.0})
+        _write(conditioned_path, cond_out.astype("float32"), prof_f32)
+        _write(conditioned_prov_path, prov_out.astype("uint8"), prof_u8)
+        audit = _summarize_precedence_audit(
+            auth=auth,
+            conditioned=conditioned,
+            support=support,
+            provenance=prov_out,
+            guidance_influence=guidance_influence,
+        )
+        _write_precedence_audit(
+            precedence_audit_path,
+            audit,
+            extra={
+                "source_authoritative_base": str(auth_src),
+                "candidate_input": str(candidate_path) if candidate_path else None,
+                "source_aware_candidate": str(source_candidate_path),
+                "conditioned_output": str(conditioned_path),
+            },
+        )
+
+    report.setdefault("authoritative_base", {})["status"] = "applied"
+    report["authoritative_base"]["inputs"] = {"source": str(auth_src)}
+    report["authoritative_base"]["outputs"] = {
+        "aligned_authoritative_base": str(aligned_auth_path),
+        "gap_mask": str(gap_mask_path),
+        "eligible_fill_mask": str(eligible_mask_path),
+        "support_class": str(support_class_path),
+        "regime_class": str(regime_class_path),
+        "source_aware_candidate": str(source_candidate_path),
+        "source_aware_candidate_provenance": str(source_candidate_prov_path),
+        "support_distance": str(support_distance_path),
+        "support_density": str(support_density_path),
+        "guidance_influence": str(guidance_influence_path),
+        "coastal_sdb_confidence": str(coastal_sdb_confidence_path),
+        "river_anchor_distance": str(river_anchor_distance_path),
+        "river_anchor_density": str(river_anchor_density_path),
+        "river_scaffold_confidence": str(river_scaffold_confidence_path),
+        "conditioned_depth": str(conditioned_path),
+        "conditioned_provenance": str(conditioned_prov_path) if conditioned_prov_path else None,
+        "source_provenance_input": str(provenance_path) if provenance_path else None,
+        "precedence_audit": str(precedence_audit_path),
+    }
+    report["authoritative_base"]["candidate_generation"] = {
+        "mode": "support_aware_direct_sources_with_legacy_backstop",
+        "template_path": str(template_path),
+        "sdb_depth": str(sdb_depth_path) if sdb_depth_path else None,
+        "river_depth": str(river_depth_path) if river_depth_path else None,
+        "legacy_candidate": str(candidate_path) if candidate_path else None,
+        "stats": source_candidate.get("stats", {}),
+        "provenance_codes": source_candidate.get("provenance_codes", {}),
+    }
+    report["authoritative_base"]["policy"] = build_final_dem_policy_dict(
+        cfg,
+        support_note=f"{support_note}; source_candidate=support_aware_direct_sources_with_legacy_backstop",
+        guidance_masks={
+            "sdb_admissibility": str(sdb_adm_path) if sdb_adm_path else None,
+            "sdb_guidance_weight": str(sdb_gw_path) if sdb_gw_path else None,
+            "sdb_trusted_interior": str(sdb_ti_path) if sdb_ti_path else None,
+            "river_admissibility": str(river_adm_path) if river_adm_path else None,
+            "river_guidance_weight": str(river_gw_path) if river_gw_path else None,
+            "river_trusted_interior": str(river_ti_path) if river_ti_path else None,
+            "river_authoritative_support": str(river_support_path) if river_support_path else None,
+            "river_authoritative_support_depth": str(river_support_depth_path) if river_support_depth_path else None,
+        },
+    )
+    try:
+        report["authoritative_base"]["precedence_audit"] = json.loads(precedence_audit_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        log.debug("[AUTHORITATIVE] Failed to reload precedence audit JSON", exc_info=True)
+    return conditioned_path, conditioned_prov_path, aligned_auth_path, gap_mask_path, eligible_mask_path, support_class_path
+
 
 def fuse(cfg: BathyConfig, sdb_raster: Optional[Path], river_raster: Optional[Path], report: Dict[str, Any]) -> Optional[Path]:
     """
@@ -5620,6 +5722,7 @@ def fuse(cfg: BathyConfig, sdb_raster: Optional[Path], river_raster: Optional[Pa
     # treat 0.0 as nodata for fusion so river can gap-fill.
     try:
         from osgeo import gdal
+        gdal.UseExceptions()
         import numpy as np
         ds0 = gdal.Open(str(sdb_fuse_path))
         if ds0 is not None:
@@ -5733,8 +5836,9 @@ def fuse(cfg: BathyConfig, sdb_raster: Optional[Path], river_raster: Optional[Pa
         """
         try:
             from osgeo import gdal
+            gdal.UseExceptions()
             import numpy as np
-        except Exception as ee:
+        except (ImportError, ModuleNotFoundError) as ee:
             raise RuntimeError(f"GDAL/NumPy not available for fallback fusion: {ee}")
 
         nodata = -9999.0
@@ -5838,21 +5942,7 @@ def fuse(cfg: BathyConfig, sdb_raster: Optional[Path], river_raster: Optional[Pa
         # We satisfy this by passing a 1/0 river_domain_mask into bathy_fusion and enabling
         # river_overrides_sdb_in_domain, which suppresses SDB where mask==1.
         # ------------------------------------------------------------------
-        river_domain_mask_for_fusion: Optional[Path] = None
-        try:
-            ro = report.get("river", {}).get("outputs", {}) if isinstance(report.get("river", {}), dict) else {}
-            cand = ro.get("river_channel_mask") or ro.get("channel_mask") or ro.get("river_domain_mask")
-            if cand:
-                river_domain_mask_for_fusion = Path(str(cand))
-        except Exception:
-            river_domain_mask_for_fusion = None
-
-        if river_domain_mask_for_fusion is None or (not river_domain_mask_for_fusion.exists()):
-            try:
-                ch = cfg.river_channel_mask
-                river_domain_mask_for_fusion = Path(str(ch)) if ch else None
-            except Exception:
-                river_domain_mask_for_fusion = None
+        river_domain_mask_for_fusion = _resolve_river_domain_mask_for_fusion(cfg, report)
 
         if river_domain_mask_for_fusion is not None and river_domain_mask_for_fusion.exists():
             report.setdefault("fusion", {}).setdefault("domain", {})["river_domain_mask"] = str(river_domain_mask_for_fusion)
@@ -5863,7 +5953,7 @@ def fuse(cfg: BathyConfig, sdb_raster: Optional[Path], river_raster: Optional[Pa
         cfg_fuse = FusionConfig(
             sdb_raster=Path(sdb_fuse_path) if sdb_fuse_path else None,
             river_raster=Path(river_fuse_path) if river_fuse_path else None,
-            measured_raster=None,
+            measured_raster=(Path(cfg.authoritative_base) if getattr(cfg, "authoritative_base", None) and Path(cfg.authoritative_base).exists() else None),
             dem_raster=None,
             river_domain_mask=river_domain_mask_for_fusion,
             ocean_domain_mask=cfg.ocean_domain_mask_for_fusion,
@@ -5884,17 +5974,7 @@ def fuse(cfg: BathyConfig, sdb_raster: Optional[Path], river_raster: Optional[Pa
             raise RuntimeError(getattr(res, "error", None) or "fusion did not return a valid combined raster")
 
         # bathy_fusion writes fixed filenames; copy to our pipeline-stable names
-        try:
-            shutil.copy2(str(res.combined_raster), str(out_depth))
-        except Exception:
-            # If copy fails, fall back to the produced path
-            out_depth = Path(res.combined_raster)
-
-        if getattr(res, "provenance_raster", None):
-            try:
-                shutil.copy2(str(res.provenance_raster), str(out_prov))
-            except Exception:
-                out_prov = Path(res.provenance_raster)
+        out_depth, out_prov = _copy_fusion_outputs(res, out_depth, out_prov)
 
         report["fusion"] = {
             "status": "success",
@@ -5913,43 +5993,33 @@ def fuse(cfg: BathyConfig, sdb_raster: Optional[Path], river_raster: Optional[Pa
         # Sanity: ensure the combined raster actually incorporated some river pixels (common failure mode
         # when river was misaligned or fully nodata after reprojection). If not, do a guaranteed union overlay.
         try:
-            import rasterio, numpy as np
-            has_river = False
-            with rasterio.open(str(out_prov if out_prov else out_depth)) as ds:
-                arr = ds.read(1)
-                # If provenance exists and contains river/blended, we consider river present.
-                # Otherwise, fall back to checking if river contributes to combined where sdb is nodata.
-            if out_prov and Path(out_prov).exists():
-                with rasterio.open(str(out_prov)) as dp:
-                    p = dp.read(1)
-                    has_river = bool(np.any((p == 2) | (p == 6)))  # PROV_RIVER=2, PROV_BLENDED=6
-            if not has_river:
-                try:
-                    _simple_union_overlay(Path(sdb_fuse_path), Path(river_fuse_path), Path(out_depth), Path(template), pri)
-                except Exception:
-                    _gdal_union_overlay(Path(sdb_fuse_path), Path(river_fuse_path), Path(out_depth), Path(template), pri)
-                report["fusion"]["note"] = "River contribution missing after fusion; applied union overlay fallback."
-        except Exception:
-            log.debug("ignored", exc_info=True)
-
+            _ensure_river_contribution(
+                union_overlay_fn=_simple_union_overlay,
+                gdal_union_overlay_fn=_gdal_union_overlay,
+                sdb_fuse_path=Path(sdb_fuse_path),
+                river_fuse_path=Path(river_fuse_path),
+                out_depth=Path(out_depth),
+                out_prov=Path(out_prov) if out_prov else None,
+                template=Path(template),
+                pri=pri,
+                report=report,
+                logger=log,
+            )
+        except (FileNotFoundError, OSError, RuntimeError, ValueError, TypeError) as e:
+            log.debug("Optional river-contribution validation failed: %s", e, exc_info=True)
 
 
         # Apply river guidance artifacts as downstream fusion controls.
-        try:
-            river_outputs = report.get('river', {}).get('outputs', {}) if isinstance(report.get('river', {}), dict) else {}
-            _apply_river_guidance_to_fused_output(
-                Path(out_depth),
-                river_path=Path(river_fuse_path) if river_fuse_path else None,
-                sdb_path=Path(sdb_fuse_path) if sdb_fuse_path else None,
-                provenance_path=Path(out_prov) if out_prov else None,
-                river_outputs=river_outputs,
-                report=report,
-                estuary_max_weight=float(cfg.estuary_max_weight),
-            )
-        except Exception as _river_guidance_e:
-            report.setdefault('fusion', {}).setdefault('guidance_controls', {})['river_guidance_applied'] = False
-            report['fusion']['guidance_controls']['error'] = str(_river_guidance_e)
-            log.debug('river guidance fusion controls failed; keeping base fused output', exc_info=True)
+        _apply_guidance_controls_with_reporting(
+            apply_fn=_apply_river_guidance_to_fused_output,
+            out_depth=Path(out_depth),
+            river_fuse_path=Path(river_fuse_path) if river_fuse_path else None,
+            sdb_fuse_path=Path(sdb_fuse_path) if sdb_fuse_path else None,
+            out_prov=Path(out_prov) if out_prov else None,
+            report=report,
+            estuary_max_weight=float(cfg.estuary_max_weight),
+            logger=log,
+        )
 
         # ------------------------------------------------------------------
         # Enforce authoritative XYZ constraints in the final fused raster.
@@ -5957,80 +6027,14 @@ def fuse(cfg: BathyConfig, sdb_raster: Optional[Path], river_raster: Optional[Pa
         # the output bed elevation must equal the sounding bed elevation exactly.
         # ------------------------------------------------------------------
         try:
-            import rasterio
-            import numpy as np
-            from rasterio.transform import rowcol
-
-            xyz_str = str(cfg.river_soundings or '').strip()
-            xyz_paths = [p for p in [s.strip() for s in xyz_str.split(',')] if p]
-            if xyz_paths and Path(out_depth).exists():
-                with rasterio.open(str(out_depth), 'r+') as ds:
-                    arr = ds.read(1).astype('float32')
-                    nodata = ds.nodata
-                    if nodata is None:
-                        nodata = -9999.0
-                    # Collect per-pixel samples (median if multiple points hit same pixel)
-                    h, w = ds.height, ds.width
-                    pix_idx = []
-                    zvals = []
-                    for xp in xyz_paths:
-                        fp = Path(xp)
-                        if not fp.exists():
-                            continue
-                        try:
-                            dat = np.genfromtxt(str(fp), dtype='float64', delimiter=None)
-                            if dat.ndim == 1:
-                                dat = dat.reshape(1, -1)
-                        except Exception:
-                            # try comma-delimited
-                            try:
-                                dat = np.genfromtxt(str(fp), dtype='float64', delimiter=',')
-                                if dat.ndim == 1:
-                                    dat = dat.reshape(1, -1)
-                            except Exception:
-                                continue
-                        if dat.size == 0:
-                            continue
-                        # take first 3 columns
-                        if dat.shape[1] < 3:
-                            continue
-                        x = dat[:, 0]
-                        y = dat[:, 1]
-                        z = dat[:, 2]
-                        m = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
-                        if not np.any(m):
-                            continue
-                        x = x[m]; y = y[m]; z = z[m]
-                        rr, cc = rowcol(ds.transform, x, y)
-                        rr = np.asarray(rr); cc = np.asarray(cc)
-                        mm = (rr >= 0) & (rr < h) & (cc >= 0) & (cc < w)
-                        if not np.any(mm):
-                            continue
-                        rr = rr[mm]; cc = cc[mm]; z = z[mm]
-                        idx = rr * w + cc
-                        pix_idx.append(idx)
-                        zvals.append(z)
-
-                    if pix_idx:
-                        idx = np.concatenate(pix_idx)
-                        zv = np.concatenate(zvals).astype('float32')
-                        # median per pixel
-                        order = np.argsort(idx)
-                        idx = idx[order]
-                        zv = zv[order]
-                        uniq, start = np.unique(idx, return_index=True)
-                        # compute median by splitting (fast enough for typical sizes)
-                        med = np.empty_like(uniq, dtype='float32')
-                        for i, s0 in enumerate(start):
-                            s1 = start[i+1] if i+1 < len(start) else len(idx)
-                            med[i] = np.median(zv[s0:s1])
-                        rr = (uniq // w).astype('int64')
-                        cc = (uniq % w).astype('int64')
-                        arr[rr, cc] = med
-                        ds.write(arr.astype('float32'), 1)
-                report.setdefault('fusion', {}).setdefault('constraints', {})['xyz_burned_into_final'] = True
-                report['fusion']['constraints']['xyz_files'] = [str(Path(x).name) for x in xyz_paths]
-        except Exception as _burn_e:
+            xyz_paths = _normalize_multi_path_value(getattr(cfg, 'river_soundings', None))
+            _burn_authoritative_xyz_into_final(
+                out_depth=Path(out_depth),
+                xyz_paths=xyz_paths,
+                report=report,
+                logger=log,
+            )
+        except (FileNotFoundError, OSError, RuntimeError, ValueError, TypeError, KeyError) as _burn_e:
             report.setdefault('fusion', {}).setdefault('constraints', {})['xyz_burned_into_final'] = False
             report['fusion']['constraints']['xyz_burn_error'] = str(_burn_e)
 
@@ -6039,23 +6043,20 @@ def fuse(cfg: BathyConfig, sdb_raster: Optional[Path], river_raster: Optional[Pa
         # correction that gently pulls the prediction surface toward measured depths
         # in the gaps between exact-overwrite pixels.
         try:
-            support_points = _load_river_authoritative_support_points(cfg)
-            if support_points is not None and len(support_points) >= 20:
-                rc_stats = _apply_residual_correction(
-                    Path(out_depth),
-                    support_points,
-                    sigma_m=1000.0,
-                    max_correction_m=8.0,
-                    min_points=20,
-                    label="FUSED_RESIDUAL",
-                )
-                report.setdefault("fusion", {})["residual_correction"] = rc_stats
-        except Exception:
-            log.debug("Optional residual correction on fused output failed", exc_info=True)
+            _apply_residual_correction_with_reporting(
+                cfg=cfg,
+                out_depth=Path(out_depth),
+                report=report,
+                logger=log,
+                load_support_points_fn=_load_river_authoritative_support_points,
+                apply_residual_correction_fn=_apply_residual_correction,
+            )
+        except (FileNotFoundError, OSError, RuntimeError, ValueError, TypeError, KeyError) as e:
+            log.debug("Optional residual correction on fused output failed: %s", e, exc_info=True)
 
         return Path(out_depth)
 
-    except Exception as e:
+    except (FileNotFoundError, OSError, RuntimeError, ValueError, TypeError, KeyError, ImportError) as e:
         # Fall back to priority-copy, but keep the error visible in the report
         err = f"weighted_overlap fusion failed; falling back to priority copy: {e}"
         report["fusion"] = {
@@ -6075,7 +6076,7 @@ def fuse(cfg: BathyConfig, sdb_raster: Optional[Path], river_raster: Optional[Pa
             report["fusion"]["mode"] = "union_overlay_fallback"
             report["fusion"]["note"] = "Fusion failed; used GDAL union overlay fallback."
             return out_depth
-        except Exception as ee2:
+        except (FileNotFoundError, OSError, RuntimeError, ValueError, TypeError) as ee2:
             report["fusion"]["note"] = f"Union overlay fallback also failed; priority copy used. union_error={ee2}"
 
         # Priority copy as last resort
@@ -6800,6 +6801,34 @@ def parse_args() -> argparse.Namespace:
                    help="One or more high-quality point files (CSV/TXT/GPKG/Shp) with x/y/z (or lon/lat/depth) columns. If omitted, uses --extra-xyz (if provided).")
     p.add_argument("--gapfill-water-mask", default=None,
                    help="Optional explicit water mask raster (1=water) to constrain gapfill. If omitted, uses waffles mask when available, otherwise finite prior pixels.")
+    p.add_argument("--authoritative-base", default=None,
+                   help="Optional hard-locked measured-constrained raster. Finite cells are preserved exactly and only its nodata gaps are eligible for conditioned fill.")
+    p.add_argument("--authoritative-base-auto", action="store_true", default=True,
+                   help="Automatically build and AOI-cache authoritative_base.tif from NOAA CUDEM tile index + spatial metadata under <cache-root>/authoritative_base/. Enabled by default; use --no-authoritative-base-auto to disable, or --authoritative-base /path/to/file.tif to override.")
+    p.add_argument("--no-authoritative-base-auto", dest="authoritative_base_auto", action="store_false",
+                   help="Disable automatic AOI-cached authoritative_base materialization.")
+    p.add_argument("--authoritative-base-tile-index-url",
+                   default="https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_2014_8483/tileindex_NCEI_ninth_Topobathy_2014.zip",
+                   help="Tile-index zip URL used when auto-building authoritative_base.")
+    p.add_argument("--authoritative-base-spatial-meta-url",
+                   default="https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_2014_8483/ninth_spatial_meta.zip",
+                   help="Spatial-metadata zip URL used when auto-building authoritative_base.")
+    p.add_argument("--authoritative-base-missing-meta-policy", choices=["skip", "tile_extent", "error"], default="skip",
+                   help="How to handle selected CUDEM tiles with no matching spatial metadata during authoritative-base auto-build.")
+    p.add_argument("--authoritative-base-force-rebuild", action="store_true", default=False,
+                   help="Force rebuild of the cached authoritative-base entry for this AOI/settings.")
+    p.add_argument("--authoritative-base-tile-url-field", default=None,
+                   help="Optional explicit tile-index attribute containing the DEM download URL during authoritative-base auto-build.")
+    p.add_argument("--authoritative-support-decay-m", type=float, default=300.0,
+                   help="Distance scale (meters) controlling how quickly inferred guidance can dominate away from authoritative_base hard control.")
+    p.add_argument("--authoritative-support-density-radius-m", type=float, default=250.0,
+                   help="Neighborhood radius (meters) used to estimate local authoritative support density for support-aware conditioning.")
+    p.add_argument("--coastal-sdb-support-transition-m", type=float, default=600.0,
+                   help="Distance scale (meters) controlling when stable optical SDB support can dominate in estuary/nearshore gaps away from hard control.")
+    p.add_argument("--river-anchor-density-radius-m", type=float, default=200.0,
+                   help="Neighborhood radius (meters) used to estimate local river anchor density during final conditioning.")
+    p.add_argument("--river-scaffold-transition-m", type=float, default=800.0,
+                   help="Distance scale (meters) controlling when river guidance becomes scaffold-dominant away from river anchors.")
     p.add_argument("--gapfill-method", default="rbf", choices=["rbf", "gp", "idw"],
                    help="Interpolation method for residuals: rbf (thin-plate spline), gp (Gaussian Process), idw (inverse distance).")
     p.add_argument("--gapfill-river-smooth-sigma", type=float, default=500.0,
@@ -7030,16 +7059,22 @@ def _apply_output_retention_policy(cfg, log, report, final_path=None, final_for_
             for child in list(out_dir.iterdir()):
                 if child.name == tmp.name:
                     continue
-                if child.is_dir():
-                    try:
-                        shutil.rmtree(str(child))
-                    except Exception as e:
-                        log.warning('[OUTPUT] Failed to delete dir %s (%s). Continuing.', str(child), e)
-                else:
-                    try:
+                try:
+                    if child.is_symlink() or child.is_file():
                         child.unlink(missing_ok=True)
-                    except Exception as e:
-                        log.warning('[OUTPUT] Failed to delete file %s (%s). Continuing.', str(child), e)
+                    elif child.is_dir():
+                        shutil.rmtree(str(child), ignore_errors=False)
+                except Exception as e:
+                    # One more quiet best-effort pass avoids noisy false alarms from transient files.
+                    try:
+                        if child.is_dir():
+                            shutil.rmtree(str(child), ignore_errors=True)
+                        else:
+                            child.unlink(missing_ok=True)
+                    except Exception:
+                        log.debug('[OUTPUT] Final cleanup pass failed for %s', str(child), exc_info=True)
+                    if child.exists():
+                        log.warning('[OUTPUT] Failed to delete %s (%s). Continuing.', str(child), e)
             log.info("[OUTPUT] Deleted intermediates (kept deliverables + run metadata only).")
 
         # Restore kept content from tmp
@@ -7060,6 +7095,28 @@ def _apply_output_retention_policy(cfg, log, report, final_path=None, final_for_
 
 
 
+
+
+
+def _enable_gdal_exceptions_best_effort() -> None:
+    """Silence GDAL 4 deprecation warnings and make failures deterministic when bindings exist."""
+    try:
+        from osgeo import gdal
+        gdal.UseExceptions()
+    except Exception:
+        return
+
+
+def _replace_with_symlink_or_copy(src: Path, dst: Path) -> None:
+    """Atomically refresh a user-facing alias without depending on symlink support."""
+    src = Path(src)
+    dst = Path(dst)
+    if dst.exists() or dst.is_symlink():
+        dst.unlink()
+    try:
+        os.symlink(src, dst)
+    except Exception:
+        shutil.copy2(src, dst)
 
 def _reproject_final_outputs(cfg, final, report, sdb_raster, river_raster, fatal_errors):
     """Reproject final rasters to the configured output SRS and apply depth metadata.
@@ -7093,20 +7150,13 @@ def _reproject_final_outputs(cfg, final, report, sdb_raster, river_raster, fatal
             if warped:
                 report.setdefault("outputs", {})["combined_warped_context"] = str(warped)
 
-                # Tile deliverable: always clip back to the original tile AOI when destination is EPSG:4269.
+                # Tile deliverable: crop back to the original tile AOI when destination is EPSG:4269.
                 bbox_tile = _parse_aoi_bbox(cfg.aoi_tile or cfg.aoi)
                 deliverable = Path(warped)
                 try:
                     if bbox_tile and dst_is_4269:
-                        clipped = combined_dir / f"{deliverable.stem}_tile.tif"
-                        clipped = _clip_raster_to_bbox(deliverable, bbox_tile, clipped, nodata=cfg.final_nodata)
-                        if clipped and Path(clipped).exists():
-                            deliverable = Path(clipped)
-                            report.setdefault("outputs", {})["combined_warped"] = str(deliverable)
-                        else:
-                            report.setdefault("outputs", {})["combined_warped"] = str(deliverable)
-                    else:
-                        report.setdefault("outputs", {})["combined_warped"] = str(deliverable)
+                        _crop_raster_extent_to_bbox(deliverable, bbox_tile, nodata=cfg.final_nodata)
+                    report.setdefault("outputs", {})["combined_warped"] = str(deliverable)
                 except Exception:
                     log.debug("ignored", exc_info=True)
                     report.setdefault("outputs", {})["combined_warped"] = str(deliverable)
@@ -7165,10 +7215,7 @@ def _reproject_final_outputs(cfg, final, report, sdb_raster, river_raster, fatal
                 try:
                     bbox_tile = _parse_aoi_bbox(cfg.aoi_tile or cfg.aoi)
                     if bbox_tile and dst_is_4269:
-                        clipped = sdb_dir / f"{deliverable.stem}_tile.tif"
-                        clipped = _clip_raster_to_bbox(deliverable, bbox_tile, clipped, nodata=cfg.final_nodata)
-                        if clipped and Path(clipped).exists():
-                            deliverable = Path(clipped)
+                        _crop_raster_extent_to_bbox(deliverable, bbox_tile, nodata=cfg.final_nodata)
                 except Exception:
                     log.debug("ignored", exc_info=True)
                 report.setdefault("outputs", {})["sdb_warped"] = str(deliverable)
@@ -7186,15 +7233,12 @@ def _reproject_final_outputs(cfg, final, report, sdb_raster, river_raster, fatal
             if warped:
                 report.setdefault("outputs", {})["river_warped_context"] = str(warped)
 
-                # Tile deliverable: clip back to original tile AOI when destination is EPSG:4269.
+                # Tile deliverable: crop back to original tile AOI when destination is EPSG:4269.
                 deliverable = Path(warped)
                 try:
                     bbox_tile = _parse_aoi_bbox(cfg.aoi_tile or cfg.aoi)
                     if bbox_tile and dst_is_4269:
-                        clipped = river_dir / f"{deliverable.stem}_tile.tif"
-                        clipped = _clip_raster_to_bbox(deliverable, bbox_tile, clipped, nodata=cfg.river_nodata)
-                        if clipped and Path(clipped).exists():
-                            deliverable = Path(clipped)
+                        _crop_raster_extent_to_bbox(deliverable, bbox_tile, nodata=cfg.river_nodata)
                 except Exception:
                     log.debug("ignored", exc_info=True)
 
@@ -7235,6 +7279,38 @@ def _reproject_final_outputs(cfg, final, report, sdb_raster, river_raster, fatal
                                 report.setdefault("outputs", {})["river_edge_tapered"] = str(deliverable)
                 except Exception:
                     log.debug("ignored", exc_info=True)
+
+                # Sanitize warped river deliverable after all crop/clip/taper operations.
+                try:
+                    rstats = sanitize_raster_values(deliverable, nodata=cfg.river_nodata, min_valid=-1.0e5, max_valid=1.0e5)
+                    report.setdefault("river", {}).setdefault("sanitation", {})["warped_depth"] = rstats
+                except Exception:
+                    log.debug("ignored", exc_info=True)
+
+                # Verify the requested final CRS actually landed on disk.
+                if not raster_crs_matches(deliverable, dst_srs):
+                    msg = f"River warped raster CRS mismatch: expected {dst_srs} for {deliverable.name}"
+                    fatal_errors.append(msg)
+                    log.error("[WARP] %s", msg)
+                else:
+                    report.setdefault("outputs", {})["river_warped"] = str(deliverable)
+
+                # Refresh the stable top-level river deliverable only after all post-processing is complete.
+                if dst_is_4269:
+                    try:
+                        stable = river_dir / "river_depth_terrain_patch.tif"
+                        working = river_dir / "river_depth_terrain_patch_working.tif"
+                        if stable.exists() and not working.exists():
+                            shutil.move(str(stable), str(working))
+                            report.setdefault("river", {}).setdefault("outputs", {})["depth_terrain_working"] = str(working)
+                        _replace_with_symlink_or_copy(deliverable, stable)
+                        try:
+                            apply_depth_metadata(stable, depth_reference="terrain_surface")
+                        except Exception:
+                            log.debug("ignored", exc_info=True)
+                        report.setdefault("river", {}).setdefault("outputs", {})["depth_terrain"] = str(stable)
+                    except Exception:
+                        log.debug("ignored", exc_info=True)
             else:
                 msg = f"River warp failed: {r_p.name} -> {river_out_name} ({dst_srs})"
                 fatal_errors.append(msg)
@@ -7259,14 +7335,11 @@ def _reproject_final_outputs(cfg, final, report, sdb_raster, river_raster, fatal
                         report.setdefault("outputs", {})["river_bottom_warped_context"] = str(bed_warp)
 
                         deliverable = Path(bed_warp)
-                        # Tile deliverable: clip back to original tile AOI when destination is EPSG:4269.
+                        # Tile deliverable: crop back to original tile AOI when destination is EPSG:4269.
                         try:
                             bbox_tile = _parse_aoi_bbox(cfg.aoi_tile or cfg.aoi)
                             if bbox_tile and dst_is_4269:
-                                clipped = river_dir / f"{deliverable.stem}_tile.tif"
-                                clipped = _clip_raster_to_bbox(deliverable, bbox_tile, clipped, nodata=cfg.river_nodata)
-                                if clipped and Path(clipped).exists():
-                                    deliverable = Path(clipped)
+                                _crop_raster_extent_to_bbox(deliverable, bbox_tile, nodata=cfg.river_nodata)
                         except Exception:
                             log.debug("ignored", exc_info=True)
 
@@ -7311,6 +7384,36 @@ def _reproject_final_outputs(cfg, final, report, sdb_raster, river_raster, fatal
                                         report.setdefault("outputs", {})["river_bottom_edge_tapered"] = str(deliverable)
                         except Exception:
                             log.debug("ignored", exc_info=True)
+
+                        # Sanitize warped river-bottom deliverable after all crop/clip/taper operations.
+                        try:
+                            bstats = sanitize_raster_values(deliverable, nodata=cfg.river_nodata, min_valid=-1.0e5, max_valid=1.0e5)
+                            report.setdefault("river", {}).setdefault("sanitation", {})["warped_bottom"] = bstats
+                        except Exception:
+                            log.debug("ignored", exc_info=True)
+
+                        if not raster_crs_matches(deliverable, dst_srs):
+                            msg = f"River bottom warped raster CRS mismatch: expected {dst_srs} for {deliverable.name}"
+                            fatal_errors.append(msg)
+                            log.error("[WARP] %s", msg)
+                        else:
+                            report.setdefault("outputs", {})["river_bottom_warped"] = str(deliverable)
+
+                        if dst_is_4269:
+                            try:
+                                stable = river_dir / "river_bottom_navd88_patch.tif"
+                                working = river_dir / "river_bottom_navd88_patch_working.tif"
+                                if stable.exists() and not working.exists():
+                                    shutil.move(str(stable), str(working))
+                                    report.setdefault("river", {}).setdefault("outputs", {})["bottom_elevation_working"] = str(working)
+                                _replace_with_symlink_or_copy(deliverable, stable)
+                                try:
+                                    apply_elevation_metadata(stable, vertical_datum="NAVD88")
+                                except Exception:
+                                    log.debug("ignored", exc_info=True)
+                                report.setdefault("river", {}).setdefault("outputs", {})["bottom_elevation"] = str(stable)
+                            except Exception:
+                                log.debug("ignored", exc_info=True)
             except OSError:
                 log.debug("ignored", exc_info=True)
 
@@ -7425,6 +7528,210 @@ def _reproject_final_outputs(cfg, final, report, sdb_raster, river_raster, fatal
     return final_for_user
 
 
+def _link_or_copy_file(src: Path, dst: Path) -> Optional[Path]:
+    """Create a lightweight packaged pointer to an existing artifact."""
+    try:
+        src = Path(src).resolve()
+        if not src.exists():
+            return None
+        ensure_dir(dst.parent)
+        if dst.exists() or dst.is_symlink():
+            dst.unlink()
+        try:
+            rel = os.path.relpath(str(src), str(dst.parent.resolve()))
+            dst.symlink_to(rel)
+        except Exception:
+            shutil.copy2(src, dst)
+        return dst
+    except Exception:
+        log.debug("[COMPARE] Failed linking/copying %s -> %s", src, dst, exc_info=True)
+        return None
+
+
+def _resolve_baseline_cudem_interpolation(cfg: "BathyConfig", report: Dict[str, Any]) -> Optional[Path]:
+    info = report.get("authoritative_base_auto", {}) if isinstance(report.get("authoritative_base_auto"), dict) else {}
+    cand = info.get("baseline_cudem_interpolation")
+    if cand:
+        p = Path(str(cand))
+        if p.exists():
+            return p
+    auth = getattr(cfg, "authoritative_base", None)
+    if auth:
+        try:
+            sibling = Path(auth).with_name("cudem_baseline_interpolation.tif")
+            if sibling.exists():
+                return sibling
+        except (TypeError, ValueError, OSError):
+            log.debug("[COMPARE] Failed resolving baseline sibling next to authoritative_base", exc_info=True)
+    return None
+
+
+def _write_authoritative_cache_receipt(cfg: "BathyConfig", report: Dict[str, Any]) -> Optional[Path]:
+    return _fr_write_authoritative_cache_receipt(cfg, report)
+
+
+def _safe_class_stats(values: np.ndarray, cls: np.ndarray, class_codes: Dict[str, str], *, pixel_area_m2: float) -> Dict[str, Any]:
+    raise RuntimeError("_safe_class_stats moved to final_reporting.py and should not be called from bathy_main directly")
+
+
+def _write_comparison_summary(
+    cfg: "BathyConfig",
+    report: Dict[str, Any],
+    packaged: Dict[str, Optional[str]],
+    out_dir: Path,
+) -> Optional[Path]:
+    return _fr_write_comparison_summary(cfg, report, packaged, out_dir, logger=log)
+
+
+def _write_final_support_regime_audit(
+    cfg: "BathyConfig",
+    report: Dict[str, Any],
+    *,
+    final_native: Optional[Path],
+    final_for_user: Optional[Path | str],
+    final_provenance: Optional[Path | str],
+) -> Optional[Path]:
+    return _fsra_write_final_support_regime_audit(cfg, report, final_native=final_native, final_for_user=final_for_user, final_provenance=final_provenance, logger=log)
+
+
+def _write_support_provenance_summary(
+    cfg: "BathyConfig",
+    report: Dict[str, Any],
+    *,
+    final_native: Optional[Path],
+    final_for_user: Optional[Path | str],
+    final_provenance: Optional[Path | str],
+) -> Optional[Path]:
+    return _pr_write_support_provenance_summary(cfg, report, final_native=final_native, final_for_user=final_for_user, final_provenance=final_provenance, logger=log)
+
+
+def _write_final_dem_selection_receipt(
+    cfg: "BathyConfig",
+    report: Dict[str, Any],
+    *,
+    final_native: Optional[Path],
+    final_for_user: Optional[Path | str],
+    final_provenance: Optional[Path | str],
+) -> Optional[Path]:
+    return _fr_write_final_dem_selection_receipt(cfg, report, final_native=final_native, final_for_user=final_for_user, final_provenance=final_provenance)
+
+
+def _finalize_sdb_run(sdb_dir: Path, report: Dict[str, Any]) -> Optional[Path]:
+    return _finalize_sdb_run_impl(sdb_dir=sdb_dir, report=report, apply_depth_metadata=apply_depth_metadata, logger=log)
+
+
+def _resolve_river_domain_mask_for_fusion(cfg: "BathyConfig", report: Dict[str, Any]) -> Optional[Path]:
+    return _resolve_river_domain_mask_for_fusion_impl(cfg, report)
+
+
+def _copy_fusion_outputs(res, out_depth: Path, out_prov: Optional[Path]):
+    return _copy_fusion_outputs_impl(res, out_depth, out_prov)
+
+
+def _emit_optional_artifacts(report_path, io_json, io_md, report, logger) -> None:
+    try:
+        from flight_recorder import emit_artifact_written
+        emit_artifact_written(report_path, kind="json", role="bathy_report")
+        if io_json is not None:
+            emit_artifact_written(io_json, kind="json", role="io_manifest")
+        if io_md is not None:
+            emit_artifact_written(io_md, kind="md", role="io_manifest")
+        _emit_artifacts_from_report(report)
+    except (ImportError, FileNotFoundError, OSError, RuntimeError, ValueError) as e:
+        logger.debug("Optional flight-recorder emit failed: %s", e)
+
+
+def _run_gapfill_stage(*, cfg: "BathyConfig", args, report: Dict[str, Any], log, final, final_provenance, river_raster, authoritative_aligned, authoritative_eligible_fill_mask):
+    if not (cfg.gapfill_enabled and final):
+        return final, final_provenance
+    try:
+        from gapfill_intelligent import gapfill_depth_raster, GapfillConfig
+
+        hq_files: List[str] = []
+        if cfg.gapfill_hq:
+            hq_files = [str(p) for p in cfg.gapfill_hq if p]
+        else:
+            ex = getattr(args, "extra_xyz", None)
+            if ex:
+                if isinstance(ex, (list, tuple)):
+                    hq_files = [str(p) for p in ex if p]
+                else:
+                    hq_files = [str(ex)]
+
+        if not hq_files:
+            log.warning("[GAPFILL] Enabled but no HQ points provided (--gapfill-hq or --extra-xyz). Skipping.")
+            return final, final_provenance
+
+        combined_dir = ensure_dir(cfg.out_dir / "combined")
+        out_gap = combined_dir / "bathy_combined_depth_gapfill.tif"
+        out_sig = combined_dir / "bathy_combined_depth_gapfill_sigma.tif"
+        out_prov = combined_dir / "bathy_combined_depth_gapfill_provenance.tif"
+
+        wm: Optional[Path] = None
+        if cfg.gapfill_water_mask and Path(cfg.gapfill_water_mask).exists():
+            wm = Path(cfg.gapfill_water_mask)
+        else:
+            wm = _find_latest_waffles_mask(cfg.cache_root)
+
+        xs_gpkg = cfg.out_dir / "river" / "river_xs_params.gpkg"
+        if not xs_gpkg.exists():
+            xs_gpkg = None
+        river_mask = Path(river_raster) if river_raster and Path(river_raster).exists() else None
+
+        gcfg = GapfillConfig(
+            interpolation_method=cfg.gapfill_method,
+            rbf_function="thin_plate",
+            prior_sigma_default=1.0,
+            rbf_min_points=25,
+            component_min_points=10,
+            river_smooth_sigma_m=cfg.gapfill_river_smooth_sigma_m,
+            residual_sigma_floor=0.25,
+            distance_sigma_scale_m=1500.0,
+            output_cudem_xyz=cfg.gapfill_output_cudem_xyz,
+        )
+
+        gapfill_stats = gapfill_depth_raster(
+            prior_raster=Path(final), hq_point_files=hq_files, out_raster=out_gap, out_sigma=out_sig, out_provenance=out_prov,
+            cfg=gcfg, prior_sigma_raster=cfg.gapfill_prior_sigma_raster, water_mask_raster=wm, river_mask_raster=river_mask,
+            bank_elev_raster=cfg.gapfill_bank_elev_raster, xs_params_gpkg=xs_gpkg, target_mask_raster=authoritative_eligible_fill_mask,
+            lock_raster=authoritative_aligned, logger=log,
+        )
+
+        report.setdefault("gapfill", {})["status"] = "applied"
+        report["gapfill"]["stats"] = gapfill_stats
+        report["gapfill"]["outputs"] = {"depth": str(out_gap), "sigma": str(out_sig), "provenance": str(out_prov)}
+        if cfg.gapfill_output_cudem_xyz and "cudem_xyz" in gapfill_stats:
+            report["gapfill"]["outputs"]["cudem_xyz"] = gapfill_stats["cudem_xyz"]
+        return out_gap, out_prov
+    except (ImportError, FileNotFoundError, OSError, RuntimeError, ValueError) as e:
+        report.setdefault("gapfill", {})["status"] = "failed"
+        report["gapfill"]["error"] = str(e)
+        log.warning("[GAPFILL] Failed: %s", e)
+        return final, final_provenance
+
+
+def _write_comparison_package(
+    cfg: "BathyConfig",
+    report: Dict[str, Any],
+    *,
+    final_native: Optional[Path],
+    final_for_user: Optional[Path | str],
+    final_provenance: Optional[Path | str],
+) -> Optional[Path]:
+    return _fr_write_comparison_package(cfg, report, final_native=final_native, final_for_user=final_for_user, final_provenance=final_provenance, logger=log)
+
+
+def _write_explicit_final_outputs_manifest(
+    cfg: "BathyConfig",
+    report: Dict[str, Any],
+    *,
+    final_native: Optional[Path],
+    final_for_user: Optional[Path | str],
+    final_provenance: Optional[Path | str],
+) -> Optional[Path]:
+    return _fr_write_explicit_final_outputs_manifest(cfg, report, final_native=final_native, final_for_user=final_for_user, final_provenance=final_provenance)
+
+
 def _run_seam_comparisons(args, cfg, report, run_id, final, final_for_user, report_path):
     """Run adjacent-tile seam comparisons and write verifiability receipts."""
     # Adjacent-tile seam comparisons (explicit neighbor io_manifest.json paths; no auto-discovery)
@@ -7491,8 +7798,8 @@ def _run_seam_comparisons(args, cfg, report, run_id, final, final_for_user, repo
             except OSError:
                 log.debug("ignored", exc_info=True)
             log.info("Seam comparisons written: %s", out_seam_json)
-    except Exception:
-        log.debug("Optional seam comparison step failed; continuing.", exc_info=True)
+    except (FileNotFoundError, OSError, RuntimeError, ValueError, KeyError, TypeError) as e:
+        log.debug("Optional seam comparison step failed; continuing: %s", e, exc_info=True)
     
     try:
         from river_diagnostics import create_unified_bathy_report
@@ -7575,7 +7882,7 @@ def _run_seam_comparisons(args, cfg, report, run_id, final, final_for_user, repo
 
 
 
-def _finalize_run(cfg, report, args, final, final_for_user, run_id, fatal_errors):
+def _finalize_run(cfg, report, args, final, final_for_user, final_provenance, run_id, fatal_errors):
     """Write run summaries, run contract tests, and apply output retention policy."""
     # Human-friendly, scan-friendly console summary
     try:
@@ -7721,7 +8028,7 @@ def _finalize_run(cfg, report, args, final, final_for_user, run_id, fatal_errors
 
     log.info("Pipeline complete.")
     log.info("SDB: %s", report.get('sdb', {}).get('status', 'skipped'))
-    log.info("River: %s", report.get('river', {}).get('status', 'skipped'))
+    log.info("River: %s (mode=%s)", report.get('river', {}).get('status', 'skipped'), report.get('river', {}).get('execution_mode', 'n/a'))
     log.info("Fusion: %s", report.get('fusion', {}).get('status', 'skipped'))
     log.info("Final output: %s", final_for_user or final or 'None')
 
@@ -7732,211 +8039,11 @@ def _finalize_run(cfg, report, args, final, final_for_user, run_id, fatal_errors
 
 def main() -> int:
     args = parse_args()
-    # ---------------------------------------------------------------------
-    # Unified data acquisition buffer (single AOI buffer knob):
-    # - User supplies --buff as a fractional expansion of the provided AOI bbox.
-    # - We download / query ALL datasets using the buffered AOI.
-    # - We keep the original AOI as the tile extent for final clipping/metrics.
-    # ---------------------------------------------------------------------
-    tile_bbox = _parse_aoi_bbox(getattr(args, "aoi", None))
-    if not tile_bbox:
-        raise SystemExit("Invalid --aoi. Expected bbox 'W/E/S/N' (lon_min/lon_max/lat_min/lat_max).")
+    run_id = _initialize_run_args(args, logger=log)
+    _authoritative_cfg = _resolve_authoritative_base_args(args)
+    _authoritative_base_auto = bool(_authoritative_cfg.get("authoritative_base_auto", False))
+    _authoritative_base_path = _authoritative_cfg.get("authoritative_base_path")
 
-    args.aoi_tile = getattr(args, "aoi", None)  # user-requested tile AOI
-    args.tile_bbox = tile_bbox
-
-    # Legacy: tile-buffer-km is deprecated; enforce single buffer knob.
-    try:
-        legacy_buf_km = float(getattr(args, "tile_buffer_km", 0.0) or 0.0)
-    except Exception:
-        legacy_buf_km = 0.0
-    if legacy_buf_km not in (0.0, -0.0):
-        log.warning("[AOI] --tile-buffer-km is deprecated and ignored. Use --buff instead. (legacy=%s)", legacy_buf_km)
-
-    try:
-        buff_frac = float(getattr(args, "buff", 0.0) or 0.0)
-    except Exception:
-        buff_frac = 0.0
-    if buff_frac < 0:
-        raise SystemExit("--buff must be >= 0")
-
-    if buff_frac > 0:
-        expanded = _expand_bbox_frac(tile_bbox, buff_frac)
-        args.aoi = _bbox_to_aoi_str(expanded)
-        log.info("[AOI] Data buffer enabled: --buff=%s -> aoi_data=%s (aoi_tile=%s)", buff_frac, args.aoi, args.aoi_tile)
-    else:
-        log.info("[AOI] No data buffer: --buff=0 -> aoi_data=aoi_tile=%s", args.aoi_tile)
-
-    # ---------------------------------------------------------------------
-    # Hydraulic modeling context buffer (river seam stability)
-    # ---------------------------------------------------------------------
-    # Rule:
-    #   - River modeling MUST run on the buffered AOI (aoi_data == args.aoi)
-    #   - Final deliverables MUST be clipped back to the original tile AOI (args.aoi_tile)
-    # This stabilizes longitudinal fits and boundary conditions across adjacent tiles.
-    args.aoi_hydro = getattr(args, "aoi", None)
-
-    # ---------------------------------------------------------------------
-    # Run-scoped logging + flight recorder
-    # ---------------------------------------------------------------------
-    run_id = None
-    try:
-        from datetime import datetime, timezone
-        from logging_config import add_file_handler, install_screen_log, start_flight_recorder
-
-        # Deterministic-enough run id for log grouping
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        run_id = f"bathy_{ts}_{os.getpid()}"
-
-        out_dir = Path(getattr(args, 'out_dir', 'output'))
-        (out_dir / "run_logs").mkdir(parents=True, exist_ok=True)
-
-        # Console-mirror text log (best file to share for exact terminal output)
-        screen_log_path = install_screen_log(out_dir / "run_logs" / f"screen_{run_id}.log")
-        log.info("[RUN] Screen log: %s", screen_log_path)
-
-        # Per-run logger file
-        add_file_handler(out_dir / "run_logs" / f"run_{run_id}.log", level=logging.INFO)
-
-        # Structured flight recorder JSONL
-        fr_path = start_flight_recorder(out_dir, run_id=run_id)
-        if fr_path is not None:
-            log.info("[RUN] Flight recorder: %s", fr_path)
-        log.info("[RUN] run_id=%s", run_id)
-    except Exception as e:
-        log.warning("Unable to initialize run logs/flight recorder: %s", e)
-    # Auto-select published regression/curve coefficients from sdb_config.json based on AOI centroid.
-    # This sets:
-    #   - --river-manning-region (for Q2 DA->Q2 regressions used by Manning inversion)
-    #   - --river-regional-curve-c/f (for DA->bankfull depth curves)
-    try:
-        here = os.path.dirname(os.path.abspath(__file__))
-        cfg_path = os.path.join(here, 'sdb_config.json')
-        cfg_json = {}
-        if os.path.exists(cfg_path):
-            with open(cfg_path, 'r', encoding='utf-8') as f:
-                cfg_json = json.load(f)
-        # Parse AOI as bbox: w/e/s/n
-        lon_c = lat_c = None
-        try:
-            if isinstance(getattr(args, 'aoi', None), str) and '/' in args.aoi:
-                w,e,s,n = [float(x) for x in args.aoi.strip().strip('"').split('/')[:4]]
-                lon_c = (w + e) / 2.0
-                lat_c = (s + n) / 2.0
-        except Exception:
-            lon_c = lat_c = None
-
-        if lon_c is not None and lat_c is not None and cfg_json:
-            from region_resolver import resolve_q2_regression, resolve_bankfull_curve
-
-            # Manning Q2 regression region key
-            if str(getattr(args, 'river_manning_region', 'default')).strip().lower() == 'auto':
-                q2_curve, msg = resolve_q2_regression(cfg_json, lon_c, lat_c)
-                if q2_curve is not None and q2_curve.name:
-                    args.river_manning_region = q2_curve.name
-                    log.info("[RIVER][MANNING] Auto region: %s", msg)
-                else:
-                    # fallback to older coarse mapping
-                    from manning_inversion import infer_manning_region_from_aoi
-                    region_key, st = infer_manning_region_from_aoi(getattr(args, 'aoi', None), state_region_map_json=getattr(args, 'river_manning_region_auto_map', None), default_region='default')
-                    args.river_manning_region = region_key
-                    log.warning("[RIVER][MANNING] Published regression not found; using coarse region=%s (state=%s)", region_key, st)
-
-            # Bankfull depth regional curve coefficients
-            if getattr(args, 'river_regional_curve_enabled', False) and (getattr(args, 'river_regional_curve_c', None) is None or getattr(args, 'river_regional_curve_f', None) is None):
-                bcurve, msg = resolve_bankfull_curve(cfg_json, lon_c, lat_c)
-                if bcurve is not None:
-                    args.river_regional_curve_region = bcurve.name
-                    args.river_regional_curve_c = float(bcurve.c)
-                    args.river_regional_curve_f = float(bcurve.f)
-                    # units in registry are recorded; keep user-selected units args as-is, but warn if mismatch
-                    log.info("[RIVER][REGIONAL] Auto coefficients: %s", msg)
-                else:
-                    log.warning("[RIVER][REGIONAL] Auto coefficients unavailable: %s", msg)
-    except Exception as e:
-        log.debug("[RIVER] Auto coefficient resolution failed: %s", e)
-
-
-    # Optional: auto-fetch SWOT RiverSP if user didn't provide a local path.
-    try:
-        if (str(getattr(args, "river_skeleton_wse_mode", "bank")).strip().lower() == "bank_profile"
-                and getattr(args, "river_swot_riversp", None) is None
-                and bool(getattr(args, "river_swot_auto", True))):
-            # Parse AOI bbox: w/e/s/n
-            w = e = s = n = None
-            try:
-                if isinstance(getattr(args, "aoi", None), str) and "/" in args.aoi:
-                    w, e, s, n = [float(x) for x in args.aoi.strip().strip('"').split("/")[:4]]
-            except Exception:
-                w = e = s = n = None
-    
-            if None not in (w, e, s, n):
-                swot_cache_root = getattr(args, "river_swot_cache_root", None)
-                if not swot_cache_root:
-                    # keep RiverSP under cache_root/swot by default
-                    swot_cache_root = os.path.join(str(getattr(args, "cache_root", "cache")), "swot")
-                from swot_riversp_fetch import fetch_riversp
-                res = fetch_riversp(
-                    bbox_wesn=(float(w), float(e), float(s), float(n)),
-                    start_date=str(getattr(args, "start_date", "")),
-                    end_date=str(getattr(args, "end_date", "")),
-                    cache_root=str(swot_cache_root),
-                    product=str(getattr(args, "river_swot_product", "reach") or "reach"),
-                    short_name=getattr(args, "river_swot_shortname", None),
-                    logger=log,
-                )
-                if res.files:
-                    args.river_swot_riversp = res.files
-                    log.info("[SWOT] Auto-fetched RiverSP (%s file(s)) -> %s", len(res.files), res.cache_dir)
-                else:
-                    log.info("[SWOT] RiverSP auto-fetch not used: %s", res.message)
-            else:
-                log.debug("[SWOT] AOI bbox parse failed; skipping RiverSP auto-fetch")
-    except Exception as _e:
-        log.debug("[SWOT] RiverSP auto-fetch failed: %s", _e)
-    # Backwards-compat alias: --river-manning-enabled
-    if getattr(args, "river_manning_enabled", False) and str(getattr(args, "river_manning_mode", "off")) == "off":
-        args.river_manning_mode = "q2_regional"
-
-
-
-    # The 1D energy solver requires a discharge-informed prior. If the user enables
-    # the solver without explicitly enabling a Manning discharge mode, default to a
-    # conservative Q2-from-drainage-area regression so the solver can run.
-    if bool(getattr(args, "river_enable_1d_energy_solver", False)) and str(getattr(args, "river_manning_mode", "off")) == "off":
-        args.river_manning_mode = "q2_regional"
-        log.info("[RIVER][MANNING] Auto-enabled manning_mode=q2_regional because --river-enable-1d-energy-solver is set")
-
-    
-    # ------------------------------------------------------------------
-    # CUDEM / waffles cache
-    # ------------------------------------------------------------------
-    # Many CUDEM tools (e.g., waffles) use CUDEM_CACHE independent of this
-    # pipeline's --cache-root. To keep runs reproducible and avoid failures
-    # when the default cache directory doesn't exist, we scope CUDEM_CACHE
-    # under --cache-root unless the user explicitly sets CUDEM_CACHE.
-    try:
-        _cc = os.environ.get("CUDEM_CACHE", "").strip()
-        if not _cc:
-            cudem_cache_dir = Path(args.cache_root) / "cudem_cache"
-            ensure_dir(cudem_cache_dir)
-            # Some CUDEM tools expect provider subdirs (e.g., "tnm") to exist.
-            # Pre-create common ones to avoid spurious ENOENT warnings.
-            try:
-                ensure_dir(cudem_cache_dir / "tnm")
-            except OSError:
-                log.debug("ignored", exc_info=True)
-            os.environ["CUDEM_CACHE"] = str(cudem_cache_dir)
-            log.info("[CUDEM_CACHE] Using pipeline-scoped CUDEM cache: %s", cudem_cache_dir)
-        else:
-            ensure_dir(Path(_cc))
-            try:
-                ensure_dir(Path(_cc) / "tnm")
-            except OSError:
-                log.debug("ignored", exc_info=True)
-            log.info("[CUDEM_CACHE] Using existing CUDEM_CACHE: %s", _cc)
-    except Exception as e:
-        log.warning("[CUDEM_CACHE] Unable to prepare CUDEM cache directory: %s", e)
     cfg = BathyConfig(
             aoi=args.aoi,
             start_date=args.start_date,
@@ -7982,6 +8089,8 @@ def main() -> int:
             river_dem_source=args.river_dem_source,
             river_dem_res_m=args.river_dem_res_m,
             extra_xyz_crs=args.extra_xyz_crs,
+            sdb_authoritative_extra_xyz=None,
+            river_authoritative_soundings=None,
             extra_xyz=list(getattr(args, "extra_xyz", []) or []),
             extra_xyz_cudem=list(getattr(args, "extra_xyz_cudem", []) or []),
     
@@ -8109,6 +8218,20 @@ def main() -> int:
             gapfill_enabled=bool(getattr(args, "gapfill_enabled", False)),
             gapfill_hq=list(getattr(args, "gapfill_hq", None)) if getattr(args, "gapfill_hq", None) else None,
             gapfill_water_mask=Path(getattr(args, "gapfill_water_mask", "")) if getattr(args, "gapfill_water_mask", None) else None,
+            authoritative_base=_authoritative_base_path,
+            authoritative_base_auto=_authoritative_base_auto,
+            authoritative_base_tile_index_url=str(getattr(args, "authoritative_base_tile_index_url", "") or ""),
+            authoritative_base_spatial_meta_url=str(getattr(args, "authoritative_base_spatial_meta_url", "") or ""),
+            authoritative_base_missing_meta_policy=str(getattr(args, "authoritative_base_missing_meta_policy", "skip") or "skip"),
+            authoritative_base_force_rebuild=bool(getattr(args, "authoritative_base_force_rebuild", False)),
+            authoritative_base_tile_url_field=getattr(args, "authoritative_base_tile_url_field", None),
+            authoritative_support_decay_m=float(getattr(args, "authoritative_support_decay_m", 300.0) or 300.0),
+            authoritative_support_density_radius_m=float(getattr(args, "authoritative_support_density_radius_m", 250.0) or 250.0),
+            coastal_sdb_support_transition_m=float(getattr(args, "coastal_sdb_support_transition_m", 600.0) or 600.0),
+            river_anchor_density_radius_m=float(getattr(args, "river_anchor_density_radius_m", 200.0) or 200.0),
+            river_scaffold_transition_m=float(getattr(args, "river_scaffold_transition_m", 800.0) or 800.0),
+            river_network_halo_km=float(getattr(args, "river_network_halo_km", 2.0) or 0.0),
+            river_trusted_halo_m=float(getattr(args, "river_trusted_halo_m", 60.0) or 0.0),
             gapfill_method=getattr(args, "gapfill_method", "rbf"),
             gapfill_river_smooth_sigma_m=float(getattr(args, "gapfill_river_smooth_sigma", 500.0)),
             gapfill_prior_sigma_raster=Path(getattr(args, "gapfill_prior_sigma", "")) if getattr(args, "gapfill_prior_sigma", None) else None,
@@ -8127,6 +8250,16 @@ def main() -> int:
     cfg.run_id = run_id
     cfg.derived_cache_root = cfg.out_dir / "derived_cache" / run_id
     ensure_dir(cfg.derived_cache_root)
+
+    try:
+        _materialize_authoritative_base_if_requested(cfg, args)
+    except (ImportError, FileNotFoundError, OSError, ValueError, KeyError, RuntimeError):
+        log.error("[AUTHORITATIVE] Failed to materialize authoritative_base for AOI=%s", cfg.aoi, exc_info=True)
+        raise
+
+    _prep_report = {}
+    _prepare_authoritative_guidance_inputs(cfg, report=_prep_report)
+    _prepare_authoritative_river_soundings(cfg, report=_prep_report)
 
     log.info("Unified bathymetry pipeline starting.")
     log.info("AOI: %s", cfg.aoi)
@@ -8315,6 +8448,9 @@ def main() -> int:
             "depth_units": "m",
             "depth_sign": "negative_down",
             "depth_reference": "water_surface",
+            "authoritative_base": str(cfg.authoritative_base) if getattr(cfg, "authoritative_base", None) else None,
+            "authoritative_base_auto": bool(getattr(cfg, "authoritative_base_auto", False)),
+            "authoritative_base_missing_meta_policy": str(getattr(cfg, "authoritative_base_missing_meta_policy", "skip") or "skip"),
         }
     }
     # Merge WAFFLES domain inference into the run report (if available)
@@ -8327,6 +8463,8 @@ def main() -> int:
     # Include any auto-fetched CUDEM soundings in the run report
     if hasattr(args, "_xyz_auto_report"):
         report["xyz_auto"] = getattr(args, "_xyz_auto_report")
+    if hasattr(args, "_authoritative_base_auto_report"):
+        report["authoritative_base_auto"] = getattr(args, "_authoritative_base_auto_report")
 
     sdb_raster = None
     river_raster = None
@@ -8364,145 +8502,26 @@ def main() -> int:
         log.debug("Constraint guardrail check failed; continuing.", exc_info=True)
 
     # If fusion would have no sources after guardrails, skip it explicitly.
-    if sdb_raster is None and river_for_fuse is None:
-        report["fusion"] = {
-            "status": "skipped",
-            "reason": "no_fusable_sources",
-            "note": "Both sources missing or river excluded by constraint guardrail.",
-            "river_excluded": river_excluded,
-        }
-        final = None
-    else:
-        final = fuse(cfg, sdb_raster, river_for_fuse, report)
-        if river_excluded is not None:
-            report.setdefault("fusion", {}).setdefault("notes", [])
-            report["fusion"]["notes"].append(river_excluded)
-
-    # Optional intelligent gap filling (Tier 1–2): prior + residual interpolation
-    if cfg.gapfill_enabled and final:
-        try:
-            from gapfill_intelligent import gapfill_depth_raster, GapfillConfig
-
-            # HQ points: prefer explicit --gapfill-hq; otherwise fall back to --extra-xyz (if present).
-            hq_files: List[str] = []
-            if cfg.gapfill_hq:
-                hq_files = [str(p) for p in cfg.gapfill_hq if p]
-            else:
-                # args.extra_xyz may not exist in older CLI variants
-                ex = getattr(args, "extra_xyz", None)
-                if ex:
-                    if isinstance(ex, (list, tuple)):
-                        hq_files = [str(p) for p in ex if p]
-                    else:
-                        hq_files = [str(ex)]
-
-            if not hq_files:
-                log.warning("[GAPFILL] Enabled but no HQ points provided (--gapfill-hq or --extra-xyz). Skipping.")
-            else:
-                combined_dir = ensure_dir(cfg.out_dir / "combined")
-                out_gap = combined_dir / "bathy_combined_depth_gapfill.tif"
-                out_sig = combined_dir / "bathy_combined_depth_gapfill_sigma.tif"
-                out_prov = combined_dir / "bathy_combined_depth_gapfill_provenance.tif"
-
-                # Water mask preference order:
-                #   1) explicit --gapfill-water-mask
-                #   2) waffles coastline mask (most recent in cache)
-                #   3) implicit: finite pixels in prior
-                wm: Optional[Path] = None
-                if cfg.gapfill_water_mask and Path(cfg.gapfill_water_mask).exists():
-                    wm = Path(cfg.gapfill_water_mask)
-                else:
-                    wm = _find_latest_waffles_mask(cfg.cache_root)
-
-                # River aids (optional): xs gpkg and river corridor mask from river output.
-                xs_gpkg = cfg.out_dir / "river" / "river_xs_params.gpkg"
-                if not xs_gpkg.exists():
-                    xs_gpkg = None
-                river_mask = None
-                if river_raster and Path(river_raster).exists():
-                    river_mask = Path(river_raster)
-
-                # Build GapfillConfig from pipeline config
-                gcfg = GapfillConfig(
-                    interpolation_method=cfg.gapfill_method,
-                    rbf_function="thin_plate",
-                    prior_sigma_default=1.0,
-                    rbf_min_points=25,
-                    component_min_points=10,
-                    river_smooth_sigma_m=cfg.gapfill_river_smooth_sigma_m,
-                    residual_sigma_floor=0.25,
-                    distance_sigma_scale_m=1500.0,
-                    output_cudem_xyz=cfg.gapfill_output_cudem_xyz,
-                )
-                
-                # Call the gap-fill function
-                gapfill_stats = gapfill_depth_raster(
-                    prior_raster=Path(final),
-                    hq_point_files=hq_files,
-                    out_raster=out_gap,
-                    out_sigma=out_sig,
-                    out_provenance=out_prov,
-                    cfg=gcfg,
-                    prior_sigma_raster=cfg.gapfill_prior_sigma_raster,
-                    water_mask_raster=wm,
-                    river_mask_raster=river_mask,
-                    bank_elev_raster=cfg.gapfill_bank_elev_raster,
-                    xs_params_gpkg=xs_gpkg,
-                    logger=log,
-                )
-
-                report.setdefault("gapfill", {})["status"] = "success"
-                report["gapfill"]["stats"] = gapfill_stats
-                report["gapfill"]["outputs"] = {
-                    "depth": str(out_gap),
-                    "sigma": str(out_sig),
-                    "provenance": str(out_prov),
-                }
-                if cfg.gapfill_output_cudem_xyz and "cudem_xyz" in gapfill_stats:
-                    report["gapfill"]["outputs"]["cudem_xyz"] = gapfill_stats["cudem_xyz"]
-                final = out_gap
-        except Exception as e:
-            report.setdefault("gapfill", {})["status"] = "failed"
-            report["gapfill"]["error"] = str(e)
-            log.warning("[GAPFILL] Failed: %s", e)
-
-    final_for_user = _reproject_final_outputs(cfg, final, report, sdb_raster, river_raster, fatal_errors)
-
-
-    report_path = cfg.out_dir / "bathy_report.json"
-    write_json(report_path, report)
-
-    # --- Unified Guidance Manifest ---
-    # Single machine-readable inventory of all guidance artifacts, their roles,
-    # domain classes, and the fusion policy applied.  Downstream CUDEM tile
-    # builders consume this to understand what the run produced.
-    try:
-        _write_guidance_manifest(cfg, report)
-    except Exception:
-        log.debug("Optional guidance manifest write failed", exc_info=True)
-
-    # Explicit IO manifest (paths observed in report + executed commands; no guessing)
-    try:
-        io_json, io_md = write_io_manifest(cfg.out_dir, report)
-    except Exception as e:
-        log.debug("Optional IO manifest write failed: %s", e)
-        io_json, io_md = None, None
-    try:
-        from flight_recorder import emit_artifact_written
-        emit_artifact_written(report_path, kind="json", role="bathy_report")
-        if io_json is not None:
-            emit_artifact_written(io_json, kind="json", role="io_manifest")
-        if io_md is not None:
-            emit_artifact_written(io_md, kind="md", role="io_manifest")
-        # Also emit all artifacts we know about from the report (so summaries can be derived from the flight recorder)
-        _emit_artifacts_from_report(report)
-    except Exception as e:
-        log.debug("Optional flight-recorder emit failed: %s", e)
-    log.info("Report written: %s", report_path)
-
-    _run_seam_comparisons(args, cfg, report, run_id, final, final_for_user, report_path)
-
-    return _finalize_run(cfg, report, args, final, final_for_user, run_id, fatal_errors)
+    return _execute_final_run_stage(
+        cfg=cfg,
+        args=args,
+        report=report,
+        log=log,
+        fatal_errors=fatal_errors,
+        sdb_raster=sdb_raster,
+        river_raster=river_raster,
+        river_for_fuse=river_for_fuse,
+        river_excluded=river_excluded,
+        fuse_fn=fuse,
+        condition_fn=_condition_final_to_authoritative_base,
+        reproject_fn=_reproject_final_outputs,
+        write_bundle_fn=_write_final_reporting_bundle,
+        finalize_run_fn=lambda cfg_, report_, args_, final_, final_for_user_, final_provenance_, fatal_errors_: _finalize_run(cfg_, report_, args_, final_, final_for_user_, final_provenance_, run_id, fatal_errors_),
+        write_io_manifest_fn=write_io_manifest,
+        emit_artifacts_fn=_emit_optional_artifacts,
+        run_seam_comparisons_fn=lambda args_, cfg_, report_, final_, final_for_user_, report_path_: _run_seam_comparisons(args_, cfg_, report_, run_id, final_, final_for_user_, report_path_),
+        conditioned_gapfill_fn=_run_gapfill_stage,
+    )
 
 
 if __name__ == "__main__":

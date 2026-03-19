@@ -31,6 +31,7 @@ from rasterio.enums import Resampling
 from rasterio.windows import Window
 import joblib
 from pyproj import Transformer
+from source_guidance_contract import build_sdb_source_contract
 try:
     from pyproj.exceptions import ProjError
 except (ImportError, AttributeError):
@@ -716,7 +717,7 @@ def _get_max_depth_from_meta(meta: Dict[str, Any], default: float = 20.0) -> Tup
             return None
         try:
             fv = float(v)
-        except Exception:
+        except (TypeError, ValueError):
             return None
         if not np.isfinite(fv) or fv <= 0:
             return None
@@ -948,7 +949,7 @@ def predict_scene(
             try:
                 if any(float(v) != 0 for v in linf_raw.values()):
                     log.warning("linf_enabled=False but NON-ZERO L∞ constants are present in metadata; ignoring.")
-            except Exception as _exc:
+            except (TypeError, ValueError) as _exc:
                 log.debug("Suppressed: %s", _exc, exc_info=True)
         log.info("L_inf disabled; using zeros.")
 
@@ -994,6 +995,7 @@ def predict_scene(
     guidance_weight_path = str(Path(out_path).with_name(Path(out_path).stem + "_guidance_weight.tif"))
     trusted_interior_path = str(Path(out_path).with_name(Path(out_path).stem + "_trusted_interior.tif"))
     admissibility_path = str(Path(out_path).with_name(Path(out_path).stem + "_admissibility.tif"))
+    regime_class_path = str(Path(out_path).with_name(Path(out_path).stem + "_regime_class.tif"))
 
     if min_confidence_threshold > 0.0 and not write_confidence:
         log.warning(
@@ -1320,7 +1322,8 @@ def predict_scene(
                                     support_domain = None
                                     try:
                                         support_domain = (support_weight_local[domain_mask_local] * edge_weight_local[domain_mask_local]).astype(np.float32)
-                                    except Exception:
+                                    except (TypeError, ValueError, AttributeError) as exc:
+                                        log.debug("Unable to compute support_domain for stumpf_residual: %s", exc)
                                         support_domain = None
                                     y_pred_domain, y_unc_hybrid, blend_weight = compute_physics_guided_prediction(
                                         rf_pred_residual=y_pred_domain,
@@ -1420,10 +1423,11 @@ def predict_scene(
                                 doa_q_domain = doa_score_local[domain_mask_local]
                                 unc_q_domain = (1.0 / (1.0 + y_unc_domain / 1.5)).astype(np.float32)
                                 support_q_domain = np.ones_like(doa_q_domain, dtype=np.float32)
-                                try:
-                                    support_q_domain = (support_weight_local[domain_mask_local] * edge_weight_local[domain_mask_local]).astype(np.float32)
-                                except Exception as _exc:
-                                    log.debug("Suppressed exception: %s", _exc)
+                                if support_weight_local is not None and edge_weight_local is not None:
+                                    try:
+                                        support_q_domain = (support_weight_local[domain_mask_local] * edge_weight_local[domain_mask_local]).astype(np.float32)
+                                    except (TypeError, ValueError, AttributeError) as _exc:
+                                        log.debug("Suppressed exception: %s", _exc)
                                 conf_domain = doa_q_domain * optical_q_domain * unc_q_domain * support_q_domain
 
                                 conf_pixels = np.full(int(np.sum(valid_mask)), NODATA_VAL, dtype=np.float32)
@@ -1432,9 +1436,12 @@ def predict_scene(
 
                             guidance_pixels = np.full(int(np.sum(valid_mask)), NODATA_VAL, dtype=np.float32)
                             trusted_pixels = np.zeros(int(np.sum(valid_mask)), dtype=np.uint8)
-                            try:
-                                support_q_domain = (support_weight_local[domain_mask_local] * edge_weight_local[domain_mask_local]).astype(np.float32)
-                            except Exception:
+                            if support_weight_local is not None and edge_weight_local is not None:
+                                try:
+                                    support_q_domain = (support_weight_local[domain_mask_local] * edge_weight_local[domain_mask_local]).astype(np.float32)
+                                except (TypeError, ValueError, AttributeError):
+                                    support_q_domain = np.ones(int(domain_mask_local.sum()), dtype=np.float32)
+                            else:
                                 support_q_domain = np.ones(int(domain_mask_local.sum()), dtype=np.float32)
                             guidance_domain = np.clip(blend_weight * support_q_domain, 0.0, 1.0).astype(np.float32)
                             guidance_pixels[domain_mask_local] = np.where(good, guidance_domain, NODATA_VAL)
@@ -1449,8 +1456,8 @@ def predict_scene(
                             admiss_pixels[domain_mask_local] = np.where(good, np.uint8(1), np.uint8(0))
                             admiss_block[valid_mask] = admiss_pixels
 
-                    except Exception:
-                        log.exception("Prediction failed on tile")
+                    except (RuntimeError, ValueError, TypeError, OSError, MemoryError) as exc:
+                        log.exception("Prediction failed on tile: %s", exc)
 
                 # FINAL hard enforcement (negative-down)
                 if max_depth is not None and np.isfinite(max_depth):
@@ -1559,7 +1566,7 @@ def predict_scene(
             with open(ledger_path, "w") as _lf:
                 _json_ledger.dump(ledger, _lf, indent=2, default=str)
             log.info("Acceptance ledger: %s", ledger_path)
-        except Exception as _ledger_e:
+        except (OSError, TypeError, ValueError) as _ledger_e:
             log.warning("Failed to write acceptance ledger: %s", _ledger_e)
 
         if funnel['predicted'] == 0:
@@ -1568,6 +1575,36 @@ def predict_scene(
         elif funnel['predicted'] < 0.01 * total:
             log.warning("Very few pixels predicted (%d). Consider reviewing mask settings.", funnel['predicted'])
 
+        try:
+            with rasterio.open(out_path, "r+") as ds_depth, \
+                 rasterio.open(guidance_weight_path, "r+") as ds_gw, \
+                 rasterio.open(trusted_interior_path, "r+") as ds_ti, \
+                 rasterio.open(admissibility_path, "r+") as ds_adm:
+                depth_arr = ds_depth.read(1).astype(np.float32)
+                gw_arr = ds_gw.read(1).astype(np.float32)
+                ti_arr = ds_ti.read(1).astype(np.uint8)
+                adm_arr = ds_adm.read(1).astype(np.uint8)
+                nodata = ds_depth.nodata if ds_depth.nodata is not None else NODATA_VAL
+                valid_depth = np.isfinite(depth_arr) & (depth_arr != nodata)
+                contract = build_sdb_source_contract(
+                    valid_depth=valid_depth,
+                    guidance_weight=gw_arr,
+                    trusted_interior=ti_arr,
+                    admissibility=adm_arr,
+                )
+                ds_gw.write(contract["guidance_weight"].astype(np.float32), 1)
+                ds_ti.write(contract["trusted_interior"].astype(np.uint8), 1)
+                ds_adm.write(contract["admissibility"].astype(np.uint8), 1)
+                regime_profile = ds_depth.profile.copy()
+                regime_profile.update(dtype=rasterio.uint8, nodata=0, count=1, compress="DEFLATE")
+            with rasterio.open(regime_class_path, "w", **regime_profile) as ds_reg:
+                ds_reg.write(contract["regime"].astype(np.uint8), 1)
+                ds_reg.update_tags(DESC="Shared regime contract class: 1=upland, 2=nearshore_water, 3=estuary_transition, 4=river_channel", ROLE="interpolation_guidance", AUTHORITATIVE="false", CUDEM_INTENT="guidance_only")
+            regime_summary = contract.get("regime_summary", {})
+        except Exception:
+            regime_summary = {}
+            log.debug("Failed to normalize SDB source guidance contract outputs", exc_info=True)
+
         if conf_path:
             log.info("Confidence raster: %s", conf_path)
             if min_confidence_threshold > 0:
@@ -1575,6 +1612,7 @@ def predict_scene(
         log.info("Guidance-weight raster: %s", guidance_weight_path)
         log.info("Trusted-interior raster: %s", trusted_interior_path)
         log.info("Admissibility raster: %s", admissibility_path)
+        log.info("Regime-class raster: %s", regime_class_path)
         if prov_path:
             log.info("Provenance raster: %s  (0=nodata, 1=predicted)", prov_path)
 
@@ -1586,6 +1624,8 @@ def predict_scene(
                                "confidence_path": conf_path, "provenance_path": prov_path,
                                "guidance_weight_path": guidance_weight_path, "trusted_interior_path": trusted_interior_path,
                                "admissibility_path": admissibility_path,
+                               "regime_class_path": regime_class_path,
+                               "regime_summary": regime_summary,
                                "cudem_guidance_only": True, "authoritative": False,
                                "min_confidence_threshold": min_confidence_threshold}}
             with open(report_dir / "predict_report.json", "w", encoding="utf-8") as f:
@@ -1615,8 +1655,15 @@ def predict_scene(
             )
             rep.setdefault("predict", {})["guide_points_path"] = guide_points_path
             log.info("SDB guide points exported: %s", guide_points_path)
-        except Exception:
+        except (ImportError, ModuleNotFoundError, OSError, ValueError, RuntimeError):
             log.debug("SDB guide-point export skipped (optional dependency missing or no valid pixels)", exc_info=True)
+
+        try:
+            from sdb_guidance import write_sdb_guidance_bounds
+            bounds = write_sdb_guidance_bounds(out_path, out_unc_path, logger=log)
+            rep.setdefault("predict", {}).update({k: v for k, v in bounds.items() if v})
+        except (ImportError, ModuleNotFoundError, OSError, ValueError, RuntimeError):
+            log.debug("SDB guidance bounds export skipped", exc_info=True)
 
     finally:
         for s in srcs.values():

@@ -21,6 +21,7 @@ Notes:
 """
 
 import argparse
+import json
 import logging
 import re
 from pathlib import Path
@@ -220,6 +221,10 @@ def main() -> int:
     # Optional: NHDArea polygons to constrain channel predictions.
     # Extract river/stream polygons only (exclude lakes/reservoirs).
     nhdarea_mask = None
+    fallback_reason = None
+    nhdarea_pixels = 0
+    fallback_reason = None
+    nhdarea_pixels = 0
     if args.nhdarea_gpkg and (args.channel_source in ("auto", "nhdarea")):
         try:
             areas = gpd.read_file(args.nhdarea_gpkg, layer=args.nhdarea_layer)
@@ -537,7 +542,6 @@ def main() -> int:
                         100.0 * ov,
                     )
                     nhdarea_mask = None
-
         if (nhdarea_mask is not None) and bool(nhdarea_mask.any()):
             channel &= (nhdarea_mask | corridor_main | keep_ocean)
         else:

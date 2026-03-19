@@ -62,7 +62,7 @@ def _deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
 def _fmt_int(x: Any) -> str:
     try:
         return f"{int(x):,}"
-    except Exception:
+    except (TypeError, ValueError, OverflowError):
         return "—"
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -70,7 +70,7 @@ def _safe_float(x: Any) -> Optional[float]:
         if x is None:
             return None
         return float(x)
-    except Exception:
+    except (TypeError, ValueError, OverflowError):
         return None
 
 def _maybe_import_matplotlib():
@@ -81,7 +81,7 @@ def _maybe_import_matplotlib():
         if plt is None:
             plt = lazy_pyplot()
         return True
-    except Exception:
+    except (ImportError, RuntimeError, AttributeError):
         return False
 
 # -----------------------------------------------------------------------------
@@ -149,7 +149,7 @@ def raster_quickstats(path: str) -> Dict[str, Any]:
             "max": float(vals.max()),
         }
         return out
-    except Exception as e:
+    except (ImportError, OSError, ValueError, RuntimeError) as e:
         return {"path": str(path), "error": str(e)}
 
 
@@ -171,7 +171,7 @@ def mask_fraction(mask_path: str, true_value: Optional[int] = None) -> Dict[str,
         else:
             tv = int(np.count_nonzero(m == int(true_value)))
         return {"path": str(p), "exists": True, "total": tot, "true": tv, "frac": float(tv / tot)}
-    except Exception as e:
+    except (ImportError, OSError, ValueError, RuntimeError) as e:
         return {"path": str(mask_path), "error": str(e)}
 
 # -----------------------------------------------------------------------------
@@ -462,7 +462,7 @@ class RunReport:
                 self.record_artifact(k, v)
             if artifacts:
                 out_path.write_text(json.dumps(self.data, indent=2))
-        except Exception:
+        except (ImportError, OSError, RuntimeError, ValueError):
             log.debug("ignored", exc_info=True)
 
         return out_path

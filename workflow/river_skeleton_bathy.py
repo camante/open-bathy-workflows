@@ -40,6 +40,7 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 import rasterio
+from rasterio.warp import transform_bounds
 from rasterio.transform import array_bounds
 from rasterio.features import rasterize
 from rasterio.warp import reproject, Resampling
@@ -141,7 +142,7 @@ def _junction_zone_mask(
                 c2 = CRS.from_user_input(crs)
                 if not c1.equals(c2):
                     gdf = gdf.to_crs(c2)
-        except Exception:
+        except (TypeError, ValueError, AttributeError):
             # Best effort; if CRS is missing or parsing fails, rasterize as-is.
             log.debug("ignored", exc_info=True)
 
@@ -149,7 +150,7 @@ def _junction_zone_mask(
         geom = gdf.geometry.buffer(float(buffer_m))
         try:
             union = geom.union_all()
-        except Exception:
+        except (AttributeError, TypeError):
             # GeoPandas < 0.14
             union = geom.unary_union
         if union is None:
@@ -165,7 +166,7 @@ def _junction_zone_mask(
         )
         return (mask_u8 == 1)
 
-    except Exception as e:
+    except (OSError, ValueError, AttributeError, RuntimeError) as e:
         # Common failure: nodes layer missing (e.g., "Null layer"). Fall back to a simple
         # endpoint-degree approximation from the flowlines layer.
         LOG.warning("junction mask: failed building junction zone mask: %s", str(e))
@@ -182,7 +183,7 @@ def _junction_zone_mask(
             if fb is not None:
                 LOG.info("junction mask: using flowline-endpoint fallback (layer=%s).", river_layer)
                 return fb
-        except Exception as e2:
+        except (OSError, ValueError, AttributeError, RuntimeError) as e2:
             LOG.warning("junction mask fallback failed: %s", str(e2))
         return None
 
@@ -218,7 +219,7 @@ def _junction_zone_mask_from_flowlines(
             if gdf is not None and not gdf.empty:
                 river_layer = lyr  # record the layer that worked
                 break
-        except Exception:
+        except (OSError, ValueError, AttributeError, RuntimeError):
             continue
 
     if gdf is None or gdf.empty:
@@ -234,7 +235,7 @@ def _junction_zone_mask_from_flowlines(
             c2 = CRS.from_user_input(crs)
             if not c1.equals(c2):
                 gdf = gdf.to_crs(c2)
-    except Exception:
+    except (TypeError, ValueError, AttributeError):
         log.debug("ignored", exc_info=True)
 
     # Collect coordinates (not just endpoints), tracking which feature each coordinate came from.
@@ -1244,7 +1245,7 @@ def _soundings_to_grids(
         if bb is not None:
             xmin, xmax, ymin, ymax = bb
             LOG.info('Template bounds (crs=%s): x=[%.3f, %.3f] y=[%.3f, %.3f]', str(template_crs), xmin, xmax, ymin, ymax)
-    except Exception:
+    except (TypeError, ValueError, AttributeError):
         log.debug("ignored", exc_info=True)
 
     xs_all, ys_all, zs_all = [], [], []
@@ -1301,7 +1302,7 @@ def _soundings_to_grids(
         r0 = _in_bbox_ratio(x, y)
         if np.isfinite(r0):
             LOG.info('Soundings inside template bbox (raw): %.3f', float(r0))
-    except Exception:
+    except (TypeError, ValueError, AttributeError):
         log.debug("ignored", exc_info=True)
 
     n_loaded = int(x.size)
@@ -1386,7 +1387,7 @@ def _soundings_to_grids(
             int(cc.min()),
             int(cc.max()),
         )
-    except Exception:
+    except (TypeError, ValueError, AttributeError):
         log.debug("ignored", exc_info=True)
 
     in_ch = channel[rr, cc]
@@ -1650,7 +1651,12 @@ def _build_residual_adjustment(
         if sigma_px > 0.01:
             num = gaussian_filter(adj, sigma=sigma_px, mode="nearest")
             den = gaussian_filter(w, sigma=sigma_px, mode="nearest")
-            adj = np.where(den > 1e-6, (num / den), 0.0).astype("float32")
+            adj = np.divide(
+                num,
+                den,
+                out=np.zeros_like(num, dtype="float32"),
+                where=(den > 1e-6),
+            ).astype("float32")
 
     return np.where(channel_mask & (dist_m <= float(max_dist_m)), adj, 0.0).astype("float32")
 
@@ -1998,7 +2004,7 @@ def _apply_bed_profile_constraints(
         crs = CRS.from_user_input(template_profile['crs'])
     try:
         gdf = gdf.to_crs(crs)
-    except Exception:
+    except (TypeError, ValueError, AttributeError):
         log.debug("ignored", exc_info=True)
 
     transform = template_profile['transform']
@@ -2381,16 +2387,103 @@ def _detect_mainstem_corridor(
     return mainstem_corridor, preserve_mainstem
 
 
+
+
+def _template_bounds_to_aoi(template_raster: Path) -> str:
+    with rasterio.open(str(template_raster)) as ds:
+        bounds = ds.bounds
+        crs = ds.crs
+    if crs is None:
+        raise RuntimeError(f"Template raster has no CRS: {template_raster}")
+    left, bottom, right, top = transform_bounds(crs, "EPSG:4326", bounds.left, bounds.bottom, bounds.right, bounds.top, densify_pts=21)
+    return f"{left}/{right}/{bottom}/{top}"
+
+
+def _materialize_authoritative_bed_if_requested(args) -> Optional[Path]:
+    """Resolve/auto-build authoritative bed raster for standalone river runs.
+
+    Enabled by default so river-only runs reuse the same AOI-keyed NOAA/CUDEM
+    authoritative-base cache as bathy_main.
+    """
+    bed_arg = getattr(args, "authoritative_bed_raster", None)
+    auto = bool(getattr(args, "authoritative_bed_auto", True))
+    bed_path: Optional[Path] = None
+    if bed_arg is not None:
+        bed_txt = str(bed_arg).strip()
+        if bed_txt and bed_txt.lower() in ("auto", "cudem", "auto_cudem"):
+            auto = True
+        elif bed_txt and bed_txt.lower() in ("off", "none", "disable", "disabled"):
+            auto = False
+        elif bed_txt:
+            bed_path = Path(bed_txt).expanduser()
+            if bed_path.exists():
+                bed_path = bed_path.resolve()
+                args.authoritative_bed_raster = str(bed_path)
+                args._authoritative_bed_auto_report = {
+                    "mode": "explicit_path",
+                    "authoritative_base": str(bed_path),
+                    "cache_hit": None,
+                }
+                return bed_path
+            if not auto:
+                LOG.warning("Provided authoritative bed raster does not exist: %s", bed_path)
+                args.authoritative_bed_raster = str(bed_path)
+                return bed_path
+            LOG.info("Explicit authoritative bed raster path not found; falling back to auto-materialization for template AOI.")
+    if not auto:
+        args.authoritative_bed_raster = None if bed_path is None else str(bed_path)
+        return bed_path
+    try:
+        from cudem_authoritative import materialize_authoritative_base_for_aoi
+    except Exception as exc:
+        LOG.error("Failed to import cudem_authoritative auto-builder: %s", exc, exc_info=True)
+        raise
+    aoi = _template_bounds_to_aoi(Path(args.template_raster))
+    build_info = materialize_authoritative_base_for_aoi(
+        aoi=aoi,
+        cache_root=Path(getattr(args, "cache_root", "cache")),
+        tile_index_url=str(getattr(args, "authoritative_base_tile_index_url", "") or ""),
+        spatial_meta_url=str(getattr(args, "authoritative_base_spatial_meta_url", "") or ""),
+        missing_meta_policy=str(getattr(args, "authoritative_base_missing_meta_policy", "skip") or "skip"),
+        tile_url_field=getattr(args, "authoritative_base_tile_url_field", None),
+        force_rebuild=bool(getattr(args, "authoritative_base_force_rebuild", False)),
+        logger=LOG,
+    )
+    bed_path = Path(build_info["authoritative_base"]).resolve()
+    args.authoritative_bed_raster = str(bed_path)
+    args._authoritative_bed_auto_report = build_info
+    LOG.info("[AUTHORITATIVE] %s authoritative bed raster: %s",
+             "Reused cached" if bool(build_info.get("cache_hit")) else "Materialized",
+             bed_path)
+    return bed_path
+
 def main(
 ) -> int:
     p = argparse.ArgumentParser(description="Generate river bed elevations using a channel-skeleton distance-transform method.")
     p.add_argument("--river-gpkg", required=True, help="river_network.gpkg from river_network.py")
+    p.add_argument("--cache-root", default="cache", help="Root directory for reusable stage caches, including AOI-keyed authoritative-base materialization.")
     p.add_argument("--rivers-layer", default="rivers_clip", help="Layer name inside gpkg (default rivers_clip)")
     p.add_argument("--template-raster", required=True, help="Template raster defining output grid (usually river_dem.tif)")
     p.add_argument("--dem", required=True, help="DEM raster (same vertical datum as desired bed elevations)")
     p.add_argument("--channel-mask", required=True, help="River channel mask raster (1=river channel pixels)")
     p.add_argument("--authoritative-bed-raster", default=None,
-                   help="Optional authoritative bed elevation raster to blend/enforce inside the river mask (same grid/vertical datum as DEM).")
+                   help="Optional authoritative bed elevation raster to blend/enforce inside the river mask (same grid/vertical datum as DEM). Auto-materialized from NOAA CUDEM spatial metadata by default when omitted; pass off/none to disable.")
+    p.add_argument("--authoritative-bed-auto", action="store_true", default=True,
+                   help="Automatically build and AOI-cache an authoritative bed/base raster from NOAA CUDEM tile index + spatial metadata using the template-raster AOI. Enabled by default; use --no-authoritative-bed-auto to disable.")
+    p.add_argument("--no-authoritative-bed-auto", dest="authoritative_bed_auto", action="store_false",
+                   help="Disable automatic AOI-cached authoritative bed/base materialization for standalone river runs.")
+    p.add_argument("--authoritative-base-tile-index-url",
+                   default="https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_2014_8483/tileindex_NCEI_ninth_Topobathy_2014.zip",
+                   help="Tile-index zip URL used when auto-building the authoritative bed/base raster.")
+    p.add_argument("--authoritative-base-spatial-meta-url",
+                   default="https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/dem/NCEI_ninth_Topobathy_2014_8483/ninth_spatial_meta.zip",
+                   help="Spatial-metadata zip URL used when auto-building the authoritative bed/base raster.")
+    p.add_argument("--authoritative-base-missing-meta-policy", choices=["skip", "tile_extent", "error"], default="skip",
+                   help="How to handle selected CUDEM tiles with no matching spatial metadata during authoritative-base auto-build.")
+    p.add_argument("--authoritative-base-force-rebuild", action="store_true", default=False,
+                   help="Force rebuild of the cached authoritative-base entry for this template AOI/settings.")
+    p.add_argument("--authoritative-base-tile-url-field", default=None,
+                   help="Optional explicit tile-index attribute containing the DEM download URL during authoritative-base auto-build.")
     p.add_argument("--authoritative-bed-max-dist-m", type=float, default=2000.0,
                    help="Max distance (m) from authoritative bed pixels to influence residual blending.")
     p.add_argument("--residual-blend-sigma-m", type=float, default=600.0,
@@ -2663,6 +2756,11 @@ def main(
                    help="Disable enforcing observed sounding depths at their grid cells (default enforces).")
     p.add_argument("--debug-dir", default=None, help="If set, write debug rasters to this directory.")
     args = p.parse_args()
+    try:
+        _materialize_authoritative_bed_if_requested(args)
+    except Exception:
+        LOG.error("Failed to materialize authoritative bed/base raster for template=%s", getattr(args, "template_raster", None), exc_info=True)
+        raise
 
     template_profile, transform, crs, shape = _read_template(Path(args.template_raster))
 

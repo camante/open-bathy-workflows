@@ -94,7 +94,22 @@ def _sample_raster_values(path: Path, max_samples: int = 50000) -> np.ndarray:
             if sum(v.size for v in vals) >= max_samples:
                 break
         if not vals:
-            return np.array([], dtype="float64")
+            # Sparse corridor products can evade the coarse grid sampler above.
+            # Fall back to a deterministic block scan before declaring the raster empty.
+            for _, win in ds.block_windows(1):
+                arr = ds.read(1, window=win, masked=True).astype("float64")
+                if np.ma.isMaskedArray(arr):
+                    a = arr.compressed()
+                else:
+                    a = arr.ravel()
+                if a.size:
+                    a = a[np.isfinite(a)]
+                    if a.size:
+                        vals.append(a)
+                        if sum(v.size for v in vals) >= max_samples:
+                            break
+            if not vals:
+                return np.array([], dtype="float64")
         out = np.concatenate(vals)
         if out.size > max_samples:
             out = out[:max_samples]
@@ -111,11 +126,16 @@ def _validate_depth_raster(path: Optional[Path], *, name: str, expect_negative: 
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"{name} raster not found: {p}")
+    depth_reference = None
+    value_type = None
     with rasterio.open(p) as ds:
         if ds.count != 1:
             raise ValueError(f"{name} raster must be single-band (got {ds.count} bands): {p}")
         if ds.dtypes and ds.dtypes[0].startswith("uint"):
             log.warning("%s raster is unsigned integer (%s). This is unusual for depth; check units/selection: %s", name, ds.dtypes[0], p)
+        tags = ds.tags() or {}
+        depth_reference = str(tags.get("DEPTH_REFERENCE", "") or "").strip().lower()
+        value_type = str(tags.get("VALUE_TYPE", "") or "").strip().lower()
 
     vals = _sample_raster_values(p, max_samples=20000)
     if vals.size == 0:
@@ -134,11 +154,24 @@ def _validate_depth_raster(path: Optional[Path], *, name: str, expect_negative: 
             name, vmin, vmax, frac_neg, p
         )
 
+    zero_dominated_relative_patch = (
+        depth_reference in {"terrain_surface", "bank_elevation", "dem_surface"}
+        and value_type == "depth"
+        and frac_neg < 0.20
+        and vmax <= 0.5
+    )
+
     if expect_negative and frac_neg < 0.20:
-        log.warning(
-            "%s raster has low fraction of negative values (frac_neg=%.3f; min=%.3f max=%.3f). For negative-down depth workflows this is suspicious: %s",
-            name, frac_neg, vmin, vmax, p
-        )
+        if zero_dominated_relative_patch:
+            log.info(
+                "%s raster is zero-dominated but tagged as relative terrain depth (frac_neg=%.3f; min=%.3f max=%.3f). Treating this as an authoritative-locked diagnostic patch, not a sign error: %s",
+                name, frac_neg, vmin, vmax, p
+            )
+        else:
+            log.warning(
+                "%s raster has low fraction of negative values (frac_neg=%.3f; min=%.3f max=%.3f). For negative-down depth workflows this is suspicious: %s",
+                name, frac_neg, vmin, vmax, p
+            )
 
 
 def _validate_uncertainty_raster(path: Optional[Path], *, name: str) -> None:

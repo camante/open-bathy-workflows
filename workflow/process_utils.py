@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Sequence, Mapping, Any
 import subprocess
+import json
+from pathlib import Path
 
 def _tail(s: str, n: int = 4000) -> str:
     if not s:
@@ -57,3 +59,27 @@ def run_cmd(
     if check and out.returncode != 0:
         raise RuntimeError(f"Command failed ({out.returncode}): {out.cmd_str}\nSTDERR:\n{out.stderr_tail}")
     return out
+
+
+def find_sdb_depth_raster(sdb_dir: Path) -> Optional[Path]:
+    """Resolve the final SDB depth raster from the explicit SDB manifest only.
+
+    No directory scanning or filename guessing is allowed here. This helper exists so
+    downstream modules can share the same no-guess manifest contract without importing
+    bathy_main and creating circular dependencies.
+    """
+    sdb_dir = Path(sdb_dir)
+    if not sdb_dir.exists():
+        return None
+    manifest = sdb_dir / "artifacts_sdb.json"
+    if not manifest.exists():
+        return None
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    rel = data.get("depth_raster")
+    if not isinstance(rel, str) or not rel.strip():
+        return None
+    p = (sdb_dir / rel).resolve() if not Path(rel).is_absolute() else Path(rel).resolve()
+    return p if p.exists() else None

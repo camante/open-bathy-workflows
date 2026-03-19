@@ -5,7 +5,8 @@ from unittest import mock
 import numpy as np
 import pandas as pd
 
-from atl import load_extra_xyz_points
+from support_points import load_extra_xyz_points
+from atl import load_extra_xyz_points as atl_load_extra_xyz_points
 from spatial_sampling import adaptive_spatial_sample, SamplingConfig
 from train import apply_stumpf_residual_filter
 
@@ -74,3 +75,11 @@ def test_adaptive_sampling_global_cap_preserves_non_xyz_sources() -> None:
     counts = sampled["source"].astype(str).value_counts().to_dict()
     assert counts.get("atl24", 0) >= 40
     assert counts.get("atl03", 0) >= 40
+
+
+def test_atl_wrapper_delegates_extra_xyz_loader() -> None:
+    fake = pd.DataFrame({"longitude": [-70.9], "latitude": [42.8], "depth_m": [-2.0], "source": ["authoritative_base"]})
+    with mock.patch("support_points.load_extra_xyz_points", return_value=fake) as m:
+        out = atl_load_extra_xyz_points(["/tmp/a.csv"], crs="EPSG:4326", aoi_str="-71/-70/42/43")
+    assert m.called
+    assert len(out) == 1

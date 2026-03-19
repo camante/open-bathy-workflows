@@ -1,0 +1,4 @@
+x,y,depth_m,source
+0.5000000000,1.5000000000,-0.750000,authoritative_base
+0.5000000000,0.5000000000,-2.250000,authoritative_base
+1.5000000000,0.5000000000,0.750000,authoritative_base
