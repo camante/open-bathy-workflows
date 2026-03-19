@@ -35,6 +35,10 @@ def support_weighted_condition_arrays(
     river_bank_graph_confidence: Optional[np.ndarray] = None,
     river_bank_confluence_damping: Optional[np.ndarray] = None,
     river_bank_estuary_side_decay: Optional[np.ndarray] = None,
+    river_centerline_elevation: Optional[np.ndarray] = None,
+    river_centerline_influence: Optional[np.ndarray] = None,
+    river_xs_support_elevation: Optional[np.ndarray] = None,
+    river_xs_support_weight: Optional[np.ndarray] = None,
     pixel_size_m: float,
     support_decay_m: float,
     support_density_radius_m: float,
@@ -70,6 +74,10 @@ def support_weighted_condition_arrays(
             river_bank_graph_confidence=river_bank_graph_confidence,
             river_bank_confluence_damping=river_bank_confluence_damping,
             river_bank_estuary_side_decay=river_bank_estuary_side_decay,
+            river_centerline_elevation=river_centerline_elevation,
+            river_centerline_influence=river_centerline_influence,
+            river_xs_support_elevation=river_xs_support_elevation,
+            river_xs_support_weight=river_xs_support_weight,
         ),
         config=TerrainInterpolationConfig(
             pixel_size_m=pixel_size_m,
@@ -187,8 +195,10 @@ def build_source_aware_candidate_arrays(
 
     # Use the legacy fused candidate as a backstop only outside the fluvial corridor, plus
     # the conservative estuary handoff where coastal and river logic intentionally overlap.
+    legacy_allowed = (~river_ok) | estuary
+    legacy_blocked = (np.isnan(candidate) & np.isfinite(legacy) & river_ok & (~estuary)) if legacy is not None else np.zeros(shp, dtype=bool)
     legacy_mask = (
-        np.isnan(candidate) & np.isfinite(legacy) & (~river_ok | estuary)
+        np.isnan(candidate) & np.isfinite(legacy) & legacy_allowed
     ) if legacy is not None else np.zeros(shp, dtype=bool)
     if np.any(legacy_mask):
         candidate[legacy_mask] = legacy[legacy_mask]
@@ -200,18 +210,25 @@ def build_source_aware_candidate_arrays(
         "river_pixels": int((provenance == PROV_RIVER).sum()),
         "blended_pixels": int((provenance == PROV_BLEND).sum()),
         "legacy_fallback_pixels": int((provenance == PROV_LEGACY).sum()),
+        "legacy_gap_only_backstop_pixels": int((provenance == PROV_LEGACY).sum()),
+        "legacy_blocked_in_river_corridor_pixels": int(legacy_blocked.sum()),
         "unused_pixels": int((provenance == PROV_NODATA).sum()),
     }
     return {
         "candidate": candidate,
         "provenance": provenance,
         "stats": stats,
+        "backstop_policy": {
+            "legacy_candidate_role": "gap_only_backstop",
+            "disallow_legacy_in_river_corridor_outside_estuary": True,
+            "legacy_allowed_domain": "outside_river_corridor_or_estuary_handoff",
+        },
         "provenance_codes": {
             "0": "nodata",
             "1": "sdb_direct",
             "2": "river_direct",
             "3": "sdb_river_blend",
-            "4": "legacy_fused_fallback",
+            "4": "legacy_gap_only_backstop",
         },
     }
 

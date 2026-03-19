@@ -12,6 +12,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core.exec import run_command
 
+
+try:
+    from scipy.ndimage import distance_transform_edt, binary_dilation, binary_opening
+except ImportError:  # pragma: no cover - runtime dependency expected in normal envs
+    distance_transform_edt = binary_dilation = binary_opening = None
+
+
 try:
     from core.hashing import stable_hash_json
 except (ImportError, AttributeError):
@@ -406,12 +413,28 @@ def build_hydraulic_estuary_hint_mask(*, cfg: Any, channel, transform, crs, px_s
         return zero, meta
 
 
+
+
+def apply_estuary_first_channel_domain(channel_mask, estuary_mask):
+    """Return the structured river generation domain after estuary exclusion.
+
+    This helper keeps river scaffold / bank / centerline generation bounded to the
+    retained fluvial corridor instead of letting estuary pixels participate and be
+    removed later. It is intentionally simple and deterministic so downstream code
+    can reuse the same estuary-first mask contract.
+    """
+    import numpy as np
+
+    channel = np.asarray(channel_mask) > 0
+    estuary = np.asarray(estuary_mask) > 0
+    return (channel & (~estuary)).astype(np.uint8)
+
+
 def clip_channel_mask_for_estuary(channel_mask_tif: Path, cfg: Any, *, ocean_mask_path: Optional[Path], report: Dict[str, Any], logger: Optional[logging.Logger] = None) -> Tuple[int, Optional[Path]]:
     log = logger or logging.getLogger(__name__)
     import numpy as np
     import rasterio
     from rasterio.warp import reproject, Resampling
-    from scipy.ndimage import distance_transform_edt, binary_dilation, binary_opening
     channel_mask_tif = Path(channel_mask_tif)
     if not channel_mask_tif.exists():
         return 0, None
@@ -466,9 +489,14 @@ def clip_channel_mask_for_estuary(channel_mask_tif: Path, cfg: Any, *, ocean_mas
             ocean_water = (ocean_raw == 0)
             if np.any(ocean_water) and np.any(estuary_mask):
                 ocean_bridge = binary_dilation(ocean_water, iterations=3)
-                connect_domain = estuary_mask | ocean_bridge
+                # Connectivity must be evaluated through the channel domain, not just by
+                # direct contact between the current estuary candidates and an ocean-edge
+                # bridge. Otherwise a broad estuary connected to the ocean by non-estuary
+                # channel pixels can collapse to a tiny fringe near the mouth.
+                channel_domain = (channel > 0)
+                connect_domain = channel_domain | ocean_bridge
                 labeled, n_components = _label(connect_domain)
-                ocean_labels = set(np.unique(labeled[ocean_water & (labeled > 0)]))
+                ocean_labels = set(np.unique(labeled[ocean_bridge & (labeled > 0)]))
                 n_before_connect = int(estuary_mask.sum())
                 if ocean_labels:
                     ocean_connected = np.isin(labeled, list(ocean_labels))
@@ -477,8 +505,8 @@ def clip_channel_mask_for_estuary(channel_mask_tif: Path, cfg: Any, *, ocean_mas
                     estuary_mask[:] = False
                 n_after_connect = int(estuary_mask.sum())
                 if n_before_connect > n_after_connect:
-                    log.info('[ESTUARY-CLIP] Ocean flood-fill: trimmed %d disconnected inland pixels (%d components checked, %d ocean-connected)', n_before_connect - n_after_connect, n_components, len(ocean_labels))
-                meta['signals']['ocean_connectivity'] = {'method': 'flood_fill', 'n_components': int(n_components), 'ocean_connected_components': len(ocean_labels), 'trimmed_inland_pixels': n_before_connect - n_after_connect}
+                    log.info('[ESTUARY-CLIP] Ocean flood-fill: trimmed %d disconnected inland pixels (%d channel/ocean components checked, %d ocean-connected)', n_before_connect - n_after_connect, n_components, len(ocean_labels))
+                meta['signals']['ocean_connectivity'] = {'method': 'channel_domain_flood_fill', 'n_components': int(n_components), 'ocean_connected_components': len(ocean_labels), 'trimmed_inland_pixels': n_before_connect - n_after_connect}
                 estuary_dilated = binary_dilation(estuary_mask, iterations=2)
                 n_edge_added = int((estuary_dilated & (channel > 0) & ~estuary_mask).sum())
                 estuary_mask = estuary_dilated & (channel > 0)

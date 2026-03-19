@@ -135,45 +135,136 @@ class _WarpedVRT:
 
 
 def _install_mocks():
-    """Install all geo-library stubs.  Safe to call multiple times."""
+    """Install all geo-library stubs. Safe to call multiple times.
+
+    Prefer the real rasterio package when it is available so tests that import
+    submodules like ``rasterio.transform`` keep working. Fall back to the light
+    tifffile-backed mock only when rasterio cannot be imported in this test
+    environment.
+    """
     if "rasterio" in sys.modules and hasattr(sys.modules["rasterio"], "_mocked"):
         return
 
-    # --- rasterio ---
-    rio = types.ModuleType("rasterio")
-    rio.float32 = "float32"
-    rio.uint8 = "uint8"
-    rio.open = lambda path, mode="r", **kw: FakeDataset(str(path), mode=mode, **kw)
-    rio._mocked = True
+    try:
+        import rasterio as _real_rasterio  # noqa: F401
+    except Exception:
+        _real_rasterio = None
 
-    win = types.ModuleType("rasterio.windows")
-    win.Window = FakeWindow
-    win.from_bounds = lambda *a, **kw: FakeWindow(0, 0, 64, 64)
+    if _real_rasterio is None:
+        # --- rasterio fallback mock ---
+        rio = types.ModuleType("rasterio")
+        rio.float32 = "float32"
+        rio.uint8 = "uint8"
+        rio.open = lambda path, mode="r", **kw: FakeDataset(str(path), mode=mode, **kw)
+        rio._mocked = True
 
-    vrt = types.ModuleType("rasterio.vrt")
-    vrt.WarpedVRT = _WarpedVRT
+        win = types.ModuleType("rasterio.windows")
+        win.Window = FakeWindow
+        win.from_bounds = lambda *a, **kw: FakeWindow(0, 0, 64, 64)
 
-    enums = types.ModuleType("rasterio.enums")
-    enums.Resampling = type("Resampling", (), {"nearest": 0, "bilinear": 1})()
+        vrt = types.ModuleType("rasterio.vrt")
+        vrt.WarpedVRT = _WarpedVRT
 
-    sys.modules.update({
-        "rasterio": rio, "rasterio.windows": win,
-        "rasterio.vrt": vrt, "rasterio.enums": enums,
-    })
+        enums = types.ModuleType("rasterio.enums")
+        enums.Resampling = type("Resampling", (), {"nearest": 0, "bilinear": 1})()
+
+        sys.modules.update({
+            "rasterio": rio, "rasterio.windows": win,
+            "rasterio.vrt": vrt, "rasterio.enums": enums,
+        })
 
     # --- pyproj ---
+    # Use a lightweight stub by default so imports remain stable even in thin
+    # environments. The stub includes CRS/Transformer/Geod/ProjError support so
+    # geopandas-backed tests that do not explicitly swap in real pyproj can
+    # still construct CRS-aware objects. Focused tests may replace this stub
+    # with the real pyproj package by clearing sys.modules first.
     pyproj = types.ModuleType("pyproj")
+
+    class _CRS:
+        def __init__(self, value=None):
+            self._value = value if value is not None else "EPSG:4326"
+
+        @classmethod
+        def from_user_input(cls, value):
+            return cls(value)
+
+        @classmethod
+        def from_epsg(cls, epsg):
+            return cls(f"EPSG:{int(epsg)}")
+
+        def to_epsg(self):
+            try:
+                text = str(self._value).upper()
+                if text.startswith("EPSG:"):
+                    return int(text.split(":", 1)[1])
+            except Exception:
+                return None
+            return None
+
+        def to_wkt(self):
+            return str(self._value)
+
+        def __str__(self):
+            return str(self._value)
+
+        def __repr__(self):
+            return f"CRS({self._value!r})"
+
     class _T:
         @staticmethod
-        def from_crs(src, dst, always_xy=True): return _T()
-        def transform(self, x, y): return x, y
+        def from_crs(src, dst, always_xy=True):
+            return _T()
+
+        def transform(self, x, y, z=None):
+            if z is None:
+                return x, y
+            return x, y, z
+
+    class _Geod:
+        def __init__(self, *a, **kw):
+            pass
+
+        def inv(self, lon1, lat1, lon2, lat2):
+            arr = np.asarray(lon1, dtype=float)
+            shape = arr.shape if arr.shape else np.asarray(lon2, dtype=float).shape
+            zeros = np.zeros(shape, dtype=float)
+            return zeros, zeros, zeros
+
+    class ProjError(Exception):
+        pass
+
+    class CRSError(ProjError):
+        pass
+
+    class DataDirError(ProjError):
+        pass
+
+    class GeodError(ProjError):
+        pass
+
+    pyproj.CRS = _CRS
     pyproj.Transformer = _T
+    pyproj.Geod = _Geod
+    pyproj.Proj = _CRS
+    pyproj.network = types.SimpleNamespace(set_ca_bundle_path=lambda *a, **kw: None)
+    exc_mod = types.ModuleType("pyproj.exceptions")
+    exc_mod.ProjError = ProjError
+    exc_mod.CRSError = CRSError
+    exc_mod.DataDirError = DataDirError
+    exc_mod.GeodError = GeodError
+    pyproj.exceptions = exc_mod
     sys.modules["pyproj"] = pyproj
+    sys.modules["pyproj.exceptions"] = exc_mod
 
     # --- misc stubs ---
     for name in ["affine", "fiona", "shapely", "shapely.geometry",
                  "geopandas", "pyogrio"]:
-        if name not in sys.modules:
+        if name in sys.modules:
+            continue
+        try:
+            __import__(name)
+        except Exception:
             sys.modules[name] = types.ModuleType(name)
 
     # --- process_utils stub ---
@@ -185,6 +276,49 @@ def _install_mocks():
 
 _install_mocks()
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
+# ---------------------------------------------------------------------------
+# Test-suite classification
+# ---------------------------------------------------------------------------
+# These markers reflect the workflow's current architecture:
+# - core: authoritative-first, support-aware, guidance-conditioned end-state
+# - transitional: tests protecting routes/behaviors still present during migration
+# - legacy: compatibility coverage for older fusion-centered behavior
+_TRANSITIONAL_TESTS = {
+    "test_bathy_main.py",
+    "test_bathy_main_authoritative_river_fallback.py",
+    "test_fusion_atl.py",
+    "test_pipeline.py",
+    "test_pipeline_aoi.py",
+    "test_river_guidance_controls.py",
+    "test_run_summary_scientific.py",
+    "test_source_aware_candidate.py",
+    "test_source_aware_candidate_river_corridor.py",
+    "test_tier2_path.py",
+}
+
+_LEGACY_TESTS = {
+    "test_bathy_fusion_numerical.py",
+}
+
+
+def pytest_collection_modifyitems(config, items):
+    """Classify the suite into core / transitional / legacy buckets.
+
+    Core is the default because the repo's present architecture is centered on
+    authoritative support, canonical scaffold generation, guidance artifacts,
+    and terrain interpolation. Only tests that explicitly protect older or
+    still-migrating routes are marked otherwise.
+    """
+    for item in items:
+        name = Path(str(item.fspath)).name
+        if name in _LEGACY_TESTS:
+            item.add_marker("legacy")
+        elif name in _TRANSITIONAL_TESTS:
+            item.add_marker("transitional")
+        else:
+            item.add_marker("core")
 
 
 # ---------------------------------------------------------------------------

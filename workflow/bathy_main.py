@@ -305,6 +305,13 @@ def _recover_river_depth_from_support(
     import rasterio
     from rasterio.features import rasterize
     from river_bank_guidance import compute_bank_distance_influence, compute_xs_bank_guidance_surfaces, compute_graph_informed_bank_context_surfaces
+    from river_structured_scaffold import (
+        select_retained_river_features,
+        build_dense_bank_points,
+        build_centerline_points,
+        build_xs_support_points,
+        _nearest_surface_from_points,
+    )
 
     result = {"recovered": False, "reason": None, "valid_pixels": 0, "support_seed_pixels": 0}
     try:
@@ -462,6 +469,13 @@ def _write_river_guidance_artifacts(
     import rasterio
     from rasterio.features import rasterize
     from river_bank_guidance import compute_bank_distance_influence, compute_xs_bank_guidance_surfaces, compute_graph_informed_bank_context_surfaces
+    from river_structured_scaffold import (
+        select_retained_river_features,
+        build_dense_bank_points,
+        build_centerline_points,
+        build_xs_support_points,
+        _nearest_surface_from_points,
+    )
 
     artifacts = {
         "guidance_weight": None,
@@ -477,6 +491,13 @@ def _write_river_guidance_artifacts(
         "bank_elevation_xs": None,
         "bank_pair_weight": None,
         "bank_points": None,
+        "centerline_points": None,
+        "xs_support_points": None,
+        "centerline_elevation": None,
+        "centerline_influence": None,
+        "xs_support_elevation": None,
+        "xs_support_weight": None,
+        "retained_network": None,
         "scaffold_domains": None,
     }
     with rasterio.open(depth_tif) as ds:
@@ -564,6 +585,13 @@ def _write_river_guidance_artifacts(
     bcd_path = river_dir / "river_bank_confluence_damping.tif"
     besd_path = river_dir / "river_bank_estuary_side_decay.tif"
     bpts_path = river_dir / "river_bank_points.gpkg"
+    cpts_path = river_dir / "river_centerline_points.gpkg"
+    xsp_path = river_dir / "river_xs_support_points.gpkg"
+    ce_path = river_dir / "river_centerline_elevation.tif"
+    ci_path = river_dir / "river_centerline_influence.tif"
+    xse_path = river_dir / "river_xs_support_elevation.tif"
+    xsw_path = river_dir / "river_xs_support_weight.tif"
+    retained_network_path = river_dir / "river_retained_network.gpkg"
     scaffold_domains_path = river_dir / "river_scaffold_domains.json"
 
     # ---------------------------------------------------------------
@@ -703,6 +731,156 @@ def _write_river_guidance_artifacts(
         except (ImportError, FileNotFoundError, OSError, RuntimeError, ValueError):
             log.debug("[RIVER] XS bank guidance build failed; continuing with corridor-edge bank guidance only.", exc_info=True)
 
+    # Structured scaffold products derived from the retained river polygon/network.
+    structured_bank_points = None
+    centerline_points = None
+    xs_support_points = None
+    river_centerline_elevation = np.full(depth.shape, np.nan, dtype="float32")
+    river_centerline_influence = np.zeros(depth.shape, dtype="float32")
+    river_xs_support_elevation = np.full(depth.shape, np.nan, dtype="float32")
+    river_xs_support_weight = np.zeros(depth.shape, dtype="float32")
+    retained_network_meta = {"enabled": False, "selection_mode": "not_attempted"}
+
+    def _estimate_native_pixel_spacing_m(ds_obj) -> float:
+        try:
+            px_x = abs(float(ds_obj.transform.a))
+            px_y = abs(float(ds_obj.transform.e))
+            if px_x <= 0.0 and px_y <= 0.0:
+                return 3.0
+            if getattr(ds_obj.crs, "is_geographic", False):
+                lat0 = 0.5 * (float(ds_obj.bounds.bottom) + float(ds_obj.bounds.top))
+                lat_rad = np.deg2rad(lat0)
+                m_per_deg_lat = 111132.92 - (559.82 * np.cos(2.0 * lat_rad)) + (1.175 * np.cos(4.0 * lat_rad))
+                m_per_deg_lon = 111412.84 * np.cos(lat_rad) - 93.5 * np.cos(3.0 * lat_rad)
+                sx = px_x * abs(m_per_deg_lon)
+                sy = px_y * abs(m_per_deg_lat)
+            else:
+                sx = px_x
+                sy = px_y
+            vals = [v for v in (sx, sy) if np.isfinite(v) and v > 0.0]
+            return float(min(vals)) if vals else 3.0
+        except Exception:
+            return 3.0
+
+    try:
+        network_gpkg = Path(cfg.derived_cache_root) / "river" / "work" / "river_network.gpkg"
+        if network_gpkg.exists():
+            retained = select_retained_river_features(
+                network_gpkg,
+                target_crs=ds.crs,
+                min_stream_order=int(getattr(cfg, "river_scaffold_min_stream_order", 3) or 3),
+                min_length_km=float(getattr(cfg, "river_scaffold_min_length_km", 0.25) or 0.25),
+                keep_top_components=int(getattr(cfg, "river_scaffold_keep_top_components", 6) or 6),
+                nhdarea_layer=str(getattr(cfg, "river_nhdarea_layer", "nhdarea_clip") or "nhdarea_clip"),
+            )
+            retained_network_meta = dict(retained.metadata)
+            retained_network_meta["enabled"] = True
+            retained_network_meta["estuary_mask_applied"] = True
+            scaffold_allowed_mask = channel.astype(bool) & (~estuary_transition.astype(bool))
+            auto_spacing_m = _estimate_native_pixel_spacing_m(ds)
+            bank_spacing_m = float(getattr(cfg, "river_bank_sample_spacing_m", None) or auto_spacing_m)
+            centerline_spacing_m = float(getattr(cfg, "river_centerline_sample_spacing_m", None) or auto_spacing_m)
+            xs_spacing_m = float(getattr(cfg, "river_xs_support_spacing_m", None) or auto_spacing_m)
+            retained_network_meta["auto_sample_spacing_m"] = float(auto_spacing_m)
+            retained_network_meta["bank_sample_spacing_m"] = float(bank_spacing_m)
+            retained_network_meta["centerline_sample_spacing_m"] = float(centerline_spacing_m)
+            retained_network_meta["xs_support_spacing_m"] = float(xs_spacing_m)
+            structured_bank_points = build_dense_bank_points(
+                retained.polygons,
+                spacing_m=bank_spacing_m,
+                raster_path=bed_tif,
+                normal_search_max_m=float(getattr(cfg, "river_bank_normal_search_max_m", 8.0) or 8.0),
+                normal_search_step_m=float(getattr(cfg, "river_bank_normal_search_step_m", 1.0) or 1.0),
+                xs_bank_points=xs_bank_points_gdf,
+                allowed_mask=scaffold_allowed_mask,
+                transform=ds.transform,
+            )
+            centerline_points = build_centerline_points(
+                retained.flows,
+                retained.polygons,
+                spacing_m=centerline_spacing_m,
+                raster_path=bed_tif,
+                allowed_mask=scaffold_allowed_mask,
+                transform=ds.transform,
+            )
+            if xs_source is not None:
+                xs_support_points = build_xs_support_points(
+                    xs_source,
+                    retained.polygons,
+                    spacing_fraction=float(getattr(cfg, "river_xs_support_fraction", 0.25) or 0.25),
+                    spacing_m=xs_spacing_m,
+                    raster_path=bed_tif,
+                    allowed_mask=scaffold_allowed_mask,
+                    transform=ds.transform,
+                )
+            if structured_bank_points is not None and not structured_bank_points.empty:
+                if xs_bank_points_gdf is not None and not xs_bank_points_gdf.empty:
+                    # Keep dense polygon-bank points as the primary bank-boundary scaffold but retain
+                    # side-tagged XS bank points for continuity/side-aware bank fields.
+                    bank_points_out = structured_bank_points.copy()
+                    bank_points_out["artifact_role"] = "bank_boundary_control"
+                else:
+                    bank_points_out = structured_bank_points.copy()
+                if not bank_points_out.empty:
+                    if bpts_path.exists():
+                        bpts_path.unlink()
+                    bank_points_out.to_file(bpts_path, driver="GPKG")
+            if centerline_points is not None and not centerline_points.empty:
+                if cpts_path.exists():
+                    cpts_path.unlink()
+                centerline_points.to_file(cpts_path, driver="GPKG")
+                river_centerline_elevation, river_centerline_influence = _nearest_surface_from_points(
+                    shape=depth.shape,
+                    transform=ds.transform,
+                    domain_mask=channel.astype(bool),
+                    points_gdf=centerline_points,
+                    value_field="centerline_z_m",
+                    max_distance_m=max(float(getattr(cfg, "river_scaffold_transition_m", 800.0) or 800.0) * 0.45, 120.0),
+                )
+            if xs_support_points is not None and not xs_support_points.empty:
+                if xsp_path.exists():
+                    xsp_path.unlink()
+                xs_support_points.to_file(xsp_path, driver="GPKG")
+                river_xs_support_elevation, river_xs_support_weight = _nearest_surface_from_points(
+                    shape=depth.shape,
+                    transform=ds.transform,
+                    domain_mask=channel.astype(bool),
+                    points_gdf=xs_support_points,
+                    value_field="xs_z_m",
+                    max_distance_m=max(float(getattr(cfg, "river_scaffold_transition_m", 800.0) or 800.0) * 0.30, 80.0),
+                )
+            # Replace generic corridor cloud with a structured scaffold union restricted to retained polygons.
+            structured_guide = []
+            for gdf in (structured_bank_points, centerline_points, xs_support_points):
+                if gdf is not None and not gdf.empty:
+                    structured_guide.append(gdf)
+            if structured_guide:
+                import geopandas as gpd
+                import pandas as pd
+                guide_gdf = gpd.GeoDataFrame(pd.concat(structured_guide, ignore_index=True), geometry="geometry", crs=structured_guide[0].crs)
+                gp_path = river_dir / 'river_guide_points.gpkg'
+                if gp_path.exists():
+                    gp_path.unlink()
+                guide_gdf.to_file(gp_path, driver='GPKG')
+                artifacts['guide_points'] = str(gp_path)
+            try:
+                import geopandas as gpd
+                retained_layers = []
+                if retained.flows is not None and not retained.flows.empty:
+                    rf = retained.flows.copy(); rf["feature_role"] = "retained_flowline"; retained_layers.append(rf)
+                if retained.polygons is not None and not retained.polygons.empty:
+                    rp = retained.polygons.copy(); rp["feature_role"] = "retained_polygon"; retained_layers.append(rp)
+                if retained_layers:
+                    if retained_network_path.exists():
+                        retained_network_path.unlink()
+                    for i, layer in enumerate(retained_layers):
+                        lname = "retained_flowlines" if i == 0 else "retained_polygons"
+                        layer.to_file(retained_network_path, layer=lname, driver="GPKG")
+            except Exception:
+                log.debug("[RIVER] Could not write retained network gpkg", exc_info=True)
+    except Exception:
+        log.debug("[RIVER] Structured scaffold generation failed; continuing with existing bank-guidance products.", exc_info=True)
+
     rc_path = river_dir / "river_regime_class.tif"
 
     with rasterio.open(gw_path, "w", **prof_f32) as dst:
@@ -737,10 +915,14 @@ def _write_river_guidance_artifacts(
         dst.write(np.clip(river_bank_confluence_damping, 0.0, 1.0).astype("float32"), 1)
     with rasterio.open(besd_path, "w", **prof_f32) as dst:
         dst.write(np.clip(river_bank_estuary_side_decay, 0.0, 1.0).astype("float32"), 1)
-    if xs_bank_points_gdf is not None and not xs_bank_points_gdf.empty:
-        if bpts_path.exists():
-            bpts_path.unlink()
-        xs_bank_points_gdf.to_file(bpts_path, driver="GPKG")
+    with rasterio.open(ce_path, "w", **prof_depth) as dst:
+        dst.write(np.where(np.isfinite(river_centerline_elevation), river_centerline_elevation, float(nodata)).astype("float32"), 1)
+    with rasterio.open(ci_path, "w", **prof_f32) as dst:
+        dst.write(np.clip(river_centerline_influence, 0.0, 1.0).astype("float32"), 1)
+    with rasterio.open(xse_path, "w", **prof_depth) as dst:
+        dst.write(np.where(np.isfinite(river_xs_support_elevation), river_xs_support_elevation, float(nodata)).astype("float32"), 1)
+    with rasterio.open(xsw_path, "w", **prof_f32) as dst:
+        dst.write(np.clip(river_xs_support_weight, 0.0, 1.0).astype("float32"), 1)
     with rasterio.open(rc_path, "w", **prof_u8) as dst:
         dst.write(regime_class.astype("uint8"), 1)
 
@@ -786,41 +968,20 @@ def _write_river_guidance_artifacts(
         "bank_graph_confidence": str(bgc_path),
         "bank_confluence_damping": str(bcd_path),
         "bank_estuary_side_decay": str(besd_path),
-        "bank_points": str(bpts_path) if xs_bank_points_gdf is not None and not xs_bank_points_gdf.empty else None,
+        "bank_points": str(bpts_path) if bpts_path.exists() else None,
+        "centerline_points": str(cpts_path) if cpts_path.exists() else None,
+        "xs_support_points": str(xsp_path) if xsp_path.exists() else None,
+        "centerline_elevation": str(ce_path),
+        "centerline_influence": str(ci_path),
+        "xs_support_elevation": str(xse_path),
+        "xs_support_weight": str(xsw_path),
+        "retained_network": str(retained_network_path) if retained_network_path.exists() else None,
         "regime_class": str(rc_path),
         "scaffold_domains": str(scaffold_domains_path),
         "trusted_interior_summary": str(trusted_summary_path),
     })
 
-    # Sparse guide points sampled from the guidance-weighted raster support.
-    try:
-        import geopandas as gpd
-        from shapely.geometry import Point
-        with rasterio.open(depth_tif) as ds:
-            depth = ds.read(1).astype("float32")
-            nodata = ds.nodata if ds.nodata is not None else float(getattr(cfg, "river_nodata", -9999.0))
-            valid_guides = np.isfinite(depth) & (depth != nodata) & (guidance_weight > 0.05) & channel
-            rows, cols = np.where(valid_guides)
-            if rows.size > 0:
-                step = max(int(np.sqrt(rows.size / 2000.0)), 1)
-                sel = np.arange(0, rows.size, step, dtype=int)
-                rows = rows[sel]
-                cols = cols[sel]
-                xs, ys = rasterio.transform.xy(ds.transform, rows, cols, offset='center')
-                vals = depth[rows, cols]
-                wts = guidance_weight[rows, cols]
-                gdf = gpd.GeoDataFrame({
-                    'depth_m': vals.astype('float32'),
-                    'guidance_weight': wts.astype('float32'),
-                    'artifact_role': ['guide_point'] * len(vals),
-                }, geometry=[Point(x, y) for x, y in zip(xs, ys)], crs=ds.crs)
-                gp_path = river_dir / 'river_guide_points.gpkg'
-                if gp_path.exists():
-                    gp_path.unlink()
-                gdf.to_file(gp_path, driver='GPKG')
-                artifacts['guide_points'] = str(gp_path)
-    except (ImportError, OSError, ValueError):
-        pass
+    # river_guide_points.gpkg is now emitted from the structured scaffold union above.
 
     support_source_counts = {}
     try:
@@ -853,6 +1014,12 @@ def _write_river_guidance_artifacts(
         'regime_summary': contract.get('regime_summary', {}),
         'zone_summary': {k: int(np.sum(v > 0)) for k, v in contract.get('zones', {}).items()},
         'corridor_mask': str(cm_path),
+        'retained_network': str(retained_network_path) if retained_network_path.exists() else None,
+        'retained_network_summary': retained_network_meta,
+        'guide_points_definition': 'Structured scaffold union restricted to retained WAFFLES/NHD river polygons: dense bank boundary points, longitudinal centerline control points, and selected cross-stream support nodes. Generic buffered-corridor random sampling is not used.',
+        'bank_points_definition': 'Dense bank-boundary control points sampled along retained WAFFLES/NHD polygon banks from the authoritative baseline DEM.',
+        'centerline_points_definition': 'Dense longitudinal control points sampled along retained mainstem/key-tributary flowlines inside the retained river polygon.',
+        'xs_support_points_definition': 'Selected cross-stream support nodes sampled from retained cross-sections inside the retained river polygon.',
         'bank_edge_mask_definition': 'interior corridor-edge pixels derived from the WAFFLES/NHD river corridor boundary',
         'bank_distance_definition': 'distance from each corridor pixel to the nearest interior bank edge, used to taper bank-boundary influence inward',
         'bank_influence_definition': 'soft bank-boundary tendency derived from corridor-edge proximity; strongest near banks and decays toward the channel interior',
@@ -2030,6 +2197,11 @@ class BathyConfig:
     coastal_sdb_support_transition_m: float = 600.0  # distance scale controlling when stable optical SDB support can dominate in estuary/nearshore gaps
     river_anchor_density_radius_m: float = 200.0  # neighborhood radius used to estimate local river anchor density
     river_scaffold_transition_m: float = 800.0  # distance scale controlling when river guidance becomes scaffold-dominant away from anchors
+    river_bank_sample_spacing_m: Optional[float] = None  # default: authoritative DEM pixel spacing in meters
+    river_centerline_sample_spacing_m: Optional[float] = None  # default: authoritative DEM pixel spacing in meters
+    river_xs_support_spacing_m: Optional[float] = None  # default: authoritative DEM pixel spacing in meters
+    river_bank_normal_search_max_m: float = 8.0
+    river_bank_normal_search_step_m: float = 1.0
     river_network_halo_km: float = 2.0  # halo used to build a more stable river scaffold domain than the clipped export AOI
     river_trusted_halo_m: float = 60.0  # interior buffer used to suppress edge-sensitive river guidance near solve-domain boundaries
     gapfill_method: str = "rbf"  # rbf | gp | idw
@@ -5477,6 +5649,10 @@ def _support_weighted_condition_arrays(
     river_bank_graph_confidence: Optional[np.ndarray] = None,
     river_bank_confluence_damping: Optional[np.ndarray] = None,
     river_bank_estuary_side_decay: Optional[np.ndarray] = None,
+    river_centerline_elevation: Optional[np.ndarray] = None,
+    river_centerline_influence: Optional[np.ndarray] = None,
+    river_xs_support_elevation: Optional[np.ndarray] = None,
+    river_xs_support_weight: Optional[np.ndarray] = None,
     pixel_size_m: float,
     support_decay_m: float,
     support_density_radius_m: float,
@@ -5505,6 +5681,10 @@ def _support_weighted_condition_arrays(
         river_bank_graph_confidence=river_bank_graph_confidence,
         river_bank_confluence_damping=river_bank_confluence_damping,
         river_bank_estuary_side_decay=river_bank_estuary_side_decay,
+        river_centerline_elevation=river_centerline_elevation,
+        river_centerline_influence=river_centerline_influence,
+        river_xs_support_elevation=river_xs_support_elevation,
+        river_xs_support_weight=river_xs_support_weight,
         pixel_size_m=pixel_size_m,
         support_decay_m=support_decay_m,
         support_density_radius_m=support_density_radius_m,
@@ -5710,6 +5890,10 @@ def _condition_final_to_authoritative_base(
         river_bank_graph_confidence_path = _resolve_existing_output_path(river_outputs, "bank_graph_confidence")
         river_bank_confluence_damping_path = _resolve_existing_output_path(river_outputs, "bank_confluence_damping")
         river_bank_estuary_side_decay_path = _resolve_existing_output_path(river_outputs, "bank_estuary_side_decay")
+        river_centerline_elevation_path = _resolve_existing_output_path(river_outputs, "centerline_elevation")
+        river_centerline_influence_path = _resolve_existing_output_path(river_outputs, "centerline_influence")
+        river_xs_support_elevation_path = _resolve_existing_output_path(river_outputs, "xs_support_elevation")
+        river_xs_support_weight_path = _resolve_existing_output_path(river_outputs, "xs_support_weight")
         river_ti = _align(river_ti_path, dtype="uint8", nodata_value=0, resampling=Resampling.nearest)
         river_estuary_transition = _align(river_estuary_transition_path, dtype="uint8", nodata_value=0, resampling=Resampling.nearest)
         river_support = _align(river_support_path, dtype="uint8", nodata_value=0, resampling=Resampling.nearest)
@@ -5722,6 +5906,10 @@ def _condition_final_to_authoritative_base(
         river_bank_graph_confidence = _align(river_bank_graph_confidence_path, dtype="float32", nodata_value=np.nan, resampling=Resampling.bilinear)
         river_bank_confluence_damping = _align(river_bank_confluence_damping_path, dtype="float32", nodata_value=np.nan, resampling=Resampling.bilinear)
         river_bank_estuary_side_decay = _align(river_bank_estuary_side_decay_path, dtype="float32", nodata_value=np.nan, resampling=Resampling.bilinear)
+        river_centerline_elevation = _align(river_centerline_elevation_path, dtype="float32", nodata_value=np.nan, resampling=Resampling.bilinear)
+        river_centerline_influence = _align(river_centerline_influence_path, dtype="float32", nodata_value=np.nan, resampling=Resampling.bilinear)
+        river_xs_support_elevation = _align(river_xs_support_elevation_path, dtype="float32", nodata_value=np.nan, resampling=Resampling.bilinear)
+        river_xs_support_weight = _align(river_xs_support_weight_path, dtype="float32", nodata_value=np.nan, resampling=Resampling.bilinear)
 
         sdb_ok = (np.asarray(sdb_adm) > 0) if sdb_adm is not None else np.zeros(auth.shape, dtype=bool)
         river_ok = (np.asarray(river_adm) > 0) if river_adm is not None else np.zeros(auth.shape, dtype=bool)
@@ -5760,6 +5948,10 @@ def _condition_final_to_authoritative_base(
             river_bank_graph_confidence=river_bank_graph_confidence,
             river_bank_confluence_damping=river_bank_confluence_damping,
             river_bank_estuary_side_decay=river_bank_estuary_side_decay,
+            river_centerline_elevation=river_centerline_elevation,
+            river_centerline_influence=river_centerline_influence,
+            river_xs_support_elevation=river_xs_support_elevation,
+            river_xs_support_weight=river_xs_support_weight,
             pixel_size_m=pixel_size_m,
             support_decay_m=float(getattr(cfg, "authoritative_support_decay_m", 300.0) or 300.0),
             support_density_radius_m=float(getattr(cfg, "authoritative_support_density_radius_m", 250.0) or 250.0),
@@ -5878,17 +6070,18 @@ def _condition_final_to_authoritative_base(
         "precedence_audit": str(precedence_audit_path),
     }
     report["authoritative_base"]["candidate_generation"] = {
-        "mode": "support_aware_direct_sources_with_legacy_backstop",
+        "mode": "support_aware_direct_sources_with_gap_only_legacy_backstop",
         "template_path": str(template_path),
         "sdb_depth": str(sdb_depth_path) if sdb_depth_path else None,
         "river_depth": str(river_depth_path) if river_depth_path else None,
         "legacy_candidate": str(candidate_path) if candidate_path else None,
         "stats": source_candidate.get("stats", {}),
+        "backstop_policy": source_candidate.get("backstop_policy", {}),
         "provenance_codes": source_candidate.get("provenance_codes", {}),
     }
     report["authoritative_base"]["policy"] = build_final_dem_policy_dict(
         cfg,
-        support_note=f"{support_note}; source_candidate=support_aware_direct_sources_with_legacy_backstop",
+        support_note=f"{support_note}; source_candidate=support_aware_direct_sources_with_gap_only_legacy_backstop",
         guidance_masks={
             "sdb_admissibility": str(sdb_adm_path) if sdb_adm_path else None,
             "sdb_guidance_weight": str(sdb_gw_path) if sdb_gw_path else None,

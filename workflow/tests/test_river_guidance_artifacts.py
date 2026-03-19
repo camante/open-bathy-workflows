@@ -61,7 +61,7 @@ def test_build_and_write_river_guidance_manifest(tmp_path: Path):
     manifest = build_river_guidance_manifest(out_root=tmp_path, river_dir=river_dir, report=report)
     assert manifest["guidance_only"] is True
     assert manifest["artifact_roles"]["depth_terrain"] == "diagnostic_only"
-    assert manifest["artifact_roles"]["guide_points"] == "sparse_guidance_points"
+    assert manifest["artifact_roles"]["guide_points"] == "structured_scaffold_points"
     assert manifest["artifact_roles"]["bank_influence"] == "corridor_bank_influence"
     assert manifest["notes"]["trusted_interior"] == "trusted export interior"
     assert manifest["artifact_roles"]["bank_continuity_weight"] == "xs_bank_longitudinal_continuity"

@@ -3,6 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from final_dem_contract import build_final_dem_contract_summary
+from final_dem_contract_validator import summarize_written_precedence_audit, validate_written_final_dem_contract
+
 
 def _runtime_state(report: Dict[str, Any]) -> Dict[str, Any]:
     state = report.get("final_dem_runtime", {})
@@ -58,6 +61,13 @@ def _guidance_artifacts(report: Dict[str, Any]) -> Dict[str, Optional[str]]:
         "river_bank_confluence_damping": _existing_path(river_outputs.get("bank_confluence_damping")),
         "river_bank_estuary_side_decay": _existing_path(river_outputs.get("bank_estuary_side_decay")),
         "river_bank_points": _existing_path(river_outputs.get("bank_points")),
+        "river_centerline_points": _existing_path(river_outputs.get("centerline_points")),
+        "river_xs_support_points": _existing_path(river_outputs.get("xs_support_points")),
+        "river_centerline_elevation": _existing_path(river_outputs.get("centerline_elevation")),
+        "river_centerline_influence": _existing_path(river_outputs.get("centerline_influence")),
+        "river_xs_support_elevation": _existing_path(river_outputs.get("xs_support_elevation")),
+        "river_xs_support_weight": _existing_path(river_outputs.get("xs_support_weight")),
+        "river_retained_network": _existing_path(river_outputs.get("retained_network")),
         "river_authoritative_support": _existing_path(river_outputs.get("authoritative_support")),
         "river_authoritative_support_depth": _existing_path(river_outputs.get("authoritative_support_depth")),
         "river_effective_water_mask": _existing_path(river_outputs.get("river_effective_water_mask")),
@@ -70,7 +80,7 @@ def _guidance_artifacts(report: Dict[str, Any]) -> Dict[str, Optional[str]]:
 
 
 _SDB_GUIDANCE_CORE = ("sdb_guide_points", "sdb_guidance_weight", "sdb_admissibility")
-_RIVER_GUIDANCE_CORE = ("river_guide_points", "river_corridor_mask", "river_bank_influence", "river_bank_elevation_xs", "river_bank_continuity_weight", "river_bank_graph_confidence", "river_bank_confluence_damping", "river_bank_estuary_side_decay")
+_RIVER_GUIDANCE_CORE = ("river_guide_points", "river_corridor_mask", "river_bank_influence", "river_bank_elevation_xs", "river_centerline_elevation", "river_centerline_influence", "river_xs_support_elevation", "river_xs_support_weight", "river_bank_continuity_weight", "river_bank_graph_confidence", "river_bank_confluence_damping", "river_bank_estuary_side_decay")
 
 
 def _guidance_readiness(artifacts: Dict[str, Optional[str]]) -> Dict[str, Any]:
@@ -248,6 +258,19 @@ def build_final_output_contract(
             "hard_lock_finite_authoritative_cells": True,
             "continuous_output": True,
         },
+        "final_dem_contract": build_final_dem_contract_summary(report),
+        "final_dem_validation": validate_written_final_dem_contract(
+            final_depth=selected_native or selected_user,
+            aligned_authoritative_base=ab_out.get("aligned_authoritative_base"),
+            support_class=ab_out.get("support_class"),
+        ),
+        "written_precedence_audit": summarize_written_precedence_audit(
+            final_depth=selected_native or selected_user,
+            aligned_authoritative_base=ab_out.get("aligned_authoritative_base"),
+            support_class=ab_out.get("support_class"),
+            final_provenance=selected_prov,
+            guidance_influence=ab_out.get("guidance_influence"),
+        ),
         "river_trusted_interior": _existing_path((report.get("outputs", {}) if isinstance(report.get("outputs", {}), dict) else {}).get("river_trusted_interior")) or _existing_path((report.get("river", {}) if isinstance(report.get("river", {}), dict) else {}).get("outputs", {}).get("trusted_interior")),
         "river_channel_mask": _existing_path((report.get("river", {}) if isinstance(report.get("river", {}), dict) else {}).get("outputs", {}).get("river_channel_mask")) or _existing_path((report.get("outputs", {}) if isinstance(report.get("outputs", {}), dict) else {}).get("river_channel_mask")),
         "river_effective_water_mask": _existing_path((report.get("river", {}) if isinstance(report.get("river", {}), dict) else {}).get("outputs", {}).get("river_effective_water_mask")),

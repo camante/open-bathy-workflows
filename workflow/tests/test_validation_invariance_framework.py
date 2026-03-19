@@ -30,6 +30,8 @@ def _from_origin(*args, **kwargs):
 
 
 def _write_tif(path: Path, arr: np.ndarray, *, nodata: float = -9999.0):
+    import rasterio
+
     path.parent.mkdir(parents=True, exist_ok=True)
     profile = {
         "driver": "GTiff",
@@ -88,11 +90,11 @@ def test_run_validation_framework_writes_metrics_and_fails_on_authoritative_viol
         auth = np.array([[1.0, np.nan], [3.0, 4.0]], dtype=np.float32)
         support = np.array([
             [int(SupportClass.AUTHORITATIVE_LOCKED), int(SupportClass.GUIDANCE_CONDITIONED_SDB)],
-            [int(SupportClass.AUTHORITATIVE_LOCKED), int(SupportClass.GUIDANCE_CONDITIONED_RIVER)],
+            [int(SupportClass.AUTHORITATIVE_LOCKED), int(SupportClass.AUTHORITATIVE_LOCKED)],
         ], dtype=np.float32)
         prov = np.array([
             [int(ProvenanceClass.AUTHORITATIVE_LOCKED), int(ProvenanceClass.SDB_CONDITIONED_FILL)],
-            [int(ProvenanceClass.AUTHORITATIVE_LOCKED), int(ProvenanceClass.RIVER_CONDITIONED_FILL)],
+            [int(ProvenanceClass.AUTHORITATIVE_LOCKED), int(ProvenanceClass.AUTHORITATIVE_LOCKED)],
         ], dtype=np.float32)
 
         final_p = _write_tif(td / "final.tif", final)
