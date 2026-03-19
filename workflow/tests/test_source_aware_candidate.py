@@ -3,7 +3,7 @@ import numpy as np
 from authoritative_conditioning import build_source_aware_candidate_arrays
 
 
-def test_source_aware_candidate_prefers_direct_domains_and_estuary_handoff_blend():
+def test_source_aware_candidate_prefers_direct_domains_and_legacy_backstop():
     legacy = np.array([[10.0, 20.0], [30.0, 40.0]], dtype=np.float32)
     sdb = np.array([[1.0, np.nan], [3.0, np.nan]], dtype=np.float32)
     river = np.array([[np.nan, 2.0], [4.0, np.nan]], dtype=np.float32)
@@ -20,7 +20,7 @@ def test_source_aware_candidate_prefers_direct_domains_and_estuary_handoff_blend
         sdb_trusted_interior=np.zeros((2, 2), dtype=np.uint8),
         river_guidance_weight=np.array([[0.0, 1.0], [0.8, 0.0]], dtype=np.float32),
         river_trusted_interior=np.zeros((2, 2), dtype=np.uint8),
-        estuary_transition=np.array([[0, 0], [1, 0]], dtype=np.uint8),
+        estuary_transition=np.array([[False, False], [True, False]]),
     )
 
     cand = out["candidate"]
@@ -28,7 +28,7 @@ def test_source_aware_candidate_prefers_direct_domains_and_estuary_handoff_blend
     np.testing.assert_allclose(cand, np.array([[1.0, 2.0], [3.8, 40.0]], dtype=np.float32))
     assert prov[0, 0] == 1  # sdb direct
     assert prov[0, 1] == 2  # river direct
-    assert prov[1, 0] == 3  # weighted blend in estuary transition handoff
+    assert prov[1, 0] == 3  # weighted blend
     assert prov[1, 1] == 4  # legacy fallback
 
 

@@ -15,7 +15,7 @@ import argparse
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List, Set
+from typing import Dict, Optional, Tuple, List, Set, Any
 
 import numpy as np
 import pandas as pd
@@ -24,7 +24,7 @@ import pandas as pd
 import compat_pandas  # noqa: F401
 import geopandas as gpd
 import rasterio
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, MultiPoint
 from shapely.ops import linemerge, split
 from shapely.strtree import STRtree
 from pyproj import CRS, Transformer
@@ -39,6 +39,9 @@ class XSConfig:
     half_width_m: float = 150.0
     sample_step_m: float = 2.0
     bank_search_m: float = 40.0
+    bank_edge_refine_m: float = 12.0
+    bank_quantile: float = 0.85
+    bank_smooth_window_m: float = 8.0
     min_centerline_len_m: float = 50.0
     max_xs_per_reach: int = 2000
     # New options for overlap handling
@@ -631,40 +634,217 @@ def sample_rasters_along_line(
 
 
 # --------------------------------------------------------------------------------------
-# Bank picking (minimal heuristic)
+# Bank picking (corridor-aware refinement with endpoint fallback)
 # --------------------------------------------------------------------------------------
 
-def pick_banks(profile: pd.DataFrame, bank_search_m: float, prefer_topo: bool = True) -> Tuple[Optional[int], Optional[int]]:
-    if profile is None or profile.empty:
+def _rolling_nanmedian(arr: np.ndarray, window_samples: int) -> np.ndarray:
+    arr = np.asarray(arr, dtype="float64")
+    if arr.size == 0 or window_samples <= 1:
+        return arr.copy()
+    half = max(1, int(window_samples) // 2)
+    out = np.full(arr.shape, np.nan, dtype="float64")
+    for i in range(arr.size):
+        lo = max(0, i - half)
+        hi = min(arr.size, i + half + 1)
+        chunk = arr[lo:hi]
+        if np.isfinite(chunk).any():
+            out[i] = float(np.nanmedian(chunk))
+    return out
+
+
+def _distance_on_line(line: LineString, geom) -> Optional[float]:
+    try:
+        if geom is None or geom.is_empty:
+            return None
+        if geom.geom_type == "Point":
+            return float(line.project(geom))
+        if geom.geom_type == "MultiPoint":
+            vals = [float(line.project(g)) for g in geom.geoms if g is not None and (not g.is_empty)]
+            return vals[0] if vals else None
+        if geom.geom_type in {"LineString", "LinearRing"}:
+            coords = list(geom.coords)
+            if not coords:
+                return None
+            mid = Point(coords[len(coords) // 2])
+            return float(line.project(mid))
+        if hasattr(geom, "geoms"):
+            vals = []
+            for g in geom.geoms:
+                v = _distance_on_line(line, g)
+                if v is not None:
+                    vals.append(v)
+            if vals:
+                vals.sort()
+                return vals[0]
+    except Exception:
+        log.debug("ignored", exc_info=True)
+    return None
+
+
+def estimate_bank_edge_distances(
+    xs_line: LineString,
+    center_pt: Optional[Point],
+    bank_domain_geom,
+) -> Tuple[Optional[float], Optional[float]]:
+    if xs_line is None or xs_line.is_empty or bank_domain_geom is None or getattr(bank_domain_geom, "is_empty", True):
         return None, None
+    try:
+        inter = xs_line.intersection(bank_domain_geom)
+    except Exception:
+        log.debug("ignored", exc_info=True)
+        return None, None
+    if inter is None or inter.is_empty:
+        return None, None
+
+    center_dist = float(xs_line.length) * 0.5
+    if center_pt is not None and not center_pt.is_empty:
+        try:
+            center_dist = float(xs_line.project(center_pt))
+        except Exception:
+            log.debug("ignored", exc_info=True)
+
+    segments: List[Tuple[float, float]] = []
+
+    def _add_segment(g):
+        if g is None or g.is_empty:
+            return
+        if g.geom_type == "Point":
+            d = float(xs_line.project(g))
+            segments.append((d, d))
+            return
+        if g.geom_type == "MultiPoint":
+            ds = sorted(float(xs_line.project(pt)) for pt in g.geoms if pt is not None and (not pt.is_empty))
+            if len(ds) >= 2:
+                for a, b in zip(ds[:-1:2], ds[1::2]):
+                    segments.append((a, b))
+            elif ds:
+                segments.append((ds[0], ds[0]))
+            return
+        if g.geom_type in {"LineString", "LinearRing"}:
+            coords = list(g.coords)
+            if coords:
+                ds = sorted(float(xs_line.project(Point(c))) for c in (coords[0], coords[-1]))
+                segments.append((ds[0], ds[-1]))
+            return
+        if hasattr(g, "geoms"):
+            for sub in g.geoms:
+                _add_segment(sub)
+
+    _add_segment(inter)
+    if not segments:
+        return None, None
+
+    chosen = None
+    best_score = None
+    for a, b in segments:
+        lo, hi = min(a, b), max(a, b)
+        contains_center = (lo - 1e-6) <= center_dist <= (hi + 1e-6)
+        score = (0 if contains_center else 1, abs(((lo + hi) * 0.5) - center_dist), -(hi - lo))
+        if best_score is None or score < best_score:
+            best_score = score
+            chosen = (lo, hi)
+    if chosen is None:
+        return None, None
+    return chosen[0], chosen[1]
+
+
+def _pick_bank_in_window(
+    z: np.ndarray,
+    z_smooth: np.ndarray,
+    d: np.ndarray,
+    expected_dist: float,
+    refine_m: float,
+    quantile: float,
+) -> Optional[int]:
+    if d.size == 0:
+        return None
+    mask = np.abs(d - float(expected_dist)) <= max(float(refine_m), 1e-6)
+    if not np.any(mask):
+        return None
+    idxs = np.where(mask)[0]
+    zc = z[idxs]
+    zsc = z_smooth[idxs]
+    valid = np.isfinite(zc)
+    if not np.any(valid):
+        return None
+    idxs = idxs[valid]
+    zc = zc[valid]
+    zsc = zsc[valid]
+    quality = np.where(np.isfinite(zsc), zsc, zc)
+    finite_quality = quality[np.isfinite(quality)]
+    if finite_quality.size == 0:
+        return None
+    q = float(np.nanquantile(finite_quality, min(max(float(quantile), 0.5), 0.99)))
+    keep = quality >= q
+    cand = idxs[keep] if np.any(keep) else idxs
+    if cand.size == 0:
+        return None
+    distances = np.abs(d[cand] - float(expected_dist))
+    if cand.size > 1:
+        qual_cand = np.where(np.isfinite(z_smooth[cand]), z_smooth[cand], z[cand])
+        order = np.lexsort((-qual_cand, distances))
+        return int(cand[order[0]])
+    return int(cand[0])
+
+
+def pick_banks(
+    profile: pd.DataFrame,
+    bank_search_m: float,
+    prefer_topo: bool = True,
+    expected_left_dist_m: Optional[float] = None,
+    expected_right_dist_m: Optional[float] = None,
+    bank_edge_refine_m: float = 12.0,
+    bank_quantile: float = 0.85,
+    bank_smooth_window_m: float = 8.0,
+) -> Tuple[Optional[int], Optional[int], Dict[str, Any]]:
+    meta: Dict[str, Any] = {
+        "method": "endpoint_peak_fallback",
+        "expected_left_dist_m": float(expected_left_dist_m) if expected_left_dist_m is not None else np.nan,
+        "expected_right_dist_m": float(expected_right_dist_m) if expected_right_dist_m is not None else np.nan,
+    }
+    if profile is None or profile.empty:
+        return None, None, meta
 
     use_topo = prefer_topo and profile["z_topo"].notna().any()
     z = profile["z_topo"].to_numpy() if use_topo else profile["z_dem"].to_numpy()
     d = profile["dist_m"].to_numpy()
     L = float(d[-1]) if len(d) else 0.0
     if L <= 0:
-        return None, None
+        return None, None, meta
+
+    step = float(np.nanmedian(np.diff(d))) if len(d) > 1 and np.isfinite(np.diff(d)).any() else 1.0
+    smooth_samples = max(1, int(round(max(float(bank_smooth_window_m), step) / max(step, 1e-6))))
+    z_smooth = _rolling_nanmedian(z, smooth_samples)
+
+    idx_left = None
+    idx_right = None
+    refined = False
+
+    if expected_left_dist_m is not None:
+        idx_left = _pick_bank_in_window(z, z_smooth, d, float(expected_left_dist_m), bank_edge_refine_m, bank_quantile)
+        refined = refined or (idx_left is not None)
+    if expected_right_dist_m is not None:
+        idx_right = _pick_bank_in_window(z, z_smooth, d, float(expected_right_dist_m), bank_edge_refine_m, bank_quantile)
+        refined = refined or (idx_right is not None)
 
     left_mask = d <= min(bank_search_m, L)
     right_mask = d >= max(0.0, L - bank_search_m)
 
-    idx_left = None
-    idx_right = None
-
-    if np.any(left_mask):
+    if idx_left is None and np.any(left_mask):
         zl = z[left_mask]
         if np.isfinite(zl).any():
             j = int(np.nanargmax(zl))
             idx_left = int(np.where(left_mask)[0][j])
-
-    if np.any(right_mask):
+    if idx_right is None and np.any(right_mask):
         zr = z[right_mask]
         if np.isfinite(zr).any():
             j = int(np.nanargmax(zr))
             idx_right = int(np.where(right_mask)[0][j])
 
-    return idx_left, idx_right
-
+    if refined and (idx_left is not None or idx_right is not None):
+        meta["method"] = "corridor_edge_refined"
+    meta["source"] = "topo" if use_topo else "dem"
+    return idx_left, idx_right, meta
 
 # --------------------------------------------------------------------------------------
 # Build XS
@@ -684,9 +864,23 @@ def build_xs_for_river(
     min_length_km: float,
     ftype_allow: List[int],
     include_artificial_path: bool,
+    bank_domain_gdf: Optional[gpd.GeoDataFrame] = None,
 ) -> None:
     rivers_clip = _explode_lines(rivers_clip)
     edges = edges.copy()
+
+    bank_domain_geom = None
+    if bank_domain_gdf is not None and not bank_domain_gdf.empty:
+        try:
+            bank_domain_gdf = bank_domain_gdf.copy()
+            bank_domain_gdf = bank_domain_gdf[bank_domain_gdf.geometry.notnull() & ~bank_domain_gdf.geometry.is_empty]
+            if not bank_domain_gdf.empty:
+                if bank_domain_gdf.crs != rivers_clip.crs:
+                    bank_domain_gdf = bank_domain_gdf.to_crs(rivers_clip.crs)
+                bank_domain_geom = bank_domain_gdf.geometry.union_all() if hasattr(bank_domain_gdf.geometry, "union_all") else bank_domain_gdf.unary_union
+        except Exception:
+            bank_domain_geom = None
+            log.debug("ignored", exc_info=True)
 
     if enable_component_prune:
         rivers_clip = filter_by_component_length(rivers_clip, edges, keep_top_components=keep_top_components)
@@ -835,7 +1029,25 @@ def build_xs_for_river(
                     xform_to_topo=xform_to_topo,
                 )
 
-                idx_l, idx_r = pick_banks(prof, bank_search_m=cfg.bank_search_m, prefer_topo=True)
+                expected_left_dist_m = None
+                expected_right_dist_m = None
+                if bank_domain_geom is not None:
+                    expected_left_dist_m, expected_right_dist_m = estimate_bank_edge_distances(
+                        xs_line,
+                        rec.get("center_pt"),
+                        bank_domain_geom,
+                    )
+
+                idx_l, idx_r, bank_pick_meta = pick_banks(
+                    prof,
+                    bank_search_m=cfg.bank_search_m,
+                    prefer_topo=True,
+                    expected_left_dist_m=expected_left_dist_m,
+                    expected_right_dist_m=expected_right_dist_m,
+                    bank_edge_refine_m=cfg.bank_edge_refine_m,
+                    bank_quantile=cfg.bank_quantile,
+                    bank_smooth_window_m=cfg.bank_smooth_window_m,
+                )
 
                 def _bank_z(idx: Optional[int]) -> float:
                     if idx is None:
@@ -852,7 +1064,11 @@ def build_xs_for_river(
                     "bank_left_dist_m": float(prof.loc[idx_l, "dist_m"]) if idx_l is not None else np.nan,
                     "bank_right_dist_m": float(prof.loc[idx_r, "dist_m"]) if idx_r is not None else np.nan,
                     "bank_left_z_m": _bank_z(idx_l),
-                    "bank_right_z_m": _bank_z(idx_r)
+                    "bank_right_z_m": _bank_z(idx_r),
+                    "bank_left_expected_dist_m": float(expected_left_dist_m) if expected_left_dist_m is not None else np.nan,
+                    "bank_right_expected_dist_m": float(expected_right_dist_m) if expected_right_dist_m is not None else np.nan,
+                    "bank_pick_method": str(bank_pick_meta.get("method", "unknown")),
+                    "bank_pick_source": str(bank_pick_meta.get("source", "unknown")),
                 })
                 # Remove temp key
                 if 'center_pt' in rec: del rec['center_pt']
@@ -866,6 +1082,7 @@ def build_xs_for_river(
                 prof["component_id"] = rec["component_id"]
                 prof["is_bank_left"] = False
                 prof["is_bank_right"] = False
+                prof["bank_pick_method"] = str(bank_pick_meta.get("method", "unknown"))
                 if idx_l is not None:
                     prof.loc[idx_l, "is_bank_left"] = True
                 if idx_r is not None:
@@ -944,7 +1161,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--spacing-m", type=float, default=200.0, help="Spacing between XS along centerline (m)")
     p.add_argument("--half-width-m", type=float, default=150.0, help="Half-width of each XS (m)")
     p.add_argument("--sample-step-m", type=float, default=2.0, help="Sampling step along XS (m)")
-    p.add_argument("--bank-search-m", type=float, default=40.0, help="Search window near each XS end for bank peak (m)")
+    p.add_argument("--bank-search-m", type=float, default=40.0, help="Search window near each XS end for fallback bank peak search (m)")
+    p.add_argument("--bank-edge-refine-m", type=float, default=12.0, help="Half-width of corridor-edge refinement window around expected bank edge (m)")
+    p.add_argument("--bank-quantile", type=float, default=0.85, help="Upper quantile used inside the corridor-edge refinement window before choosing nearest bank candidate")
+    p.add_argument("--bank-smooth-window-m", type=float, default=8.0, help="Rolling-median smoothing scale (m) used before bank picking")
     p.add_argument("--min-centerline-len-m", type=float, default=50.0, help="Skip centerlines shorter than this (m)")
     
     # Overlap and smoothing options
@@ -1003,6 +1223,9 @@ def main() -> None:
         half_width_m=float(args.half_width_m),
         sample_step_m=float(args.sample_step_m),
         bank_search_m=float(args.bank_search_m),
+        bank_edge_refine_m=float(args.bank_edge_refine_m),
+        bank_quantile=float(args.bank_quantile),
+        bank_smooth_window_m=float(args.bank_smooth_window_m),
         min_centerline_len_m=float(args.min_centerline_len_m),
         smoothing_window_m=float(args.smoothing_window_m),
         trim_overlaps=bool(args.trim_overlaps),
@@ -1018,6 +1241,16 @@ def main() -> None:
     river_gpkg = Path(args.river_gpkg)
     rivers = _read_layer(river_gpkg, args.rivers_layer)
     edges = _read_layer(river_gpkg, args.edges_layer)
+    bank_domain_gdf = None
+    for layer_name in ("nhdarea_clip", "nhdarea_aoi"):
+        try:
+            bank_domain_gdf = _read_layer(river_gpkg, layer_name)
+            if bank_domain_gdf is not None and not bank_domain_gdf.empty:
+                log.info("Using %s as corridor-aware bank domain for XS bank picking.", layer_name)
+                break
+        except Exception:
+            bank_domain_gdf = None
+            log.debug("No optional bank domain layer %s available.", layer_name, exc_info=True)
 
     if CRS.from_user_input(rivers.crs).is_geographic:
         raise RuntimeError(
@@ -1051,6 +1284,7 @@ def main() -> None:
         min_length_km=float(args.min_length_km),
         ftype_allow=ftype_allow,
         include_artificial_path=bool(args.include_artificial_path),
+        bank_domain_gdf=bank_domain_gdf,
     )
 
 

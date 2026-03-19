@@ -15,6 +15,9 @@ import numpy as np
 from core.json_io import write_json
 from core.paths import ensure_dir
 from output_products import build_final_output_contract
+from canonical_river_scaffold import nested_aoi_relationship
+
+from validation_invariance_framework import run_validation_invariance_framework
 
 
 def _grid_pixel_size_m(transform, crs, ref_lat_deg: Optional[float] = None) -> float:
@@ -386,6 +389,9 @@ def write_explicit_final_outputs_manifest(cfg: Any, report: Dict[str, Any], *, f
         "river_anchor_distance": ab_out.get("river_anchor_distance"),
         "river_anchor_density": ab_out.get("river_anchor_density"),
         "river_scaffold_confidence": ab_out.get("river_scaffold_confidence"),
+        "river_trusted_interior": report.get("outputs", {}).get("river_trusted_interior") if isinstance(report.get("outputs", {}), dict) else None,
+        "river_scaffold_domains": report.get("outputs", {}).get("river_scaffold_domains") if isinstance(report.get("outputs", {}), dict) else None,
+        "river_trusted_interior_summary": report.get("outputs", {}).get("river_trusted_interior_summary") if isinstance(report.get("outputs", {}), dict) else None,
         "final_depth_native": contract.get("selected_final_native"),
         "final_depth_user": contract.get("selected_final_user"),
         "final_provenance_native": contract.get("selected_final_provenance"),
@@ -405,3 +411,110 @@ def write_explicit_final_outputs_manifest(cfg: Any, report: Dict[str, Any], *, f
         "guidance_manifests": contract.get("guidance_manifests"),
     })
     return out_path
+
+
+
+def write_validation_invariance_summary(cfg: Any, report: Dict[str, Any], *, final_native: Optional[Path], final_for_user: Optional[Path | str], final_provenance: Optional[Path | str], logger: Optional[logging.Logger] = None, enforce_hard_fail: bool = True) -> Optional[Path]:
+    log = logger or logging.getLogger(__name__)
+    try:
+        manifest_path = Path(cfg.out_dir) / "final_outputs.json"
+        if not manifest_path.exists():
+            return None
+        payload = run_validation_invariance_framework(
+            final_outputs_manifest=manifest_path,
+            overlap_identity_evaluation=report.get("seams", {}).get("overlap_identity_evaluation") if isinstance(report.get("seams", {}), dict) else None,
+            validation_truth=str(getattr(cfg, "validation_truth", None)) if getattr(cfg, "validation_truth", None) else None,
+            case_specs=list(getattr(cfg, "validation_case_specs", []) or []),
+            case_manifest=str(getattr(cfg, "validation_case_manifest", None)) if getattr(cfg, "validation_case_manifest", None) else None,
+            guidance_baseline_case=str(getattr(cfg, "validation_guidance_baseline_case", "baseline_cudem_interpolation")),
+            guidance_target_case=str(getattr(cfg, "validation_guidance_target_case", "selected_final")),
+            require_guidance_non_degradation=bool(getattr(cfg, "validation_require_guidance_non_degradation", False)),
+            guidance_rmse_tolerance=float(getattr(cfg, "validation_guidance_rmse_tolerance", 0.0) or 0.0),
+        )
+        out_path = Path(cfg.out_dir) / "validation_invariance_summary.json"
+        write_json(out_path, payload)
+        report.setdefault("outputs", {})["validation_invariance_summary"] = str(out_path)
+        report.setdefault("validation", {}).update(payload)
+        if payload.get("all_hard_invariants_ok") is False:
+            reasons = "; ".join(payload.get("hard_failures", []))
+            if enforce_hard_fail:
+                raise RuntimeError(f"Validation/invariance framework hard-failed: {reasons}")
+            log.warning("[VALIDATION] Deferred hard-fail until post-seam evaluation: %s", reasons)
+        return out_path
+    except RuntimeError:
+        raise
+    except Exception:
+        log.debug("[VALIDATION] Failed writing validation/invariance summary", exc_info=True)
+        return None
+
+
+
+
+
+def evaluate_overlap_identity_checks(overlap_checks: list[dict] | None, *, tolerance: float = 1e-6) -> Dict[str, Any]:
+    """Evaluate overlap identity results and decide whether they pass the stability contract."""
+    checks = list(overlap_checks or [])
+    failures = []
+    for check in checks:
+        status = check.get('status')
+        if status == 'no_valid':
+            continue
+        if status != 'ok':
+            failures.append({
+                'artifact': check.get('artifact'),
+                'neighbor_io_manifest': check.get('neighbor_io_manifest'),
+                'status': status,
+                'reason': f'non-ok status: {status}',
+            })
+            continue
+        max_abs = check.get('max_abs')
+        if max_abs is not None and float(max_abs) > float(tolerance):
+            failures.append({
+                'artifact': check.get('artifact'),
+                'neighbor_io_manifest': check.get('neighbor_io_manifest'),
+                'status': status,
+                'max_abs': float(max_abs),
+                'tolerance': float(tolerance),
+                'reason': f'max_abs {float(max_abs):.12g} exceeds tolerance {float(tolerance):.12g}',
+            })
+    return {
+        'checked': len(checks),
+        'tolerance': float(tolerance),
+        'all_ok': len(failures) == 0 if checks else None,
+        'failures': failures,
+    }
+
+def write_river_stability_summary(cfg: Any, report: Dict[str, Any], *, logger: Optional[logging.Logger] = None) -> Optional[Path]:
+    log = logger or logging.getLogger(__name__)
+    try:
+        river_guidance = report.get('river', {}).get('guidance', {}) if isinstance(report.get('river', {}), dict) else {}
+        outputs = report.get('outputs', {}) if isinstance(report.get('outputs', {}), dict) else {}
+        scaffold_path = river_guidance.get('scaffold_domains') or outputs.get('river_scaffold_domains')
+        trusted_summary_path = outputs.get('river_trusted_interior_summary')
+        scaffold_payload = None
+        trusted_payload = None
+        if scaffold_path and Path(scaffold_path).exists():
+            scaffold_payload = __import__('json').loads(Path(scaffold_path).read_text(encoding='utf-8'))
+        if trusted_summary_path and Path(trusted_summary_path).exists():
+            trusted_payload = __import__('json').loads(Path(trusted_summary_path).read_text(encoding='utf-8'))
+        seam_results = report.get('seams', {}).get('adjacent_tile_comparisons', []) if isinstance(report.get('seams', {}), dict) else []
+        overlap_checks = report.get('seams', {}).get('overlap_identity_checks', []) if isinstance(report.get('seams', {}), dict) else []
+        nested = nested_aoi_relationship(str(cfg.aoi), scaffold_payload.get('solve_aoi')) if scaffold_payload and scaffold_payload.get('solve_aoi') else None
+        overlap_eval = evaluate_overlap_identity_checks(overlap_checks)
+        payload = {
+            'aoi': str(cfg.aoi),
+            'scaffold_contract': scaffold_payload,
+            'trusted_interior_contract': trusted_payload,
+            'nested_aoi_relationship_to_solve_domain': nested,
+            'adjacent_tile_seam_checks': seam_results,
+            'overlap_identity_checks': overlap_checks,
+            'overlap_identity_evaluation': overlap_eval,
+            'all_overlap_identity_ok': overlap_eval.get('all_ok'),
+        }
+        out = Path(cfg.out_dir) / 'river_stability_summary.json'
+        write_json(out, payload)
+        report.setdefault('outputs', {})['river_stability_summary'] = str(out)
+        return out
+    except Exception:
+        log.debug('[STABILITY] Failed writing river stability summary', exc_info=True)
+        return None

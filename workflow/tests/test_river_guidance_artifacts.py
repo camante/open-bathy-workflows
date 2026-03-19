@@ -21,6 +21,13 @@ def test_build_and_write_river_guidance_manifest(tmp_path: Path):
         "corridor_mask",
         "authoritative_support",
         "authoritative_support_depth",
+        "bank_edge_mask",
+        "bank_distance",
+        "bank_influence",
+        "bank_continuity_weight",
+        "bank_graph_confidence",
+        "bank_confluence_damping",
+        "bank_estuary_side_decay",
         "depth_terrain",
         "bottom_elevation",
         "scaffold_domains",
@@ -55,7 +62,10 @@ def test_build_and_write_river_guidance_manifest(tmp_path: Path):
     assert manifest["guidance_only"] is True
     assert manifest["artifact_roles"]["depth_terrain"] == "diagnostic_only"
     assert manifest["artifact_roles"]["guide_points"] == "sparse_guidance_points"
+    assert manifest["artifact_roles"]["bank_influence"] == "corridor_bank_influence"
     assert manifest["notes"]["trusted_interior"] == "trusted export interior"
+    assert manifest["artifact_roles"]["bank_continuity_weight"] == "xs_bank_longitudinal_continuity"
+    assert manifest["artifact_roles"]["bank_graph_confidence"] == "graph_informed_bank_confidence"
 
     manifest_path = write_river_guidance_manifest(out_root=tmp_path, river_dir=river_dir, report=report)
     saved = json.loads(manifest_path.read_text(encoding="utf-8"))

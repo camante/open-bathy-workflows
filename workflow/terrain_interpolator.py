@@ -8,6 +8,10 @@ import numpy as np
 
 from provenance_schema import ProvenanceClass
 from support_classes import SupportClass, build_regime_masks, regime_array_from_masks
+from river_bank_guidance import (
+    compute_bank_distance_influence,
+    compute_bank_elevation_surface_from_authoritative,
+)
 
 log = logging.getLogger("terrain_interpolator")
 
@@ -49,6 +53,14 @@ class TerrainInterpolationInputs:
     river_support: Optional[np.ndarray] = None
     river_support_depth: Optional[np.ndarray] = None
     estuary_transition: Optional[np.ndarray] = None
+    river_corridor_mask: Optional[np.ndarray] = None
+    river_bank_influence: Optional[np.ndarray] = None
+    river_bank_elevation: Optional[np.ndarray] = None
+    river_bank_pair_weight: Optional[np.ndarray] = None
+    river_bank_continuity_weight: Optional[np.ndarray] = None
+    river_bank_graph_confidence: Optional[np.ndarray] = None
+    river_bank_confluence_damping: Optional[np.ndarray] = None
+    river_bank_estuary_side_decay: Optional[np.ndarray] = None
 
 
 def _as_float32(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
@@ -69,6 +81,14 @@ def _validate_shapes(inputs: TerrainInterpolationInputs) -> None:
         "river_support": inputs.river_support,
         "river_support_depth": inputs.river_support_depth,
         "estuary_transition": inputs.estuary_transition,
+        "river_corridor_mask": inputs.river_corridor_mask,
+        "river_bank_influence": inputs.river_bank_influence,
+        "river_bank_elevation": inputs.river_bank_elevation,
+        "river_bank_pair_weight": inputs.river_bank_pair_weight,
+        "river_bank_continuity_weight": inputs.river_bank_continuity_weight,
+        "river_bank_graph_confidence": inputs.river_bank_graph_confidence,
+        "river_bank_confluence_damping": inputs.river_bank_confluence_damping,
+        "river_bank_estuary_side_decay": inputs.river_bank_estuary_side_decay,
     }
     for name, arr in named.items():
         if arr is None:
@@ -234,6 +254,14 @@ def interpolate_support_aware_surface(
     river_ti = None if inputs.river_ti is None else np.asarray(inputs.river_ti)
     river_support = None if inputs.river_support is None else np.asarray(inputs.river_support)
     river_support_depth = _as_float32(inputs.river_support_depth)
+    river_corridor_mask = np.asarray(inputs.river_corridor_mask, dtype=bool) if inputs.river_corridor_mask is not None else None
+    river_bank_influence_input = _as_float32(inputs.river_bank_influence)
+    river_bank_elevation_input = _as_float32(inputs.river_bank_elevation)
+    river_bank_pair_weight = _as_float32(inputs.river_bank_pair_weight)
+    river_bank_continuity_weight = _as_float32(inputs.river_bank_continuity_weight)
+    river_bank_graph_confidence = _as_float32(inputs.river_bank_graph_confidence)
+    river_bank_confluence_damping = _as_float32(inputs.river_bank_confluence_damping)
+    river_bank_estuary_side_decay = _as_float32(inputs.river_bank_estuary_side_decay)
 
     locked = np.isfinite(auth)
     gap = ~locked
@@ -266,7 +294,58 @@ def interpolate_support_aware_surface(
     river_anchor = ((np.asarray(river_support) > 0) if river_support is not None else np.zeros_like(gap, dtype=bool))
     if (not np.any(river_anchor)) and river_ti is not None:
         river_anchor = np.asarray(river_ti) > 0
+    river_corridor = np.asarray(river_corridor_mask, dtype=bool) if river_corridor_mask is not None else np.asarray(river_ok, dtype=bool)
     river_domain = gap & river_ok
+    river_bank_edge, river_bank_distance_m, river_bank_influence = compute_bank_distance_influence(
+        river_corridor,
+        pixel_size_m=cfg.pixel_size_m,
+        full_influence_m=0.0,
+        zero_influence_m=max(cfg.river_scaffold_transition_m * 0.18, 60.0),
+    )
+    if river_bank_influence_input is not None:
+        river_bank_influence = np.maximum(river_bank_influence.astype(np.float32), np.clip(np.nan_to_num(river_bank_influence_input, nan=0.0), 0.0, 1.0).astype(np.float32))
+        river_bank_influence[~river_corridor] = 0.0
+    river_bank_elevation = compute_bank_elevation_surface_from_authoritative(
+        auth,
+        river_corridor,
+        max_bank_distance_m=max(cfg.river_scaffold_transition_m * 0.35, 120.0),
+        bank_distance_m=river_bank_distance_m,
+    )
+    if river_bank_elevation_input is not None:
+        use_xs_bank = river_corridor & np.isfinite(river_bank_elevation_input)
+        if np.any(use_xs_bank):
+            river_bank_elevation[use_xs_bank] = river_bank_elevation_input[use_xs_bank].astype(np.float32)
+    if river_bank_pair_weight is not None:
+        river_bank_influence = np.clip(
+            river_bank_influence * (0.55 + (0.45 * np.clip(np.nan_to_num(river_bank_pair_weight, nan=0.0), 0.0, 1.0))),
+            0.0,
+            1.0,
+        ).astype(np.float32)
+        river_bank_influence[~river_corridor] = 0.0
+    if river_bank_continuity_weight is not None:
+        cont = np.clip(np.nan_to_num(river_bank_continuity_weight, nan=0.0), 0.0, 1.0).astype(np.float32)
+        river_bank_influence = np.clip(
+            river_bank_influence * (0.60 + (0.40 * cont)),
+            0.0,
+            1.0,
+        ).astype(np.float32)
+        river_bank_influence[~river_corridor] = 0.0
+    if river_bank_graph_confidence is not None:
+        graph_conf = np.clip(np.nan_to_num(river_bank_graph_confidence, nan=0.0), 0.0, 1.0).astype(np.float32)
+        river_bank_influence = np.clip(
+            river_bank_influence * (0.45 + (0.55 * graph_conf)),
+            0.0,
+            1.0,
+        ).astype(np.float32)
+        river_bank_influence[~river_corridor] = 0.0
+    if river_bank_confluence_damping is not None:
+        confluence = np.clip(np.nan_to_num(river_bank_confluence_damping, nan=1.0), 0.0, 1.0).astype(np.float32)
+        river_bank_influence = np.clip(river_bank_influence * confluence, 0.0, 1.0).astype(np.float32)
+        river_bank_influence[~river_corridor] = 0.0
+    if river_bank_estuary_side_decay is not None:
+        est_decay = np.clip(np.nan_to_num(river_bank_estuary_side_decay, nan=1.0), 0.0, 1.0).astype(np.float32)
+        river_bank_influence = np.clip(river_bank_influence * est_decay, 0.0, 1.0).astype(np.float32)
+        river_bank_influence[~river_corridor] = 0.0
     river_anchor_distance_m, river_anchor_density, river_scaffold_confidence = compute_river_anchor_support_fields(
         river_anchor=river_anchor,
         river_guidance_weight=river_gw,
@@ -302,6 +381,8 @@ def interpolate_support_aware_surface(
             river_local = np.maximum(river_local, 0.70 * (np.asarray(river_ti) > 0).astype(np.float32))
         river_signal = np.maximum(river_local, river_scaffold_confidence.astype(np.float32))
         river_influence = np.clip(0.75 + (0.25 * river_signal), 0.75, 1.0).astype(np.float32)
+        if np.any(river_corridor):
+            river_influence = np.clip(river_influence * (1.0 - (0.40 * river_bank_influence)), 0.55, 1.0).astype(np.float32)
         estuary_cap = np.where(estuary_transition, 0.85, 1.0).astype(np.float32)
         river_influence = np.minimum(river_influence, estuary_cap).astype(np.float32)
         guidance_influence[river_ok] = np.maximum(guidance_influence[river_ok], river_influence[river_ok])
@@ -353,6 +434,31 @@ def interpolate_support_aware_surface(
     use_river_anchor_surface = river_domain & np.isfinite(river_channel_anchor_surface)
     if np.any(use_river_anchor_surface):
         anchor_surface[use_river_anchor_surface] = river_channel_anchor_surface[use_river_anchor_surface]
+
+    river_bank_constrained = river_domain & (~river_anchor) & np.isfinite(river_bank_elevation) & (river_bank_influence > 0.0)
+    if np.any(river_bank_constrained):
+        edge_mix = np.clip(river_bank_influence[river_bank_constrained], 0.0, 1.0).astype(np.float32)
+        if river_bank_continuity_weight is not None:
+            cont_mix = np.clip(np.nan_to_num(river_bank_continuity_weight[river_bank_constrained], nan=0.0), 0.0, 1.0).astype(np.float32)
+            edge_mix = np.clip(edge_mix * (0.60 + (0.40 * cont_mix)), 0.0, 1.0).astype(np.float32)
+        if river_bank_graph_confidence is not None:
+            graph_mix = np.clip(np.nan_to_num(river_bank_graph_confidence[river_bank_constrained], nan=0.0), 0.0, 1.0).astype(np.float32)
+            edge_mix = np.clip(edge_mix * (0.45 + (0.55 * graph_mix)), 0.0, 1.0).astype(np.float32)
+        if river_bank_confluence_damping is not None:
+            conf_mix = np.clip(np.nan_to_num(river_bank_confluence_damping[river_bank_constrained], nan=1.0), 0.0, 1.0).astype(np.float32)
+            edge_mix = np.clip(edge_mix * conf_mix, 0.0, 1.0).astype(np.float32)
+        if river_bank_estuary_side_decay is not None:
+            est_mix = np.clip(np.nan_to_num(river_bank_estuary_side_decay[river_bank_constrained], nan=1.0), 0.0, 1.0).astype(np.float32)
+            edge_mix = np.clip(edge_mix * est_mix, 0.0, 1.0).astype(np.float32)
+        anchor_vals = anchor_surface[river_bank_constrained].astype(np.float32)
+        bank_vals = river_bank_elevation[river_bank_constrained].astype(np.float32)
+        finite_anchor = np.isfinite(anchor_vals)
+        mixed_vals = bank_vals.copy()
+        mixed_vals[finite_anchor] = (
+            ((1.0 - edge_mix[finite_anchor]) * anchor_vals[finite_anchor])
+            + (edge_mix[finite_anchor] * bank_vals[finite_anchor])
+        ).astype(np.float32)
+        anchor_surface[river_bank_constrained] = mixed_vals
 
     conditioned = np.full_like(candidate, np.nan, dtype=np.float32)
     conditioned[locked] = auth[locked]
@@ -434,6 +540,14 @@ def interpolate_support_aware_surface(
         "river_anchor_distance_m": river_anchor_distance_m,
         "river_anchor_density": river_anchor_density,
         "river_scaffold_confidence": river_scaffold_confidence,
+        "river_bank_edge": river_bank_edge.astype(np.uint8),
+        "river_bank_distance_m": river_bank_distance_m.astype(np.float32),
+        "river_bank_influence": river_bank_influence.astype(np.float32),
+        "river_bank_elevation": river_bank_elevation.astype(np.float32),
+        "river_bank_continuity_weight": np.clip(np.nan_to_num(river_bank_continuity_weight, nan=0.0), 0.0, 1.0).astype(np.float32) if river_bank_continuity_weight is not None else np.zeros_like(candidate, dtype=np.float32),
+        "river_bank_graph_confidence": np.clip(np.nan_to_num(river_bank_graph_confidence, nan=0.0), 0.0, 1.0).astype(np.float32) if river_bank_graph_confidence is not None else np.zeros_like(candidate, dtype=np.float32),
+        "river_bank_confluence_damping": np.clip(np.nan_to_num(river_bank_confluence_damping, nan=1.0), 0.0, 1.0).astype(np.float32) if river_bank_confluence_damping is not None else np.ones_like(candidate, dtype=np.float32),
+        "river_bank_estuary_side_decay": np.clip(np.nan_to_num(river_bank_estuary_side_decay, nan=1.0), 0.0, 1.0).astype(np.float32) if river_bank_estuary_side_decay is not None else np.ones_like(candidate, dtype=np.float32),
         "conditioned": conditioned,
         "provenance": provenance,
         "regime": regime,

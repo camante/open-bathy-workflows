@@ -188,6 +188,10 @@ def main() -> int:
     p.add_argument("--out-channel-mask", required=True, help="Output TIFF for river channel mask (1=river,0=else).")
     p.add_argument("--out-open-water-mask", required=True, help="Output TIFF for open water mask (1=open water,0=else).")
     p.add_argument("--out-mainstem-mask", default=None, help="Optional output TIFF for mainstem corridor mask (1=mainstem,0=else). Useful for hybrid XS+Skeleton.")
+    p.add_argument("--out-policy-json", default=None, help="Optional JSON summary describing river-domain mask policy, harmonization, and overlap diagnostics.")
+    p.add_argument("--out-effective-water-mask", default=None, help="Optional output TIFF for the effective water mask used after ocean exclusion and harmonization (1=water,0=else).")
+    p.add_argument("--out-corridor-mask", default=None, help="Optional output TIFF for the buffered river corridor mask used by river-domain selection (1=corridor,0=else).")
+    p.add_argument("--out-nhdarea-mask", default=None, help="Optional output TIFF for the filtered NHDArea river mask when available (1=river polygon,0=else).")
 
 
     args = p.parse_args()
@@ -457,6 +461,11 @@ def main() -> int:
 
 
 
+    water_source_effective = "unknown"
+    water_mask_harmonization_applied = False
+    water_mask_harmonization_reason = None
+    water_corridor_overlap_frac = None
+
     if args.water_mask:
         wm = _warp_mask_to_template(Path(args.water_mask), template_profile)
         water_all = (wm == 0)  # waffles convention: water=0
@@ -478,6 +487,8 @@ def main() -> int:
                         100.0 * frac,
                     )
                     water = corridor & (~ocean_exclude)
+                    water_mask_harmonization_applied = True
+                    water_mask_harmonization_reason = "low_water_corridor_overlap"
         else:
             water = water_all
             LOG.info("Water mask loaded: %s (waffles convention water=0 land=1)", args.water_mask)
@@ -493,15 +504,32 @@ def main() -> int:
                         100.0 * frac,
                     )
                     water = corridor.copy()
+                    water_mask_harmonization_applied = True
+                    water_mask_harmonization_reason = "low_water_corridor_overlap"
     else:
         if ocean is not None:
             # Fallback when NHD water mask is unavailable: restrict corridor to non-ocean areas
             water = corridor & (~ocean_exclude)
+            water_mask_harmonization_applied = True
+            water_mask_harmonization_reason = "missing_water_mask"
             LOG.warning("No --water-mask supplied; using corridor constrained to non-ocean areas from --ocean-mask.")
         else:
             # Last-resort fallback: treat corridor as water
             water = corridor.copy()
+            water_mask_harmonization_applied = True
+            water_mask_harmonization_reason = "missing_water_and_ocean_masks"
             LOG.warning("No --water-mask or --ocean-mask supplied; using buffered corridor as 'water' (ocean separation degraded).")
+
+    if args.water_mask and ocean is not None:
+        water_source_effective = "with_nhd_minus_ocean" if not water_mask_harmonization_applied else "with_nhd_corridor_fallback"
+    elif args.water_mask:
+        water_source_effective = "with_nhd" if not water_mask_harmonization_applied else "with_nhd_corridor_fallback"
+    elif ocean is not None:
+        water_source_effective = "corridor_minus_ocean"
+    else:
+        water_source_effective = "corridor_only"
+    if corridor.sum() > 0:
+        water_corridor_overlap_frac = float((water & corridor).sum()) / float(corridor.sum())
 
     # Do not replace the water mask with NHDArea here because NHDArea is filtered
     # to river/stream polygons only (excluding lakes). Using that as a general water mask
@@ -560,6 +588,34 @@ def main() -> int:
     out_open = Path(args.out_open_water_mask)
     out_channel.parent.mkdir(parents=True, exist_ok=True)
 
+    channel_source_effective = "nhdarea" if ((args.channel_source != "corridor") and (nhdarea_mask is not None) and bool(nhdarea_mask.any()) and nhdarea_pixels > 0 and np.any(channel & nhdarea_mask)) else "corridor"
+    nhd_overlap_frac = None
+    if (nhdarea_mask is not None) and bool(nhdarea_mask.any()) and corridor.sum() > 0:
+        nhd_overlap_frac = float((nhdarea_mask & corridor).sum()) / float(corridor.sum())
+    policy_summary = {
+        "channel_source_requested": str(args.channel_source),
+        "channel_source_effective": channel_source_effective,
+        "effective_water_source": water_source_effective,
+        "water_mask_harmonization_applied": bool(water_mask_harmonization_applied),
+        "water_mask_harmonization_reason": water_mask_harmonization_reason,
+        "ocean_mask_available": bool(args.ocean_mask),
+        "with_nhd_water_mask_available": bool(args.water_mask),
+        "nhdarea_available": bool(args.nhdarea_gpkg),
+        "nhdarea_effective": bool(channel_source_effective == "nhdarea"),
+        "corridor_pixels": int(corridor.sum()),
+        "mainstem_corridor_pixels": int(corridor_main.sum()),
+        "effective_water_pixels": int(water.sum()),
+        "channel_pixels": int(channel.sum()),
+        "open_water_pixels": int(open_water.sum()),
+        "ocean_pixels": int(ocean.sum()) if ocean is not None else 0,
+        "kept_ocean_pixels": int(keep_ocean.sum()) if "keep_ocean" in locals() else 0,
+        "nhdarea_pixels": int(nhdarea_mask.sum()) if (nhdarea_mask is not None) else 0,
+        "effective_water_corridor_overlap_frac": water_corridor_overlap_frac,
+        "channel_corridor_overlap_frac": float((channel & corridor).sum()) / float(corridor.sum()) if corridor.sum() > 0 else None,
+        "open_water_corridor_overlap_frac": float((open_water & corridor).sum()) / float(corridor.sum()) if corridor.sum() > 0 else None,
+        "nhdarea_corridor_overlap_frac": nhd_overlap_frac,
+    }
+
     _save_u8(out_channel, channel.astype("uint8"), template_profile, nodata=0)
     _save_u8(out_open, open_water.astype("uint8"), template_profile, nodata=0)
     if args.out_mainstem_mask:
@@ -567,7 +623,26 @@ def main() -> int:
         out_main.parent.mkdir(parents=True, exist_ok=True)
         _save_u8(out_main, corridor_main.astype("uint8"), template_profile, nodata=0)
         LOG.info("Wrote: %s", out_main)
-
+    if args.out_effective_water_mask:
+        out_eff = Path(args.out_effective_water_mask)
+        out_eff.parent.mkdir(parents=True, exist_ok=True)
+        _save_u8(out_eff, water.astype("uint8"), template_profile, nodata=0)
+        LOG.info("Wrote: %s", out_eff)
+    if args.out_corridor_mask:
+        out_corr = Path(args.out_corridor_mask)
+        out_corr.parent.mkdir(parents=True, exist_ok=True)
+        _save_u8(out_corr, corridor.astype("uint8"), template_profile, nodata=0)
+        LOG.info("Wrote: %s", out_corr)
+    if args.out_nhdarea_mask and (nhdarea_mask is not None):
+        out_nhd = Path(args.out_nhdarea_mask)
+        out_nhd.parent.mkdir(parents=True, exist_ok=True)
+        _save_u8(out_nhd, nhdarea_mask.astype("uint8"), template_profile, nodata=0)
+        LOG.info("Wrote: %s", out_nhd)
+    if args.out_policy_json:
+        out_json = Path(args.out_policy_json)
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        out_json.write_text(json.dumps(policy_summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        LOG.info("Wrote: %s", out_json)
 
     if args.write_debug:
         dbg = out_channel.parent

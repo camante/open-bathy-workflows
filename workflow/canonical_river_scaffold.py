@@ -373,3 +373,26 @@ def write_scaffold_manifest(path: str | Path, *, domains: RiverAoiDomains, netwo
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, indent=2), encoding='utf-8')
     return out
+
+
+
+def nested_aoi_relationship(export_aoi: str, candidate_aoi: str) -> Dict[str, object]:
+    """Describe whether candidate_aoi contains the export_aoi and the overlap area."""
+    ew, ee, es, en = _parse_aoi(export_aoi)
+    cw, ce, cs, cn = _parse_aoi(candidate_aoi)
+    overlap_w = max(ew, cw)
+    overlap_e = min(ee, ce)
+    overlap_s = max(es, cs)
+    overlap_n = min(en, cn)
+    overlap_wd = max(0.0, overlap_e - overlap_w)
+    overlap_hd = max(0.0, overlap_n - overlap_s)
+    export_area = max(0.0, ee - ew) * max(0.0, en - es)
+    overlap_area = overlap_wd * overlap_hd
+    contains_export = (cw <= ew) and (ce >= ee) and (cs <= es) and (cn >= en)
+    return {
+        'contains_export_aoi': bool(contains_export),
+        'overlap_fraction_of_export': float(overlap_area / max(export_area, 1e-12)),
+        'export_bounds': _bounds_to_dict((ew, ee, es, en)),
+        'candidate_bounds': _bounds_to_dict((cw, ce, cs, cn)),
+        'overlap_bounds': _bounds_to_dict((overlap_w, overlap_e, overlap_s, overlap_n)) if overlap_area > 0 else None,
+    }

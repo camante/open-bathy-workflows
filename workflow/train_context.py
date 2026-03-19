@@ -93,6 +93,9 @@ class TrainContext:
     model_bank_retrain_min_new: int = 2000
     model_bank_context: Optional[Dict[str, Any]] = None
 
+    # --- ATL03 admissibility summary -----------------------------------------
+    atl03_admissibility_summary: Optional[Dict[str, Any]] = None
+
     # -------------------------------------------------------------------------
     # Factory
     # -------------------------------------------------------------------------
@@ -204,4 +207,5 @@ class TrainContext:
             "model_bank_seed": self.model_bank_seed,
             "model_bank_retrain_min_new": self.model_bank_retrain_min_new,
             "model_bank_context": self.model_bank_context,
+            "atl03_admissibility_summary": self.atl03_admissibility_summary,
         }

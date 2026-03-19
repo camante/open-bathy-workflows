@@ -148,6 +148,7 @@ from trusted_interior import (
     build_trusted_export_region,
     build_river_trusted_interior,
     restrict_river_admissibility,
+    summarize_trusted_export_region,
 )
 from sdb_results import finalize_sdb_run as _finalize_sdb_run_impl
 from river_guidance import (
@@ -164,11 +165,16 @@ from river_masking import determine_effective_methods_from_waffles as _rm_determ
 from river_masking import find_latest_waffles_mask as _rm_find_latest_waffles_mask
 from river_masking import stage_cached_waffles_mask as _rm_stage_cached_waffles_mask
 from river_masking import waffles_water_fraction as _rm_waffles_water_fraction
+from river_domain_policy import evaluate_river_domain_summary as _evaluate_river_domain_summary
+from river_domain_policy import load_river_domain_summary as _load_river_domain_summary
 from final_reporting import write_authoritative_cache_receipt as _fr_write_authoritative_cache_receipt
 from final_reporting import write_comparison_package as _fr_write_comparison_package
 from final_reporting import write_comparison_summary as _fr_write_comparison_summary
 from final_reporting import write_explicit_final_outputs_manifest as _fr_write_explicit_final_outputs_manifest
 from final_reporting import write_final_dem_selection_receipt as _fr_write_final_dem_selection_receipt
+from final_reporting import write_river_stability_summary as _fr_write_river_stability_summary
+from final_reporting import write_validation_invariance_summary as _fr_write_validation_invariance_summary
+from final_reporting import evaluate_overlap_identity_checks as _fr_evaluate_overlap_identity_checks
 from provenance_reporting import write_support_provenance_summary as _pr_write_support_provenance_summary
 from final_support_audit import write_final_support_regime_audit as _fsra_write_final_support_regime_audit
 from io_artifacts import build_io_manifest as _io_build_io_manifest
@@ -298,6 +304,7 @@ def _recover_river_depth_from_support(
     import numpy as np
     import rasterio
     from rasterio.features import rasterize
+    from river_bank_guidance import compute_bank_distance_influence, compute_xs_bank_guidance_surfaces, compute_graph_informed_bank_context_surfaces
 
     result = {"recovered": False, "reason": None, "valid_pixels": 0, "support_seed_pixels": 0}
     try:
@@ -454,6 +461,7 @@ def _write_river_guidance_artifacts(
     import numpy as np
     import rasterio
     from rasterio.features import rasterize
+    from river_bank_guidance import compute_bank_distance_influence, compute_xs_bank_guidance_surfaces, compute_graph_informed_bank_context_surfaces
 
     artifacts = {
         "guidance_weight": None,
@@ -463,6 +471,12 @@ def _write_river_guidance_artifacts(
         "authoritative_support": None,
         "authoritative_support_depth": None,
         "corridor_mask": None,
+        "bank_edge_mask": None,
+        "bank_distance": None,
+        "bank_influence": None,
+        "bank_elevation_xs": None,
+        "bank_pair_weight": None,
+        "bank_points": None,
         "scaffold_domains": None,
     }
     with rasterio.open(depth_tif) as ds:
@@ -540,6 +554,16 @@ def _write_river_guidance_artifacts(
     sp_path = river_dir / "river_authoritative_support.tif"
     sd_path = river_dir / "river_authoritative_support_depth.tif"
     cm_path = river_dir / "river_corridor_mask.tif"
+    be_path = river_dir / "river_bank_edge_mask.tif"
+    bd_path = river_dir / "river_bank_distance_m.tif"
+    bi_path = river_dir / "river_bank_influence.tif"
+    bx_path = river_dir / "river_bank_elevation_xs.tif"
+    bpw_path = river_dir / "river_bank_pair_weight.tif"
+    bcw_path = river_dir / "river_bank_continuity_weight.tif"
+    bgc_path = river_dir / "river_bank_graph_confidence.tif"
+    bcd_path = river_dir / "river_bank_confluence_damping.tif"
+    besd_path = river_dir / "river_bank_estuary_side_decay.tif"
+    bpts_path = river_dir / "river_bank_points.gpkg"
     scaffold_domains_path = river_dir / "river_scaffold_domains.json"
 
     # ---------------------------------------------------------------
@@ -620,6 +644,65 @@ def _write_river_guidance_artifacts(
     regime_class = contract["regime"]
     guidance_weight = contract["guidance_weight"]
 
+    river_bank_edge, river_bank_distance_m, river_bank_influence = compute_bank_distance_influence(
+        channel.astype(bool),
+        pixel_size_m=px_m,
+        full_influence_m=0.0,
+        zero_influence_m=max(float(getattr(cfg, "river_scaffold_transition_m", 800.0) or 800.0) * 0.18, 60.0),
+    )
+    river_bank_elevation_xs = np.full(depth.shape, np.nan, dtype="float32")
+    river_bank_pair_weight = np.zeros(depth.shape, dtype="float32")
+    river_bank_continuity_weight = np.zeros(depth.shape, dtype="float32")
+    river_bank_graph_confidence = np.zeros(depth.shape, dtype="float32")
+    river_bank_confluence_damping = np.ones(depth.shape, dtype="float32")
+    river_bank_estuary_side_decay = np.ones(depth.shape, dtype="float32")
+    xs_bank_points_gdf = None
+    xs_candidates = [
+        Path(cfg.derived_cache_root) / "river" / "work" / "cross_sections_mainstem.gpkg",
+        Path(cfg.derived_cache_root) / "river" / "work" / "cross_sections.gpkg",
+        river_dir / "river_xs_params.gpkg",
+    ]
+    xs_source = next((xp for xp in xs_candidates if xp.exists()), None)
+    if xs_source is not None:
+        try:
+            try:
+                from river_bank_guidance import build_persistent_bank_network_points
+                xs_bank_points_gdf = build_persistent_bank_network_points(xs_source, target_crs=ds.crs)
+            except (ImportError, FileNotFoundError, OSError, RuntimeError, ValueError):
+                xs_bank_points_gdf = None
+            xs_bank = compute_xs_bank_guidance_surfaces(
+                corridor_mask=channel.astype(bool),
+                transform=ds.transform,
+                auth=np.full(depth.shape, np.nan, dtype="float32"),
+                xs_gpkg=xs_source,
+                raster_crs=ds.crs,
+                max_bank_distance_m=max(float(getattr(cfg, "river_scaffold_transition_m", 800.0) or 800.0) * 0.35, 120.0),
+                bank_points_gdf=xs_bank_points_gdf,
+            )
+            river_bank_elevation_xs = xs_bank["bank_elevation"].astype("float32")
+            river_bank_pair_weight = xs_bank["bank_pair_weight"].astype("float32")
+            river_bank_continuity_weight = xs_bank.get("bank_continuity_weight", np.zeros(depth.shape, dtype="float32")).astype("float32")
+            bank_ctx = compute_graph_informed_bank_context_surfaces(
+                corridor_mask=channel.astype(bool),
+                transform=ds.transform,
+                bank_points_gdf=xs_bank_points_gdf,
+                estuary_transition=estuary_transition.astype(bool),
+                estuary_decay_distance_m=max(float(getattr(cfg, "river_scaffold_transition_m", 800.0) or 800.0) * 0.22, 120.0),
+            )
+            river_bank_graph_confidence = bank_ctx.get("bank_graph_confidence", np.zeros(depth.shape, dtype="float32")).astype("float32")
+            river_bank_confluence_damping = bank_ctx.get("bank_confluence_damping", np.ones(depth.shape, dtype="float32")).astype("float32")
+            river_bank_estuary_side_decay = bank_ctx.get("bank_estuary_side_decay", np.ones(depth.shape, dtype="float32")).astype("float32")
+            river_bank_influence = np.clip(
+                river_bank_influence
+                * (0.40 + (0.20 * np.clip(river_bank_pair_weight, 0.0, 1.0)) + (0.20 * np.clip(river_bank_continuity_weight, 0.0, 1.0)) + (0.20 * np.clip(river_bank_graph_confidence, 0.0, 1.0)))
+                * np.clip(river_bank_confluence_damping, 0.0, 1.0)
+                * np.clip(river_bank_estuary_side_decay, 0.0, 1.0),
+                0.0,
+                1.0,
+            ).astype("float32")
+        except (ImportError, FileNotFoundError, OSError, RuntimeError, ValueError):
+            log.debug("[RIVER] XS bank guidance build failed; continuing with corridor-edge bank guidance only.", exc_info=True)
+
     rc_path = river_dir / "river_regime_class.tif"
 
     with rasterio.open(gw_path, "w", **prof_f32) as dst:
@@ -636,6 +719,28 @@ def _write_river_guidance_artifacts(
         dst.write(np.where(np.isfinite(support_depth), support_depth, float(nodata)).astype("float32"), 1)
     with rasterio.open(cm_path, "w", **prof_u8) as dst:
         dst.write(channel.astype("uint8"), 1)
+    with rasterio.open(be_path, "w", **prof_u8) as dst:
+        dst.write(river_bank_edge.astype("uint8"), 1)
+    with rasterio.open(bd_path, "w", **prof_f32) as dst:
+        dst.write(np.where(np.isfinite(river_bank_distance_m), river_bank_distance_m, 0.0).astype("float32"), 1)
+    with rasterio.open(bi_path, "w", **prof_f32) as dst:
+        dst.write(river_bank_influence.astype("float32"), 1)
+    with rasterio.open(bx_path, "w", **prof_depth) as dst:
+        dst.write(np.where(np.isfinite(river_bank_elevation_xs), river_bank_elevation_xs, float(nodata)).astype("float32"), 1)
+    with rasterio.open(bpw_path, "w", **prof_f32) as dst:
+        dst.write(np.clip(river_bank_pair_weight, 0.0, 1.0).astype("float32"), 1)
+    with rasterio.open(bcw_path, "w", **prof_f32) as dst:
+        dst.write(np.clip(river_bank_continuity_weight, 0.0, 1.0).astype("float32"), 1)
+    with rasterio.open(bgc_path, "w", **prof_f32) as dst:
+        dst.write(np.clip(river_bank_graph_confidence, 0.0, 1.0).astype("float32"), 1)
+    with rasterio.open(bcd_path, "w", **prof_f32) as dst:
+        dst.write(np.clip(river_bank_confluence_damping, 0.0, 1.0).astype("float32"), 1)
+    with rasterio.open(besd_path, "w", **prof_f32) as dst:
+        dst.write(np.clip(river_bank_estuary_side_decay, 0.0, 1.0).astype("float32"), 1)
+    if xs_bank_points_gdf is not None and not xs_bank_points_gdf.empty:
+        if bpts_path.exists():
+            bpts_path.unlink()
+        xs_bank_points_gdf.to_file(bpts_path, driver="GPKG")
     with rasterio.open(rc_path, "w", **prof_u8) as dst:
         dst.write(regime_class.astype("uint8"), 1)
 
@@ -646,6 +751,14 @@ def _write_river_guidance_artifacts(
     )
     scaffold_domains = scaffold_domains.as_dict()
     scaffold_domains["trusted_halo_px"] = int(edge_buffer_px)
+    trusted_summary = summarize_trusted_export_region(
+        channel=channel.astype("uint8"),
+        trusted_export_region=trusted_interior.astype("uint8"),
+        estuary_transition=estuary_transition.astype("uint8"),
+        edge_buffer_px=int(edge_buffer_px),
+    )
+    trusted_summary_path = river_dir / "river_trusted_interior_summary.json"
+    write_json(trusted_summary_path, trusted_summary)
     write_scaffold_manifest(
         scaffold_domains_path,
         domains=get_river_aoi_domains(
@@ -664,8 +777,19 @@ def _write_river_guidance_artifacts(
         "authoritative_support": str(sp_path),
         "authoritative_support_depth": str(sd_path),
         "corridor_mask": str(cm_path),
+        "bank_edge_mask": str(be_path),
+        "bank_distance": str(bd_path),
+        "bank_influence": str(bi_path),
+        "bank_elevation_xs": str(bx_path),
+        "bank_pair_weight": str(bpw_path),
+        "bank_continuity_weight": str(bcw_path),
+        "bank_graph_confidence": str(bgc_path),
+        "bank_confluence_damping": str(bcd_path),
+        "bank_estuary_side_decay": str(besd_path),
+        "bank_points": str(bpts_path) if xs_bank_points_gdf is not None and not xs_bank_points_gdf.empty else None,
         "regime_class": str(rc_path),
         "scaffold_domains": str(scaffold_domains_path),
+        "trusted_interior_summary": str(trusted_summary_path),
     })
 
     # Sparse guide points sampled from the guidance-weighted raster support.
@@ -729,8 +853,15 @@ def _write_river_guidance_artifacts(
         'regime_summary': contract.get('regime_summary', {}),
         'zone_summary': {k: int(np.sum(v > 0)) for k, v in contract.get('zones', {}).items()},
         'corridor_mask': str(cm_path),
+        'bank_edge_mask_definition': 'interior corridor-edge pixels derived from the WAFFLES/NHD river corridor boundary',
+        'bank_distance_definition': 'distance from each corridor pixel to the nearest interior bank edge, used to taper bank-boundary influence inward',
+        'bank_influence_definition': 'soft bank-boundary tendency derived from corridor-edge proximity; strongest near banks and decays toward the channel interior',
         'scaffold_domains': scaffold_domains,
+        'trusted_interior_summary': trusted_summary,
     })
+    report.setdefault('outputs', {})['river_trusted_interior'] = str(ti_path)
+    report.setdefault('outputs', {})['river_scaffold_domains'] = str(scaffold_domains_path)
+    report.setdefault('outputs', {})['river_trusted_interior_summary'] = str(trusted_summary_path)
     return artifacts
 
 
@@ -1625,6 +1756,15 @@ class BathyConfig:
     # ── Outputs / nodata ────────────────────────────────────────────────────
     final_nodata: float = -9999.0
 
+    # Validation / invariance framework
+    validation_truth: Optional[Path] = None
+    validation_case_specs: List[str] = field(default_factory=list)
+    validation_case_manifest: Optional[Path] = None
+    validation_guidance_baseline_case: str = "baseline_cudem_interpolation"
+    validation_guidance_target_case: str = "selected_final"
+    validation_require_guidance_non_degradation: bool = False
+    validation_guidance_rmse_tolerance: float = 0.0
+
     # ── WAFFLES mask configuration ───────────────────────────────────────────
     waffles_inc_arcsec: float = 1.0          # mask resolution (1.0 ≈ 30 m)
     # Runtime paths — set during pipeline, not from CLI:
@@ -1643,6 +1783,10 @@ class BathyConfig:
     river_channel_source: str = "auto"   # 'auto' | 'nhd' | 'nhdarea' | 'waffles'
     river_nhdarea_allow_ftype: Optional[str] = None
     river_nhdarea_allow_fcode: Optional[str] = None
+    river_domain_min_water_corridor_frac: float = 0.02
+    river_domain_min_channel_corridor_frac: float = 0.001
+    river_domain_min_channel_pixels: int = 1
+    river_domain_hard_fail: bool = False
 
     # ── Soundings calibration ────────────────────────────────────────────────
     river_soundings_calib_max_dist_m: float = 0.0   # 0 = disabled
@@ -1914,7 +2058,7 @@ def _record_authoritative_child_passthrough(report: Dict[str, Any], stage: str, 
 
 def _write_final_reporting_bundle(cfg: "BathyConfig", report: Dict[str, Any], *, final_native: Optional[Path], final_for_user: Optional[Path | str], final_provenance: Optional[Path | str]) -> Path:
     """Thin wrapper around reporting_coordinator bundle writer."""
-    return _write_final_reporting_bundle_impl(
+    report_path = _write_final_reporting_bundle_impl(
         cfg,
         report,
         final_native=final_native,
@@ -1929,6 +2073,71 @@ def _write_final_reporting_bundle(cfg: "BathyConfig", report: Dict[str, Any], *,
         write_comparison_package=_write_comparison_package,
         logger=log,
     )
+    _fr_write_validation_invariance_summary(
+        cfg,
+        report,
+        final_native=final_native,
+        final_for_user=final_for_user,
+        final_provenance=final_provenance,
+        logger=log,
+        enforce_hard_fail=False,
+    )
+    return report_path
+
+
+def _river_domain_artifact_paths(work_dir: Path) -> Dict[str, Path]:
+    return {
+        "policy_json": Path(work_dir) / "river_domain_policy.json",
+        "effective_water_mask": Path(work_dir) / "river_effective_water_mask.tif",
+        "corridor_mask": Path(work_dir) / "river_corridor_mask_debug.tif",
+        "nhdarea_mask": Path(work_dir) / "river_nhdarea_mask_debug.tif",
+    }
+
+
+def _append_river_domain_policy_args(cmd: List[str], work_dir: Path) -> Dict[str, Path]:
+    paths = _river_domain_artifact_paths(work_dir)
+    cmd.extend([
+        f"--out-policy-json={paths['policy_json']}",
+        f"--out-effective-water-mask={paths['effective_water_mask']}",
+        f"--out-corridor-mask={paths['corridor_mask']}",
+        f"--out-nhdarea-mask={paths['nhdarea_mask']}",
+    ])
+    return paths
+
+
+def _record_river_domain_policy(
+    cfg: "BathyConfig",
+    report: Dict[str, Any],
+    *,
+    work_dir: Path,
+    logger: Optional[logging.Logger] = None,
+) -> Dict[str, Any]:
+    log_local = logger or log
+    paths = _river_domain_artifact_paths(work_dir)
+    summary = _load_river_domain_summary(paths["policy_json"])
+    validation = _evaluate_river_domain_summary(
+        summary,
+        min_effective_water_corridor_overlap_frac=float(getattr(cfg, "river_domain_min_water_corridor_frac", 0.02) or 0.02),
+        min_channel_corridor_overlap_frac=float(getattr(cfg, "river_domain_min_channel_corridor_frac", 0.001) or 0.001),
+        min_channel_pixels=int(getattr(cfg, "river_domain_min_channel_pixels", 1) or 1),
+    ) if summary else {"ok": None, "reason": "missing river_domain_policy summary"}
+    river = report.setdefault("river", {})
+    river["domain_policy"] = summary
+    river["domain_validation"] = validation
+    outputs = river.setdefault("outputs", {})
+    outputs["river_domain_policy_json"] = str(paths["policy_json"]) if paths["policy_json"].exists() else None
+    outputs["river_effective_water_mask"] = str(paths["effective_water_mask"]) if paths["effective_water_mask"].exists() else None
+    outputs["river_corridor_mask_debug"] = str(paths["corridor_mask"]) if paths["corridor_mask"].exists() else None
+    outputs["river_nhdarea_mask_debug"] = str(paths["nhdarea_mask"]) if paths["nhdarea_mask"].exists() else None
+    if validation.get("ok") is False:
+        msg = "; ".join(
+            f"{f.get('check')}={f.get('value', f.get('effective', 'fail'))}"
+            for f in validation.get("failures", [])
+        )
+        log_local.warning("[RIVER] River-domain validation failed: %s", msg or validation)
+        if bool(getattr(cfg, "river_domain_hard_fail", False)) or bool(getattr(cfg, "strict", False)):
+            raise RuntimeError(f"River-domain validation failed: {msg or validation}")
+    return validation
 
 
 def _materialize_authoritative_base_if_requested(cfg: "BathyConfig", args: argparse.Namespace) -> Optional[Path]:
@@ -2544,6 +2753,7 @@ def fetch_cudem_soundings_via_dlim(
     sources: List[str],
     cache_root: Path,
     out_crs: str,
+    source_vdatum: Optional[str] = None,
     thin_res_m: Optional[float] = 10.0,
     filter_spec: Optional[str] = None,
     force: bool = False,
@@ -2557,6 +2767,7 @@ def fetch_cudem_soundings_via_dlim(
     report: Dict[str, Any] = {
         "requested_sources": list(sources),
         "out_crs": out_crs,
+        "source_vdatum": source_vdatum,
         "thin_res_m": thin_res_m,
         "filter_spec": filter_spec,
         "outputs": [],
@@ -2613,6 +2824,7 @@ def fetch_cudem_soundings_via_dlim(
             src,
             aoi,
             out_crs,
+            source_vdatum or "source_unspecified",
             filter_spec or (f"block_thin:res={thin_res_m_eff}" if thin_res_m_eff else "no_filter"),
         )
         out_xyz = xyz_cache / f"{src}_{key}.xyz"
@@ -2623,7 +2835,17 @@ def fetch_cudem_soundings_via_dlim(
         # With filter: dlim -R=W/E/S/N <source> -F block_thin:res=10
         cmd = [dlim_exe, f'-R={aoi}', src]
         
-        # Add projection if specified (dlim defaults to epsg:4326 output)
+        # Add explicit vertical source when provided. This is useful when the
+        # provider's bathymetry should be treated as a known source datum (for
+        # example NAVD88) and converted to the requested target compound CRS
+        # (for example an MTL-based training datum) during fetch.
+        if source_vdatum:
+            src_vdatum = str(source_vdatum).lower()
+            if not src_vdatum.startswith("epsg:"):
+                src_vdatum = f"epsg:{src_vdatum}" if src_vdatum.isdigit() else src_vdatum
+            cmd += ["-J", src_vdatum]
+
+        # Add projection / target compound CRS if specified (dlim defaults to epsg:4326 output)
         if out_crs:
             # dlim -P expects lowercase 'epsg:' format
             crs_str = str(out_crs).lower()
@@ -3164,6 +3386,7 @@ def _run_river_skeleton(
         cmd.append(f"--water-mask={with_nhd_mask}")
     if cfg.river_save_skeleton_debug:
         cmd.append("--write-debug")
+    _append_river_domain_policy_args(cmd, work_dir)
 
     # For reporting: prefer the more inclusive water mask (with_nhd) if it exists,
     # otherwise fall back to the ocean-only mask (still useful to prevent ocean bleed).
@@ -3197,6 +3420,7 @@ def _run_river_skeleton(
     log.info("[RIVER] Channel mask built: %s", channel_mask_tif)
 
     report.setdefault("river", {}).setdefault("outputs", {})["river_channel_mask"] = str(channel_mask_tif)
+    _record_river_domain_policy(cfg, report, work_dir=work_dir, logger=log)
 
     # Stash river domain/channel mask for fusion: inside this mask, river should override SDB to avoid tile seams
     cfg.river_domain_mask_for_fusion = Path(channel_mask_tif)
@@ -5245,6 +5469,14 @@ def _support_weighted_condition_arrays(
     river_support: Optional[np.ndarray],
     river_support_depth: Optional[np.ndarray],
     estuary_transition: Optional[np.ndarray] = None,
+    river_corridor_mask: Optional[np.ndarray] = None,
+    river_bank_influence: Optional[np.ndarray] = None,
+    river_bank_elevation: Optional[np.ndarray] = None,
+    river_bank_pair_weight: Optional[np.ndarray] = None,
+    river_bank_continuity_weight: Optional[np.ndarray] = None,
+    river_bank_graph_confidence: Optional[np.ndarray] = None,
+    river_bank_confluence_damping: Optional[np.ndarray] = None,
+    river_bank_estuary_side_decay: Optional[np.ndarray] = None,
     pixel_size_m: float,
     support_decay_m: float,
     support_density_radius_m: float,
@@ -5265,6 +5497,14 @@ def _support_weighted_condition_arrays(
         river_support=river_support,
         river_support_depth=river_support_depth,
         estuary_transition=estuary_transition,
+        river_corridor_mask=river_corridor_mask,
+        river_bank_influence=river_bank_influence,
+        river_bank_elevation=river_bank_elevation,
+        river_bank_pair_weight=river_bank_pair_weight,
+        river_bank_continuity_weight=river_bank_continuity_weight,
+        river_bank_graph_confidence=river_bank_graph_confidence,
+        river_bank_confluence_damping=river_bank_confluence_damping,
+        river_bank_estuary_side_decay=river_bank_estuary_side_decay,
         pixel_size_m=pixel_size_m,
         support_decay_m=support_decay_m,
         support_density_radius_m=support_density_radius_m,
@@ -5368,6 +5608,9 @@ def _condition_final_to_authoritative_base(
     river_anchor_distance_path = combined_dir / "river_anchor_distance.tif"
     river_anchor_density_path = combined_dir / "river_anchor_density.tif"
     river_scaffold_confidence_path = combined_dir / "river_scaffold_confidence.tif"
+    river_bank_distance_path = combined_dir / "river_bank_distance.tif"
+    river_bank_influence_runtime_path = combined_dir / "river_bank_influence_runtime.tif"
+    river_bank_elevation_path = combined_dir / "river_bank_elevation.tif"
     conditioned_path = combined_dir / "bathy_combined_depth_conditioned.tif"
     conditioned_prov_path = combined_dir / "bathy_combined_depth_conditioned_provenance.tif"
     precedence_audit_path = combined_dir / "authoritative_precedence_audit.json"
@@ -5459,10 +5702,26 @@ def _condition_final_to_authoritative_base(
         river_estuary_transition_path = _resolve_existing_output_path(river_outputs, "estuary_transition")
         river_support_path = _resolve_existing_output_path(river_outputs, "authoritative_support")
         river_support_depth_path = _resolve_existing_output_path(river_outputs, "authoritative_support_depth")
+        river_corridor_path = _resolve_existing_output_path(river_outputs, "corridor_mask")
+        river_bank_influence_path = _resolve_existing_output_path(river_outputs, "bank_influence")
+        river_bank_elevation_xs_path = _resolve_existing_output_path(river_outputs, "bank_elevation_xs")
+        river_bank_pair_weight_path = _resolve_existing_output_path(river_outputs, "bank_pair_weight")
+        river_bank_continuity_weight_path = _resolve_existing_output_path(river_outputs, "bank_continuity_weight")
+        river_bank_graph_confidence_path = _resolve_existing_output_path(river_outputs, "bank_graph_confidence")
+        river_bank_confluence_damping_path = _resolve_existing_output_path(river_outputs, "bank_confluence_damping")
+        river_bank_estuary_side_decay_path = _resolve_existing_output_path(river_outputs, "bank_estuary_side_decay")
         river_ti = _align(river_ti_path, dtype="uint8", nodata_value=0, resampling=Resampling.nearest)
         river_estuary_transition = _align(river_estuary_transition_path, dtype="uint8", nodata_value=0, resampling=Resampling.nearest)
         river_support = _align(river_support_path, dtype="uint8", nodata_value=0, resampling=Resampling.nearest)
         river_support_depth = _align(river_support_depth_path, dtype="float32", nodata_value=np.nan, resampling=Resampling.bilinear)
+        river_corridor = _align(river_corridor_path, dtype="uint8", nodata_value=0, resampling=Resampling.nearest)
+        river_bank_influence = _align(river_bank_influence_path, dtype="float32", nodata_value=np.nan, resampling=Resampling.bilinear)
+        river_bank_elevation_xs = _align(river_bank_elevation_xs_path, dtype="float32", nodata_value=np.nan, resampling=Resampling.bilinear)
+        river_bank_pair_weight = _align(river_bank_pair_weight_path, dtype="float32", nodata_value=np.nan, resampling=Resampling.bilinear)
+        river_bank_continuity_weight = _align(river_bank_continuity_weight_path, dtype="float32", nodata_value=np.nan, resampling=Resampling.bilinear)
+        river_bank_graph_confidence = _align(river_bank_graph_confidence_path, dtype="float32", nodata_value=np.nan, resampling=Resampling.bilinear)
+        river_bank_confluence_damping = _align(river_bank_confluence_damping_path, dtype="float32", nodata_value=np.nan, resampling=Resampling.bilinear)
+        river_bank_estuary_side_decay = _align(river_bank_estuary_side_decay_path, dtype="float32", nodata_value=np.nan, resampling=Resampling.bilinear)
 
         sdb_ok = (np.asarray(sdb_adm) > 0) if sdb_adm is not None else np.zeros(auth.shape, dtype=bool)
         river_ok = (np.asarray(river_adm) > 0) if river_adm is not None else np.zeros(auth.shape, dtype=bool)
@@ -5493,6 +5752,14 @@ def _condition_final_to_authoritative_base(
             river_support=river_support,
             river_support_depth=river_support_depth,
             estuary_transition=river_estuary_transition,
+            river_corridor_mask=river_corridor,
+            river_bank_influence=river_bank_influence,
+            river_bank_elevation=river_bank_elevation_xs,
+            river_bank_pair_weight=river_bank_pair_weight,
+            river_bank_continuity_weight=river_bank_continuity_weight,
+            river_bank_graph_confidence=river_bank_graph_confidence,
+            river_bank_confluence_damping=river_bank_confluence_damping,
+            river_bank_estuary_side_decay=river_bank_estuary_side_decay,
             pixel_size_m=pixel_size_m,
             support_decay_m=float(getattr(cfg, "authoritative_support_decay_m", 300.0) or 300.0),
             support_density_radius_m=float(getattr(cfg, "authoritative_support_density_radius_m", 250.0) or 250.0),
@@ -5512,6 +5779,13 @@ def _condition_final_to_authoritative_base(
         river_anchor_distance_m = result["river_anchor_distance_m"]
         river_anchor_density = result["river_anchor_density"]
         river_scaffold_confidence = result["river_scaffold_confidence"]
+        river_bank_distance_m = result["river_bank_distance_m"]
+        river_bank_influence_runtime = result["river_bank_influence"]
+        river_bank_elevation = result["river_bank_elevation"]
+        river_bank_continuity_weight_runtime = result.get("river_bank_continuity_weight")
+        river_bank_graph_confidence_runtime = result.get("river_bank_graph_confidence")
+        river_bank_confluence_damping_runtime = result.get("river_bank_confluence_damping")
+        river_bank_estuary_side_decay_runtime = result.get("river_bank_estuary_side_decay")
         conditioned = result["conditioned"]
         prov_out = result["provenance"]
         support_note = result["support_note"]
@@ -5546,6 +5820,17 @@ def _condition_final_to_authoritative_base(
         _write(river_anchor_distance_path, np.where(np.isfinite(river_anchor_distance_m), river_anchor_distance_m, np.float32(nodata)).astype("float32"), prof_f32)
         _write(river_anchor_density_path, np.clip(river_anchor_density, 0.0, 1.0).astype("float32"), {**prof_f32, "nodata": -9999.0})
         _write(river_scaffold_confidence_path, np.clip(river_scaffold_confidence, 0.0, 1.0).astype("float32"), {**prof_f32, "nodata": -9999.0})
+        _write(river_bank_distance_path, np.where(np.isfinite(river_bank_distance_m), river_bank_distance_m, np.float32(nodata)).astype("float32"), prof_f32)
+        _write(river_bank_influence_runtime_path, np.clip(river_bank_influence_runtime, 0.0, 1.0).astype("float32"), {**prof_f32, "nodata": -9999.0})
+        _write(river_bank_elevation_path, np.where(np.isfinite(river_bank_elevation), river_bank_elevation, np.float32(nodata)).astype("float32"), prof_f32)
+        river_bank_continuity_runtime_path = combined_dir / "river_bank_continuity_weight.tif"
+        river_bank_graph_confidence_runtime_path = combined_dir / "river_bank_graph_confidence.tif"
+        river_bank_confluence_damping_runtime_path = combined_dir / "river_bank_confluence_damping.tif"
+        river_bank_estuary_side_decay_runtime_path = combined_dir / "river_bank_estuary_side_decay.tif"
+        _write(river_bank_continuity_runtime_path, np.clip(np.nan_to_num(river_bank_continuity_weight_runtime, nan=0.0), 0.0, 1.0).astype("float32"), {**prof_f32, "nodata": -9999.0})
+        _write(river_bank_graph_confidence_runtime_path, np.clip(np.nan_to_num(river_bank_graph_confidence_runtime, nan=0.0), 0.0, 1.0).astype("float32"), {**prof_f32, "nodata": -9999.0})
+        _write(river_bank_confluence_damping_runtime_path, np.clip(np.nan_to_num(river_bank_confluence_damping_runtime, nan=1.0), 0.0, 1.0).astype("float32"), {**prof_f32, "nodata": -9999.0})
+        _write(river_bank_estuary_side_decay_runtime_path, np.clip(np.nan_to_num(river_bank_estuary_side_decay_runtime, nan=1.0), 0.0, 1.0).astype("float32"), {**prof_f32, "nodata": -9999.0})
         _write(conditioned_path, cond_out.astype("float32"), prof_f32)
         _write(conditioned_prov_path, prov_out.astype("uint8"), prof_u8)
         audit = _summarize_precedence_audit(
@@ -5583,6 +5868,10 @@ def _condition_final_to_authoritative_base(
         "river_anchor_distance": str(river_anchor_distance_path),
         "river_anchor_density": str(river_anchor_density_path),
         "river_scaffold_confidence": str(river_scaffold_confidence_path),
+        "river_bank_distance": str(river_bank_distance_path),
+        "river_bank_influence": str(river_bank_influence_runtime_path),
+        "river_bank_elevation": str(river_bank_elevation_path),
+        "river_bank_continuity_weight": str(river_bank_continuity_runtime_path),
         "conditioned_depth": str(conditioned_path),
         "conditioned_provenance": str(conditioned_prov_path) if conditioned_prov_path else None,
         "source_provenance_input": str(provenance_path) if provenance_path else None,
@@ -6222,6 +6511,13 @@ def parse_args() -> argparse.Namespace:
             "to compute seam metrics against in batch. Explicit-only (no auto-discovery)."
         ),
     )
+    p.add_argument("--validation-truth", default=None, help="Optional truth raster aligned or alignable to the final DEM grid for support-class validation metrics.")
+    p.add_argument("--validation-case", action="append", default=[], help="Optional ablation case as NAME=PATH. Repeatable. Used with --validation-truth.")
+    p.add_argument("--validation-case-manifest", default=None, help="Optional JSON file mapping validation case names to raster paths.")
+    p.add_argument("--validation-guidance-baseline-case", default="baseline_cudem_interpolation", help="Baseline case name for optional guidance non-degradation evaluation.")
+    p.add_argument("--validation-guidance-target-case", default="selected_final", help="Target case name for optional guidance non-degradation evaluation.")
+    p.add_argument("--validation-require-guidance-non-degradation", action="store_true", help="Fail the run when the guidance target case is worse than the baseline in guidance-conditioned support families, if validation truth is provided.")
+    p.add_argument("--validation-guidance-rmse-tolerance", type=float, default=0.0, help="Allowed RMSE degradation for guidance-conditioned support-family comparison before validation fails.")
 
     # SDB cross-tile consistency (DEFAULT): bounded model bank reservoir + periodic retrain
     p.add_argument("--sdb-model-bank", default="auto",
@@ -6350,10 +6646,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--extra-xyz-cudem-crs",
         default="epsg:4269+5714",
-        help=("Compound CRS string passed to dlim -P for --extra-xyz-cudem outputs. "
-              "Default: epsg:4269+5714 = NAD83 + MSL height. This ensures downloaded soundings "
-              "(which are typically in MLLW) are converted to MSL to match ICESat-2 training data. "
-              "Use --convert-sdb-to-navd88 to convert final SDB output from MSL to NAVD88."),
+        help=("Target CRS/compound CRS passed to dlim -P for --extra-xyz-cudem outputs. "
+              "Default: epsg:4269+5714 = NAD83 + MSL height. Set this to your effective optical-training datum "
+              "(for example an MTL compound CRS) when you want provider soundings fetched directly in that datum."),
+    )
+    p.add_argument(
+        "--extra-xyz-cudem-source-vdatum",
+        default=None,
+        help=("Optional source compound CRS passed to dlim -J for --extra-xyz-cudem outputs. "
+              "Use this when the provider soundings should be treated as a known source datum before conversion, "
+              "for example NAVD88 -> MTL during fetch."),
     )
 
     p.add_argument(
@@ -6460,6 +6762,14 @@ def parse_args() -> argparse.Namespace:
                help="Disable NHDArea polygon constraint for river domain (if available).")
     p.add_argument("--river-nhdarea-layer", default="nhdarea_clip",
                help="Layer name in river_network.gpkg containing NHDArea polygons (default nhdarea_clip).")
+    p.add_argument("--river-domain-min-water-corridor-frac", dest="river_domain_min_water_corridor_frac", type=float, default=0.02,
+               help="Minimum acceptable effective-water∩corridor overlap fraction after harmonization (default 0.02).")
+    p.add_argument("--river-domain-min-channel-corridor-frac", dest="river_domain_min_channel_corridor_frac", type=float, default=0.001,
+               help="Minimum acceptable channel∩corridor overlap fraction for river-domain validation (default 0.001).")
+    p.add_argument("--river-domain-min-channel-pixels", dest="river_domain_min_channel_pixels", type=int, default=1,
+               help="Minimum acceptable number of river channel pixels after domain harmonization (default 1).")
+    p.add_argument("--river-domain-hard-fail", dest="river_domain_hard_fail", action="store_true", default=False,
+               help="Fail the run when river-domain validation fails instead of only recording the failure.")
     p.add_argument("--river-ocean-keep-dist-m", dest="river_ocean_keep_dist_m", type=float, default=0.0,
                help="Allow ocean-connected water within this distance (m) of flowlines when building the river channel mask. Useful for tidal river mouths/estuaries where the mainstem is classified as ocean water. 0 disables.")
     p.add_argument("--estuary-transition-m", dest="estuary_transition_m", type=float, default=500.0,
@@ -7749,7 +8059,7 @@ def _run_seam_comparisons(args, cfg, report, run_id, final, final_for_user, repo
             else:
                 raise FileNotFoundError(f"--seam-compare-with-io-list not found: {p}")
         if seam_ios:
-            from seam_metrics import compute_seam_metrics, load_primary_raster_from_io_manifest
+            from seam_metrics import compute_seam_metrics, load_primary_raster_from_io_manifest, compute_raster_overlap_identity_metrics
             import json as _json
 
             this_raster = None
@@ -7783,22 +8093,70 @@ def _run_seam_comparisons(args, cfg, report, run_id, final, final_for_user, repo
                         "error": str(e),
                     })
 
+            overlap_identity_checks = []
+            try:
+                this_outputs_manifest = Path(cfg.out_dir) / "final_outputs.json"
+                this_outputs = _json.loads(this_outputs_manifest.read_text(encoding="utf-8")) if this_outputs_manifest.exists() else {}
+                current_support = this_outputs.get("support_class")
+                current_prov = this_outputs.get("final_provenance_native")
+                current_trusted = report.get("outputs", {}).get("river_trusted_interior") or report.get("river", {}).get("outputs", {}).get("trusted_interior")
+                for nio in seam_ios:
+                    nio_p = Path(str(nio))
+                    if not nio_p.exists():
+                        continue
+                    try:
+                        neighbor_outputs = _json.loads(nio_p.read_text(encoding="utf-8"))
+                    except Exception:
+                        continue
+                    current_river_channel = report.get("river", {}).get("outputs", {}).get("river_channel_mask") or report.get("outputs", {}).get("river_channel_mask")
+                    current_effective_water = report.get("river", {}).get("outputs", {}).get("river_effective_water_mask")
+                    for label, cur_path, nbr_key in (
+                        ("final_depth", str(this_raster), "selected_final_depth"),
+                        ("support_class", current_support, "support_class"),
+                        ("final_provenance_native", current_prov, "final_provenance_native"),
+                        ("river_trusted_interior", current_trusted, "river_trusted_interior"),
+                        ("river_channel_mask", current_river_channel, "river_channel_mask"),
+                        ("river_effective_water_mask", current_effective_water, "river_effective_water_mask"),
+                    ):
+                        nbr_path = neighbor_outputs.get(nbr_key)
+                        if not cur_path or not nbr_path:
+                            continue
+                        stats = compute_raster_overlap_identity_metrics(cur_path, nbr_path)
+                        stats.update({"neighbor_io_manifest": str(nio_p), "artifact": label})
+                        overlap_identity_checks.append(stats)
+            except Exception:
+                log.debug("Optional overlap identity checks failed; continuing", exc_info=True)
+
             out_seam_json = Path(cfg.out_dir) / "seam_comparisons.json"
             out_seam_json.write_text(_json.dumps({
                 "this_raster": str(this_raster),
                 "strip_px": int(getattr(args, "seam_strip_px", 3)),
                 "comparisons": seam_results,
+                "overlap_identity_checks": overlap_identity_checks,
             }, indent=2), encoding="utf-8")
 
             report.setdefault("seams", {})["adjacent_tile_comparisons"] = seam_results
+            report.setdefault("seams", {})["overlap_identity_checks"] = overlap_identity_checks
+            overlap_eval = _fr_evaluate_overlap_identity_checks(overlap_identity_checks)
+            report.setdefault("seams", {})["overlap_identity_evaluation"] = overlap_eval
             report.setdefault("outputs", {})["seam_comparisons_json"] = str(out_seam_json)
             # Update report on disk to include seam results
             try:
                 write_json(report_path, report)
             except OSError:
                 log.debug("ignored", exc_info=True)
+            _fr_write_validation_invariance_summary(cfg, report, final_native=Path(final) if final else None, final_for_user=Path(str(final_for_user)) if final_for_user else None, final_provenance=report.get("outputs", {}).get("selected_final_provenance"), logger=log, enforce_hard_fail=True)
+            _fr_write_river_stability_summary(cfg, report)
             log.info("Seam comparisons written: %s", out_seam_json)
-    except (FileNotFoundError, OSError, RuntimeError, ValueError, KeyError, TypeError) as e:
+            if overlap_eval.get("all_ok") is False:
+                failure_summary = "; ".join(
+                    f"{f.get('artifact')} vs {f.get('neighbor_io_manifest')}: {f.get('reason')}"
+                    for f in overlap_eval.get("failures", [])
+                )
+                raise RuntimeError(f"Overlap identity checks failed: {failure_summary}")
+    except RuntimeError:
+        raise
+    except (FileNotFoundError, OSError, ValueError, KeyError, TypeError) as e:
         log.debug("Optional seam comparison step failed; continuing: %s", e, exc_info=True)
     
     try:
@@ -8084,6 +8442,13 @@ def main() -> int:
             working_srs=args.working_srs,
             working_vcrs_epsg=args.working_vcrs_epsg,
             final_out_srs=args.final_out_srs,
+            validation_truth=Path(args.validation_truth).resolve() if args.validation_truth else None,
+            validation_case_specs=list(getattr(args, "validation_case", []) or []),
+            validation_case_manifest=Path(args.validation_case_manifest).resolve() if args.validation_case_manifest else None,
+            validation_guidance_baseline_case=str(getattr(args, "validation_guidance_baseline_case", "baseline_cudem_interpolation")),
+            validation_guidance_target_case=str(getattr(args, "validation_guidance_target_case", "selected_final")),
+            validation_require_guidance_non_degradation=bool(getattr(args, "validation_require_guidance_non_degradation", False)),
+            validation_guidance_rmse_tolerance=float(getattr(args, "validation_guidance_rmse_tolerance", 0.0) or 0.0),
             require_river_constraints=str(getattr(args, "require_river_constraints", "none")),
             river_dem_auto=args.river_dem_auto,
             river_dem_source=args.river_dem_source,
@@ -8164,6 +8529,10 @@ def main() -> int:
             river_max_mainstem_width_m=args.river_max_mainstem_width_m,
             river_use_nhdarea=bool(getattr(args, "river_use_nhdarea", True)),
             river_nhdarea_layer=getattr(args, "river_nhdarea_layer", "nhdarea_clip"),
+            river_domain_min_water_corridor_frac=float(getattr(args, "river_domain_min_water_corridor_frac", 0.02)),
+            river_domain_min_channel_corridor_frac=float(getattr(args, "river_domain_min_channel_corridor_frac", 0.001)),
+            river_domain_min_channel_pixels=int(getattr(args, "river_domain_min_channel_pixels", 1)),
+            river_domain_hard_fail=bool(getattr(args, "river_domain_hard_fail", False)),
             river_shape_exp=args.river_shape_exp,
             river_dmax_min_m=args.river_dmax_min_m,
             river_dmax_max_m=args.river_dmax_max_m,
@@ -8337,6 +8706,7 @@ def main() -> int:
                     sources=requested,
                     cache_root=Path(cfg.cache_root),
                     out_crs=dlim_crs,
+                    source_vdatum=getattr(args, "extra_xyz_cudem_source_vdatum", None),
                     thin_res_m=float(getattr(args, "extra_xyz_cudem_thin_res_m", 10.0))
                         if float(getattr(args, "extra_xyz_cudem_thin_res_m", 10.0)) > 0 else None,
                     filter_spec=getattr(args, "extra_xyz_cudem_filter", None),

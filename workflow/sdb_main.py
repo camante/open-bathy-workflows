@@ -1663,10 +1663,13 @@ def _write_sdb_manifest(
             "guide_points",
             "lower_bound_raster",
             "upper_bound_raster",
+            "regime_class_raster",
         ):
             val = guidance_artifacts.get(key)
             if val:
                 artifacts[key] = val
+        artifacts["guidance_mode"] = guidance_artifacts.get("guidance_mode", "guidance_first")
+        artifacts["depth_raster_role"] = guidance_artifacts.get("depth_raster_role", "diagnostic_only")
         auth_base = guidance_artifacts.get("authoritative_base")
         if auth_base:
             artifacts["authoritative_base"] = str(auth_base)
@@ -1683,7 +1686,9 @@ def _write_sdb_manifest(
 
         (out_root / "artifacts_sdb.json").write_text(json.dumps(artifacts, indent=2), encoding="utf-8")
         log.info("Wrote SDB manifest: %s", out_root / 'artifacts_sdb.json')
-        write_sdb_guidance_manifest(out_root=out_root, depth_raster=out_tif, args=args, logger=log)
+        guidance_manifest_path = write_sdb_guidance_manifest(out_root=out_root, depth_raster=out_tif, args=args, logger=log)
+        artifacts["guidance_manifest"] = str(guidance_manifest_path.relative_to(out_root)) if str(guidance_manifest_path).startswith(str(out_root)) else str(guidance_manifest_path)
+        (out_root / "artifacts_sdb.json").write_text(json.dumps(artifacts, indent=2), encoding="utf-8")
     except (OSError, ValueError, TypeError, KeyError) as exc:
         log.warning("Failed to write outputs/manifest: %s", exc)
 
@@ -2749,6 +2754,13 @@ def main():
     except (OSError, TypeError, ValueError):
         log.warning("[ATL][AUDIT] Failed to build raw-to-retained ATL audit ledger.", exc_info=True)
 
+    try:
+        atl03_adm_outputs = atl.write_atl03_admissibility_artifacts(audit=atl03_audit, out_dir=dir_logs, logger=log)
+        if isinstance(atl03_adm_outputs, dict) and any(atl03_adm_outputs.values()):
+            log.info("[ATL03][ADMISSIBILITY] CSV=%s JSON=%s GPKG=%s", atl03_adm_outputs.get('csv'), atl03_adm_outputs.get('json'), atl03_adm_outputs.get('gpkg'))
+    except (OSError, TypeError, ValueError):
+        log.warning("[ATL03][ADMISSIBILITY] Failed to write admissibility artifacts.", exc_info=True)
+
     # ------------------------------------------------------------------
     # Kd-based ATL reliability filter (pre-fusion)
     # ------------------------------------------------------------------
@@ -2956,6 +2968,7 @@ def main():
         )
         tc.max_depth_sdb = max_depth_sdb_product
         tc.spatial_split = False  # Production model uses stratified random split
+        tc.atl03_admissibility_summary = (atl03_audit or {}).get('admissibility') if isinstance(atl03_audit, dict) else None
 
         _train_kwargs = tc.to_kwargs()
         _train_kwargs["fallback_registry"] = fallback_registry

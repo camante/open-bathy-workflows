@@ -40,6 +40,7 @@ import logging
 import hashlib
 import pickle
 import argparse
+import json
 import textwrap
 import shlex
 from support_points import load_extra_xyz_points
@@ -828,6 +829,231 @@ def infer_bottom_from_atl03_binned(binned, ws_height_df, height_res=0.25, percen
     return pd.concat(bath_rows, ignore_index=True)
 
 
+def _atl03_segment_distance_m(lat0: float, lon0: float, lat1: float, lon1: float) -> float:
+    """Fast local distance approximation for along-track segmentation."""
+    r = 6371000.0
+    lat0r = np.radians(float(lat0))
+    lat1r = np.radians(float(lat1))
+    lon0r = np.radians(float(lon0))
+    lon1r = np.radians(float(lon1))
+    x = (lon1r - lon0r) * np.cos(0.5 * (lat0r + lat1r))
+    y = lat1r - lat0r
+    return float(r * np.sqrt((x * x) + (y * y)))
+
+
+def _segment_atl03_candidates(
+    bath_df: pd.DataFrame,
+    *,
+    max_gap_m: float = 40.0,
+) -> pd.DataFrame:
+    """Assign contiguous ATL03 retained picks to candidate segments.
+
+    Segmentation operates on the already depth/support-gated retained picks. The
+    ordering tries to preserve along-track coherence so east-west or diagonal tracks
+    are not scrambled by latitude sorting alone.
+    """
+    if not isinstance(bath_df, pd.DataFrame) or bath_df.empty:
+        return pd.DataFrame(columns=list(getattr(bath_df, 'columns', [])) + ['atl03_segment_ord', 'atl03_segment_id', 'atl03_alongtrack_m'])
+
+    df = bath_df.copy().reset_index(drop=True)
+    order = np.arange(len(df), dtype=np.int64)
+    lat = pd.to_numeric(df.get('latitude'), errors='coerce').to_numpy(dtype=np.float64)
+    lon = pd.to_numeric(df.get('longitude'), errors='coerce').to_numpy(dtype=np.float64)
+    finite_ll = np.isfinite(lat) & np.isfinite(lon)
+    if finite_ll.sum() >= 2:
+        x = lon[finite_ll].astype(np.float64) * 111320.0 * np.cos(np.deg2rad(np.nanmedian(lat[finite_ll])))
+        y = lat[finite_ll].astype(np.float64) * 111320.0
+        xy = np.column_stack([x, y])
+        xy0 = xy - np.nanmean(xy, axis=0)
+        try:
+            cov = np.cov(xy0.T)
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            axis = eigvecs[:, int(np.argmax(eigvals))]
+            proj = xy0 @ axis
+            finite_idx = np.flatnonzero(finite_ll)
+            order = finite_idx[np.argsort(proj, kind='mergesort')]
+        except (np.linalg.LinAlgError, ValueError, FloatingPointError):
+            sort_cols = [c for c in ('latitude', 'longitude', 'photon_height') if c in df.columns]
+            if sort_cols:
+                order = df.sort_values(sort_cols, kind='mergesort').index.to_numpy(dtype=np.int64)
+    else:
+        sort_cols = [c for c in ('latitude', 'longitude', 'photon_height') if c in df.columns]
+        if sort_cols:
+            order = df.sort_values(sort_cols, kind='mergesort').index.to_numpy(dtype=np.int64)
+
+    df = df.iloc[order].reset_index(drop=True)
+    seg_ord = np.zeros(len(df), dtype=np.int32)
+    alongtrack_m = np.zeros(len(df), dtype=np.float64)
+    seg_id = 0
+    seg_dist = 0.0
+    for i in range(1, len(df)):
+        d_m = _atl03_segment_distance_m(
+            df.iloc[i - 1]['latitude'],
+            df.iloc[i - 1]['longitude'],
+            df.iloc[i]['latitude'],
+            df.iloc[i]['longitude'],
+        )
+        if (not np.isfinite(d_m)) or d_m > float(max_gap_m):
+            seg_id += 1
+            seg_dist = 0.0
+        else:
+            seg_dist += float(d_m)
+        seg_ord[i] = seg_id
+        alongtrack_m[i] = seg_dist
+    df['atl03_segment_ord'] = seg_ord.astype(np.int32)
+    df['atl03_alongtrack_m'] = alongtrack_m.astype(np.float32)
+    gran = df.get('granule', pd.Series(['unknown'] * len(df), index=df.index)).astype(str)
+    beam = df.get('beam', pd.Series(['unknown'] * len(df), index=df.index)).astype(str)
+    df['atl03_segment_id'] = gran + '::' + beam + '::seg' + df['atl03_segment_ord'].astype(str)
+    return df
+
+
+def _score_atl03_segment_admissibility(
+    segments_df: pd.DataFrame,
+    *,
+    min_points: int = 3,
+    min_track_span_m: float = 15.0,
+    max_ws_height_std_m: float = 0.35,
+    max_near_floor_frac: float = 0.60,
+    min_median_frac_bottom: float = 0.05,
+    min_median_n_bottom: float = 2.0,
+    min_depth_range_m: float = 0.20,
+    shallow_floor_m: float = 0.5,
+) -> pd.DataFrame:
+    if not isinstance(segments_df, pd.DataFrame) or segments_df.empty:
+        return pd.DataFrame(columns=[
+            'atl03_segment_id', 'segment_points', 'segment_track_span_m', 'ws_height_std_m',
+            'near_floor_fraction', 'median_frac_bottom', 'median_n_bottom', 'depth_range_m',
+            'admissible', 'rejection_reason',
+        ])
+
+    rows = []
+    for seg_id, grp in segments_df.groupby('atl03_segment_id', sort=False):
+        sort_cols = ['atl03_alongtrack_m'] if 'atl03_alongtrack_m' in grp.columns else [c for c in ('latitude', 'longitude') if c in grp.columns]
+        g = grp.sort_values(sort_cols, kind='mergesort').reset_index(drop=True)
+        if 'atl03_alongtrack_m' in g.columns:
+            span_m = float(np.nanmax(pd.to_numeric(g['atl03_alongtrack_m'], errors='coerce').to_numpy(dtype=np.float64))) if len(g) else 0.0
+        else:
+            span_m = 0.0
+            for i in range(1, len(g)):
+                span_m += _atl03_segment_distance_m(
+                    g.iloc[i - 1]['latitude'], g.iloc[i - 1]['longitude'],
+                    g.iloc[i]['latitude'], g.iloc[i]['longitude'],
+                )
+        depth_abs = np.abs(pd.to_numeric(g.get('depth_m'), errors='coerce').to_numpy(dtype=np.float64))
+        depth_abs = depth_abs[np.isfinite(depth_abs)]
+        ws_vals = pd.to_numeric(g.get('ws_h'), errors='coerce').to_numpy(dtype=np.float64)
+        ws_vals = ws_vals[np.isfinite(ws_vals)]
+        frac_bottom = pd.to_numeric(g.get('frac_bottom'), errors='coerce').to_numpy(dtype=np.float64)
+        frac_bottom = frac_bottom[np.isfinite(frac_bottom)]
+        n_bottom = pd.to_numeric(g.get('n_bottom'), errors='coerce').to_numpy(dtype=np.float64)
+        n_bottom = n_bottom[np.isfinite(n_bottom)]
+        near_floor_fraction = float(np.mean(np.abs(depth_abs - float(shallow_floor_m)) <= 0.20)) if depth_abs.size else 1.0
+        depth_range_m = float(np.nanmax(depth_abs) - np.nanmin(depth_abs)) if depth_abs.size else 0.0
+        depth_p10_m = float(np.nanpercentile(depth_abs, 10.0)) if depth_abs.size else 0.0
+        depth_p90_m = float(np.nanpercentile(depth_abs, 90.0)) if depth_abs.size else 0.0
+        ws_std_m = float(np.nanstd(ws_vals)) if ws_vals.size else np.inf
+        med_frac_bottom = float(np.nanmedian(frac_bottom)) if frac_bottom.size else 0.0
+        med_n_bottom = float(np.nanmedian(n_bottom)) if n_bottom.size else 0.0
+        lon_center = float(np.nanmedian(pd.to_numeric(g.get('longitude'), errors='coerce').to_numpy(dtype=np.float64))) if 'longitude' in g.columns else np.nan
+        lat_center = float(np.nanmedian(pd.to_numeric(g.get('latitude'), errors='coerce').to_numpy(dtype=np.float64))) if 'latitude' in g.columns else np.nan
+
+        reasons = []
+        if int(len(g)) < int(min_points):
+            reasons.append('too_few_points')
+        if span_m < float(min_track_span_m):
+            reasons.append('short_track_span')
+        if not np.isfinite(ws_std_m) or ws_std_m > float(max_ws_height_std_m):
+            reasons.append('unstable_water_surface')
+        if near_floor_fraction > float(max_near_floor_frac):
+            reasons.append('shallow_floor_cluster')
+        if med_frac_bottom < float(min_median_frac_bottom):
+            reasons.append('weak_bottom_fraction')
+        if med_n_bottom < float(min_median_n_bottom):
+            reasons.append('weak_bottom_support')
+        if depth_range_m < float(min_depth_range_m):
+            reasons.append('low_depth_variability')
+
+        rows.append({
+            'atl03_segment_id': str(seg_id),
+            'segment_points': int(len(g)),
+            'segment_track_span_m': float(span_m),
+            'ws_height_std_m': None if not np.isfinite(ws_std_m) else float(ws_std_m),
+            'near_floor_fraction': float(near_floor_fraction),
+            'median_frac_bottom': float(med_frac_bottom),
+            'median_n_bottom': float(med_n_bottom),
+            'depth_range_m': float(depth_range_m),
+            'depth_p10_m': float(depth_p10_m),
+            'depth_p90_m': float(depth_p90_m),
+            'longitude': None if not np.isfinite(lon_center) else float(lon_center),
+            'latitude': None if not np.isfinite(lat_center) else float(lat_center),
+            'admissible': bool(len(reasons) == 0),
+            'rejection_reason': 'accepted' if len(reasons) == 0 else ';'.join(reasons),
+            'primary_rejection_reason': 'accepted' if len(reasons) == 0 else reasons[0],
+        })
+    return pd.DataFrame(rows)
+
+
+def _filter_atl03_segments_by_admissibility(
+    bath_df: pd.DataFrame,
+    *,
+    shallow_floor_m: float,
+    segment_gap_m: float = 40.0,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    seg_df = _segment_atl03_candidates(bath_df, max_gap_m=segment_gap_m)
+    summary = _score_atl03_segment_admissibility(seg_df, shallow_floor_m=shallow_floor_m)
+    if seg_df.empty or summary.empty:
+        return seg_df, summary
+    keep_ids = set(summary.loc[summary['admissible'].astype(bool), 'atl03_segment_id'].astype(str).tolist())
+    out = seg_df.loc[seg_df['atl03_segment_id'].astype(str).isin(keep_ids)].copy()
+    out['atl03_segment_admissible'] = True
+    return out, summary
+
+
+def _build_atl03_admissibility_audit(summary: pd.DataFrame) -> Dict[str, Any]:
+    if not isinstance(summary, pd.DataFrame) or summary.empty:
+        return {
+            'candidate_segments': 0,
+            'admissible_segments': 0,
+            'rejected_segments': 0,
+            'candidate_points': 0,
+            'retained_points': 0,
+            'rejected_points': 0,
+            'retained_fraction': 0.0,
+            'rejection_reason_counts': {},
+            'primary_rejection_reason_counts': {},
+            'median_track_span_m': None,
+            'median_depth_range_m': None,
+        }
+    reason_counts: Dict[str, int] = {}
+    primary_reason_counts: Dict[str, int] = {}
+    rejected = summary.loc[~summary['admissible'].astype(bool)].copy()
+    for raw in rejected['rejection_reason'].astype(str):
+        for reason in [r for r in raw.split(';') if r and r != 'accepted']:
+            reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+    for reason in rejected.get('primary_rejection_reason', pd.Series(dtype=str)).astype(str):
+        if reason and reason != 'accepted':
+            primary_reason_counts[reason] = int(primary_reason_counts.get(reason, 0)) + 1
+    candidate_points = int(pd.to_numeric(summary.get('segment_points'), errors='coerce').fillna(0).sum())
+    retained_points = int(pd.to_numeric(summary.loc[summary['admissible'].astype(bool), 'segment_points'], errors='coerce').fillna(0).sum())
+    retained_fraction = float(retained_points / candidate_points) if candidate_points > 0 else 0.0
+    span = pd.to_numeric(summary.get('segment_track_span_m'), errors='coerce')
+    depth_range = pd.to_numeric(summary.get('depth_range_m'), errors='coerce')
+    return {
+        'candidate_segments': int(len(summary)),
+        'admissible_segments': int(summary['admissible'].astype(bool).sum()),
+        'rejected_segments': int((~summary['admissible'].astype(bool)).sum()),
+        'candidate_points': candidate_points,
+        'retained_points': retained_points,
+        'rejected_points': int(candidate_points - retained_points),
+        'retained_fraction': retained_fraction,
+        'rejection_reason_counts': dict(sorted(reason_counts.items())),
+        'primary_rejection_reason_counts': dict(sorted(primary_reason_counts.items())),
+        'median_track_span_m': None if span.dropna().empty else float(np.nanmedian(span.to_numpy(dtype=np.float64))),
+        'median_depth_range_m': None if depth_range.dropna().empty else float(np.nanmedian(depth_range.to_numpy(dtype=np.float64))),
+    }
+
+
 # -----------------------------------------------------------------------------
 # ATL24 Helper
 # -----------------------------------------------------------------------------
@@ -1170,6 +1396,40 @@ def summarize_atl_raw_to_retained_audit(
     return summary, rows
 
 
+def write_atl03_admissibility_artifacts(
+    *,
+    audit: Optional[Dict[str, Any]],
+    out_dir: str | Path,
+    logger: Optional[logging.Logger] = None,
+) -> Dict[str, Optional[str]]:
+    active_log = logger or log
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    payload = audit if isinstance(audit, dict) else {}
+    summary_df = pd.DataFrame(payload.get('admissibility_summary_rows') or [])
+    outputs: Dict[str, Optional[str]] = {'csv': None, 'json': None, 'gpkg': None}
+    if summary_df.empty:
+        return outputs
+    csv_path = out_dir / 'atl03_admissibility_segments.csv'
+    json_path = out_dir / 'atl03_admissibility_summary.json'
+    summary_df.to_csv(csv_path, index=False)
+    json_path.write_text(json.dumps(payload.get('admissibility') or {}, indent=2), encoding='utf-8')
+    outputs['csv'] = str(csv_path)
+    outputs['json'] = str(json_path)
+    try:
+        if {'longitude', 'latitude'}.issubset(summary_df.columns):
+            import geopandas as gpd  # type: ignore
+            from shapely.geometry import Point  # type: ignore
+            gdf = gpd.GeoDataFrame(summary_df.copy(), geometry=[Point(xy) for xy in zip(summary_df['longitude'], summary_df['latitude'])], crs='EPSG:4326')
+            gpkg_path = out_dir / 'atl03_admissibility_segments.gpkg'
+            gdf.to_file(gpkg_path, driver='GPKG')
+            outputs['gpkg'] = str(gpkg_path)
+    except Exception:
+        active_log.debug('Failed to write ATL03 admissibility GeoPackage.', exc_info=True)
+    active_log.info('[ATL03][ADMISSIBILITY] Wrote segment admissibility artifacts: %s', outputs)
+    return outputs
+
+
 def summarize_atl_training_quality(df_atl03: pd.DataFrame, df_atl24: pd.DataFrame, min_depth_floor_m: float = 0.5, colloc_dist_m: float = 20.0):
     df03 = df_atl03.copy() if isinstance(df_atl03, pd.DataFrame) else pd.DataFrame()
     df24 = df_atl24.copy() if isinstance(df_atl24, pd.DataFrame) else pd.DataFrame()
@@ -1293,6 +1553,10 @@ def collect_training_points_from_atl03(
     bottom_candidates = 0
     depth_gate_kept = 0
     support_gate_kept = 0
+    admissible_candidate_segments = 0
+    admissible_segments_kept = 0
+    admissibility_rejected_points = 0
+    admissibility_rows: List[Dict[str, Any]] = []
 
 
     # ---------------------------------------------------------------------
@@ -1421,7 +1685,24 @@ def collect_training_points_from_atl03(
 
                 bath_df["granule"] = Path(atl03_path).stem; bath_df["beam"] = f"gt{laser_num}"; bath_df["source"] = "atl03"
 
-                all_rows.append(bath_df[["longitude", "latitude", "depth_m", "ws_h", "photon_height", "n_bottom", "n_subsurface", "frac_bottom", "granule", "beam", "source"]])
+                bath_df, seg_summary = _filter_atl03_segments_by_admissibility(
+                    bath_df,
+                    shallow_floor_m=float(min_depth_m),
+                )
+                if isinstance(seg_summary, pd.DataFrame) and not seg_summary.empty:
+                    admissible_candidate_segments += int(len(seg_summary))
+                    admissible_segments_kept += int(seg_summary["admissible"].astype(bool).sum())
+                    kept_ids = set(bath_df.get("atl03_segment_id", pd.Series(dtype=str)).astype(str).tolist())
+                    seg_summary = seg_summary.copy()
+                    seg_summary["granule"] = Path(atl03_path).stem
+                    seg_summary["beam"] = f"gt{laser_num}"
+                    seg_summary["retained_points"] = seg_summary["segment_points"].where(seg_summary["admissible"].astype(bool), 0).astype(int)
+                    seg_summary["rejected_points"] = (seg_summary["segment_points"] - seg_summary["retained_points"]).astype(int)
+                    admissibility_rows.extend(seg_summary.to_dict(orient="records"))
+                    admissibility_rejected_points += int(pd.to_numeric(seg_summary.get("rejected_points"), errors="coerce").fillna(0).sum())
+
+                if not bath_df.empty:
+                    all_rows.append(bath_df[["longitude", "latitude", "depth_m", "ws_h", "photon_height", "n_bottom", "n_subsurface", "frac_bottom", "granule", "beam", "source", "atl03_segment_id", "atl03_segment_admissible"]])
 
         except Exception as exc:
             audit["parse_failures"].append({"file": str(Path(atl03_path).name), "error": str(exc)})
@@ -1435,7 +1716,11 @@ def collect_training_points_from_atl03(
         {"stage": "bottom_candidates", "rows": int(bottom_candidates), "detail": "candidate ATL03 bottom picks before depth limits"},
         {"stage": "after_depth_gate", "rows": int(depth_gate_kept), "detail": "bottom picks within configured ATL03 depth range"},
         {"stage": "after_support_gate", "rows": int(support_gate_kept), "detail": "bottom picks meeting min_bottom_photons and min_bottom_frac"},
+        {"stage": "candidate_segments", "rows": int(admissible_candidate_segments), "detail": "ATL03 retained-point segments considered for admissibility"},
+        {"stage": "admissible_segments", "rows": int(admissible_segments_kept), "detail": "ATL03 segments that passed continuity/support admissibility"},
     ])
+    audit["admissibility_summary_rows"] = admissibility_rows
+    audit["admissibility"] = _build_atl03_admissibility_audit(pd.DataFrame(admissibility_rows))
 
     # If we have no valid rows, still write an empty cache entry.
     # This avoids repeated expensive parsing work across identical runs.
@@ -1485,6 +1770,9 @@ def collect_training_points_from_atl03(
 
     out = out.reset_index(drop=True)
     audit["retained_points"] = int(len(out))
+    if isinstance(audit.get("admissibility"), dict):
+        audit["admissibility"]["retained_points"] = int(len(out))
+        audit["admissibility"]["rejected_points"] = int(admissibility_rejected_points)
     return (out, audit) if return_audit else out
 
 

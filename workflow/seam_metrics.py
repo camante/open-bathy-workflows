@@ -332,3 +332,49 @@ def compute_mask_boundary_seam_metrics(
         "boundary_mode": boundary_mode,
         "mask_threshold": float(mask_threshold),
     }
+
+
+
+def compute_array_overlap_identity_metrics(a: np.ndarray, b: np.ndarray, *, nodata: Optional[float] = None) -> Dict[str, Any]:
+    """Compute identity stats over common valid pixels for same-grid overlap checks."""
+    arr_a = np.asarray(a, dtype='float64')
+    arr_b = np.asarray(b, dtype='float64')
+    ny = min(arr_a.shape[0], arr_b.shape[0])
+    nx = min(arr_a.shape[1], arr_b.shape[1])
+    arr_a = arr_a[:ny, :nx]
+    arr_b = arr_b[:ny, :nx]
+    valid = np.isfinite(arr_a) & np.isfinite(arr_b)
+    if nodata is not None:
+        valid &= (arr_a != nodata) & (arr_b != nodata)
+    n_valid = int(valid.sum())
+    if n_valid <= 0:
+        return {'status': 'no_valid', 'n_valid': 0}
+    dv = (arr_a - arr_b)[valid]
+    absdv = np.abs(dv)
+    exact = int(np.count_nonzero(absdv == 0.0))
+    return {
+        'status': 'ok',
+        'n_valid': n_valid,
+        'mean_abs': float(absdv.mean()),
+        'rmse': float(np.sqrt((dv * dv).mean())),
+        'max_abs': float(absdv.max()),
+        'p95_abs': float(np.quantile(absdv, 0.95)),
+        'exact_identity_fraction': float(exact / max(n_valid, 1)),
+    }
+
+
+def compute_raster_overlap_identity_metrics(raster_a: str | Path, raster_b: str | Path) -> Dict[str, Any]:
+    import rasterio
+    ra = Path(raster_a)
+    rb = Path(raster_b)
+    if not ra.exists() or not rb.exists():
+        raise FileNotFoundError(f'missing overlap raster(s): {ra}, {rb}')
+    with rasterio.open(ra) as da, rasterio.open(rb) as db:
+        if da.crs != db.crs or da.transform != db.transform or da.width != db.width or da.height != db.height:
+            return {'status': 'not_aligned', 'raster_a': str(ra), 'raster_b': str(rb)}
+        a = da.read(1)
+        b = db.read(1)
+        nd = da.nodata if da.nodata is not None else db.nodata
+        out = compute_array_overlap_identity_metrics(a, b, nodata=nd)
+        out.update({'raster_a': str(ra), 'raster_b': str(rb)})
+        return out

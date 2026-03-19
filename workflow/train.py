@@ -1931,6 +1931,44 @@ def _try_reuse_model_bank(
     return rf_reuse, lr_reuse, pd.DataFrame(), pd.DataFrame(), metadata
 
 
+def _rebuild_training_fit_arrays(df_tr_fit: pd.DataFrame, feat_cols: list[str]) -> tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    X_train = df_tr_fit[feat_cols].to_numpy(dtype=np.float32, copy=True)
+    y_train_raw = pd.to_numeric(df_tr_fit["depth_m"], errors="coerce").to_numpy(dtype=np.float32)
+    w_train = None
+    if "sample_weight" in df_tr_fit.columns:
+        w_train = pd.to_numeric(df_tr_fit["sample_weight"], errors="coerce").to_numpy(dtype=np.float32)
+    return X_train, y_train_raw, w_train
+
+
+def _validate_training_fit_arrays(
+    *,
+    X_train: np.ndarray,
+    y_train_raw: np.ndarray,
+    w_train: Optional[np.ndarray],
+    feat_cols: list[str],
+    df_tr_fit: pd.DataFrame,
+) -> None:
+    if not isinstance(X_train, np.ndarray) or X_train.ndim != 2:
+        raise ValueError(f"Training design matrix must be 2D; got shape {getattr(X_train, 'shape', None)}")
+    if X_train.shape[1] != len(feat_cols):
+        raise ValueError(f"Training design matrix column mismatch: got {X_train.shape[1]} columns for {len(feat_cols)} features")
+    if X_train.shape[0] != len(df_tr_fit):
+        raise ValueError(f"Training design matrix row mismatch: {X_train.shape[0]} vs dataframe {len(df_tr_fit)}")
+    if y_train_raw.ndim != 1 or y_train_raw.shape[0] != X_train.shape[0]:
+        raise ValueError(f"Training target length mismatch: {y_train_raw.shape} vs {X_train.shape}")
+    if not np.isfinite(X_train).all():
+        raise ValueError("Training design matrix contains non-finite values after final QC/rebalancing")
+    if not np.isfinite(y_train_raw).any():
+        raise ValueError("Training target contains no finite values after final QC/rebalancing")
+    if w_train is not None:
+        if w_train.ndim != 1 or w_train.shape[0] != X_train.shape[0]:
+            raise ValueError(f"Training sample-weight length mismatch: {w_train.shape} vs {X_train.shape}")
+        if not np.isfinite(w_train).all():
+            raise ValueError("Training sample weights contain non-finite values after final QC/rebalancing")
+        if np.any(w_train < 0):
+            raise ValueError("Training sample weights contain negative values after final QC/rebalancing")
+
+
 def train_sdb_model(
     train_df: pd.DataFrame,
     max_depth_sdb: float,
@@ -1970,6 +2008,7 @@ def train_sdb_model(
     model_bank_seed: int = 1337,
     model_bank_retrain_min_new: int = 2000,
     model_bank_context: Optional[Dict[str, Any]] = None,
+    atl03_admissibility_summary: Optional[Dict[str, Any]] = None,
     fallback_registry: Optional[Any] = None,
 ) -> Tuple[RandomForestRegressor, Optional[LinearRegression], pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
 
@@ -2416,6 +2455,9 @@ def train_sdb_model(
     metadata["min_samples_per_bin"] = int(min_samples_per_bin)
     metadata["max_depth_sdb_auto"] = None
     metadata["max_depth_sdb_auto_diagnostics"] = {}
+    metadata["atl03_segment_gate_applied"] = bool(atl03_admissibility_summary is not None)
+    if atl03_admissibility_summary:
+        metadata["atl03_admissibility"] = _to_python_float(dict(atl03_admissibility_summary))
     if model_bank_context:
         metadata["model_bank_partition"] = _to_python_float(dict(model_bank_context))
 
@@ -3097,14 +3139,14 @@ def train_sdb_model(
         log.warning("Dropping missing feature columns: %s", missing)
         feat_cols = [c for c in feat_cols if c not in missing]
 
-    X_train = df_tr_fit[feat_cols].to_numpy()
-    y_train_raw = df_tr_fit["depth_m"].to_numpy()
-    w_train = df_tr_fit["sample_weight"].to_numpy() if "sample_weight" in df_tr_fit.columns else None
-
-    # Refresh arrays after any optional rebalancing / QC changes to df_tr_fit
-    X_train = df_tr_fit[feat_cols].to_numpy()
-    y_train_raw = df_tr_fit["depth_m"].to_numpy()
-    w_train = df_tr_fit["sample_weight"].to_numpy() if "sample_weight" in df_tr_fit.columns else None
+    X_train, y_train_raw, w_train = _rebuild_training_fit_arrays(df_tr_fit, feat_cols)
+    _validate_training_fit_arrays(
+        X_train=X_train,
+        y_train_raw=y_train_raw,
+        w_train=w_train,
+        feat_cols=feat_cols,
+        df_tr_fit=df_tr_fit,
+    )
 
     depths_finite = y_train_raw[np.isfinite(y_train_raw)]
     
@@ -3196,125 +3238,63 @@ def train_sdb_model(
                         "Expect weak generalization / source-specific bias.",
                         dom_src, dom_frac * 100, dom_n, total_n,
                     )
-                # Conservative deterministic cap: only trim if one source dominates AND others exist,
-                # *and* doing so will not catastrophically collapse the training set.  In dense
-                # authoritative-support mode we prefer keeping a large, source-dominated but physically
-                # grounded fit set over shrinking the sample to a tiny mixed subset that no longer reflects
-                # the survey-controlled optics regime.
-                max_dom_frac = 0.70
-                if dom_frac > 0.90 and total_n >= 1000:
-                    allowed_dom = int(max(100, (max_dom_frac / max(1e-9, 1.0 - max_dom_frac)) * (total_n - dom_n)))
-                    other_n = int(total_n - dom_n)
-                    rebalance_total = int(other_n + min(dom_n, allowed_dom))
-                    collapse_ratio = rebalance_total / float(max(1, total_n))
-                    minority_pool_too_small = other_n < max(50, int(np.ceil(0.10 * total_n)))
-                    catastrophic_collapse = rebalance_total < 1000 or collapse_ratio < 0.50
-                    if allowed_dom < dom_n and not minority_pool_too_small and not catastrophic_collapse:
+                # Conservative deterministic cap: only trim if one source dominates AND there is a
+                # substantial pool of non-dominant support. This avoids collapsing a dense
+                # authoritative fit set down to an unrealistically tiny mixed subset.
+                max_dom_frac = 0.85
+                other_n = int(total_n - dom_n)
+                if dom_frac > 0.95 and total_n >= 5000 and other_n >= 1000:
+                    allowed_dom = int(np.floor((max_dom_frac / max(1e-9, 1.0 - max_dom_frac)) * other_n))
+                    allowed_dom = int(max(min(dom_n, allowed_dom), 1000))
+                    if allowed_dom < dom_n:
                         dom_idx = df_tr_fit.index[df_tr_fit[source_col] == dom_src].to_numpy()
                         keep_dom = np.random.default_rng(int(seed)).choice(dom_idx, size=allowed_dom, replace=False)
                         keep_other = df_tr_fit.index[df_tr_fit[source_col] != dom_src].to_numpy()
                         keep_idx = np.concatenate([keep_other, keep_dom])
                         df_tr_fit = df_tr_fit.loc[keep_idx].copy()
+                        X_train, y_train_raw, w_train = _rebuild_training_fit_arrays(df_tr_fit, feat_cols)
+                        _validate_training_fit_arrays(
+                            X_train=X_train,
+                            y_train_raw=y_train_raw,
+                            w_train=w_train,
+                            feat_cols=feat_cols,
+                            df_tr_fit=df_tr_fit,
+                        )
                         log.warning(
-                            "Rebalanced dominant source '%s' to reduce count domination: "
-                            "%d -> %d rows (dominant kept=%d).",
-                            dom_src, total_n, len(df_tr_fit), allowed_dom,
+                            "Rebalanced dominant source '%s' conservatively: %d -> %d rows "
+                            "(dominant kept=%d, other=%d, target max frac=%.2f).",
+                            dom_src, total_n, len(df_tr_fit), allowed_dom, other_n, max_dom_frac,
                         )
                         metadata['training_qc']['dominant_source_rebalanced'] = True
                         metadata['training_qc']['dominant_source_rebalanced_target_frac'] = float(max_dom_frac)
-                    elif allowed_dom < dom_n:
-                        log.warning(
-                            "Skipped dominant-source row rebalance for '%s' to avoid collapsing the fit set "
-                            "(total=%d, dominant=%d, minority=%d, proposed_total=%d, collapse_ratio=%.3f, minority_pool_too_small=%s).",
-                            dom_src,
-                            total_n,
-                            dom_n,
-                            other_n,
-                            rebalance_total,
-                            collapse_ratio,
-                            minority_pool_too_small,
-                        )
-                        metadata['training_qc']['dominant_source_rebalanced'] = False
-                        metadata['training_qc']['dominant_source_rebalance_skipped'] = True
-                        metadata['training_qc']['dominant_source_rebalance_skip_reason'] = 'catastrophic_collapse_or_tiny_minority_pool'
+                        metadata['training_qc']['dominant_source_rebalanced_other_n'] = int(other_n)
         except (TypeError, ValueError, KeyError, RuntimeError) as _ex:
             log.error("Dominance guardrail failed: %s", _ex, exc_info=True)
 
-    # Refresh arrays after all training-row QC / source-balance adjustments.
-    if not feat_cols:
-        raise ValueError("No training feature columns remain after QC and schema checks")
-    X_train = df_tr_fit.loc[:, feat_cols].to_numpy(dtype=np.float32, copy=True)
-    y_train_raw = pd.to_numeric(df_tr_fit["depth_m"], errors="coerce").to_numpy(dtype=np.float32)
-    w_train = (
-        pd.to_numeric(df_tr_fit["sample_weight"], errors="coerce").to_numpy(dtype=np.float32)
-        if "sample_weight" in df_tr_fit.columns
-        else None
-    )
-
-    if X_train.ndim != 2:
-        raise ValueError(f"Training design matrix must be 2D; got shape={getattr(X_train, 'shape', None)}")
-    if X_train.shape[0] != len(df_tr_fit):
-        raise ValueError(
-            f"Training design matrix row mismatch after QC: X_rows={X_train.shape[0]} df_rows={len(df_tr_fit)}"
-        )
-    if X_train.shape[1] != len(feat_cols):
-        raise ValueError(
-            f"Training design matrix column mismatch after QC: X_cols={X_train.shape[1]} feat_cols={len(feat_cols)}"
-        )
-    if not np.isfinite(X_train).all():
-        bad = int(np.size(X_train) - np.isfinite(X_train).sum())
-        raise ValueError(f"Training design matrix contains {bad} non-finite feature values after QC")
-    if not np.isfinite(y_train_raw).all():
-        bad = int(y_train_raw.size - np.isfinite(y_train_raw).sum())
-        raise ValueError(f"Training target contains {bad} non-finite depth values after QC")
-    if w_train is not None:
-        if w_train.ndim != 1 or w_train.shape[0] != len(df_tr_fit):
-            raise ValueError(
-                f"Sample-weight vector mismatch after QC: shape={getattr(w_train, 'shape', None)} df_rows={len(df_tr_fit)}"
-            )
-        if not np.isfinite(w_train).all():
-            bad = int(w_train.size - np.isfinite(w_train).sum())
-            raise ValueError(f"Sample-weight vector contains {bad} non-finite values after QC")
-
-    if metadata.get("prediction_mode") == "direct_depth":
-        y_train = np.abs(y_train_raw).astype(np.float32)
-        metadata["residual_target_stats"] = {
-            "min": float(np.nanmin(y_train)),
-            "max": float(np.nanmax(y_train)),
-            "p05": float(np.nanpercentile(y_train, 5)),
-            "p95": float(np.nanpercentile(y_train, 95)),
-        }
-        log.info(
-            "Final direct-depth target after QC: n=%d range=[%.2f, %.2f] m",
-            len(y_train),
-            float(np.nanmin(y_train)),
-            float(np.nanmax(y_train)),
-        )
+    # Recompute the final target arrays after any last-minute dominance rebalance so
+    # the RF fit arrays and target semantics stay synchronized.
+    depths_finite = y_train_raw[np.isfinite(y_train_raw)]
+    if len(depths_finite) == 0:
+        raise ValueError("No finite depth values remain after final training QC/rebalancing")
+    y_train_mag = np.abs(y_train_raw)
+    if _anchor_good:
+        y_train = y_train_mag.astype(np.float32)
+        metadata["prediction_mode"] = "direct_depth"
+        metadata["residual_clip_m"] = 0.0
     else:
         if "stumpf_depth" not in df_tr_fit.columns:
-            raise ValueError("Missing stumpf_depth feature after final QC for residual training")
-        residual_clip_m = float(metadata.get("residual_clip_m", guidance_settings.get("residual_clip_m", 0.5)))
-        stumpf_base_train = np.maximum(
-            pd.to_numeric(df_tr_fit["stumpf_depth"], errors="coerce").to_numpy(dtype=np.float32),
-            0.0,
-        )
-        if not np.isfinite(stumpf_base_train).all():
-            bad = int(stumpf_base_train.size - np.isfinite(stumpf_base_train).sum())
-            raise ValueError(f"Stumpf baseline contains {bad} non-finite values after QC")
-        y_train = np.clip(np.abs(y_train_raw) - stumpf_base_train, -residual_clip_m, residual_clip_m).astype(np.float32)
-        metadata["residual_target_stats"] = {
-            "min": float(np.nanmin(y_train)),
-            "max": float(np.nanmax(y_train)),
-            "p05": float(np.nanpercentile(y_train, 5)),
-            "p95": float(np.nanpercentile(y_train, 95)),
-        }
-        log.info(
-            "Final residual target after QC: n=%d residual_range=[%.2f, %.2f] m (clip=±%.2f)",
-            len(y_train),
-            float(np.nanmin(y_train)),
-            float(np.nanmax(y_train)),
-            residual_clip_m,
-        )
+            raise ValueError("Missing stumpf_depth feature for physics-guided residual training")
+        stumpf_base_train = np.maximum(pd.to_numeric(df_tr_fit["stumpf_depth"], errors="coerce").to_numpy(dtype=np.float32), 0.0)
+        residual_clip_m = float(guidance_settings.get("residual_clip_m", 0.5))
+        y_train = np.clip(y_train_mag - stumpf_base_train, -residual_clip_m, residual_clip_m).astype(np.float32)
+        metadata["prediction_mode"] = "stumpf_residual"
+        metadata["residual_clip_m"] = residual_clip_m
+    metadata["residual_target_stats"] = {
+        "min": float(np.nanmin(y_train)),
+        "max": float(np.nanmax(y_train)),
+        "p05": float(np.nanpercentile(y_train, 5)),
+        "p95": float(np.nanpercentile(y_train, 95)),
+    }
 
     # Log training data composition by source (single pass)
     if 'source' in df_tr_fit.columns or 'source_norm' in df_tr_fit.columns:
@@ -3342,6 +3322,19 @@ def train_sdb_model(
         except Exception as _exc:
             log.debug("Suppressed: %s", _exc, exc_info=True)
 
+    _validate_training_fit_arrays(
+        X_train=X_train,
+        y_train_raw=y_train_raw,
+        w_train=w_train,
+        feat_cols=feat_cols,
+        df_tr_fit=df_tr_fit,
+    )
+    metadata.setdefault('training_qc', {})
+    metadata['training_qc']['final_fit_rows'] = int(X_train.shape[0])
+    metadata['training_qc']['final_fit_features'] = int(X_train.shape[1])
+    metadata['training_qc']['final_fit_has_weights'] = bool(w_train is not None)
+    if y_train.ndim != 1 or y_train.shape[0] != X_train.shape[0] or (not np.isfinite(y_train).all()):
+        raise ValueError(f"Final training target array is invalid for RF fit: shape={getattr(y_train, 'shape', None)} rows={X_train.shape[0]}")
     rf.fit(X_train, y_train, sample_weight=w_train)
     log.info("RF trained on %s samples. (Test set: %s)", len(df_tr_fit), len(df_te))
 
