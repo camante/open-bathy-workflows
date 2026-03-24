@@ -36,8 +36,10 @@ import traceback
 import importlib.util
 import inspect
 import shutil
+from types import SimpleNamespace
 from vdatum_utils import convert_sdb_msl_to_navd88
 from process_utils import run_cmd
+from guidance_domains import ensure_guidance_domains, make_guidance_domain_cfg
 import hashlib
 from pathlib import Path
 from datetime import datetime, timezone
@@ -355,14 +357,15 @@ def apply_sdb_metadata(
     """Apply vertical datum metadata tags to an SDB raster."""
     try:
         tags = {
-            "VALUE_TYPE": "bed_elevation",
+            "VALUE_TYPE": "elevation",
+            "ELEVATION_ROLE": "bed_elevation",
             "UNITS": "m",
             "VERTICAL_DATUM": vertical_datum,
             "VERTICAL_DATUM_EPSG": str(vertical_datum_epsg),
-            "SIGN_CONVENTION": "negative_below_datum",
+            "SIGN_CONVENTION": "relative_to_datum",
             "NOTE": (
                 f"SDB-derived seabed elevation relative to {vertical_datum}. "
-                "Negative values = below datum zero. "
+                "Values may be negative or positive depending on the local bed height relative to the vertical datum. "
                 "Derived from Sentinel-2 imagery trained on ICESat-2."
             ),
         }
@@ -541,22 +544,25 @@ def generate_coastline_mask(target_raster_path, aoi, cache_masks, out_mask_tif, 
     cudem_cache_dir.mkdir(exist_ok=True)
     cache_masks.mkdir(parents=True, exist_ok=True)
 
+    # SDB source coastline masks must not request NHD/rivers from WAFFLES.
+    # River/NHD water is handled separately in the canonical river-side masks.
     if sdb_mode == "lakes":
         want_nhd = False
         want_lakes = True
     elif sdb_mode == "ocean":
-        want_nhd = True
+        want_nhd = False
         want_lakes = False
     else:
-        want_nhd = True
+        # all_sdb / mixed modes: include lakes, but never NHD rivers.
+        want_nhd = False
         want_lakes = True
 
     params = f"want_nhd={str(want_nhd).lower()}:want_lakes={str(want_lakes).lower()}"
     chash = hashlib.sha1(
-        f"{aoi_buf}|{WAFFLES_INC_ARCSEC:.9f}|{params}".encode()
+        f"v2|{aoi_buf}|{WAFFLES_INC_ARCSEC:.9f}|{params}".encode()
     ).hexdigest()[:12]
 
-    base_prefix = cache_masks / f"waffles_coastline_{chash}"
+    base_prefix = cache_masks / f"waffles_coastline_sdb_source_v2_{chash}"
     base_tif = base_prefix.with_suffix(".tif")
 
     # 3. Run Waffles if Raw TIF missing
@@ -1472,6 +1478,7 @@ def _run_sdb_post_processing(
                     try:
                         nb_pred = nb.get("outputs", {}).get("sdb_prediction", {}).get("path", None)
                     except Exception:
+                        log.debug("sdb_main: suppressed exception", exc_info=True)
                         nb_pred = None
                     # No fallback filename guessing for neighbor outputs.
                     # Neighbor must explicitly record its prediction path in run_report.json.
@@ -1615,6 +1622,17 @@ def _write_sdb_manifest(
         raster_quickstats = raster_quickstats or ctx.raster_quickstats
     else:
         args = ctx_or_args
+        fallback_registry = None
+
+    out_tif_navd88 = None
+    if out_tif is not None:
+        try:
+            out_path_for_navd = Path(out_tif)
+            candidate_navd88 = out_path_for_navd.with_name(f"{out_path_for_navd.stem}_bed_navd88{out_path_for_navd.suffix}")
+            if candidate_navd88.exists():
+                out_tif_navd88 = candidate_navd88
+        except (TypeError, ValueError, OSError):
+            out_tif_navd88 = None
     # -------------------------------------------------------------------------
     # Artifact manifest paths are derived from run_id, not guessed
     # -------------------------------------------------------------------------
@@ -1724,6 +1742,18 @@ def _write_sdb_manifest(
                 rr.add_dict("scientific_fallbacks", fallback_registry.summary())
 
             rr.write(status="ok")
+            try:
+                from contracts_sign_semantics_runtime import run_sdb_sign_semantics_runtime_contracts
+                semantic_report = {"outputs": {}}
+                if out_tif is not None:
+                    semantic_report["outputs"]["final_depth_native"] = str(out_tif)
+                if out_tif_navd88 is not None and Path(out_tif_navd88).exists():
+                    semantic_report["outputs"]["sdb_navd88_native"] = str(out_tif_navd88)
+                semantic_suite = run_sdb_sign_semantics_runtime_contracts(args, contracts_dir=out_root / "contracts", report=semantic_report)
+                if rr is not None:
+                    rr.add_dict("contracts.sign_semantics_sdb", semantic_suite.get("summary", {}))
+            except Exception as _sem_exc:
+                log.warning("[CONTRACT][SIGN_SEMANTICS][SDB] Runtime semantic contract evaluation failed: %s", _sem_exc, exc_info=True)
             log.info("SDB pipeline done")
     except (OSError, ValueError, TypeError, KeyError) as _exc:
         log.debug("Suppressed: %s", _exc, exc_info=True)
@@ -1973,6 +2003,7 @@ def _filter_extra_xyz_for_sdb(df_xyz_local, args, ctx=None):
             vc = _df["source"].astype(str).str.lower().value_counts(dropna=False)
             return {str(k): int(v) for k, v in vc.to_dict().items()}
         except Exception:
+            log.debug("_src_counts: suppressed exception", exc_info=True)
             return {}
 
     try:
@@ -2314,6 +2345,7 @@ def main():
                                 if len(_z) > 0:
                                     _all_depths.append(_z)
                         except Exception:
+                            log.debug("sdb_main: suppressed exception", exc_info=True)
                             try:
                                 _dat = _np_ad.genfromtxt(str(_xp), dtype="float64", delimiter=",", max_rows=500000)
                                 if _dat.ndim == 1:
@@ -2324,6 +2356,7 @@ def main():
                                     if len(_z) > 0:
                                         _all_depths.append(_z)
                             except Exception:
+                                log.debug("sdb_main: suppressed exception", exc_info=True)
                                 continue
                     if _all_depths:
                         _combined = _np_ad.concatenate(_all_depths)
@@ -2593,6 +2626,61 @@ def main():
     log.info("Mask generation")
     land_mask_out = dir_rast / "LAND_MASK_aligned.tif"
     waffles_cache = Path(os.environ.get("WAFFLES_CACHE_ROOT", mask_cache))
+
+    if (not args.land_mask_user) and getattr(args, "guidance_domain_mask", None):
+        cand = Path(args.guidance_domain_mask)
+        if cand.exists():
+            args.land_mask_user = str(cand)
+            log.info("Using precomputed SDB guidance-domain mask: %s", cand)
+
+    if (not args.land_mask_user) and getattr(args, "guidance_domain_manifest", None):
+        try:
+            manifest_path = Path(args.guidance_domain_manifest)
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            outputs = payload.get("outputs", {}) if isinstance(payload, dict) else {}
+            cand = Path(outputs.get("sdb_guidance_domain_mask", ""))
+            if cand.exists():
+                args.land_mask_user = str(cand)
+                log.info("Using SDB guidance-domain mask from manifest: %s", cand)
+        except Exception:
+            log.debug("Failed to load guidance-domain manifest", exc_info=True)
+
+    if (not args.land_mask_user) and getattr(args, "guidance_river_gpkg", None) and getattr(args, "guidance_river_template_dem", None):
+        try:
+            guidance_cfg = make_guidance_domain_cfg(
+                args,
+                cache_root=cache_root,
+                river_channel_source=str(getattr(args, "guidance_river_channel_source", "auto") or "auto"),
+                river_use_nhdarea=bool(getattr(args, "guidance_river_use_nhdarea", True)),
+                river_nhdarea_layer=str(getattr(args, "guidance_river_nhdarea_layer", "nhdarea_clip") or "nhdarea_clip"),
+                river_nhdarea_allow_ftype=str(getattr(args, "guidance_river_nhdarea_allow_ftype", "460") or "460"),
+                river_nhdarea_allow_fcode=getattr(args, "guidance_river_nhdarea_allow_fcode", None),
+                river_channel_buffer_m=float(getattr(args, "guidance_river_channel_buffer_m", 400.0) or 400.0),
+                river_max_channel_width_m=float(getattr(args, "guidance_river_max_channel_width_m", 600.0) or 600.0),
+                river_mainstem_method=str(getattr(args, "guidance_river_mainstem_method", "dominant_trunk") or "dominant_trunk"),
+                river_mainstem_solve_layer=str(getattr(args, "guidance_river_mainstem_solve_layer", "auto") or "auto"),
+                river_mainstem_min_order=int(getattr(args, "guidance_river_mainstem_min_order", 5) or 5),
+                river_max_mainstem_width_m=float(getattr(args, "guidance_river_max_mainstem_width_m", 2500.0) or 2500.0),
+                river_ocean_keep_dist_m=float(getattr(args, "guidance_river_ocean_keep_dist_m", 0.0) or 0.0),
+                estuary_width_ratio_thresh=float(getattr(args, "guidance_estuary_width_ratio_thresh", 3.0) or 3.0),
+                estuary_transition_m=float(getattr(args, "guidance_estuary_transition_m", 500.0) or 500.0),
+                estuary_connect_dist_m=float(getattr(args, "guidance_estuary_connect_dist_m", 200.0) or 200.0),
+            )
+            derived_root = Path(getattr(args, "guidance_derived_cache_root", None) or (out_root / "derived_cache" / "sdb_guidance_domains"))
+            domain_paths = ensure_guidance_domains(
+                guidance_cfg,
+                river_dem=Path(args.guidance_river_template_dem),
+                river_gpkg=Path(args.guidance_river_gpkg),
+                derived_cache_root=derived_root,
+                review_root=out_root,
+                report={},
+                logger=log,
+            )
+            args.land_mask_user = str(domain_paths.sdb_guidance_domain_mask)
+            log.info("Auto-built SDB guidance-domain mask: %s", args.land_mask_user)
+            log.info("Review staged guidance domains before SDB inference in: %s", domain_paths.review_dir)
+        except Exception:
+            log.debug("Direct SDB guidance-domain auto-build failed", exc_info=True)
 
     if args.land_mask_user:
         s2_optics.prepare_user_land_mask(args.land_mask_user, s2_paths["B02"], str(land_mask_out))
@@ -2983,6 +3071,7 @@ def main():
             if isinstance(model_meta, dict):
                 reused_from_bank = bool(model_meta.get('model_bank', {}).get('reused_model', False))
         except Exception:
+            log.debug("sdb_main: suppressed exception", exc_info=True)
             reused_from_bank = False
 
         if df_train_final is not None and df_train_final.empty and (not reused_from_bank):
@@ -3154,12 +3243,14 @@ def main():
                     fv = float(v)
                     return f"{fv:.3f}" if np.isfinite(fv) else "n/a"
                 except Exception:
+                    log.debug("_fmt_metric_cell: suppressed exception", exc_info=True)
                     return "n/a"
 
             def _fmt_count_cell(v):
                 try:
                     return str(int(v))
                 except Exception:
+                    log.debug("_fmt_count_cell: suppressed exception", exc_info=True)
                     return str(v)
 
 
@@ -3188,6 +3279,7 @@ def main():
                     try:
                         fv = float(v)
                     except Exception:
+                        log.debug("_coerce_positive: suppressed exception", exc_info=True)
                         return None
                     return fv if np.isfinite(fv) and fv > 0 else None
 
@@ -3239,6 +3331,7 @@ def main():
                                 if fv is not None:
                                     return fv, f"{tp.name}:train.{key}"
                     except Exception:
+                        log.debug("sdb_main: suppressed exception", exc_info=True)
                         continue
                 return None, None
 
@@ -3396,10 +3489,12 @@ def main():
                 try:
                     _n = int(_m.get("n", 0) or 0)
                 except Exception:
+                    log.debug("sdb_main: suppressed exception", exc_info=True)
                     _n = 0
                 try:
                     _r2 = float(_m.get("r2", float("nan")))
                 except Exception:
+                    log.debug("sdb_main: suppressed exception", exc_info=True)
                     _r2 = float("nan")
                 if _n > 0 and np.isfinite(_r2) and (_r2 < 0):
                     model_bank_save_ok = False
@@ -3855,6 +3950,27 @@ def parse_args():
 # Masks
     p.add_argument("--land-mask", dest="land_mask_user", default=None,
                help="User-supplied land mask to override waffles")
+    p.add_argument("--guidance-domain-mask", default=None, help="Precomputed SDB guidance-domain mask (0=water,1=land).")
+    p.add_argument("--guidance-domain-manifest", default=None, help="Manifest written by guidance_domains_main.py or bathy_main early-domain planning.")
+    p.add_argument("--guidance-river-channel-buffer-m", type=float, default=400.0, help="Standalone SDB auto-domain: river channel buffer for NHD river-domain planning.")
+    p.add_argument("--guidance-river-max-channel-width-m", type=float, default=600.0, help="Standalone SDB auto-domain: maximum retained river width in meters.")
+    p.add_argument("--guidance-river-mainstem-method", choices=["dominant_trunk", "stream_order"], default="dominant_trunk", help="Standalone SDB auto-domain: mainstem identification policy.")
+    p.add_argument("--guidance-river-mainstem-solve-layer", default="auto", help="Standalone SDB auto-domain: layer used for dominant trunk solving. 'auto' prefers major_system_network, then mainstem_solve_network, then rivers_aoi, for AOI-stable trunk selection.")
+    p.add_argument("--guidance-river-mainstem-min-order", type=int, default=5, help="Standalone SDB auto-domain: minimum stream order used for legacy stream-order mainstem identification.")
+    p.add_argument("--guidance-river-max-mainstem-width-m", type=float, default=2500.0, help="Standalone SDB auto-domain: maximum mainstem width in meters.")
+    p.add_argument("--guidance-river-channel-source", default="auto", choices=["auto", "nhdarea", "corridor"], help="Standalone SDB auto-domain: river channel source policy.")
+    p.add_argument("--guidance-river-use-nhdarea", dest="guidance_river_use_nhdarea", action="store_true", default=True, help="Standalone SDB auto-domain: use NHD area polygons when available.")
+    p.add_argument("--guidance-no-river-use-nhdarea", dest="guidance_river_use_nhdarea", action="store_false", help="Standalone SDB auto-domain: disable NHD area polygon use.")
+    p.add_argument("--guidance-river-nhdarea-layer", default="nhdarea_clip", help="Standalone SDB auto-domain: NHD area layer name.")
+    p.add_argument("--guidance-river-nhdarea-allow-ftype", default="460", help="Standalone SDB auto-domain: allowed NHD area FType values.")
+    p.add_argument("--guidance-river-nhdarea-allow-fcode", default=None, help="Standalone SDB auto-domain: allowed NHD area FCode values.")
+    p.add_argument("--guidance-river-ocean-keep-dist-m", type=float, default=0.0, help="Standalone SDB auto-domain: retain ocean-connected water within this distance of flowlines.")
+    p.add_argument("--guidance-estuary-width-ratio-thresh", type=float, default=3.0, help="Standalone SDB auto-domain: estuary width-ratio threshold.")
+    p.add_argument("--guidance-estuary-transition-m", type=float, default=500.0, help="Standalone SDB auto-domain: retained upstream transition length.")
+    p.add_argument("--guidance-estuary-connect-dist-m", type=float, default=200.0, help="Standalone SDB auto-domain: ocean-connectivity distance filter.")
+    p.add_argument("--guidance-river-gpkg", default=None, help="Optional river network GeoPackage used to auto-build the SDB guidance domain when running sdb_main.py directly.")
+    p.add_argument("--guidance-river-template-dem", default=None, help="Template DEM/raster used to define the shared guidance-domain grid when auto-building from sdb_main.py.")
+    p.add_argument("--guidance-derived-cache-root", default=None, help="Optional run-scoped cache root for auto-built guidance domains from direct sdb_main.py runs.")
 
 # Mask gating thresholds (applied consistently in training and prediction)
 # If you want "waffles defines water", keep land_max=0.0 (hard water-only constraint).

@@ -17,8 +17,11 @@ from dataclasses import dataclass
 from pathlib import Path
 import hashlib
 import json
+import logging
 import os
 from typing import List, Optional, Tuple
+
+log = logging.getLogger(__name__)
 
 def _hash_dict(d: dict) -> str:
     b = json.dumps(d, sort_keys=True).encode("utf-8")
@@ -85,6 +88,7 @@ def fetch_riversp(
         # netrc strategy won't prompt
         earthaccess.login(strategy="netrc")
     except Exception:
+        log.debug("fetch_riversp: suppressed exception", exc_info=True)
         u = os.environ.get("EARTHDATA_USERNAME") or os.environ.get("NASA_EARTHDATA_USERNAME")
         p = os.environ.get("EARTHDATA_PASSWORD") or os.environ.get("NASA_EARTHDATA_PASSWORD")
         if u and p:
@@ -112,6 +116,7 @@ def fetch_riversp(
             if cols:
                 used_short = cols[0].short_name
         except Exception:
+            log.debug("swot_riversp_fetch: suppressed exception", exc_info=True)
             # fallback to common PO.DAAC short name patterns
             used_short = f"{prefix}{product}_D"  # older naming
 

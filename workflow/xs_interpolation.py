@@ -10,16 +10,19 @@ log = logging.getLogger("xs_infer_bathy")
 try:  # pragma: no cover - optional dependency
     from scipy.spatial import cKDTree  # type: ignore
 except Exception:  # pragma: no cover
+    log.debug("xs_interpolation: suppressed exception", exc_info=True)
     cKDTree = None  # type: ignore
 
 try:  # pragma: no cover - optional dependency
     from sklearn.neighbors import KDTree  # type: ignore
 except Exception:  # pragma: no cover
+    log.debug("xs_interpolation: suppressed exception", exc_info=True)
     KDTree = None  # type: ignore
 
 try:  # pragma: no cover - optional dependency
     from shapely.geometry import Point  # type: ignore
 except Exception:  # pragma: no cover
+    log.debug("xs_interpolation: suppressed exception", exc_info=True)
     Point = None  # type: ignore
 
 

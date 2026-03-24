@@ -383,6 +383,7 @@ def _worker_predict_tile(args: Tuple) -> TileResult:
         )
         
     except Exception as e:
+        log.debug("predict_parallel: suppressed exception", exc_info=True)
         duration = time.time() - start_time
         return TileResult(
             tile_id=tile_id,

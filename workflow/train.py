@@ -78,9 +78,17 @@ def stratified_train_test_split(df, target_col='depth_m', test_size=0.2, seed=42
         return train_df.index.to_numpy(), test_df.index.to_numpy()
 
     except (ValueError, TypeError) as e:
-        log.warning("Stratification failed (%s). Falling back to random split.", e)
-        tr, te = train_test_split(df.index.to_numpy(), test_size=test_size, random_state=seed)
-        return tr, te
+        depth = pd.to_numeric(df[target_col], errors='coerce')
+        finite_depth = depth[np.isfinite(depth)]
+        diag = {
+            "n_rows": int(len(df)),
+            "n_finite_depth": int(np.isfinite(depth).sum()),
+            "depth_min": float(np.nanmin(finite_depth)) if len(finite_depth) else np.nan,
+            "depth_max": float(np.nanmax(finite_depth)) if len(finite_depth) else np.nan,
+            "target_col": str(target_col),
+            "test_size": float(test_size),
+        }
+        raise ValueError(f"Stratified train/test split failed; fix depth distribution/binning rather than using a random split. diagnostics={diag}") from e
 
 
 def estimate_linf_from_df(df, *, nir_max=0.03, bright_max=0.15, percentile=1.0, cw_col=None):
@@ -370,6 +378,7 @@ def apply_stumpf_residual_filter(
                 src.str.contains("hydronos|ehydro|survey|sonar|lidar|bag|sound|authoritative_base", regex=True)
             ).to_numpy(dtype=bool)
         except Exception:
+            log.debug("apply_stumpf_residual_filter: suppressed exception", exc_info=True)
             protected_mask = np.zeros(len(df), dtype=bool)
 
     stumpf = pd.to_numeric(df["stumpf_idx"], errors="coerce").to_numpy(dtype="float64")
@@ -766,6 +775,7 @@ def _spatially_thin_lonlat_dataframe(ll: pd.DataFrame, max_keep: int, *, anchor_
         try:
             max_keep = max(int(max_keep), 50000)
         except Exception:
+            log.debug("_spatially_thin_lonlat_dataframe: suppressed exception", exc_info=True)
             max_keep = 50000
     if ll is None or ll.empty or len(ll) <= max_keep:
         return ll
@@ -1887,6 +1897,7 @@ def _try_reuse_model_bank(
         try:
             lr_reuse = joblib.load(lr_p)
         except Exception:
+            log.debug("_try_reuse_model_bank: suppressed exception", exc_info=True)
             lr_reuse = None
 
     mm = None
@@ -1896,6 +1907,7 @@ def _try_reuse_model_bank(
             with open(mm_p, "r", encoding="utf-8") as _f:
                 mm = json.load(_f)
         except Exception:
+            log.debug("_try_reuse_model_bank: suppressed exception", exc_info=True)
             mm = None
 
     if required_context:
@@ -2479,6 +2491,7 @@ def train_sdb_model(
                     list(feat_cols) + ["longitude", "latitude", "source", "source_norm", "depth_m"]
                 ))
             except Exception:
+                log.debug("train: suppressed exception", exc_info=True)
                 bank_schema_cols = ["longitude", "latitude", "source", "source_norm", "depth_m"]
 
             bank_df, bank_meta = update_bank(
@@ -2531,6 +2544,7 @@ def train_sdb_model(
                     last_trained_n_seen = int(_bm.get("last_trained_n_seen", 0))
                     n_seen_now = int(_bm.get("n_seen", 0))
                 except Exception:
+                    log.debug("train: suppressed exception", exc_info=True)
                     last_trained_n_seen = 0
                     n_seen_now = 0
             new_since_train = max(0, n_seen_now - last_trained_n_seen) if n_seen_now else 0
@@ -2617,16 +2631,9 @@ def train_sdb_model(
         # Also, sklearn versions prior to 1.4 may not accept n_init=10.
         do_spatial = coords.shape[0] >= 200
         if not do_spatial:
-            log.warning(
-                "Spatial split requested but too few samples for stable clustering (n=%d). "
-                "Falling back to stratified random split.",
-                coords.shape[0],
-            )
-            idx_tr, idx_te = stratified_train_test_split(
-                df_validation,
-                target_col='depth_m',
-                test_size=0.2,
-                seed=seed
+            raise ValueError(
+                "Spatial split requested but too few samples for stable clustering; "
+                f"n={coords.shape[0]} requires either more support points or disabling spatial_split."
             )
         else:
             # Choose a conservative cluster count based on sample size.
@@ -2634,9 +2641,11 @@ def train_sdb_model(
             n_clusters = int(min(5, max(2, coords.shape[0] // 500)))
             try:
                 km = KMeans(n_clusters=n_clusters, random_state=seed, n_init=10).fit(coords)
-            except Exception:
-                # Last-resort fallback
-                km = KMeans(n_clusters=2, random_state=seed, n_init=10).fit(coords)
+            except Exception as exc:
+                log.debug("train: suppressed exception", exc_info=True)
+                raise RuntimeError(
+                    f"Spatial split KMeans failed for n_clusters={n_clusters}; diagnose coordinate distribution instead of downgrading the split."
+                ) from exc
         
         if do_spatial:
             # Analyze clusters using positive depth magnitudes. Reject shallow, low-variance,
@@ -3131,6 +3140,7 @@ def train_sdb_model(
     try:
         final_target_n = int(max(5000, min(len(df_tr_fit), int(model_bank_max_samples))))
     except Exception:
+        log.debug("train: suppressed exception", exc_info=True)
         final_target_n = int(max(5000, len(df_tr_fit)))
     df_tr_fit = _enforce_final_source_quota(df_tr_fit, seed, final_target_n, _max_source_frac=0.85)
 
@@ -3585,6 +3595,7 @@ def train_sdb_model(
                             return float("nan")
                         return float(x)
                     except Exception:
+                        log.debug("_safe_float: suppressed exception", exc_info=True)
                         return float("nan")
 
                 kd_490 = metadata.get("kd_490_median")
@@ -3652,6 +3663,7 @@ def train_sdb_model(
             training_p95 = float(_np.nanpercentile(d_vals[_np.isfinite(d_vals)], 95))
             training_max = float(_np.nanmax(d_vals[_np.isfinite(d_vals)]))
         except Exception:
+            log.debug("train: suppressed exception", exc_info=True)
             training_p95 = None
             training_max = None
         

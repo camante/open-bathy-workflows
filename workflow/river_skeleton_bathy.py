@@ -38,6 +38,8 @@ from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+from sign_semantics import maybe_warn_auto_depth_mode, semantics_from_soundings_mode
 import geopandas as gpd
 import rasterio
 from rasterio.warp import transform_bounds
@@ -47,8 +49,6 @@ from rasterio.warp import reproject, Resampling
 from rasterio.transform import rowcol
 from pyproj import CRS, Transformer
 from scipy.ndimage import distance_transform_edt, gaussian_filter, binary_dilation
-
-LOG = logging.getLogger("river_skeleton_bathy")
 
 
 def _pixel_size_m(transform: rasterio.Affine) -> float:
@@ -129,7 +129,7 @@ def _junction_zone_mask(
         if gdf.empty:
             return None
         if "degree" not in gdf.columns:
-            LOG.warning("junction mask: nodes layer '%s' lacks 'degree' column; skipping.", nodes_layer)
+            log.warning("junction mask: nodes layer '%s' lacks 'degree' column; skipping.", nodes_layer)
             return None
         gdf = gdf[gdf.geometry.notnull() & (~gdf.geometry.is_empty)].copy()
         gdf = gdf[gdf.geometry.geom_type.isin(["Point", "MultiPoint"])].copy()
@@ -169,7 +169,7 @@ def _junction_zone_mask(
     except (OSError, ValueError, AttributeError, RuntimeError) as e:
         # Common failure: nodes layer missing (e.g., "Null layer"). Fall back to a simple
         # endpoint-degree approximation from the flowlines layer.
-        LOG.warning("junction mask: failed building junction zone mask: %s", str(e))
+        log.warning("junction mask: failed building junction zone mask: %s", str(e))
         try:
             fb = _junction_zone_mask_from_flowlines(
                 river_gpkg=river_gpkg,
@@ -181,10 +181,10 @@ def _junction_zone_mask(
                 buffer_m=buffer_m,
             )
             if fb is not None:
-                LOG.info("junction mask: using flowline-endpoint fallback (layer=%s).", river_layer)
+                log.info("junction mask: using flowline-endpoint fallback (layer=%s).", river_layer)
                 return fb
         except (OSError, ValueError, AttributeError, RuntimeError) as e2:
-            LOG.warning("junction mask fallback failed: %s", str(e2))
+            log.warning("junction mask fallback failed: %s", str(e2))
         return None
 
 
@@ -223,7 +223,7 @@ def _junction_zone_mask_from_flowlines(
             continue
 
     if gdf is None or gdf.empty:
-        LOG.warning("junction mask fallback: could not read any flowlines layer (tried=%s)", tried)
+        log.warning("junction mask fallback: could not read any flowlines layer (tried=%s)", tried)
         return None
     gdf = gdf[gdf.geometry.notnull() & (~gdf.geometry.is_empty)].copy()
     if gdf.empty:
@@ -433,7 +433,7 @@ def _build_wse_longitudinal_profile(
             try:
                 swot_tree = cKDTree(np.asarray(swot_pts, dtype=float))
             except Exception as e:
-                LOG.warning("WSE longitudinal profile: could not build SWOT KDTree: %s", e)
+                log.warning("WSE longitudinal profile: could not build SWOT KDTree: %s", e)
                 swot_tree = None
         # Robust aggregation helper for multiple SWOT observations near a sample.
         def _robust_median_mad(v: np.ndarray, zmax: float = 4.0) -> float:
@@ -454,7 +454,7 @@ def _build_wse_longitudinal_profile(
             return float(np.nanmedian(v2))
 
     except Exception as e:
-        LOG.warning("WSE longitudinal profile: missing deps: %s", e)
+        log.warning("WSE longitudinal profile: missing deps: %s", e)
         return None
 
     if bank_wse is None:
@@ -465,10 +465,10 @@ def _build_wse_longitudinal_profile(
     try:
         gdf = gpd.read_file(str(river_gpkg), layer=river_layer)
     except Exception as e:
-        LOG.warning("WSE longitudinal profile: could not read %s layer=%s: %s", river_gpkg, river_layer, e)
+        log.warning("WSE longitudinal profile: could not read %s layer=%s: %s", river_gpkg, river_layer, e)
         return None
     if gdf is None or len(gdf) == 0:
-        LOG.warning("WSE longitudinal profile: empty flowlines layer %s", river_layer)
+        log.warning("WSE longitudinal profile: empty flowlines layer %s", river_layer)
         return None
 
     # Reproject to template CRS if needed (robust CRS equality)
@@ -479,12 +479,12 @@ def _build_wse_longitudinal_profile(
             if not c1.equals(c2):
                 gdf = gdf.to_crs(c2)
     except Exception as e:
-        LOG.warning("WSE longitudinal profile: CRS reprojection check failed: %s", e)
+        log.warning("WSE longitudinal profile: CRS reprojection check failed: %s", e)
 
     # Densify lines and sample bank_wse at points
     valid = np.isfinite(bank_wse) & channel
     if not valid.any():
-        LOG.warning("WSE longitudinal profile: bank_wse has no valid in-channel samples")
+        log.warning("WSE longitudinal profile: bank_wse has no valid in-channel samples")
         return None
 
     # helper to sample raster at xy
@@ -492,6 +492,7 @@ def _build_wse_longitudinal_profile(
         try:
             r, c = rasterio.transform.rowcol(template_transform, x, y)
         except Exception:
+            log.debug("_sample_at_xy: suppressed exception", exc_info=True)
             return np.nan
         if r < 0 or c < 0 or r >= h or c >= w:
             return np.nan
@@ -566,6 +567,7 @@ def _build_wse_longitudinal_profile(
                                             ii0 = int(idxs[int(np.argmin(di))])
                                             swot_used_idx.add(ii0)
                                         except Exception:
+                                            log.debug("river_skeleton_bathy: suppressed exception", exc_info=True)
                                             swot_used_idx.add(int(idxs[0]))
                                         swot_ws.append(float(wsv))
                                         swot_d.append(float(d))
@@ -660,7 +662,7 @@ def _build_wse_longitudinal_profile(
                         # apply weighted correction
                         wgrid = (wgrid + float(swot_weight or 1.0) * resid_grid).astype(float)
                 except Exception as e:
-                    LOG.warning("SWOT anchoring failed for a flowline segment; continuing without SWOT. Error: %s", e)
+                    log.warning("SWOT anchoring failed for a flowline segment; continuing without SWOT. Error: %s", e)
 
             # Enforce a physically consistent monotonic (non-increasing) WSE trend along the flowline.
             # We infer the most likely downstream direction from the endpoints (higher -> lower),
@@ -692,7 +694,7 @@ def _build_wse_longitudinal_profile(
                 all_vals.append(float(wv))
 
     if len(all_vals) < int(min_samples):
-        LOG.warning("WSE longitudinal profile: insufficient valid samples overall (%d)", len(all_vals))
+        log.warning("WSE longitudinal profile: insufficient valid samples overall (%d)", len(all_vals))
         return None
 
     pts = np.asarray(all_pts, dtype=float)
@@ -710,7 +712,7 @@ def _build_wse_longitudinal_profile(
 
     # If centerline is empty, can't seed; fall back to bank_wse
     if not centerline.any():
-        LOG.warning("WSE longitudinal profile: centerline rasterization produced empty mask")
+        log.warning("WSE longitudinal profile: centerline rasterization produced empty mask")
         return None
 
     # Assign a WSE value to each centerline pixel using nearest sampled profile point
@@ -742,7 +744,7 @@ def _build_wse_longitudinal_profile(
     wse_long = np.where(channel, wse_long, np.nan).astype("float32")
 
     if not np.isfinite(wse_long[channel]).any():
-        LOG.warning("WSE longitudinal profile: output has no finite values in channel")
+        log.warning("WSE longitudinal profile: output has no finite values in channel")
         return None
 
     return wse_long
@@ -786,7 +788,7 @@ def _read_swot_riversp_points(paths, template_crs=None, wse_field=None, qual_fie
         from shapely.geometry import Point, LineString, MultiLineString
         from pyproj import CRS
     except Exception as e:
-        LOG.warning("SWOT RiverSP: missing deps: %s", e)
+        log.warning("SWOT RiverSP: missing deps: %s", e)
         return np.zeros((0, 2), dtype=float), np.zeros((0,), dtype=float)
 
     if not paths:
@@ -806,7 +808,7 @@ def _read_swot_riversp_points(paths, template_crs=None, wse_field=None, qual_fie
         try:
             gdf = gpd.read_file(p)
         except Exception as e:
-            LOG.warning("SWOT RiverSP: could not read %s: %s", p, e)
+            log.warning("SWOT RiverSP: could not read %s: %s", p, e)
             continue
         if gdf is None or len(gdf) == 0:
             continue
@@ -819,7 +821,7 @@ def _read_swot_riversp_points(paths, template_crs=None, wse_field=None, qual_fie
                 if not c1.equals(c2):
                     gdf = gdf.to_crs(c2)
         except Exception as e:
-            LOG.warning("SWOT RiverSP: CRS reprojection failed for %s: %s", p, e)
+            log.warning("SWOT RiverSP: CRS reprojection failed for %s: %s", p, e)
 
         # Pick WSE column
         wcol = None
@@ -840,7 +842,7 @@ def _read_swot_riversp_points(paths, template_crs=None, wse_field=None, qual_fie
                     except Exception:
                         log.debug("ignored", exc_info=True)
         if wcol is None:
-            LOG.warning("SWOT RiverSP: could not find a WSE column in %s (provide --swot-wse-field)", p)
+            log.warning("SWOT RiverSP: could not find a WSE column in %s (provide --swot-wse-field)", p)
             continue
 
         # Optional quality filter (defensive):
@@ -864,6 +866,7 @@ def _read_swot_riversp_points(paths, template_crs=None, wse_field=None, qual_fie
                         qcol = c
                         break
                 except Exception:
+                    log.debug("river_skeleton_bathy: suppressed exception", exc_info=True)
                     continue
         if qcol is not None:
             try:
@@ -885,6 +888,7 @@ def _read_swot_riversp_points(paths, template_crs=None, wse_field=None, qual_fie
             try:
                 wv = float(wv) + float(wse_offset_m or 0.0)
             except Exception:
+                log.debug("river_skeleton_bathy: suppressed exception", exc_info=True)
                 continue
             if not np.isfinite(wv):
                 continue
@@ -913,6 +917,7 @@ def _read_swot_riversp_points(paths, template_crs=None, wse_field=None, qual_fie
                     rp = geom.representative_point()
                     x, y = float(rp.x), float(rp.y)
             except Exception:
+                log.debug("river_skeleton_bathy: suppressed exception", exc_info=True)
                 continue
 
             pts.append((x, y))
@@ -970,6 +975,7 @@ def _estimate_swot_vertical_offset(
     try:
         from rasterio.transform import rowcol
     except Exception:
+        log.debug("_estimate_swot_vertical_offset: suppressed exception", exc_info=True)
         rowcol = None
 
     # Sample bank_wse at SWOT point locations (nearest pixel)
@@ -989,6 +995,7 @@ def _estimate_swot_vertical_offset(
             cols = np.asarray(np.round((swot_pts[:, 0] - c0) / a), dtype=int)
             rows = np.asarray(np.round((swot_pts[:, 1] - f0) / e), dtype=int)
     except Exception:
+        log.debug("_estimate_swot_vertical_offset: suppressed exception", exc_info=True)
         return 0.0, 0, {}
 
     h, w = bank_wse.shape
@@ -1131,6 +1138,12 @@ def _coerce_depth(z, mode: str):
     if z.size == 0:
         return z
     mode = (mode or 'auto').strip().lower()
+    sem = semantics_from_soundings_mode(mode)
+    if sem == 'absolute_elevation':
+        LOG.info('[RIVER_SOUNDINGS] Explicit soundings semantics: absolute_elevation (bed_elev mode).')
+    elif sem in {'depth_positive_down', 'depth_negative_down'}:
+        LOG.info('[RIVER_SOUNDINGS] Explicit soundings semantics: %s.', sem)
+    maybe_warn_auto_depth_mode(LOG, label='RIVER_SOUNDINGS', values=z, mode=mode, bed_elev_hint=True)
     if mode == 'depth_pos':
         d = z.copy()
     elif mode == 'depth_neg':
@@ -1179,9 +1192,9 @@ def _soundings_to_grids(
     H, W = channel.shape
     try:
         u = np.unique(channel)
-        LOG.info("Channel mask unique values: %s", u.tolist() if hasattr(u,'tolist') else str(u))
+        log.info("Channel mask unique values: %s", u.tolist() if hasattr(u,'tolist') else str(u))
     except Exception:
-        LOG.debug("ignored", exc_info=True)
+        log.debug("ignored", exc_info=True)
 
     depth_grid = np.full(channel.shape, np.nan, dtype="float32")
     dmax_grid = np.full(channel.shape, np.nan, dtype="float32")
@@ -1205,9 +1218,10 @@ def _soundings_to_grids(
                         vals = vals[vals != '']
                         if len(vals) > 0:
                             soundings_crs = vals.iloc[0]
-                            LOG.info('Inferred soundings_crs from parquet: %s', soundings_crs)
+                            log.info('Inferred soundings_crs from parquet: %s', soundings_crs)
                             break
             except Exception:
+                log.debug("river_skeleton_bathy: suppressed exception", exc_info=True)
                 continue
 
     # Optional CRS transform into template CRS
@@ -1225,6 +1239,7 @@ def _soundings_to_grids(
             xmin, ymin, xmax, ymax = array_bounds(H, W, transform)
             return float(xmin), float(xmax), float(ymin), float(ymax)
         except Exception:
+            log.debug("_template_bbox_xy: suppressed exception", exc_info=True)
             return None
 
     def _in_bbox_ratio(xv: np.ndarray, yv: np.ndarray) -> float:
@@ -1244,7 +1259,7 @@ def _soundings_to_grids(
         bb = _template_bbox_xy()
         if bb is not None:
             xmin, xmax, ymin, ymax = bb
-            LOG.info('Template bounds (crs=%s): x=[%.3f, %.3f] y=[%.3f, %.3f]', str(template_crs), xmin, xmax, ymin, ymax)
+            log.info('Template bounds (crs=%s): x=[%.3f, %.3f] y=[%.3f, %.3f]', str(template_crs), xmin, xmax, ymin, ymax)
     except (TypeError, ValueError, AttributeError):
         log.debug("ignored", exc_info=True)
 
@@ -1253,7 +1268,7 @@ def _soundings_to_grids(
     for fp in sounding_files:
         pth = Path(fp)
         if not pth.exists():
-            LOG.warning("Soundings file not found: %s", pth)
+            log.warning("Soundings file not found: %s", pth)
             continue
         try:
             x, y, z = _read_soundings_file(pth)
@@ -1264,7 +1279,7 @@ def _soundings_to_grids(
             zs_all.append(np.asarray(z, dtype="float64"))
             sizes.append(int(len(x)))
         except Exception as e:
-            LOG.warning("Failed reading soundings %s: %s", pth, e)
+            log.warning("Failed reading soundings %s: %s", pth, e)
 
     if not xs_all:
         return depth_grid, dmax_grid, bed_grid
@@ -1288,7 +1303,7 @@ def _soundings_to_grids(
                 new_ys.append(y_i[idx])
                 new_zs.append(z_i[idx])
         xs_all, ys_all, zs_all = new_xs, new_ys, new_zs
-        LOG.warning("Soundings downsampled to ~%d points (from %d) to avoid OOM (soundings_max_points=%d).",
+        log.warning("Soundings downsampled to ~%d points (from %d) to avoid OOM (soundings_max_points=%d).",
                     int(sum(len(a) for a in xs_all)), total_n, int(max_points))
 
     x = np.concatenate(xs_all)
@@ -1298,17 +1313,17 @@ def _soundings_to_grids(
     try:
         sx0, sx1 = float(np.nanmin(x)), float(np.nanmax(x))
         sy0, sy1 = float(np.nanmin(y)), float(np.nanmax(y))
-        LOG.info('Soundings bounds (raw): x=[%.3f, %.3f] y=[%.3f, %.3f] n=%d', sx0, sx1, sy0, sy1, int(len(x)))
+        log.info('Soundings bounds (raw): x=[%.3f, %.3f] y=[%.3f, %.3f] n=%d', sx0, sx1, sy0, sy1, int(len(x)))
         r0 = _in_bbox_ratio(x, y)
         if np.isfinite(r0):
-            LOG.info('Soundings inside template bbox (raw): %.3f', float(r0))
+            log.info('Soundings inside template bbox (raw): %.3f', float(r0))
     except (TypeError, ValueError, AttributeError):
         log.debug("ignored", exc_info=True)
 
     n_loaded = int(x.size)
     m = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
     x, y, z = x[m], y[m], z[m]
-    LOG.info("Soundings: loaded=%d finite=%d", n_loaded, int(x.size))
+    log.info("Soundings: loaded=%d finite=%d", n_loaded, int(x.size))
     if x.size == 0:
         return depth_grid, dmax_grid, bed_grid
 
@@ -1325,7 +1340,7 @@ def _soundings_to_grids(
     try:
         r_after = _in_bbox_ratio(x, y)
         if np.isfinite(r_after):
-            LOG.info('Soundings inside template bbox (post-declared-crs): %.3f', float(r_after))
+            log.info('Soundings inside template bbox (post-declared-crs): %.3f', float(r_after))
         best_ratio = r_after
         best_tr = None
         best_swap = False
@@ -1344,10 +1359,11 @@ def _soundings_to_grids(
                     if np.isfinite(rr1) and (best_ratio is None or float(rr1) > float(best_ratio)):
                         best_ratio, best_tr, best_swap = rr1, tr, True
                 except Exception:
+                    log.debug("river_skeleton_bathy: suppressed exception", exc_info=True)
                     continue
 
             if best_tr is not None and np.isfinite(best_ratio) and float(best_ratio) >= 0.50:
-                LOG.warning(
+                log.warning(
                     'Soundings CRS/axis mismatch detected: in_bbox=%.3f after declared CRS; using %s with swap_xy=%s (in_bbox=%.3f).',
                     float(r_after), str(getattr(best_tr, 'source_crs', 'geo')), str(best_swap), float(best_ratio)
                 )
@@ -1359,7 +1375,7 @@ def _soundings_to_grids(
                 x = np.asarray(xx, dtype='float64')
                 y = np.asarray(yy, dtype='float64')
     except Exception:
-        LOG.debug('Soundings CRS self-check failed; continuing.', exc_info=True)
+        log.debug('Soundings CRS self-check failed; continuing.', exc_info=True)
 
     rr, cc = rowcol(transform, x, y)
     rr = np.asarray(rr, dtype="int64")
@@ -1367,7 +1383,7 @@ def _soundings_to_grids(
 
     inb = (rr >= 0) & (rr < channel.shape[0]) & (cc >= 0) & (cc < channel.shape[1])
     n_inb = int(np.count_nonzero(inb))
-    LOG.info(
+    log.info(
         "Soundings: in_template_bbox=%d (grid=%dx%d channel_true_pixels=%d)",
         n_inb,
         int(channel.shape[1]),
@@ -1380,7 +1396,7 @@ def _soundings_to_grids(
 
     # Row/col range diagnostics for in-bounds points (helps catch axis swaps / transform mismatch)
     try:
-        LOG.info(
+        log.info(
             "Soundings row/col range (in-bounds): row=[%d..%d] col=[%d..%d]",
             int(rr.min()),
             int(rr.max()),
@@ -1392,14 +1408,14 @@ def _soundings_to_grids(
 
     in_ch = channel[rr, cc]
     n_in_ch = int(np.count_nonzero(in_ch))
-    LOG.info("Soundings: in_channel_mask=%d", n_in_ch)
+    log.info("Soundings: in_channel_mask=%d", n_in_ch)
     if n_in_ch == 0:
         # Provide a small spread sample so we can see whether points are systematically off.
         try:
             samp_n = min(12, int(rr.size))
             if samp_n > 0:
                 idx = np.linspace(0, int(rr.size) - 1, num=samp_n, dtype=int)
-                LOG.info(
+                log.info(
                     "Soundings sample (row,col,mask): %s",
                     ", ".join([f"({int(rr[i])},{int(cc[i])},{bool(in_ch[i])})" for i in idx]),
                 )
@@ -1416,6 +1432,7 @@ def _soundings_to_grids(
             dist_px = distance_transform_edt(~channel)
             d = dist_px[rr, cc]
         except Exception:
+            log.debug("river_skeleton_bathy: suppressed exception", exc_info=True)
             d = None
 
         if d is None:
@@ -1436,12 +1453,12 @@ def _soundings_to_grids(
                     diff = rc_s[:, None, :] - ch_rc_f[None, :, :]
                     d = np.sqrt((diff * diff).sum(axis=2)).min(axis=1)
             except Exception as e:
-                LOG.debug("Soundings distance_to_channel_px fallback failed: %s", str(e))
+                log.debug("Soundings distance_to_channel_px fallback failed: %s", str(e))
                 d = None
 
         if d is not None and np.size(d):
             try:
-                LOG.info(
+                log.info(
                     "Soundings distance_to_channel_px: min=%.2f p50=%.2f p95=%.2f max=%.2f",
                     float(np.min(d)),
                     float(np.percentile(d, 50)),
@@ -1513,9 +1530,9 @@ def _soundings_to_grids(
             }
             diag_path.parent.mkdir(parents=True, exist_ok=True)
             diag_path.write_text(json.dumps(receipt, indent=2) + "\n")
-            LOG.info("Soundings/channel receipt written: %s", str(diag_path))
+            log.info("Soundings/channel receipt written: %s", str(diag_path))
         except Exception as e:
-            LOG.warning("Failed to write soundings/channel receipt: %s", str(e))
+            log.warning("Failed to write soundings/channel receipt: %s", str(e))
     rr, cc, z = rr[in_ch], cc[in_ch], z[in_ch]
     if rr.size == 0:
         return depth_grid, dmax_grid, bed_grid
@@ -1566,7 +1583,7 @@ def _soundings_to_grids(
                 q4 = df4.groupby("idx")["v"].quantile(pct_dm / 100.0)
                 dmax_grid.ravel()[q4.index.to_numpy(dtype=np.int64)] = q4.to_numpy(dtype=np.float64)
         else:
-            LOG.warning("soundings-mode=bed_elev but no wse_map provided; skipping depth/Dmax inference from soundings.")
+            log.warning("soundings-mode=bed_elev but no wse_map provided; skipping depth/Dmax inference from soundings.")
 
         return depth_grid, dmax_grid, bed_grid
 
@@ -1576,6 +1593,13 @@ def _soundings_to_grids(
     rr2, cc2, z_num = rr[ok], cc[ok], z_num[ok]
     if rr2.size == 0:
         return depth_grid, dmax_grid, bed_grid
+
+    sem = semantics_from_soundings_mode(mode_l)
+    if sem == 'absolute_elevation':
+        LOG.info('[RIVER_SOUNDINGS_GRID] Explicit soundings semantics: absolute_elevation (bed_elev mode).')
+    elif sem in {'depth_positive_down', 'depth_negative_down'}:
+        LOG.info('[RIVER_SOUNDINGS_GRID] Explicit soundings semantics: %s.', sem)
+    maybe_warn_auto_depth_mode(LOG, label='RIVER_SOUNDINGS_GRID', values=z_num, mode=mode_l, bed_elev_hint=np.isfinite(wse_map).any() if isinstance(wse_map, np.ndarray) else False)
 
     if mode_l == "depth_pos":
         d = z_num
@@ -1724,6 +1748,7 @@ def _densify_linestring(ls: LineString, step_m: float) -> LineString:
     try:
         length = float(ls.length)
     except Exception:
+        log.debug("_densify_linestring: suppressed exception", exc_info=True)
         return ls
     if not np.isfinite(length) or length <= step_m:
         return ls
@@ -1847,6 +1872,7 @@ def _densify_linestring_to_points(ls, step_m):
         import numpy as np
         from shapely.geometry import Point
     except Exception:
+        log.debug("_densify_linestring_to_points: suppressed exception", exc_info=True)
         return []
     if ls is None or ls.length == 0:
         return []
@@ -1986,6 +2012,7 @@ def _apply_bed_profile_constraints(
                     line_layer = name
                     break
             except Exception:
+                log.debug("river_skeleton_bathy: suppressed exception", exc_info=True)
                 continue
 
     if line_layer is None:
@@ -2001,6 +2028,7 @@ def _apply_bed_profile_constraints(
     try:
         crs = CRS.from_wkt(template_profile['crs'].to_wkt()) if hasattr(template_profile.get('crs'), 'to_wkt') else CRS.from_user_input(template_profile['crs'])
     except Exception:
+        log.debug("river_skeleton_bathy: suppressed exception", exc_info=True)
         crs = CRS.from_user_input(template_profile['crs'])
     try:
         gdf = gdf.to_crs(crs)
@@ -2170,6 +2198,7 @@ def _detect_mainstem_corridor(
                     try:
                         orders = g_edges[mainstem_attr].astype("float64").to_numpy()
                     except Exception:
+                        log.debug("_detect_mainstem_corridor: suppressed exception", exc_info=True)
                         orders = None
     
                 # Build adjacency graph from edge endpoints
@@ -2189,11 +2218,13 @@ def _detect_mainstem_corridor(
                         c0 = geom.coords[0]
                         c1 = geom.coords[-1]
                     except Exception:
+                        log.debug("_key_xy: suppressed exception", exc_info=True)
                         try:
                             lg = max(list(geom.geoms), key=lambda g: g.length)
                             c0 = lg.coords[0]
                             c1 = lg.coords[-1]
                         except Exception:
+                            log.debug("_key_xy: suppressed exception", exc_info=True)
                             edge_ends.append((None, None))
                             edge_len[i] = 0.0
                             continue
@@ -2322,6 +2353,7 @@ def _detect_mainstem_corridor(
                                                                             thr = float(np.nanpercentile(vals, pctl)) if vals.size else abs_min_width_m
                                                                             thr = max(thr, abs_min_width_m)
                                                                         except Exception:
+                                                                            log.debug("river_skeleton_bathy: suppressed exception", exc_info=True)
                                                                             thr = abs_min_width_m
                                                                         
                                                                         mainstem_wide = channel & (w_proxy_m >= thr)
@@ -2358,7 +2390,7 @@ def _detect_mainstem_corridor(
                             corr_junc = channel & jm & (dist_line <= np.maximum(min_corr, 1.25 * halfw))
                             corridor = corr_base | corr_junc
     
-                            LOG.info(
+                            log.info(
                                 "Mainstem corridor: channel_n=%d jm_n=%d corridor_n=%d",
                                 int(np.count_nonzero(channel)),
                                 int(np.count_nonzero(jm)),
@@ -2371,7 +2403,7 @@ def _detect_mainstem_corridor(
                                 log.debug("ignored", exc_info=True)
                             mainstem_corridor = corridor
                             if int(np.count_nonzero(preserve_mainstem)) == 0:
-                                LOG.warning("Mainstem preserve mask is empty; mainstem selection/rasterization likely failed.")
+                                log.warning("Mainstem preserve mask is empty; mainstem selection/rasterization likely failed.")
     
                             # Debug rasters
                             try:
@@ -2382,7 +2414,7 @@ def _detect_mainstem_corridor(
                             except Exception:
                                 log.debug("ignored", exc_info=True)
     except Exception:
-        LOG.warning("Mainstem corridor detection failed", exc_info=True)
+        log.warning("Mainstem corridor detection failed", exc_info=True)
         return None, None
     return mainstem_corridor, preserve_mainstem
 
@@ -2426,17 +2458,17 @@ def _materialize_authoritative_bed_if_requested(args) -> Optional[Path]:
                 }
                 return bed_path
             if not auto:
-                LOG.warning("Provided authoritative bed raster does not exist: %s", bed_path)
+                log.warning("Provided authoritative bed raster does not exist: %s", bed_path)
                 args.authoritative_bed_raster = str(bed_path)
                 return bed_path
-            LOG.info("Explicit authoritative bed raster path not found; falling back to auto-materialization for template AOI.")
+            log.info("Explicit authoritative bed raster path not found; falling back to auto-materialization for template AOI.")
     if not auto:
         args.authoritative_bed_raster = None if bed_path is None else str(bed_path)
         return bed_path
     try:
         from cudem_authoritative import materialize_authoritative_base_for_aoi
     except Exception as exc:
-        LOG.error("Failed to import cudem_authoritative auto-builder: %s", exc, exc_info=True)
+        log.error("Failed to import cudem_authoritative auto-builder: %s", exc, exc_info=True)
         raise
     aoi = _template_bounds_to_aoi(Path(args.template_raster))
     build_info = materialize_authoritative_base_for_aoi(
@@ -2452,7 +2484,7 @@ def _materialize_authoritative_bed_if_requested(args) -> Optional[Path]:
     bed_path = Path(build_info["authoritative_base"]).resolve()
     args.authoritative_bed_raster = str(bed_path)
     args._authoritative_bed_auto_report = build_info
-    LOG.info("[AUTHORITATIVE] %s authoritative bed raster: %s",
+    log.info("[AUTHORITATIVE] %s authoritative bed raster: %s",
              "Reused cached" if bool(build_info.get("cache_hit")) else "Materialized",
              bed_path)
     return bed_path
@@ -2759,7 +2791,7 @@ def main(
     try:
         _materialize_authoritative_bed_if_requested(args)
     except Exception:
-        LOG.error("Failed to materialize authoritative bed/base raster for template=%s", getattr(args, "template_raster", None), exc_info=True)
+        log.error("Failed to materialize authoritative bed/base raster for template=%s", getattr(args, "template_raster", None), exc_info=True)
         raise
 
     template_profile, transform, crs, shape = _read_template(Path(args.template_raster))
@@ -2771,12 +2803,13 @@ def main(
         if _crs_obj is None or (hasattr(_crs_obj, 'is_projected') and not _crs_obj.is_projected):
             raise ValueError(f"Template CRS must be projected (meters). Got: {crs}")
     except Exception as e:
+        log.debug("river_skeleton_bathy: suppressed exception", exc_info=True)
         raise ValueError(f"Template CRS must be projected (meters). Got: {crs}") from e
 
     template_profile["transform"] = transform
     template_profile["crs"] = crs
     pix = _pixel_size_m(transform)
-    LOG.info("Template grid: %s x %s | pixel_size≈%.3fm", shape[1], shape[0], pix)
+    log.info("Template grid: %s x %s | pixel_size≈%.3fm", shape[1], shape[0], pix)
 
     # Load channel mask and DEM on template grid
     ch_raw, _ = _warp_to_template(Path(args.channel_mask), template_profile, dtype="uint8")
@@ -2796,9 +2829,9 @@ def main(
             authoritative_bed = authoritative_bed.astype("float32")
             if authoritative_bed_nodata is not None:
                 authoritative_bed = np.where(authoritative_bed == float(authoritative_bed_nodata), np.nan, authoritative_bed).astype("float32")
-            LOG.info("Loaded authoritative bed raster: %s", args.authoritative_bed_raster)
+            log.info("Loaded authoritative bed raster: %s", args.authoritative_bed_raster)
         except Exception as e:
-            LOG.warning("Failed loading authoritative bed raster (%s): %s", args.authoritative_bed_raster, e)
+            log.warning("Failed loading authoritative bed raster (%s): %s", args.authoritative_bed_raster, e)
 
     # Load rivers
     rivers = gpd.read_file(args.river_gpkg, layer=args.rivers_layer)
@@ -2873,9 +2906,9 @@ def main(
             ).astype("float32")
 
             dmax_skel = np.where(skeleton, np.clip(dmax_skel * mult_r, float(args.dmax_min_m), float(args.dmax_max_m)), np.nan).astype("float32")
-            LOG.info("Applied multivariate Dmax factor using attrs: area=%s slope=%s", area_col, slope_col)
+            log.info("Applied multivariate Dmax factor using attrs: area=%s slope=%s", area_col, slope_col)
         else:
-            LOG.info("prior-mode=multivariate but no suitable area/slope attrs found; using powerlaw only.")
+            log.info("prior-mode=multivariate but no suitable area/slope attrs found; using powerlaw only.")
     # Nearest-skeleton propagation (Voronoi via EDT indices)
     inv2 = np.ones(shape, dtype=np.uint8)
     inv2[skeleton] = 0
@@ -2930,13 +2963,13 @@ def main(
                 dbg.mkdir(parents=True, exist_ok=True)
                 _save_f32(dbg / "debug_curvature_k.tif", k_r.astype("float32"), template_profile, nodata=-9999.0)
                 _save_f32(dbg / "debug_r_asym.tif", r.astype("float32"), template_profile, nodata=-9999.0)
-            LOG.info(
+            log.info(
                 "Applied curvature-driven asymmetry: strength=%.3f curv_ref=%.5f max_shift=%.3f min_width=%.1f min_curv=%.5f",
                 float(args.asymmetry_strength), curv_ref, float(args.asymmetry_max_shift),
                 float(args.asymmetry_min_width_m), float(args.asymmetry_min_curv),
             )
         except Exception as e:
-            LOG.warning("Failed applying curvature-driven asymmetry; continuing with symmetric r. Error: %s", e)
+            log.warning("Failed applying curvature-driven asymmetry; continuing with symmetric r. Error: %s", e)
 
     # Water surface elevation (WSE) proxy:
     # For correctness, default to a bank-derived WSE (banks are usually better represented than in-channel DEM).
@@ -2963,7 +2996,7 @@ def main(
                     wse_offset_m=float(getattr(args, "swot_wse_offset_m", 0.0) or 0.0),
                 )
                 if swot_pts is not None and len(swot_pts) > 0:
-                    LOG.info(
+                    log.info(
                         "Loaded SWOT RiverSP WSE samples: n=%d (user_offset=%.3f m).",
                         len(swot_pts),
                         float(getattr(args, "swot_wse_offset_m", 0.0) or 0.0),
@@ -2986,14 +3019,14 @@ def main(
                         )
                         if n_used > 0 and abs(float(est_off)) > 1e-9:
                             swot_wse = (swot_wse - float(est_off)).astype(float)
-                            LOG.info(
+                            log.info(
                                 "SWOT vertical offset estimated: %.3f m (n=%d). Applied as swot_wse -= offset. Stats=%s",
                                 float(est_off), int(n_used), str(est_stats),
                             )
                         elif n_used > 0:
-                            LOG.info("SWOT vertical offset estimated ~0.0 m (n=%d).", int(n_used))
+                            log.info("SWOT vertical offset estimated ~0.0 m (n=%d).", int(n_used))
                         else:
-                            LOG.warning(
+                            log.warning(
                                 "SWOT vertical offset could not be estimated (mode=%s). "
                                 "Ensure vertical datums are compatible or provide --swot-wse-offset-m.",
                                 off_mode,
@@ -3001,7 +3034,7 @@ def main(
                     else:
                         # Safety warning: datums are not automatically reconciled.
                         if abs(float(getattr(args, "swot_wse_offset_m", 0.0) or 0.0)) < 1e-6:
-                            LOG.warning(
+                            log.warning(
                                 "SWOT RiverSP anchoring enabled but auto offset is disabled and swot_wse_offset_m is 0.0. "
                                 "Ensure SWOT WSE is in the same vertical datum as your DEM/WSE proxy (e.g., NAVD88), "
                                 "or set an offset."
@@ -3032,9 +3065,9 @@ def main(
             if wse_prof is not None:
                 wse_map = wse_prof
             else:
-                LOG.warning("wse-mode=bank_profile could not build a longitudinal WSE profile; falling back to wse-mode=bank")
+                log.warning("wse-mode=bank_profile could not build a longitudinal WSE profile; falling back to wse-mode=bank")
         else:
-            LOG.warning("wse-mode=bank_profile could not build bank WSE; falling back to wse-mode=bank")
+            log.warning("wse-mode=bank_profile could not build bank WSE; falling back to wse-mode=bank")
 
     if wse_map is None and mode == "bank":
         wse_map = _build_wse_from_bank_dem(
@@ -3045,7 +3078,7 @@ def main(
             smooth_sigma_m=float(args.wse_smooth_sigma_m or 0.0),
         )
         if wse_map is None:
-            LOG.warning("wse-mode=bank could not build WSE from bank samples; falling back to skeleton-derived WSE.")
+            log.warning("wse-mode=bank could not build WSE from bank samples; falling back to skeleton-derived WSE.")
 
     if wse_map is None:
         # Legacy behavior: use DEM values along the skeleton and fill outward.
@@ -3062,7 +3095,7 @@ def main(
             else:
                 wse_med = 0.0
             wse_skel[skeleton] = wse_med
-            LOG.warning("No valid DEM samples on skeleton; using fallback WSE=%.3f", wse_med)
+            log.warning("No valid DEM samples on skeleton; using fallback WSE=%.3f", wse_med)
 
         wse_map = wse_skel[ny, nx].astype("float32")
 
@@ -3110,16 +3143,16 @@ def main(
                 n_use = int(np.count_nonzero(use))
                 if n_use > 0:
                     dmax_skel = np.where(use, np.maximum(dmax_skel, snd_dmax_field), dmax_skel).astype("float32")
-                    LOG.info(
+                    log.info(
                         "Soundings: updated Dmax prior on %d skeleton pixels (max_dist=%.1fm, sigma=%.1fm, mode=%s).",
                         n_use, float(args.soundings_max_dist_m), float(args.residual_blend_sigma_m), str(args.soundings_mode)
                     )
                 else:
-                    LOG.info("Soundings: Dmax anchors did not influence any skeleton pixels; Dmax prior unchanged.")
+                    log.info("Soundings: Dmax anchors did not influence any skeleton pixels; Dmax prior unchanged.")
             else:
-                LOG.info("Soundings provided but no valid points fell inside the channel mask.")
+                log.info("Soundings provided but no valid points fell inside the channel mask.")
         except Exception as e:
-            LOG.warning("Failed to incorporate soundings into Dmax prior: %s", e)
+            log.warning("Failed to incorporate soundings into Dmax prior: %s", e)
 
     # Propagate Dmax from skeleton to the full channel domain
     dmax_map = dmax_skel[ny, nx].astype("float32")
@@ -3130,7 +3163,7 @@ def main(
         n_infl = int(np.count_nonzero(channel & np.isfinite(snd_dmax_field)))
         if n_infl > 0:
             dmax_map = np.where(np.isfinite(snd_dmax_field), np.maximum(dmax_map, snd_dmax_field), dmax_map).astype("float32")
-            LOG.info("Soundings: merged continuous Dmax field into channel (influenced_pixels=%d).", n_infl)
+            log.info("Soundings: merged continuous Dmax field into channel (influenced_pixels=%d).", n_infl)
 
 
     # Depth field (m, positive downward)
@@ -3143,9 +3176,9 @@ def main(
             n_snd = int(np.count_nonzero(m_snd))
             if n_snd > 0:
                 depth[m_snd] = snd_depth_grid[m_snd].astype("float32")
-                LOG.info("Soundings: enforced observed depths at %d grid cells.", n_snd)
+                log.info("Soundings: enforced observed depths at %d grid cells.", n_snd)
         except Exception as e:
-            LOG.warning("Soundings: failed enforcing observed depths: %s", e)
+            log.warning("Soundings: failed enforcing observed depths: %s", e)
 
     
     # Junction/confluence handling: optionally smooth or mask outputs near high-degree graph nodes.
@@ -3193,6 +3226,7 @@ def main(
                         debug_jm_path = out_bed_path.parent / "junction_zone_mask.tif"
                         debug_ms_path = out_bed_path.parent / "mainstem_preserve_mask.tif"
                 except Exception:
+                    log.debug("river_skeleton_bathy: suppressed exception", exc_info=True)
                     debug_jm_path = None
                     debug_ms_path = None
 
@@ -3210,6 +3244,7 @@ def main(
                         debug_ms_path=debug_ms_path,
                     )
                 except Exception:
+                    log.debug("river_skeleton_bathy: suppressed exception", exc_info=True)
                     preserve_mainstem = None
                     mainstem_corridor = None
                 depth_pre_smooth = depth.copy()
@@ -3219,7 +3254,7 @@ def main(
                 if jmode == "mask":
                     depth[jm] = np.nan
                     wse_map[jm] = np.nan
-                    LOG.info("Junction mode=mask: set %d channel cells to nodata within junction zones.", n_jm)
+                    log.info("Junction mode=mask: set %d channel cells to nodata within junction zones.", n_jm)
                 elif jmode == "smooth":
                     sig_m = float(getattr(args, "junction_smooth_sigma_m", 80.0) or 0.0)
                     if sig_m > 0.0:
@@ -3257,6 +3292,7 @@ def main(
                         try:
                             jm_w = width[jm] if width is not None else None
                         except Exception:
+                            log.debug("_smooth_in_zone: suppressed exception", exc_info=True)
                             jm_w = None
 
                         sigma_px_large = sig_m / max(pix, 1e-9)
@@ -3287,7 +3323,7 @@ def main(
                                 scale = float(np.clip(scale, 0.25, 1.0))
                                 sigma_px_small = sigma_px_large * scale
 
-                            LOG.info(
+                            log.info(
                                 "Junction smoothing width-scaled: p25=%.2fm p50=%.2fm p75=%.2fm sigma_small=%.1fm sigma_large=%.1fm",
                                 p25,
                                 p50,
@@ -3313,14 +3349,14 @@ def main(
                             if preserve_mainstem is not None and np.any(preserve_mainstem):
                                 depth[preserve_mainstem] = depth_pre_smooth[preserve_mainstem]
                                 wse_map[preserve_mainstem] = wse_pre_smooth[preserve_mainstem]
-                                LOG.info("Preserved mainstem corridor during junction smoothing (cells=%d).", int(np.count_nonzero(preserve_mainstem)))
+                                log.info("Preserved mainstem corridor during junction smoothing (cells=%d).", int(np.count_nonzero(preserve_mainstem)))
                         except Exception:
                             log.warning("Mainstem preservation step failed during junction smoothing", exc_info=True)
-                        LOG.info("Junction mode=smooth: locally smoothed WSE (depth recomputed from WSE-bed) in %d junction-zone cells (sigma_base=%.1fm).", n_jm, sig_m)
+                        log.info("Junction mode=smooth: locally smoothed WSE (depth recomputed from WSE-bed) in %d junction-zone cells (sigma_base=%.1fm).", n_jm, sig_m)
                     else:
-                        LOG.info("Junction mode=smooth requested but sigma<=0; no smoothing applied.")
+                        log.info("Junction mode=smooth requested but sigma<=0; no smoothing applied.")
                 else:
-                    LOG.info("Junction mode=%s: no action.", jmode)
+                    log.info("Junction mode=%s: no action.", jmode)
 
     # Mask outputs to channel domain
     depth = np.where(channel, depth, np.nan).astype("float32")
@@ -3339,9 +3375,9 @@ def main(
             # enforce exact authoritative values where present
             bed[m_auth] = authoritative_bed[m_auth].astype("float32")
             depth = (wse_map - bed).astype("float32")
-            LOG.info("Authoritative bed: anchored %d cells; blended to %.1fm (sigma=%.1fm).", n_auth, float(args.authoritative_bed_max_dist_m), float(args.residual_blend_sigma_m))
+            log.info("Authoritative bed: anchored %d cells; blended to %.1fm (sigma=%.1fm).", n_auth, float(args.authoritative_bed_max_dist_m), float(args.residual_blend_sigma_m))
         else:
-            LOG.info("Authoritative bed raster provided but has no finite data within channel mask.")
+            log.info("Authoritative bed raster provided but has no finite data within channel mask.")
 
     # Optional: incorporate bed-elevation soundings (mode=bed_elev).
     # We correct the *bed elevation* surface directly (in DEM's vertical datum), then recompute depth.
@@ -3359,9 +3395,9 @@ def main(
                 if bool(getattr(args, "soundings_enforce", True)):
                     bed[m_bed] = snd_bed_grid[m_bed].astype("float32")
                 depth = (wse_map - bed).astype("float32")
-                LOG.info("Soundings: bed-elevation blending using %d cells (max_dist=%.1fm, sigma=%.1fm).", n_bed, maxd, float(args.residual_blend_sigma_m))
+                log.info("Soundings: bed-elevation blending using %d cells (max_dist=%.1fm, sigma=%.1fm).", n_bed, maxd, float(args.residual_blend_sigma_m))
             except Exception as e:
-                LOG.warning("Soundings: failed bed-elevation blending: %s", e)
+                log.warning("Soundings: failed bed-elevation blending: %s", e)
 
     out_bed = Path(args.out_bed)
     out_bed.parent.mkdir(parents=True, exist_ok=True)
@@ -3395,9 +3431,9 @@ def main(
             # Re-impose mainstem corridor after bed profile constraints as well.
             if (mainstem_corridor is not None) and np.any(mainstem_corridor):
                 bed[mainstem_corridor] = bed_pre_constraints[mainstem_corridor]
-                LOG.info("Mainstem corridor preserved after profile constraints (cells=%d).", int(np.count_nonzero(mainstem_corridor)))
+                log.info("Mainstem corridor preserved after profile constraints (cells=%d).", int(np.count_nonzero(mainstem_corridor)))
     except Exception as e:
-        LOG.warning('Bed profile constraints failed; continuing without them. Error: %s', e)
+        log.warning('Bed profile constraints failed; continuing without them. Error: %s', e)
 
     # Use spaces for indentation in this block to avoid TabError.
     _save_f32(out_bed, bed, template_profile)
@@ -3422,7 +3458,7 @@ def main(
         if snd_dist is not None:
             _save_f32(ddir / 'snd_dist_m.tif', np.where(channel, snd_dist, np.nan), template_profile)
 
-    LOG.info("Wrote bed raster: %s", out_bed)
+    log.info("Wrote bed raster: %s", out_bed)
     return 0
 
 

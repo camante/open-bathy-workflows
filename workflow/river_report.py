@@ -223,6 +223,7 @@ def create_network_metadata(
                 layers = gpd.list_layers(network_gpkg)
                 layer_names = [str(v) for v in layers["name"].tolist()] if layers is not None else []
             except Exception:
+                log.debug("create_network_metadata: suppressed exception", exc_info=True)
                 layer_names = []
             preferred = next((lyr for lyr in ["rivers_clip", "rivers_aoi", "rivers", "graph_edges"] if lyr in layer_names), None)
             network = gpd.read_file(network_gpkg, layer=preferred) if preferred is not None else gpd.read_file(network_gpkg)
@@ -275,7 +276,11 @@ def create_xs_metadata(
     if xs_gpkg.exists():
         try:
             import geopandas as gpd
-            xs = gpd.read_file(xs_gpkg)
+            try:
+                xs = gpd.read_file(xs_gpkg, layer="xs_lines")
+            except Exception:
+                log.debug("create_xs_metadata: suppressed exception", exc_info=True)
+                xs = gpd.read_file(xs_gpkg)
             
             metadata["statistics"] = {
                 "cross_sections_count": len(xs),

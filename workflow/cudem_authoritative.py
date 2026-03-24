@@ -73,6 +73,7 @@ def parse_aoi(aoi_str: str) -> tuple[float, float, float, float]:
     try:
         west, east, south, north = (float(v) for v in str(aoi_str).split("/"))
     except Exception as exc:
+        LOG.debug("parse_aoi: suppressed exception", exc_info=True)
         raise ValueError(f"Could not parse AOI '{aoi_str}' as W/E/S/N") from exc
     if not (west < east and south < north):
         raise ValueError(f"Invalid AOI extents: {aoi_str}")
@@ -289,6 +290,7 @@ def polygon_layers(gpkg_path: Path) -> Iterator[str]:
             with fiona.open(gpkg_path, layer=layer) as src:
                 geom_type = (src.schema or {}).get("geometry", "")
         except Exception:
+            LOG.debug("polygon_layers: suppressed exception", exc_info=True)
             continue
         if "Polygon" in str(geom_type):
             yield layer

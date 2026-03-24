@@ -64,7 +64,10 @@ import requests
 from shapely.geometry import box, Point
 from pyproj import CRS
 import fiona
-
+from hydrologic_solve_domain import (
+    build_hydrologic_solve_domain_artifacts,
+    write_hydrologic_solve_domain_json,
+)
 
 # Use centralized logging - get logger, don't configure root here
 log = logging.getLogger("river_network")
@@ -83,7 +86,7 @@ def _sha256_bytes_iter(chunks_iter):
     return h.hexdigest()
 
 
-def fingerprint_path(path: Path) -> Dict[str, Any]:
+def fingerprint_path(path: Path) -> Optional[Dict[str, Any]]:
     """Compute a deterministic fingerprint for a dataset path.
 
     - For regular files: SHA256 of bytes.
@@ -127,6 +130,7 @@ def fingerprint_path(path: Path) -> Dict[str, Any]:
                 h.update(str(size).encode("utf-8"))
                 return h.hexdigest()
             except Exception:
+                log.debug("_sample_sha256: suppressed exception", exc_info=True)
                 return "stat_or_read_failed"
 
         entries = []
@@ -139,9 +143,11 @@ def fingerprint_path(path: Path) -> Dict[str, Any]:
                 entries.append(f"{rel}	{size}	{samp}")
                 n_files += 1
             except Exception:
+                log.debug("_sample_sha256: suppressed exception", exc_info=True)
                 try:
                     entries.append(str(fp.relative_to(path)))
                 except Exception:
+                    log.debug("_sample_sha256: suppressed exception", exc_info=True)
                     entries.append(str(fp))
         payload = ("\n".join(entries)).encode("utf-8", errors="replace")
         return {
@@ -151,7 +157,7 @@ def fingerprint_path(path: Path) -> Dict[str, Any]:
             "method": "sha256(dir_listing(relpath,size,sha256(head+tail+size)))",
             "n_files": n_files,
         }
-    return {"path": str(path), "type": "missing", "sha256": None, "method": "missing"}
+    return None
 
 
 def load_lock(path: Path) -> Optional[Dict[str, Any]]:
@@ -198,6 +204,85 @@ def enforce_or_write_lock(lock_path: Optional[Path], provenance: Dict[str, Any])
         raise RuntimeError(json.dumps(msg, indent=2))
     log.info("River network lock matched: %s", str(lock_path))
 
+
+
+
+def _network_manifest_default_path(out_gpkg: Path) -> Path:
+    out_gpkg = Path(out_gpkg)
+    return out_gpkg.with_name(f"{out_gpkg.stem}_manifest.json")
+
+
+def _parse_aoi_bounds(aoi_text: str | None) -> Dict[str, float] | None:
+    if not aoi_text:
+        return None
+    try:
+        aoi = [float(x) for x in str(aoi_text).split('/')[:4]]
+        return {"west": aoi[0], "east": aoi[1], "south": aoi[2], "north": aoi[3]}
+    except Exception:
+        log.debug("_parse_aoi_bounds: suppressed exception", exc_info=True)
+        return None
+
+
+def _build_network_manifest(*, args: argparse.Namespace, out_gpkg: Path, hydrologic_domain_path: Path, hydrologic_manifest: Dict[str, Any], mainstem_solve_network, major_system_network, outlet_anchors, estuary_control_points, rivers_aoi, rivers_clip, nodes_gdf, edges_gdf, nhdarea_clip) -> Dict[str, Any]:
+    solve_aoi = str(getattr(args, "solve_aoi", None) or args.aoi)
+    export_aoi = str(getattr(args, "export_aoi", None) or args.aoi)
+    scaffold_aoi = str(getattr(args, "scaffold_aoi", None) or solve_aoi)
+    solve_domain_receipt = {
+        "export_aoi": export_aoi,
+        "export_aoi_bounds": _parse_aoi_bounds(export_aoi),
+        "solve_aoi": solve_aoi,
+        "solve_aoi_bounds": _parse_aoi_bounds(solve_aoi),
+        "scaffold_aoi": scaffold_aoi,
+        "scaffold_aoi_bounds": _parse_aoi_bounds(scaffold_aoi),
+        "solve_role": str(getattr(args, "solve_domain_role", "broader river-network solve extent used to produce AOI-stable dominant trunk selection")),
+        "export_role": str(getattr(args, "export_domain_role", "working river export clipped to the requested solve AOI grid/domain")),
+        "scaffold_role": str(getattr(args, "scaffold_domain_role", "canonical scaffold domain used for stable river topology and guidance generation")),
+        "solve_domain_rationale": str(getattr(args, "solve_domain_rationale", "Solve the dominant trunk on a broader halo-expanded network, then clip/rasterize to the export grid for AOI-stable results.")),
+        "halo_km": float(getattr(args, "solve_halo_km", 0.0) or 0.0),
+        "trusted_halo_m": float(getattr(args, "trusted_halo_m", 0.0) or 0.0),
+    }
+    topology_fields = [c for c in ["from_node", "to_node", "component_id", "root_node", "s_m_from", "s_m_to", "s_m_min", "s_m_max", "length_m"] if c in mainstem_solve_network.columns]
+    return {
+        "product_type": "river_network_manifest",
+        "network_gpkg": str(Path(out_gpkg).resolve()),
+        "solve_layer_name": "mainstem_solve_network",
+        "major_system_layer_name": "major_system_network",
+        "active_export_layer_name": "rivers_clip",
+        "hydrologic_solve_domain_json": str(Path(hydrologic_domain_path).resolve()),
+        "solve_domain_receipt": solve_domain_receipt,
+        "hydrologic_solve_domain": hydrologic_manifest,
+        "mainstem_solve_contract": {
+            "method_intent": "solve dominant trunk on explicit broader network layer, then clip/rasterize to export grid",
+            "layer_priority_if_auto": ["major_system_network", "mainstem_solve_network", "rivers_aoi", "rivers_clip"],
+            "mainstem_solve_network_written": True,
+            "major_system_network_written": True,
+            "mainstem_solve_network_geometry_basis": "graph edges built on the broader solve domain so dominant trunk solving uses explicit directed topology when available",
+            "mainstem_solve_network_topology_fields": topology_fields,
+            "outlet_anchor_layer_name": "outlet_anchors",
+            "estuary_control_layer_name": "estuary_control_points",
+        },
+        "layers": {
+            "mainstem_solve_network": {"count": int(len(mainstem_solve_network)), "crs": str(mainstem_solve_network.crs)},
+            "major_system_network": {"count": int(len(major_system_network)), "crs": str(major_system_network.crs)},
+            "outlet_anchors": {"count": int(len(outlet_anchors)), "crs": str(outlet_anchors.crs)},
+            "estuary_control_points": {"count": int(len(estuary_control_points)), "crs": str(estuary_control_points.crs)},
+            "rivers_aoi": {"count": int(len(rivers_aoi)), "crs": str(rivers_aoi.crs)},
+            "rivers_clip": {"count": int(len(rivers_clip)), "crs": str(rivers_clip.crs)},
+            "graph_nodes": {"count": int(len(nodes_gdf)), "crs": str(nodes_gdf.crs)},
+            "graph_edges": {"count": int(len(edges_gdf)), "crs": str(edges_gdf.crs)},
+            "nhdarea_clip": {"count": int(len(nhdarea_clip) if nhdarea_clip is not None else 0), "crs": str(nhdarea_clip.crs) if nhdarea_clip is not None else None},
+        },
+        "hydrography_source": str(args.hydrography_source),
+        "tnm_dataset": str(args.tnm_dataset),
+        "tnm_enable": bool(args.tnm_enable),
+        "snap_m": float(args.snap_m),
+    }
+
+
+def _write_network_manifest(path: Path, payload: Dict[str, Any]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 TNM_PRODUCTS_URL = "https://tnmaccess.nationalmap.gov/api/v1/products"
 TNM_DATASETS_URL = "https://tnmaccess.nationalmap.gov/api/v1/datasets"
@@ -269,6 +354,7 @@ def arcgis_query_layer_geojson(
         try:
             gdf = gpd.GeoDataFrame.from_features(js.get("features", []), crs="EPSG:4326")
         except Exception:
+            log.debug("river_network: suppressed exception", exc_info=True)
             gdf = gpd.read_file(json.dumps(js))
         if gdf is None or gdf.empty:
             break
@@ -493,6 +579,7 @@ def arcgis_list_layers(service_url: str, timeout_s: int = 60) -> List[Dict[str, 
         _ARCGIS_LAYER_CACHE[service_url] = out
         return out
     except Exception:
+        log.debug("arcgis_list_layers: suppressed exception", exc_info=True)
         return []
 
 def arcgis_find_layer_id(service_url: str, name_patterns: List[str], timeout_s: int = 60) -> Optional[int]:
@@ -571,6 +658,7 @@ def try_arcgis_nhdarea_polygons(
             vnum = vals.astype("float64")
             keep = (vnum == 460)
         except Exception:
+            log.debug("_filter_streamriver_polys: suppressed exception", exc_info=True)
             # String coding (common: "StreamRiver")
             vstr = vals.astype(str).str.lower()
             keep = vstr.str.contains("streamriver") | vstr.str.contains("stream river")
@@ -943,6 +1031,7 @@ def find_best_flowline_source(extract_roots: List[Path]) -> Tuple[Optional[Path]
                 try:
                     layers = fiona.listlayers(str(c))
                 except Exception:
+                    log.debug("score: suppressed exception", exc_info=True)
                     layers = []
                 if layers:
                     for lp in layer_pref:
@@ -1177,6 +1266,15 @@ def build_reach_graph(gdf_lines: gpd.GeoDataFrame, snap_m: float = 5.0) -> Tuple
             node_degree[nid] = 0
         return nid
 
+    passthrough_cols = [
+        c for c in [
+            "streamorde", "streamorder", "streamord", "Strahler", "strahler",
+            "totdasqkm", "divdasqkm", "areasqkm", "drainarea", "drainage_a", "upa_km2",
+            "arbolatesu", "arbsumkm", "arbolate", "arbolate_km",
+            "ftype", "FType", "gnis_name", "GNIS_NAME", "reachcode", "ReachCode", "source",
+        ] if c in gdf_lines.columns
+    ]
+
     edges = []
     for idx, row in gdf_lines.iterrows():
         geom = row.geometry
@@ -1192,16 +1290,17 @@ def build_reach_graph(gdf_lines: gpd.GeoDataFrame, snap_m: float = 5.0) -> Tuple
             n1 = get_node_id(p1)
             node_degree[n0] += 1
             node_degree[n1] += 1
-            edges.append(
-                {
-                    "edge_id": f"e_{len(edges)+1:08d}",
-                    "river_id": row.get("river_id", str(idx)),
-                    "from_node": n0,
-                    "to_node": n1,
-                    "length_m": float(part.length),
-                    "geometry": part,
-                }
-            )
+            edge_row = {
+                "edge_id": f"e_{len(edges)+1:08d}",
+                "river_id": row.get("river_id", str(idx)),
+                "from_node": n0,
+                "to_node": n1,
+                "length_m": float(part.length),
+                "geometry": part,
+            }
+            for col in passthrough_cols:
+                edge_row[col] = row.get(col)
+            edges.append(edge_row)
 
     nodes = [{"node_id": nid, "degree": int(node_degree[nid]), "geometry": Point(node_xy[nid])} for nid in sorted(node_xy)]
     return gpd.GeoDataFrame(nodes, crs=gdf_lines.crs), gpd.GeoDataFrame(edges, crs=gdf_lines.crs)
@@ -1290,6 +1389,15 @@ def _parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--aoi", required=True, help="AOI bbox lonmin/lonmax/latmin/latmax")
+    p.add_argument("--export-aoi", default=None, help="Optional export AOI receipt for the clipped output domain.")
+    p.add_argument("--solve-aoi", default=None, help="Optional broader solve AOI receipt for the dominant trunk domain.")
+    p.add_argument("--scaffold-aoi", default=None, help="Optional scaffold AOI receipt for the canonical river-network domain.")
+    p.add_argument("--solve-halo-km", type=float, default=0.0, help="Optional halo (km) used upstream to build the solve/scaffold domain.")
+    p.add_argument("--trusted-halo-m", type=float, default=0.0, help="Optional trusted-export halo (m) used downstream to suppress edge-sensitive river guidance.")
+    p.add_argument("--solve-domain-role", default="broader river-network solve extent used to produce AOI-stable dominant trunk selection")
+    p.add_argument("--export-domain-role", default="working river export clipped to the requested solve AOI grid/domain")
+    p.add_argument("--scaffold-domain-role", default="canonical scaffold domain used for stable river topology and guidance generation")
+    p.add_argument("--solve-domain-rationale", default="Solve the dominant trunk on a broader halo-expanded network, then clip/rasterize to the export grid for AOI-stable results.")
     p.add_argument("--out-gpkg", required=True, help="Output GeoPackage path")
     p.add_argument("--provenance-lock", default=None, help="Optional JSON lock file path. If exists, enforce exact match of selected flowlines dataset + fingerprint; otherwise write it.")
 
@@ -1365,9 +1473,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--snap-m", type=float, default=5.0, help="Endpoint snap tolerance for node merging (m).")
     p.add_argument(
         "--write-layers",
-        default="rivers_aoi,rivers_clip,graph_nodes,graph_edges,nhdarea_aoi,nhdarea_clip",
+        default="mainstem_solve_network,major_system_network,outlet_anchors,estuary_control_points,rivers_aoi,rivers_clip,graph_nodes,graph_edges,nhdarea_aoi,nhdarea_clip",
         help="Comma-separated output layers to write.",
     )
+    p.add_argument("--manifest-json", default=None, help="Optional river-network manifest JSON path. Defaults next to --out-gpkg.")
     return p.parse_args()
 
 
@@ -1395,6 +1504,7 @@ def _attach_drainage_area_from_raster(
         import rasterio
         from pyproj import Transformer
     except Exception as e:
+        log.debug("_attach_drainage_area_from_raster: suppressed exception", exc_info=True)
         log_.warning("[DA_RASTER] raster sampling unavailable (missing deps): %s", e)
         return gdf_ll
 
@@ -1422,6 +1532,7 @@ def _attach_drainage_area_from_raster(
                     lambda g: g.interpolate(0.5, normalized=True) if g is not None else None
                 )
             except Exception:
+                log.debug("river_network: suppressed exception", exc_info=True)
                 mids = gdf_ll.loc[need, "geometry"].apply(
                     lambda g: g.representative_point() if g is not None else None
                 )
@@ -1474,6 +1585,7 @@ def _attach_drainage_area_from_raster(
                 units,
             )
     except Exception as e:
+        log.debug("river_network: suppressed exception", exc_info=True)
         log_.warning("[DA_RASTER] Failed to sample drainage-area raster '%s': %s", da_raster, e)
 
     return gdf_ll
@@ -1668,6 +1780,26 @@ def main() -> None:
         except Exception as e:
             log.warning("NHDArea polygon fetch failed (continuing): %s", str(e))
 
+    solve_nodes_gdf, solve_edges_gdf = build_reach_graph(rivers_aoi, snap_m=float(args.snap_m))
+    solve_edges_gdf = station_edges_from_root(solve_nodes_gdf, solve_edges_gdf)
+    mainstem_solve_network = solve_edges_gdf.copy()
+    mainstem_solve_network["solve_domain_role"] = "dominant trunk solve layer"
+    hydrologic_artifacts = build_hydrologic_solve_domain_artifacts(
+        solve_network=mainstem_solve_network,
+        nodes=solve_nodes_gdf,
+        export_aoi=getattr(args, "export_aoi", None),
+        solve_aoi=getattr(args, "solve_aoi", None),
+        scaffold_aoi=getattr(args, "scaffold_aoi", None),
+        solve_halo_km=float(getattr(args, "solve_halo_km", 0.0) or 0.0),
+        trusted_halo_m=float(getattr(args, "trusted_halo_m", 0.0) or 0.0),
+        solve_domain_role=str(getattr(args, "solve_domain_role", "broader river-network solve extent used to produce AOI-stable dominant trunk selection")),
+        export_domain_role=str(getattr(args, "export_domain_role", "working river export clipped to the requested solve AOI grid/domain")),
+        scaffold_domain_role=str(getattr(args, "scaffold_domain_role", "canonical scaffold domain used for stable river topology and guidance generation")),
+        solve_domain_rationale=str(getattr(args, "solve_domain_rationale", "Solve the dominant trunk on a broader halo-expanded network, then clip/rasterize to the export grid for AOI-stable results.")),
+    )
+    major_system_network = hydrologic_artifacts.major_system_network.copy()
+    major_system_network["solve_domain_role"] = "major hydrologic system used for dominant trunk selection"
+
     nodes_gdf, edges_gdf = build_reach_graph(rivers_clip, snap_m=float(args.snap_m))
     edges_gdf = station_edges_from_root(nodes_gdf, edges_gdf)
 
@@ -1676,6 +1808,14 @@ def main() -> None:
     layers = [s.strip() for s in args.write_layers.split(",") if s.strip()]
 
     log.info("%s", out_path)
+    if "mainstem_solve_network" in layers:
+        mainstem_solve_network.to_file(out_path, layer="mainstem_solve_network", driver="GPKG")
+    if "major_system_network" in layers:
+        major_system_network.to_file(out_path, layer="major_system_network", driver="GPKG")
+    if "outlet_anchors" in layers and hydrologic_artifacts.outlet_anchors is not None and not hydrologic_artifacts.outlet_anchors.empty:
+        hydrologic_artifacts.outlet_anchors.to_file(out_path, layer="outlet_anchors", driver="GPKG")
+    if "estuary_control_points" in layers and hydrologic_artifacts.estuary_control_points is not None and not hydrologic_artifacts.estuary_control_points.empty:
+        hydrologic_artifacts.estuary_control_points.to_file(out_path, layer="estuary_control_points", driver="GPKG")
     if "rivers_aoi" in layers:
         rivers_aoi.to_file(out_path, layer="rivers_aoi", driver="GPKG")
     if "rivers_clip" in layers:
@@ -1690,8 +1830,36 @@ def main() -> None:
         layer_name = getattr(args, "nhdarea_layer_name", "nhdarea_clip")
         nhdarea_clip.to_file(out_path, layer=layer_name, driver="GPKG")
 
+    hydrologic_domain_path = out_path.with_name("hydrologic_solve_domain.json")
+    write_hydrologic_solve_domain_json(hydrologic_domain_path, hydrologic_artifacts.hydrologic_manifest)
+
+    manifest_path = Path(args.manifest_json) if getattr(args, "manifest_json", None) else _network_manifest_default_path(out_path)
+    _write_network_manifest(
+        manifest_path,
+        _build_network_manifest(
+            args=args,
+            out_gpkg=out_path,
+            hydrologic_domain_path=hydrologic_domain_path,
+            hydrologic_manifest=hydrologic_artifacts.hydrologic_manifest,
+            mainstem_solve_network=mainstem_solve_network,
+            major_system_network=major_system_network,
+            outlet_anchors=hydrologic_artifacts.outlet_anchors,
+            estuary_control_points=hydrologic_artifacts.estuary_control_points,
+            rivers_aoi=rivers_aoi,
+            rivers_clip=rivers_clip,
+            nodes_gdf=nodes_gdf,
+            edges_gdf=edges_gdf,
+            nhdarea_clip=nhdarea_clip,
+        ),
+    )
+    log.info("[DONE] river_network_manifest=%s", manifest_path)
+    log.info("[DONE] hydrologic_solve_domain=%s", hydrologic_domain_path)
+
     log.info(
-        "[DONE] rivers_aoi=%d | rivers_clip=%d | nodes=%d | edges=%d | nhdarea=%d | CRS=%s | source=%s",
+        "[DONE] mainstem_solve_network=%d | major_system_network=%d | outlet_anchors=%d | rivers_aoi=%d | rivers_clip=%d | nodes=%d | edges=%d | nhdarea=%d | CRS=%s | source=%s",
+        len(mainstem_solve_network),
+        len(major_system_network),
+        len(hydrologic_artifacts.outlet_anchors),
         len(rivers_aoi),
         len(rivers_clip),
         len(nodes_gdf),

@@ -51,6 +51,7 @@ def _raster_has_valid_pixels(p: Path, max_sample_pixels: int = 250000) -> bool:
                 return bool(np.any(finite))
             return bool(np.any(finite & (arr != nodata)))
     except Exception:
+        log.debug("_raster_has_valid_pixels: suppressed exception", exc_info=True)
         # Best-effort: if we cannot read, don't block the pipeline.
         return True
 
@@ -82,6 +83,7 @@ def sanitize_raster_values(
         import numpy as np
         import rasterio
     except Exception:
+        log.debug("sanitize_raster_values: suppressed exception", exc_info=True)
         return stats
 
     raster_path = Path(raster_path)
@@ -132,6 +134,7 @@ def raster_crs_matches(raster_path: Path, expected_srs: str) -> bool:
                 return False
             return _CRS.from_user_input(ds.crs) == _CRS.from_user_input(expected_srs)
     except Exception:
+        log.debug("raster_crs_matches: suppressed exception", exc_info=True)
         return False
 
 
@@ -154,6 +157,7 @@ def _clip_raster_to_mask(
         import rasterio
         import numpy as np
     except Exception:
+        log.debug("_clip_raster_to_mask: suppressed exception", exc_info=True)
         return False
 
     if not Path(raster_path).exists() or not Path(mask_path).exists():
@@ -203,6 +207,7 @@ def _clip_raster_to_mask_reproject(
 
         nodata = -9999.0
     except Exception:
+        log.debug("_clip_raster_to_mask_reproject: suppressed exception", exc_info=True)
         return False
 
     raster_path = Path(raster_path)
@@ -296,6 +301,7 @@ def _apply_tile_edge_taper_epsg4269(
         import rasterio
         import numpy as np
     except Exception:
+        log.debug("_apply_tile_edge_taper_epsg4269: suppressed exception", exc_info=True)
         return None
 
     raster_path = Path(raster_path)
@@ -369,6 +375,7 @@ def _compute_edge_band_metrics_epsg4269(
         import rasterio
         import numpy as np
     except Exception:
+        log.debug("_compute_edge_band_metrics_epsg4269: suppressed exception", exc_info=True)
         return out
 
     raster_path = Path(raster_path)
@@ -460,6 +467,7 @@ def _clip_raster_to_bbox(
         import numpy as np
         from rasterio.windows import from_bounds
     except Exception:
+        log.debug("_clip_raster_to_bbox: suppressed exception", exc_info=True)
         return False
 
     raster_path = Path(raster_path)
@@ -482,6 +490,7 @@ def _clip_raster_to_bbox(
             row1 = min(src.height, int(np.ceil(win.row_off + win.height)))
             col1 = min(src.width, int(np.ceil(win.col_off + win.width)))
         except Exception:
+            log.debug("_clip_raster_to_bbox: suppressed exception", exc_info=True)
             return False
 
         mask = np.zeros((src.height, src.width), dtype=bool)
@@ -512,6 +521,7 @@ def _crop_raster_extent_to_bbox(
         import numpy as np
         from rasterio.windows import from_bounds
     except Exception:
+        log.debug("_crop_raster_extent_to_bbox: suppressed exception", exc_info=True)
         return False
 
     raster_path = Path(raster_path)
@@ -667,6 +677,7 @@ def _mask_raster_to_nhdarea(
         import rasterio
         from rasterio.features import rasterize
     except Exception:
+        log.debug("_mask_raster_to_nhdarea: suppressed exception", exc_info=True)
         return False
 
     raster_path = Path(raster_path)
@@ -678,6 +689,7 @@ def _mask_raster_to_nhdarea(
     try:
         areas = gpd.read_file(nhd_gpkg, layer=nhd_layer)
     except Exception:
+        log.debug("_mask_raster_to_nhdarea: suppressed exception", exc_info=True)
         return False
 
     if areas is None or areas.empty:
@@ -720,6 +732,7 @@ def _mask_raster_to_nhdarea(
     try:
         geom = _union_all_geoms(areas.geometry)
     except Exception:
+        log.debug("raster_ops: suppressed exception", exc_info=True)
         return False
 
     mask = rasterize(
@@ -783,7 +796,7 @@ def apply_depth_metadata(
         with rasterio.open(raster_path, "r+") as dst:
             dst.update_tags(**tags)
     except Exception:
-        return
+        log.debug("Failed to apply depth metadata to %s", raster_path, exc_info=True)
 
 
 def apply_elevation_metadata(
@@ -803,11 +816,12 @@ def apply_elevation_metadata(
             "ELEV_UNITS": units,
             "VERTICAL_DATUM": vertical_datum,
             "VERTICAL_DATUM_NOTE": "Elevation values are orthometric heights in the stated vertical datum; CRS may be horizontal-only.",
+            "SIGN_CONVENTION": "relative_to_datum",
         }
         with rasterio.open(raster_path, "r+") as dst:
             dst.update_tags(**tags)
     except Exception:
-        return
+        log.debug("Failed to apply elevation metadata to %s", raster_path, exc_info=True)
 
 
 def compute_depth_from_bed_and_dem(
@@ -920,6 +934,7 @@ def warp_raster_to_srs(
         with rasterio.open(in_raster) as src:
             src_nodata = src.nodata
     except Exception:
+        log.debug("raster_ops: suppressed exception", exc_info=True)
         src_nodata = None
 
     # Fallback nodata for float outputs (depth/bed rasters). Keep conservative.

@@ -233,6 +233,7 @@ def read_meta(meta_path: Union[str, Path]) -> Optional[Dict[str, Any]]:
     try:
         return json.loads(p.read_text())
     except Exception:
+        log.debug("read_meta: suppressed exception", exc_info=True)
         return None
 
 def write_meta(meta_path: Union[str, Path], payload: Dict[str, Any]) -> Path:

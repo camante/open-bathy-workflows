@@ -18,6 +18,7 @@ from output_products import build_final_output_contract
 from canonical_river_scaffold import nested_aoi_relationship
 
 from validation_invariance_framework import run_validation_invariance_framework
+from scientific_validation_stage import write_scientific_validation_summary
 
 
 def _grid_pixel_size_m(transform, crs, ref_lat_deg: Optional[float] = None) -> float:
@@ -435,6 +436,20 @@ def write_validation_invariance_summary(cfg: Any, report: Dict[str, Any], *, fin
         write_json(out_path, payload)
         report.setdefault("outputs", {})["validation_invariance_summary"] = str(out_path)
         report.setdefault("validation", {}).update(payload)
+        sci_path = Path(cfg.out_dir) / "scientific_validation_summary.json"
+        sci_payload = write_scientific_validation_summary(
+            out_path=sci_path,
+            final_outputs_manifest=manifest_path,
+            overlap_identity_evaluation=report.get("seams", {}).get("overlap_identity_evaluation") if isinstance(report.get("seams", {}), dict) else None,
+            validation_truth=str(getattr(cfg, "validation_truth", None)) if getattr(cfg, "validation_truth", None) else None,
+            case_specs=list(getattr(cfg, "validation_case_specs", []) or []),
+            case_manifest=str(getattr(cfg, "validation_case_manifest", None)) if getattr(cfg, "validation_case_manifest", None) else None,
+            guidance_baseline_case=str(getattr(cfg, "validation_guidance_baseline_case", "baseline_cudem_interpolation")),
+            guidance_target_case=str(getattr(cfg, "validation_guidance_target_case", "selected_final")),
+            guidance_rmse_tolerance=float(getattr(cfg, "validation_guidance_rmse_tolerance", 0.0) or 0.0),
+        )
+        report.setdefault("outputs", {})["scientific_validation_summary"] = str(sci_path)
+        report.setdefault("validation", {})["scientific_validation_summary"] = sci_payload
         if payload.get("all_hard_invariants_ok") is False:
             reasons = "; ".join(payload.get("hard_failures", []))
             if enforce_hard_fail:

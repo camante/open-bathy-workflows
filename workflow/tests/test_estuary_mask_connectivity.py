@@ -83,3 +83,98 @@ def test_estuary_ocean_connectivity_uses_channel_domain(monkeypatch):
             mask = ds.read(1) > 0
         # The upstream estuary candidate should survive because it is ocean-connected via the channel domain.
         assert int(mask.sum()) >= int(width_estuary.sum())
+
+
+def test_estuary_channel_distance_cap_limits_mask_extent(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        channel = np.zeros((30, 160), dtype='uint8')
+        channel[10:20, 2:150] = 1
+        channel_path = td / 'channel_long.tif'
+        _write_u8(channel_path, channel)
+
+        ocean = np.ones((30, 160), dtype='uint8')
+        ocean[:, :2] = 0
+        ocean_path = td / 'ocean.tif'
+        _write_u8(ocean_path, ocean)
+
+        width_estuary = np.zeros((30, 160), dtype=bool)
+        width_estuary[10:20, 8:28] = True
+
+        monkeypatch.setattr(river_masking, 'build_hydraulic_estuary_hint_mask', lambda **kwargs: (np.zeros_like(channel), {'backwater_slope_reaches': 0}))
+        monkeypatch.setattr(river_masking, 'binary_dilation', lambda arr, iterations=1: arr)
+        monkeypatch.setattr(river_masking, 'binary_opening', lambda arr, iterations=1: arr)
+
+        def fake_edt(arr, sampling=None):
+            if arr.dtype == bool and arr.shape == channel.shape and np.array_equal(arr, channel > 0):
+                out = np.ones_like(arr, dtype='float32')
+                out[width_estuary] = 10.0
+                return out
+            return np.zeros_like(arr, dtype='float32')
+
+        monkeypatch.setattr(river_masking, 'distance_transform_edt', fake_edt)
+
+        removed, mask_path = river_masking.clip_channel_mask_for_estuary(
+            channel_path,
+            DummyCfg(),
+            ocean_mask_path=ocean_path,
+            report={},
+        )
+
+        assert removed > 0
+        with rasterio.open(mask_path) as ds:
+            mask = ds.read(1) > 0
+        flagged_cols = np.where(mask.any(axis=0))[0]
+        assert flagged_cols.size > 0
+        assert flagged_cols.max() <= 32
+
+
+def test_estuary_transition_mask_is_retained_channel_subset(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        channel = np.zeros((30, 80), dtype='uint8')
+        channel[10:20, 2:70] = 1
+        channel_path = td / 'channel_transition.tif'
+        _write_u8(channel_path, channel)
+
+        ocean = np.ones((30, 80), dtype='uint8')
+        ocean[:, :2] = 0
+        ocean_path = td / 'ocean.tif'
+        _write_u8(ocean_path, ocean)
+
+        width_estuary = np.zeros((30, 80), dtype=bool)
+        width_estuary[10:20, 6:20] = True
+
+        monkeypatch.setattr(river_masking, 'build_hydraulic_estuary_hint_mask', lambda **kwargs: (np.zeros_like(channel), {'backwater_slope_reaches': 0}))
+        monkeypatch.setattr(river_masking, 'binary_opening', lambda arr, iterations=1: arr)
+
+        def fake_edt(arr, sampling=None):
+            if arr.dtype == bool and arr.shape == channel.shape and np.array_equal(arr, channel > 0):
+                out = np.ones_like(arr, dtype='float32')
+                out[width_estuary] = 10.0
+                return out
+            return np.zeros_like(arr, dtype='float32')
+
+        monkeypatch.setattr(river_masking, 'distance_transform_edt', fake_edt)
+
+        report = {}
+        removed, mask_path = river_masking.clip_channel_mask_for_estuary(
+            channel_path,
+            DummyCfg(),
+            ocean_mask_path=ocean_path,
+            report=report,
+        )
+
+        assert removed > 0
+        transition_path = td / 'estuary_transition_mask.tif'
+        debug_receipt = td / 'estuary_debug_receipt.json'
+        assert transition_path.exists()
+        assert debug_receipt.exists()
+
+        with rasterio.open(channel_path) as ds_ch, rasterio.open(transition_path) as ds_tr:
+            channel_final = ds_ch.read(1) > 0
+            transition = ds_tr.read(1) > 0
+        assert np.any(transition)
+        assert np.all(transition <= channel_final)
+        assert int(transition.sum()) <= int(channel_final.sum())
+        assert report['river']['outputs']['estuary_transition'].endswith('estuary_transition_mask.tif')

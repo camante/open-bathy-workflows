@@ -10,14 +10,21 @@ from terrain_interpolator import (
     compute_coastal_sdb_support_confidence,
     compute_river_anchor_support_fields,
     compute_support_distance_density_guidance,
+    compute_anchor_uncertainty,
+    combine_conditioning_uncertainty,
     interpolate_support_aware_surface,
 )
 
 
 def support_weighted_condition_arrays(
     *,
-    candidate: np.ndarray,
+    candidate: Optional[np.ndarray] = None,
     auth: np.ndarray,
+    sdb_depth_guidance: Optional[np.ndarray] = None,
+    river_depth_guidance: Optional[np.ndarray] = None,
+    sdb_guide_points_path: Optional[str] = None,
+    river_guide_points_path: Optional[str] = None,
+    guidance_template_raster: Optional[str] = None,
     sdb_ok: np.ndarray,
     river_ok: np.ndarray,
     sdb_gw: Optional[np.ndarray],
@@ -37,14 +44,23 @@ def support_weighted_condition_arrays(
     river_bank_estuary_side_decay: Optional[np.ndarray] = None,
     river_centerline_elevation: Optional[np.ndarray] = None,
     river_centerline_influence: Optional[np.ndarray] = None,
+    river_centerline_stationing: Optional[np.ndarray] = None,
+    river_longitudinal_profile_elevation: Optional[np.ndarray] = None,
+    river_longitudinal_profile_uncertainty: Optional[np.ndarray] = None,
+    river_longitudinal_profile_influence: Optional[np.ndarray] = None,
     river_xs_support_elevation: Optional[np.ndarray] = None,
     river_xs_support_weight: Optional[np.ndarray] = None,
+    sdb_uncertainty: Optional[np.ndarray] = None,
+    river_uncertainty: Optional[np.ndarray] = None,
     pixel_size_m: float,
     support_decay_m: float,
     support_density_radius_m: float,
     coastal_sdb_support_transition_m: float,
     river_anchor_density_radius_m: float,
     river_scaffold_transition_m: float,
+    river_aniso_along_scale_m: float = 500.0,
+    river_aniso_cross_scale_m: float = 30.0,
+    use_inverse_variance_blend_when_available: bool = True,
     **legacy_kwargs: Any,
 ) -> Dict[str, Any]:
     if estuary_transition is None:
@@ -55,8 +71,13 @@ def support_weighted_condition_arrays(
         raise TypeError(f"support_weighted_condition_arrays() got unexpected keyword argument(s): {unexpected}")
     return interpolate_support_aware_surface(
         inputs=TerrainInterpolationInputs(
-            candidate=candidate,
             auth=auth,
+            candidate=candidate,
+            sdb_depth_guidance=sdb_depth_guidance,
+            river_depth_guidance=river_depth_guidance,
+            sdb_guide_points_path=sdb_guide_points_path,
+            river_guide_points_path=river_guide_points_path,
+            guidance_template_raster=guidance_template_raster,
             sdb_ok=sdb_ok,
             river_ok=river_ok,
             sdb_gw=sdb_gw,
@@ -76,8 +97,14 @@ def support_weighted_condition_arrays(
             river_bank_estuary_side_decay=river_bank_estuary_side_decay,
             river_centerline_elevation=river_centerline_elevation,
             river_centerline_influence=river_centerline_influence,
+            river_centerline_stationing=river_centerline_stationing,
+            river_longitudinal_profile_elevation=river_longitudinal_profile_elevation,
+            river_longitudinal_profile_uncertainty=river_longitudinal_profile_uncertainty,
+            river_longitudinal_profile_influence=river_longitudinal_profile_influence,
             river_xs_support_elevation=river_xs_support_elevation,
             river_xs_support_weight=river_xs_support_weight,
+            sdb_uncertainty=sdb_uncertainty,
+            river_uncertainty=river_uncertainty,
         ),
         config=TerrainInterpolationConfig(
             pixel_size_m=pixel_size_m,
@@ -86,6 +113,9 @@ def support_weighted_condition_arrays(
             coastal_sdb_support_transition_m=coastal_sdb_support_transition_m,
             river_anchor_density_radius_m=river_anchor_density_radius_m,
             river_scaffold_transition_m=river_scaffold_transition_m,
+            river_aniso_along_scale_m=river_aniso_along_scale_m,
+            river_aniso_cross_scale_m=river_aniso_cross_scale_m,
+            use_inverse_variance_blend_when_available=use_inverse_variance_blend_when_available,
         ),
     )
 
@@ -102,12 +132,13 @@ def build_source_aware_candidate_arrays(
     river_guidance_weight: Optional[np.ndarray],
     river_trusted_interior: Optional[np.ndarray],
     estuary_transition: Optional[np.ndarray] = None,
+    allow_legacy_backstop: bool = True,
 ) -> Dict[str, Any]:
     """Build a direct support-aware candidate surface before final conditioning.
 
     This is intentionally *not* the final DEM. It is a guidance-seeded candidate
-    surface that prefers admissible river/SDB products directly and only falls
-    back to a legacy fused candidate where neither guidance domain contributes.
+    surface that prefers admissible river/SDB products directly. Legacy fused
+    candidate use is optional and may be disabled for a guidance-only final route.
     """
 
     def _shape_of(*arrays: Optional[np.ndarray]) -> tuple[int, int]:
@@ -193,13 +224,14 @@ def build_source_aware_candidate_arrays(
                     candidate[choose_sdb] = sdb[choose_sdb]
                     provenance[choose_sdb] = PROV_SDB
 
-    # Use the legacy fused candidate as a backstop only outside the fluvial corridor, plus
-    # the conservative estuary handoff where coastal and river logic intentionally overlap.
+    # Legacy fused candidate use is optional. The no-legacy final route keeps the
+    # candidate centered on direct guidance sources and lets the deterministic
+    # terrain interpolator own continuity/fallback behavior.
     legacy_allowed = (~river_ok) | estuary
     legacy_blocked = (np.isnan(candidate) & np.isfinite(legacy) & river_ok & (~estuary)) if legacy is not None else np.zeros(shp, dtype=bool)
     legacy_mask = (
         np.isnan(candidate) & np.isfinite(legacy) & legacy_allowed
-    ) if legacy is not None else np.zeros(shp, dtype=bool)
+    ) if (allow_legacy_backstop and legacy is not None) else np.zeros(shp, dtype=bool)
     if np.any(legacy_mask):
         candidate[legacy_mask] = legacy[legacy_mask]
         provenance[legacy_mask] = PROV_LEGACY
@@ -219,9 +251,10 @@ def build_source_aware_candidate_arrays(
         "provenance": provenance,
         "stats": stats,
         "backstop_policy": {
-            "legacy_candidate_role": "gap_only_backstop",
+            "legacy_candidate_enabled": bool(allow_legacy_backstop),
+            "legacy_candidate_role": "gap_only_backstop" if allow_legacy_backstop else "disabled",
             "disallow_legacy_in_river_corridor_outside_estuary": True,
-            "legacy_allowed_domain": "outside_river_corridor_or_estuary_handoff",
+            "legacy_allowed_domain": "outside_river_corridor_or_estuary_handoff" if allow_legacy_backstop else None,
         },
         "provenance_codes": {
             "0": "nodata",

@@ -101,9 +101,11 @@ def write_final_support_regime_audit(
         scaffold_code = int(SupportClass.SCAFFOLD_INFERRED)
         low_conf_code = int(SupportClass.LOW_CONFIDENCE_CONTINUOUS_FILL)
 
+        estuary_scaffold_count = int(np.count_nonzero(domain & (regime_arr == estuary_code) & (support_arr == scaffold_code)))
         suspicious = {
             "locked_pixels_with_nonlocked_provenance": int(np.count_nonzero(domain & (support_arr == locked_code) & (prov_arr != 10))),
-            "estuary_pixels_using_scaffold_inferred": int(np.count_nonzero(domain & (regime_arr == estuary_code) & (support_arr == scaffold_code))),
+            "estuary_pixels_using_scaffold_inferred": estuary_scaffold_count,
+            "estuary_pixels_using_channel_structure_guidance": estuary_scaffold_count,
             "river_pixels_without_river_support_class": int(np.count_nonzero(domain & (regime_arr == river_code) & ~np.isin(support_arr, [locked_code, river_guided_code, scaffold_code, low_conf_code]))),
             "nearshore_pixels_using_river_guidance": int(np.count_nonzero(domain & (regime_arr == int(RegimeClass.NEARSHORE_WATER)) & np.isin(support_arr, [river_guided_code, scaffold_code]))),
         }
@@ -126,6 +128,7 @@ def write_final_support_regime_audit(
                 "low_confidence_continuous_fill_pixels": int(np.count_nonzero(domain & (support_arr == low_conf_code))),
                 "sdb_guided_pixels": int(np.count_nonzero(domain & (support_arr == sdb_code))),
                 "river_guided_pixels": int(np.count_nonzero(domain & (support_arr == river_guided_code))),
+                "channel_structure_guidance_pixels": int(np.count_nonzero(domain & (support_arr == scaffold_code))),
             },
             "final_generation_route": report.get("final_dem_runtime", {}).get("final_generation_route"),
         }

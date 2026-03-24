@@ -89,6 +89,8 @@ class FakeDataset:
             "blockxsize": 64, "blockysize": 64,
         }
         self.profile.update(kw)
+        if self.profile.get("blockxsize") or self.profile.get("blockysize"):
+            self.profile["tiled"] = True
 
     def read(self, band: int = 1, window=None, **kw) -> np.ndarray:
         d = self._arr[band - 1]

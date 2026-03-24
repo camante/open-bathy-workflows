@@ -106,6 +106,18 @@ except (AttributeError, OSError, SyntaxError) as e:
     _physics_import_error = f"{type(e).__name__}: {e}"
     log.error("Physics module failed to load: %s", _physics_import_error, exc_info=True)
 
+# Physics-based Kd estimation (Lee et al. 2005)
+KD_ESTIMATION_AVAILABLE: bool = False
+_kd_estimation_import_error: Optional[str] = None
+try:
+    from kd_estimation import estimate_kd_from_reflectance as _estimate_kd_physics
+    KD_ESTIMATION_AVAILABLE = True
+except ImportError as e:
+    _kd_estimation_import_error = f"ImportError: {e}"
+except (AttributeError, OSError, SyntaxError) as e:
+    _kd_estimation_import_error = f"{type(e).__name__}: {e}"
+    log.error("kd_estimation module failed to load: %s", _kd_estimation_import_error, exc_info=True)
+
 # Import standardized constants
 try:
     from constants import NODATA_DEPTH, DEFAULT_TILE_SIZE, NUMERICAL_EPS
@@ -631,7 +643,10 @@ def _compute_features_block(
     features: Dict[str, np.ndarray] = {
         "B02": b02, "B03": b03, "B04": b04, "B08": b08,
         "log_B02": log_b02, "log_B03": log_b03, "log_B04": log_b04, "log_B08": log_b08,
-        "brightness": brightness,
+        # Recompute brightness from L∞-corrected bands to match training
+        # (train.py:add_s2_optical_features uses corrected b02/b03/b04).
+        # When L∞ is zero this is identical to the raw BRT raster.
+        "brightness": (b02_c + b03_c + b04_c) / 3.0,
         "B03_B02": b03_c / b02_c,
         "B04_B03": b04_c / b03_c,
         "nbri": (b03_c - b08_c) / (b03_c + b08_c + eps),
@@ -1107,6 +1122,10 @@ def predict_scene(
             elif support_gate_required:
                 log.warning("CUDEM support-distance DOA gate is active but no usable support tree was built; prediction will fail closed for unsupported pixels.")
             log.info("CUDEM alignment: outputs are guidance-only and non-authoritative; use guidance_weight/trusted_interior to control interpolation influence.")
+            if KD_ESTIMATION_AVAILABLE:
+                log.info("Per-pixel Kd estimation: Lee et al. (2005) semi-analytical (kd_estimation.py)")
+            else:
+                log.warning("Per-pixel Kd estimation: B03/B02 ratio heuristic fallback (kd_estimation.py unavailable: %s)", _kd_estimation_import_error)
 
             windows = [
                 Window(c, r, min(tile_size, width - c), min(tile_size, height - r))
@@ -1304,12 +1323,28 @@ def predict_scene(
 
                             y_pred_domain = np.maximum(y_pred_domain, 0.0)
 
-                            # crude Kd estimate for optical limit / uncertainty
+                            # Per-pixel Kd(490) for optical depth limit and uncertainty.
+                            # Uses Lee et al. (2005) semi-analytical algorithm from
+                            # kd_estimation.py when available; falls back to a simple
+                            # B03/B02 ratio heuristic otherwise.
                             b02_domain = b02[valid_mask][domain_mask_local]
                             b03_domain = b03[valid_mask][domain_mask_local]
-                            b02_safe = np.maximum(b02_domain, 0.001)
-                            ratio = b03_domain / b02_safe
-                            kd_est = (0.02 + 0.12 * np.clip(ratio, 0.5, 3.0)).astype(np.float32)
+                            b04_domain = b04[valid_mask][domain_mask_local]
+                            if KD_ESTIMATION_AVAILABLE:
+                                try:
+                                    kd_est = _estimate_kd_physics(
+                                        b02_domain, b03_domain, b04_domain,
+                                        algorithm="lee2005",
+                                    )
+                                except Exception as _kd_exc:
+                                    log.debug("Physics Kd estimation failed; using ratio fallback: %s", _kd_exc, exc_info=True)
+                                    b02_safe = np.maximum(b02_domain, 0.001)
+                                    ratio = b03_domain / b02_safe
+                                    kd_est = (0.02 + 0.12 * np.clip(ratio, 0.5, 3.0)).astype(np.float32)
+                            else:
+                                b02_safe = np.maximum(b02_domain, 0.001)
+                                ratio = b03_domain / b02_safe
+                                kd_est = (0.02 + 0.12 * np.clip(ratio, 0.5, 3.0)).astype(np.float32)
 
                             stumpf_depth_col = feature_cols.index("stumpf_depth") if "stumpf_depth" in feature_cols else None
                             stumpf_idx_col = feature_cols.index("stumpf_idx") if "stumpf_idx" in feature_cols else None
@@ -1356,7 +1391,13 @@ def predict_scene(
                                 y_unc_hybrid = None
 
                             # apply limits
-                            if stumpf_depth_col is not None and model_tier < 2:
+                            # Skip Stumpf envelope clip in direct-depth mode:
+                            # the RF was trained on absolute depth, not Stumpf
+                            # residuals, because Stumpf can be unreliable in
+                            # turbid anchor-supported water. Clipping the RF
+                            # back toward a Stumpf envelope would reintroduce
+                            # that baseline error.
+                            if stumpf_depth_col is not None and model_tier < 2 and prediction_mode != "direct_depth":
                                 stumpf_support = np.maximum(X_domain[:, stumpf_depth_col], 0.0)
                                 y_pred_domain = np.clip(
                                     y_pred_domain,
@@ -1366,6 +1407,13 @@ def predict_scene(
                             if depth_limit_mode == "optical":
                                 optical_max_depth = optical_depth_factor / np.maximum(kd_est, 0.02)
                                 optical_max_depth = np.minimum(optical_max_depth, max_depth_hard_cap)
+                                # When dense authoritative data supports deeper predictions,
+                                # the physics-based Kd limit should not clip below the
+                                # training data range — the RF was trained on measured depths
+                                # that are ground truth regardless of optical penetration.
+                                if anchor_support_good and actual_training_depth_max is not None:
+                                    anchor_floor = float(actual_training_depth_max) * 1.05
+                                    optical_max_depth = np.maximum(optical_max_depth, anchor_floor)
                                 beyond = y_pred_domain > optical_max_depth
                                 y_pred_domain[beyond] = np.nan
                             elif depth_limit_mode == "training":
@@ -1549,6 +1597,7 @@ def predict_scene(
                 },
                 "optical_limits": {
                     "depth_limit_mode": str(depth_limit_mode),
+                    "kd_algorithm": "lee2005" if KD_ESTIMATION_AVAILABLE else "ratio_heuristic",
                     "max_depth_training_m": float(max_depth_training) if max_depth_training else None,
                     "max_depth_hard_cap": float(max_depth_hard_cap) if max_depth_hard_cap else None,
                     "cw_min": float(cw_min) if cw_min is not None else None,

@@ -47,12 +47,14 @@ def estimate_memory_requirement_gb(width: int, height: int, n_features: int = 14
             n_arrays=int(overhead_factor),
         )
     except Exception:
+        log.debug("estimate_memory_requirement_gb: suppressed exception", exc_info=True)
         # Fallback: simple heuristic if chunked_processing is unavailable
         try:
             n_pix = int(width) * int(height)
             bytes_needed = float(n_pix) * float(n_features) * float(dtype_bytes) * float(overhead_factor)
             return bytes_needed / 1e9
         except Exception:
+            log.debug("estimate_memory_requirement_gb: suppressed exception", exc_info=True)
             return 0.0
 
 

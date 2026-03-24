@@ -1,6 +1,7 @@
 
 """Helpers for WAFFLES-based river/coastal masking and estuary clipping."""
 from __future__ import annotations
+import numpy as np
 
 import json
 import pandas as pd
@@ -11,6 +12,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.exec import run_command
+
+log = logging.getLogger(__name__)
+
+try:
+    from core.json_io import write_json
+except (ImportError, AttributeError):
+    def write_json(path, obj):
+        Path(path).write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
 
 
 try:
@@ -34,6 +43,83 @@ except (ImportError, AttributeError):
         return Path(path)
 
 
+
+
+
+
+def _estimate_pixel_size_m(transform, crs, *, height: int | None = None) -> float:
+    """Estimate pixel size in meters, including geographic grids."""
+    try:
+        px_x = abs(float(transform.a))
+        px_y = abs(float(transform.e))
+        if px_x <= 0.0 and px_y <= 0.0:
+            return 1.0
+        if bool(getattr(crs, "is_geographic", False)):
+            row_count = int(height) if height is not None and int(height) > 0 else 1
+            center_y = float(transform.f) - (0.5 * row_count * px_y)
+            lat_rad = np.deg2rad(center_y)
+            m_per_deg_lat = 111132.92 - (559.82 * np.cos(2.0 * lat_rad)) + (1.175 * np.cos(4.0 * lat_rad))
+            m_per_deg_lon = 111412.84 * np.cos(lat_rad) - 93.5 * np.cos(3.0 * lat_rad)
+            sx = px_x * abs(m_per_deg_lon)
+            sy = px_y * abs(m_per_deg_lat)
+        else:
+            sx = px_x
+            sy = px_y
+        vals = [v for v in (sx, sy) if np.isfinite(v) and v > 0.0]
+        return float(min(vals)) if vals else 1.0
+    except Exception:
+        log.debug("_estimate_pixel_size_m: suppressed exception", exc_info=True)
+        return 1.0
+
+
+
+
+def _channel_distance_from_seed(channel_mask: np.ndarray, seed_mask: np.ndarray) -> np.ndarray:
+    """Shortest 8-neighbor step distance inside a channel mask from seed pixels.
+
+    Returns np.inf outside the channel or when no seed exists. Distances are in pixel
+    steps so callers can scale by the target pixel size.
+    """
+    from collections import deque
+
+    channel = np.asarray(channel_mask, dtype=bool)
+    seeds = np.asarray(seed_mask, dtype=bool) & channel
+    dist = np.full(channel.shape, np.inf, dtype=np.float32)
+    if not np.any(channel) or not np.any(seeds):
+        return dist
+    q = deque()
+    seed_rows, seed_cols = np.nonzero(seeds)
+    for r, c in zip(seed_rows.tolist(), seed_cols.tolist()):
+        dist[r, c] = 0.0
+        q.append((r, c))
+    nrows, ncols = channel.shape
+    nbrs = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
+    while q:
+        r, c = q.popleft()
+        base = float(dist[r, c])
+        for dr, dc in nbrs:
+            rr = r + dr
+            cc = c + dc
+            if rr < 0 or rr >= nrows or cc < 0 or cc >= ncols or (not channel[rr, cc]):
+                continue
+            step = 1.41421356 if (dr != 0 and dc != 0) else 1.0
+            cand = base + step
+            if cand + 1e-6 < float(dist[rr, cc]):
+                dist[rr, cc] = cand
+                q.append((rr, cc))
+    return dist
+
+def _mask_to_geometry(mask, transform):
+    from rasterio.features import shapes
+    from shapely.geometry import shape
+    from shapely.ops import unary_union
+    mask_bool = np.asarray(mask, dtype=bool)
+    if not np.any(mask_bool):
+        return None
+    geoms = [shape(geom) for geom, value in shapes(mask_bool.astype("uint8"), mask=mask_bool, transform=transform) if int(value) == 1]
+    if not geoms:
+        return None
+    return unary_union(geoms)
 
 
 def waffles_preflight(*, logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
@@ -258,19 +344,19 @@ def determine_effective_methods_from_waffles(cfg: Any, report: Dict[str, Any], *
     if preflight.get('help_ok') is False:
         raise RuntimeError(f"WAFFLES preflight failed: {preflight.get('error') or 'help_failed'}")
     ocean_mask_cache = ensure_waffles_coastline_mask(cache_masks_shared, cfg.aoi, inc_arcsec=float(cfg.waffles_inc_arcsec or 1.0), want_nhd=False, want_lakes=False, prefix='waffles_coastline_ocean_only', force=force_masks, logger=log)
-    nhd_mask_cache = ensure_waffles_coastline_mask(cache_masks_shared, cfg.aoi, inc_arcsec=float(cfg.waffles_inc_arcsec or 1.0), want_nhd=True, want_lakes=False, prefix='waffles_coastline_with_nhd', force=force_masks, logger=log)
     cache_masks_run = Path(cfg.derived_cache_root) / 'masks'
     ocean_mask = stage_cached_waffles_mask(ocean_mask_cache, cache_masks_run / 'waffles_coastline_ocean_only.tif', logger=log)
-    nhd_mask = stage_cached_waffles_mask(nhd_mask_cache, cache_masks_run / 'waffles_coastline_with_nhd.tif', logger=log)
+    nhd_mask_cache = None
+    nhd_mask = None
     ocean_frac = waffles_water_fraction(ocean_mask, logger=log) if ocean_mask else 0.0
-    nhd_frac = waffles_water_fraction(nhd_mask, logger=log) if nhd_mask else 0.0
+    nhd_frac = None
     if ocean_mask and ocean_frac == 0.0 and want_sdb:
         log.warning('[DOMAIN] WAFFLES ocean mask has 0%% water (all-land). If the AOI contains ocean/coast, the cached mask may be stale or waffles may have failed silently. Try --force-waffles-masks to regenerate, or --waffles-min-water-fraction=0 to bypass the gate and run SDB regardless. Mask: %s', ocean_mask)
-    if nhd_mask and nhd_frac == 0.0 and want_river:
-        log.warning('[DOMAIN] WAFFLES NHD mask has 0%% water (all-land). If the AOI contains rivers/lakes, the cached mask may be stale or waffles may have failed for this AOI. Try --force-waffles-masks to regenerate, or --waffles-min-water-fraction=0 to bypass the gate and run regardless. Mask: %s', nhd_mask)
     min_frac = float(cfg.waffles_min_water_fraction)
     run_sdb = bool(want_sdb and (ocean_frac >= min_frac))
-    run_river = bool(want_river and (nhd_frac >= min_frac))
+    # River viability is determined later by extracted river-network polygons and the canonical
+    # with-NHD mask built from them. Do not gate river execution here on a raw WAFFLES NHD mask.
+    run_river = bool(want_river)
     effective: List[str] = []
     skipped: Dict[str, str] = {}
     if want_sdb:
@@ -289,10 +375,10 @@ def determine_effective_methods_from_waffles(cfg: Any, report: Dict[str, Any], *
         else:
             skipped['fuse'] = 'no_upstream_sources'
     cfg.waffles_ocean_mask = Path(ocean_mask) if ocean_mask else None
-    cfg.waffles_with_nhd_mask = Path(nhd_mask) if nhd_mask else None
+    cfg.waffles_with_nhd_mask = None
     cfg.ocean_domain_mask_for_fusion = Path(ocean_mask) if ocean_mask else None
-    cfg.water_domain_mask_for_final = Path(nhd_mask) if nhd_mask else None
-    meta = {'requested': requested, 'effective': effective, 'skipped': skipped, 'waffles': {'ocean_only_mask': str(ocean_mask) if ocean_mask else None, 'with_nhd_mask': str(nhd_mask) if nhd_mask else None, 'ocean_only_mask_cache': str(ocean_mask_cache) if ocean_mask_cache is not None else None, 'with_nhd_mask_cache': str(nhd_mask_cache) if nhd_mask_cache is not None else None, 'ocean_water_fraction': ocean_frac, 'with_nhd_water_fraction': nhd_frac, 'min_water_fraction': min_frac}}
+    cfg.water_domain_mask_for_final = None
+    meta = {'requested': requested, 'effective': effective, 'skipped': skipped, 'waffles': {'ocean_only_mask': str(ocean_mask) if ocean_mask else None, 'with_nhd_mask': None, 'ocean_only_mask_cache': str(ocean_mask_cache) if ocean_mask_cache is not None else None, 'with_nhd_mask_cache': None, 'ocean_water_fraction': ocean_frac, 'with_nhd_water_fraction': nhd_frac, 'min_water_fraction': min_frac}}
     report.setdefault('domain_inference', {}).update(meta)
     return effective, meta
 
@@ -346,6 +432,7 @@ def build_hydraulic_estuary_hint_mask(*, cfg: Any, channel, transform, crs, px_s
                     layer = cand
                     break
         except Exception:
+            log.debug("build_hydraulic_estuary_hint_mask: suppressed exception", exc_info=True)
             layer = None
         gdf = gpd.read_file(gpkg, layer=layer) if layer else gpd.read_file(gpkg)
         meta['river_network_layer'] = layer or 'default'
@@ -430,11 +517,50 @@ def apply_estuary_first_channel_domain(channel_mask, estuary_mask):
     return (channel & (~estuary)).astype(np.uint8)
 
 
+def _write_debug_mask(path: Path, profile: Dict[str, Any], mask: np.ndarray) -> None:
+    import rasterio
+
+    out_prof = profile.copy()
+    out_prof.pop('blockxsize', None)
+    out_prof.pop('blockysize', None)
+    out_prof.pop('tiled', None)
+    out_prof.update(dtype='uint8', nodata=0, compress='deflate')
+    with rasterio.open(path, 'w', **out_prof) as dst:
+        dst.write((np.asarray(mask) > 0).astype('uint8'), 1)
+
+
+def _mask_bbox_summary(mask: np.ndarray, transform) -> Dict[str, Any]:
+    import numpy as np
+    import rasterio.transform
+
+    ys, xs = np.where(np.asarray(mask) > 0)
+    if ys.size == 0:
+        return {'pixels': 0, 'bbox': None}
+    r0, r1 = int(ys.min()), int(ys.max())
+    c0, c1 = int(xs.min()), int(xs.max())
+    x0, y0 = rasterio.transform.xy(transform, r0, c0, offset='center')
+    x1, y1 = rasterio.transform.xy(transform, r1, c1, offset='center')
+    return {
+        'pixels': int(ys.size),
+        'bbox': {
+            'row_min': r0,
+            'row_max': r1,
+            'col_min': c0,
+            'col_max': c1,
+            'x_min_center': float(min(x0, x1)),
+            'x_max_center': float(max(x0, x1)),
+            'y_min_center': float(min(y0, y1)),
+            'y_max_center': float(max(y0, y1)),
+        },
+    }
+
+
 def clip_channel_mask_for_estuary(channel_mask_tif: Path, cfg: Any, *, ocean_mask_path: Optional[Path], report: Dict[str, Any], logger: Optional[logging.Logger] = None) -> Tuple[int, Optional[Path]]:
     log = logger or logging.getLogger(__name__)
     import numpy as np
     import rasterio
     from rasterio.warp import reproject, Resampling
+
     channel_mask_tif = Path(channel_mask_tif)
     if not channel_mask_tif.exists():
         return 0, None
@@ -443,13 +569,29 @@ def clip_channel_mask_for_estuary(channel_mask_tif: Path, cfg: Any, *, ocean_mas
         prof = ds.profile.copy()
         transform = ds.transform
         crs = ds.crs
-        px_size_m = max(abs(float(transform.a)), abs(float(transform.e)), 1e-6)
+        px_size_m = max(_estimate_pixel_size_m(transform, crs, height=ds.height), 1e-6)
     if not np.any(channel > 0):
         return 0, None
-    estuary_mask = np.zeros_like(channel, dtype=bool)
+
+    channel_before = (channel > 0)
+    estuary_mask = np.zeros_like(channel_before, dtype=bool)
+    width_estuary = np.zeros_like(channel_before, dtype=bool)
+    hydraulic_hint = np.zeros_like(channel_before, dtype=bool)
+    slope_near_widening = np.zeros_like(channel_before, dtype=bool)
+    ocean_water = np.zeros_like(channel_before, dtype=bool)
+    ocean_touch = np.zeros_like(channel_before, dtype=bool)
+    ocean_connected = np.zeros_like(channel_before, dtype=bool)
+    near_mouth_corridor = np.zeros_like(channel_before, dtype=bool)
+    width_support = np.zeros_like(channel_before, dtype=bool)
+    constrained_corridor = np.zeros_like(channel_before, dtype=bool)
+    local_width = np.zeros_like(channel, dtype='float32')
+    valid_widths = np.array([], dtype='float32')
+    transition_m = max(float(getattr(cfg, 'estuary_transition_m', 500.0) or 500.0), 3.0 * px_size_m)
+    corridor_limit_m = transition_m
     meta = {'signals': {}}
+
     try:
-        chan_bool = (channel > 0)
+        chan_bool = channel_before
         d_bank = distance_transform_edt(chan_bool, sampling=px_size_m).astype('float32')
         local_width = (2.0 * d_bank).astype('float32')
         valid_widths = local_width[chan_bool & (local_width > 0)]
@@ -464,72 +606,126 @@ def clip_channel_mask_for_estuary(channel_mask_tif: Path, cfg: Any, *, ocean_mas
                 if n_width > 0:
                     estuary_mask |= width_estuary
                     log.info('[ESTUARY-CLIP] Width-ratio: %d pixels exceed %.0f m (%.1fx median %.0f m, p25=%.0f m)', n_width, threshold_width, width_ratio_thresh, median_width, p25)
-                meta['signals']['width_ratio'] = {'median_width_m': round(float(median_width),1), 'threshold_width_m': round(float(threshold_width),1), 'ratio_thresh': float(width_ratio_thresh), 'pixels_flagged': n_width}
+                meta['signals']['width_ratio'] = {
+                    'median_width_m': round(float(median_width), 1),
+                    'threshold_width_m': round(float(threshold_width), 1),
+                    'ratio_thresh': float(width_ratio_thresh),
+                    'pixels_flagged': n_width,
+                }
     except (ValueError, RuntimeError, ImportError):
         log.debug('[ESTUARY-CLIP] Width-ratio signal failed', exc_info=True)
-    try:
-        if np.any(estuary_mask):
-            hydraulic_hint, hydraulic_meta = build_hydraulic_estuary_hint_mask(cfg=cfg, channel=(channel > 0), transform=transform, crs=crs, px_size_m=px_size_m, logger=log)
-            if np.any(hydraulic_hint > 0):
-                dist_to_width_det = distance_transform_edt(~estuary_mask) * px_size_m
-                slope_near_widening = (hydraulic_hint > 0) & (dist_to_width_det <= 1000.0)
-                n_slope_add = int(((~estuary_mask) & slope_near_widening).sum())
-                if n_slope_add > 0:
-                    estuary_mask |= slope_near_widening
-                    log.info('[ESTUARY-CLIP] Low-slope extension: %d pixels added near width-ratio detections (backwater=%d reaches)', n_slope_add, hydraulic_meta.get('backwater_slope_reaches', 0))
-            meta['signals']['low_slope_extension'] = {'backwater_slope_reaches': hydraulic_meta.get('backwater_slope_reaches', 0), 'pixels_added': locals().get('n_slope_add', 0), 'max_extension_m': 1000.0, 'note': 'low-slope only extends width-ratio detections, never independent'}
-    except (ValueError, RuntimeError, ImportError):
-        log.debug('[ESTUARY-CLIP] Low-slope extension failed', exc_info=True)
+
+    # Intentionally keep estuary detection simple and deterministic for now:
+    # width-ratio only, optionally filtered by ocean connectivity below.
+    hydraulic_hint = np.zeros_like(channel_before, dtype=bool)
+    slope_near_widening = np.zeros_like(channel_before, dtype=bool)
+
     if ocean_mask_path is not None and Path(ocean_mask_path).exists():
         try:
             from scipy.ndimage import label as _label
+
             ocean_raw = np.zeros_like(channel, dtype='uint8')
             with rasterio.open(ocean_mask_path) as om:
-                reproject(source=rasterio.band(om, 1), destination=ocean_raw, src_transform=om.transform, src_crs=om.crs, dst_transform=transform, dst_crs=crs, resampling=Resampling.nearest, src_nodata=om.nodata, dst_nodata=255)
+                reproject(
+                    source=rasterio.band(om, 1),
+                    destination=ocean_raw,
+                    src_transform=om.transform,
+                    src_crs=om.crs,
+                    dst_transform=transform,
+                    dst_crs=crs,
+                    resampling=Resampling.nearest,
+                    src_nodata=om.nodata,
+                    dst_nodata=255,
+                )
             ocean_water = (ocean_raw == 0)
-            if np.any(ocean_water) and np.any(estuary_mask):
-                ocean_bridge = binary_dilation(ocean_water, iterations=3)
-                # Connectivity must be evaluated through the channel domain, not just by
-                # direct contact between the current estuary candidates and an ocean-edge
-                # bridge. Otherwise a broad estuary connected to the ocean by non-estuary
-                # channel pixels can collapse to a tiny fringe near the mouth.
-                channel_domain = (channel > 0)
-                connect_domain = channel_domain | ocean_bridge
+            if np.any(ocean_water):
+                channel_domain = channel_before
+                ocean_touch = channel_domain & binary_dilation(ocean_water, iterations=1)
+                connect_domain = channel_domain | binary_dilation(ocean_water, iterations=1)
                 labeled, n_components = _label(connect_domain)
-                ocean_labels = set(np.unique(labeled[ocean_bridge & (labeled > 0)]))
-                n_before_connect = int(estuary_mask.sum())
+                ocean_labels = set(np.unique(labeled[ocean_touch & (labeled > 0)]))
                 if ocean_labels:
-                    ocean_connected = np.isin(labeled, list(ocean_labels))
-                    estuary_mask &= ocean_connected
+                    ocean_connected = np.isin(labeled, list(ocean_labels)) & channel_domain
                 else:
-                    estuary_mask[:] = False
+                    ocean_connected = np.zeros_like(channel_domain, dtype=bool)
+                n_before_connect = int(estuary_mask.sum())
+                estuary_mask &= ocean_connected
                 n_after_connect = int(estuary_mask.sum())
                 if n_before_connect > n_after_connect:
-                    log.info('[ESTUARY-CLIP] Ocean flood-fill: trimmed %d disconnected inland pixels (%d channel/ocean components checked, %d ocean-connected)', n_before_connect - n_after_connect, n_components, len(ocean_labels))
-                meta['signals']['ocean_connectivity'] = {'method': 'channel_domain_flood_fill', 'n_components': int(n_components), 'ocean_connected_components': len(ocean_labels), 'trimmed_inland_pixels': n_before_connect - n_after_connect}
-                estuary_dilated = binary_dilation(estuary_mask, iterations=2)
-                n_edge_added = int((estuary_dilated & (channel > 0) & ~estuary_mask).sum())
-                estuary_mask = estuary_dilated & (channel > 0)
-                if n_edge_added > 0:
-                    log.info('[ESTUARY-CLIP] Edge dilation: added %d channel-edge pixels to estuary mask', n_edge_added)
-                estuary_opened = binary_opening(estuary_mask, iterations=2)
-                estuary_opened = binary_dilation(estuary_opened, iterations=2) & (channel > 0)
-                n_smoothed = int(estuary_mask.sum() - estuary_opened.sum())
-                if n_smoothed > 0 and estuary_opened.sum() > 0.5 * estuary_mask.sum():
-                    estuary_mask = estuary_opened
-                    log.info('[ESTUARY-CLIP] Morphological opening: removed %d rounded buffer artifact pixels', n_smoothed)
+                    log.info('[ESTUARY-CLIP] Ocean connectivity trim: removed %d disconnected inland pixels (%d channel/ocean components checked, %d ocean-connected)', n_before_connect - n_after_connect, n_components, len(ocean_labels))
+
+                channel_dist_px = _channel_distance_from_seed(ocean_connected, ocean_touch)
+                channel_dist_m = channel_dist_px * px_size_m
+                finite_channel_dist = np.isfinite(channel_dist_m) & ocean_connected
+                min_transition_m = max(float(getattr(cfg, 'estuary_connect_dist_m', 200.0) or 200.0), 3.0 * px_size_m)
+                transition_m = max(float(getattr(cfg, 'estuary_transition_m', 500.0) or 500.0), min_transition_m)
+                near_mouth_corridor = finite_channel_dist & (channel_dist_m <= transition_m)
+
+                width_seed = np.asarray(estuary_mask, dtype=bool)
+                if np.any(width_seed):
+                    support_width_m = max(float(np.percentile(valid_widths, 60)) if valid_widths.size > 0 else 0.0, 1.5 * px_size_m)
+                    width_support = ocean_connected & (local_width >= support_width_m)
+                    farthest_seed_m = float(np.nanmax(channel_dist_m[width_seed])) if np.any(width_seed) else 0.0
+                    corridor_limit_m = max(transition_m, farthest_seed_m + max(4.0 * px_size_m, 50.0))
+                else:
+                    corridor_limit_m = transition_m
+                constrained_corridor = finite_channel_dist & (channel_dist_m <= corridor_limit_m)
+
+                estuary_mask = (near_mouth_corridor | (width_support & constrained_corridor)) & ocean_connected
+
+                if np.any(estuary_mask):
+                    est_labeled, est_n = _label(estuary_mask)
+                    if est_n > 1:
+                        sizes = np.bincount(est_labeled.ravel())
+                        keep = np.zeros(est_n + 1, dtype=bool)
+                        min_keep_px = max(4, int(round((transition_m / max(px_size_m, 1e-6)) * 0.25)))
+                        for idx in range(1, est_n + 1):
+                            if sizes[idx] >= min_keep_px:
+                                keep[idx] = True
+                        if np.any(keep[1:]):
+                            estuary_mask = keep[est_labeled]
+
+                meta['signals']['ocean_connectivity'] = {
+                    'method': 'ocean_connected_channel_corridor',
+                    'n_components': int(n_components),
+                    'ocean_connected_components': len(ocean_labels),
+                    'trimmed_inland_pixels': int(n_before_connect - n_after_connect),
+                    'transition_m': round(float(transition_m), 1),
+                    'corridor_limit_m': round(float(corridor_limit_m), 1),
+                }
         except (OSError, ValueError, RuntimeError, ImportError):
             log.debug('[ESTUARY-CLIP] Ocean connectivity filter failed', exc_info=True)
-    n_removed = int(((channel > 0) & estuary_mask).sum())
-    if n_removed == 0:
-        log.info('[ESTUARY-CLIP] No estuary pixels detected in channel mask; no clipping applied.')
-        return 0, None
+
+    n_removed = int((channel_before & estuary_mask).sum())
+
     estuary_clip_path = channel_mask_tif.parent / 'estuary_clip_mask.tif'
+    estuary_transition_path = channel_mask_tif.parent / 'estuary_transition_mask.tif'
+    estuary_debug_receipt_path = channel_mask_tif.parent / 'estuary_debug_receipt.json'
+    estuary_debug_dir = channel_mask_tif.parent / 'estuary_debug'
+    estuary_debug_dir.mkdir(parents=True, exist_ok=True)
+
     prof_u8 = prof.copy()
+    prof_u8.pop('blockxsize', None)
+    prof_u8.pop('blockysize', None)
+    prof_u8.pop('tiled', None)
     prof_u8.update(dtype='uint8', nodata=0, compress='deflate')
     with rasterio.open(estuary_clip_path, 'w', **prof_u8) as dst:
         dst.write(estuary_mask.astype('uint8'), 1)
+
+    if n_removed == 0:
+        with rasterio.open(estuary_transition_path, 'w', **prof_u8) as dst:
+            dst.write(np.zeros_like(channel, dtype='uint8'), 1)
+        meta['signals']['result'] = {
+            'estuary_pixels_removed': 0,
+            'transition_pixels': 0,
+            'border_eroded_pixels': 0,
+        }
+        estuary_debug_receipt_path.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding='utf-8')
+        log.info('[ESTUARY-CLIP] No estuary pixels detected in channel mask; wrote zero estuary and transition masks.')
+        return 0, estuary_clip_path
+
     channel[estuary_mask] = 0
+    n_border_eroded = 0
     try:
         estuary_border = binary_dilation(estuary_mask, iterations=2) & ~estuary_mask
         border_channel = (channel > 0) & estuary_border
@@ -538,11 +734,80 @@ def clip_channel_mask_for_estuary(channel_mask_tif: Path, cfg: Any, *, ocean_mas
             channel[border_channel] = 0
             log.info('[ESTUARY-CLIP] Border erosion: removed %d channel-edge pixels adjacent to estuary boundary', n_border_eroded)
     except (ValueError, RuntimeError, ImportError):
-        pass
+        estuary_border = np.zeros_like(estuary_mask, dtype=bool)
+        border_channel = np.zeros_like(estuary_mask, dtype=bool)
+
+    channel_after = (channel > 0)
+    transition_seed = channel_after & binary_dilation(estuary_mask, iterations=1)
+    if not np.any(transition_seed):
+        transition_seed = channel_after & binary_dilation(border_channel, iterations=1)
+    if not np.any(transition_seed):
+        transition_seed = channel_after & binary_dilation(near_mouth_corridor, iterations=1)
+    transition_channel_dist_px = _channel_distance_from_seed(channel_after, transition_seed)
+    transition_channel_dist_m = transition_channel_dist_px * px_size_m
+    estuary_transition = channel_after & np.isfinite(transition_channel_dist_m) & (transition_channel_dist_m <= transition_m)
+    estuary_transition &= channel_after
+
+    with rasterio.open(estuary_transition_path, 'w', **prof_u8) as dst:
+        dst.write(estuary_transition.astype('uint8'), 1)
+
+    prof.pop('blockxsize', None)
+    prof.pop('blockysize', None)
+    prof.pop('tiled', None)
     prof.update(dtype='uint8', nodata=0)
     with rasterio.open(channel_mask_tif, 'w', **prof) as dst:
         dst.write(channel.astype('uint8'), 1)
-    n_remaining = int((channel > 0).sum())
+    n_remaining = int(channel_after.sum())
     log.info('[ESTUARY-CLIP] Removed %d estuary pixels from channel mask (%d remaining). Estuary mask: %s', n_removed, n_remaining, estuary_clip_path)
-    report.setdefault('river', {}).setdefault('estuary_clip', {}).update({'pixels_removed': n_removed, 'pixels_remaining': n_remaining, 'estuary_clip_mask': str(estuary_clip_path), 'method': 'width_ratio + low_slope, ocean-connectivity filtered', 'signals': meta.get('signals', {})})
+    log.info('[ESTUARY-CLIP] Transition zone retained upstream of estuary clip: %d pixels (%.0f m along-channel)', int(estuary_transition.sum()), float(transition_m))
+
+    debug_masks = {
+        'channel_preclip': channel_before,
+        'aligned_ocean_water': ocean_water,
+        'width_ratio_seed': width_estuary,
+        'hydraulic_hint': hydraulic_hint,
+        'low_slope_extension': slope_near_widening,
+        'ocean_touch': ocean_touch,
+        'ocean_connected_channel': ocean_connected,
+        'near_mouth_corridor': near_mouth_corridor,
+        'width_support': width_support,
+        'constrained_corridor': constrained_corridor,
+        'estuary_clip': estuary_mask,
+        'estuary_transition': estuary_transition,
+        'channel_postclip': channel_after,
+    }
+    for name, mask in debug_masks.items():
+        _write_debug_mask(estuary_debug_dir / f'{name}.tif', prof, mask)
+
+    debug_receipt = {
+        'method': 'width_ratio, ocean-connectivity filtered',
+        'pixel_size_m': float(px_size_m),
+        'transition_m': float(transition_m),
+        'corridor_limit_m': float(corridor_limit_m),
+        'signals': meta.get('signals', {}),
+        'masks': {name: _mask_bbox_summary(mask, transform) for name, mask in debug_masks.items()},
+        'paths': {
+            'estuary_clip_mask': str(estuary_clip_path),
+            'estuary_transition_mask': str(estuary_transition_path),
+            'debug_dir': str(estuary_debug_dir),
+        },
+    }
+    write_json(estuary_debug_receipt_path, debug_receipt)
+
+    report.setdefault('river', {}).setdefault('estuary_clip', {}).update({
+        'pixels_removed': n_removed,
+        'pixels_remaining': n_remaining,
+        'border_eroded_pixels': int(n_border_eroded),
+        'estuary_clip_mask': str(estuary_clip_path),
+        'estuary_transition_mask': str(estuary_transition_path),
+        'estuary_debug_receipt': str(estuary_debug_receipt_path),
+        'estuary_debug_dir': str(estuary_debug_dir),
+        'method': 'width_ratio, ocean-connectivity filtered',
+        'signals': meta.get('signals', {}),
+    })
+    report.setdefault('river', {}).setdefault('outputs', {}).update({
+        'estuary_clip_mask': str(estuary_clip_path),
+        'estuary_transition': str(estuary_transition_path),
+        'estuary_debug_receipt': str(estuary_debug_receipt_path),
+    })
     return n_removed, estuary_clip_path

@@ -12,6 +12,7 @@ from validation_runner import (
     compute_support_class_metrics,
     run_ablation_matrix,
 )
+from final_dem_contract_validator import validate_written_final_dem_contract
 
 
 def _parse_case_spec(spec: str) -> tuple[str, str]:
@@ -240,12 +241,36 @@ def run_validation_invariance_framework(*,
     authoritative = _load_float_raster(authoritative_base, reference=invariant_final) if authoritative_base else None
     provenance = _load_class_raster(provenance_path, reference=invariant_final) if provenance_path else None
 
-    authoritative_invariant = evaluate_authoritative_lock_invariant(
-        pred=pred,
-        authoritative=authoritative if authoritative is not None else np.full_like(pred, np.nan),
-        support_class=support,
-        tolerance=tolerance,
-    ) if authoritative_base else {"checked": 0, "ok": None, "reason": "no authoritative_base available"}
+    authoritative_contract = None
+    if authoritative_base and support_path and invariant_final:
+        authoritative_contract = validate_written_final_dem_contract(
+            final_depth=invariant_final,
+            aligned_authoritative_base=authoritative_base,
+            support_class=support_path,
+            atol=tolerance,
+        )
+    if authoritative_contract and authoritative_contract.get("validated") and not authoritative_contract.get("skipped"):
+        hard_lock = authoritative_contract.get("authoritative_hard_lock", {}) if isinstance(authoritative_contract.get("authoritative_hard_lock", {}), dict) else {}
+        authoritative_invariant = {
+            "checked": int(hard_lock.get("locked_finite_authoritative_pixels", 0) or 0),
+            "tolerance": float(tolerance),
+            "ok": hard_lock.get("ok"),
+            "max_abs": hard_lock.get("max_abs_diff_m"),
+            "mean_abs": None,
+            "source": "final_dem_contract_validator",
+            "mismatch_pixels": int(hard_lock.get("mismatch_pixels", 0) or 0),
+        }
+    else:
+        authoritative_invariant = evaluate_authoritative_lock_invariant(
+            pred=pred,
+            authoritative=authoritative if authoritative is not None else np.full_like(pred, np.nan),
+            support_class=support,
+            tolerance=tolerance,
+        ) if authoritative_base else {"checked": 0, "ok": None, "reason": "no authoritative_base available"}
+        if authoritative_contract is not None:
+            authoritative_invariant["source"] = "fallback_direct_eval"
+            if authoritative_contract.get("skipped"):
+                authoritative_invariant["contract_skip_reason"] = authoritative_contract.get("skip_reason")
 
     payload: Dict[str, Any] = {
         "selected_final_depth": str(selected_final),

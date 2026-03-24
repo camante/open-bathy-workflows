@@ -655,6 +655,7 @@ def resume_or_run(
         return result
         
     except Exception as e:
+        log.debug("checkpoints: suppressed exception", exc_info=True)
         duration = time.time() - start
         checkpoint.mark_failed(stage, str(e), duration)
         raise

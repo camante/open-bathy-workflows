@@ -407,6 +407,7 @@ def adaptive_grid_thinning(
         h = float(np.nanmax(y_m) - np.nanmin(y_m))
         area_m2 = max(1.0, w) * max(1.0, h)
     except Exception:
+        log.debug("spatial_sampling: suppressed exception", exc_info=True)
         area_m2 = None
 
     # Desired local floor (we never exceed n_points)
@@ -657,6 +658,7 @@ def identify_gap_regions(
     try:
         n_cov = int(getattr(covered_points_kdtree, 'n', 0))
     except Exception:
+        log.debug("identify_gap_regions: suppressed exception", exc_info=True)
         n_cov = 0
     if n_cov == 0:
         return np.ones(len(all_points), dtype=bool)

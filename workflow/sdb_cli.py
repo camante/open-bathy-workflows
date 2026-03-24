@@ -50,6 +50,13 @@ def build_sdb_command(cfg: Any, *, out_dir: str, authoritative_passthrough_args:
     ]
     if authoritative_passthrough_args:
         cmd.extend(str(x) for x in authoritative_passthrough_args)
+    domain_mask = getattr(cfg, 'sdb_guidance_domain_mask', None)
+    if domain_mask:
+        cmd.extend([
+            f"--land-mask={domain_mask}",
+            "--land-mask-type=land_binary",
+            "--land-mask-water-val=0",
+        ])
     return cmd
 
 

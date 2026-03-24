@@ -84,6 +84,7 @@ def _read_csv_xyz(path: Path) -> np.ndarray:
             try:
                 vals.append(float(v))
             except Exception:
+                log.debug("pick: suppressed exception", exc_info=True)
                 continue
         if len(vals) >= 3:
             out.append((vals[0], vals[1], vals[2]))
@@ -107,6 +108,7 @@ def read_xyz_points(paths: Iterable[Path]) -> Tuple[np.ndarray, np.ndarray, np.n
             else:
                 arr = _read_text_xyz(p)
         except Exception:
+            log.debug("read_xyz_points: suppressed exception", exc_info=True)
             continue
         if arr.size == 0:
             continue

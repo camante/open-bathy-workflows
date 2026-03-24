@@ -22,7 +22,7 @@ Behavior:
 - authoritative finite cells are locked
 - only authoritative gaps are eligible for interpolation
 - SDB and river guidance act as confidence-weighted subordinate influence
-- river scaffold-dominant areas can elevate support class to scaffold_inferred
+- river channel structure guidance areas can elevate support class to scaffold_inferred
 - remaining gaps use a deterministic nearest-valid backstop to maintain a
   continuous raster, reported as low_confidence_continuous_fill when needed
 

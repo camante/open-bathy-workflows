@@ -455,6 +455,7 @@ def get_sun_view_angles_from_s2_metadata(s2_dir: Union[str, Path]) -> Tuple[floa
                 break
                 
         except Exception:
+            log.debug("physics_integration: suppressed exception", exc_info=True)
             continue
     
     # Source 2: Try to compute from raster metadata (date + location)

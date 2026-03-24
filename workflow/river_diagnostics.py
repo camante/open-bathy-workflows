@@ -337,6 +337,7 @@ def create_unified_bathy_report(
             # Keep the main report embedded for traceability (users can inspect one file)
             rep["bathy_report"] = main_rep
         except Exception as e:
+            log.debug("river_diagnostics: suppressed exception", exc_info=True)
             rep["status"]["bathy_report_read_error"] = str(e)
 
     def _discover_artifacts(base: Path, kinds: tuple[str, ...] = (".tif", ".tiff", ".gpkg", ".json", ".csv", ".pkl")) -> List[str]:
@@ -348,6 +349,7 @@ def create_unified_bathy_report(
                 if p.is_file() and p.suffix.lower() in kinds:
                     out.append(str(p))
         except Exception:
+            log.debug("_discover_artifacts: suppressed exception", exc_info=True)
             return []
         # Avoid huge reports: cap
         return out[:200]

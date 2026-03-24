@@ -15,6 +15,7 @@ Usage:
         try:
             return gpd.read_file(path)
         except Exception as e:
+            log.debug("load_data: suppressed exception", exc_info=True)
             raise ProcessingError(f"Failed to read {path}") from e
 """
 
@@ -280,6 +281,7 @@ def safe_operation(func, *args, error_class=ProcessingError,
         # Re-raise our custom errors
         raise
     except Exception as e:
+        log.debug("safe_operation: suppressed exception", exc_info=True)
         # Wrap other exceptions
         raise error_class(
             context,

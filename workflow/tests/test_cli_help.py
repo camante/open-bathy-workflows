@@ -30,3 +30,7 @@ def test_sdb_main_help():
 
 def test_river_skeleton_help():
     _run_help("river_skeleton_bathy.py")
+
+
+def test_guidance_domains_help():
+    _run_help("guidance_domains_main.py")

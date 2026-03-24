@@ -33,6 +33,8 @@ def test_final_output_contract_exposes_guidance_first_inputs(tmp_path: Path):
     assert contract["guidance_artifacts"]["river_corridor_mask"] == str(corridor)
     assert contract["guidance_contract"]["artifacts_present"]["sdb_guide_points"] is True
     assert contract["guidance_contract"]["final_dem_inputs"][0] == "authoritative_hard_locks"
+    assert "authoritative_aligned_base" in contract["guidance_contract"]["allowed_final_route_inputs"]
+    assert "legacy_fused_candidate_raster" in contract["guidance_contract"]["forbidden_structural_inputs"]
 
 
 
@@ -51,3 +53,27 @@ def test_final_output_contract_reports_guidance_readiness(tmp_path: Path):
     assert readiness["sdb_guidance_ready"] is False
     assert "sdb_guidance_weight" in readiness["missing_core_artifacts"]
     assert readiness["guidance_ready"] is False
+
+
+def test_final_output_contract_reports_no_legacy_candidate_backstop(tmp_path: Path):
+    final_native = _touch(tmp_path / "combined" / "conditioned_depth.tif")
+    final_prov = _touch(tmp_path / "combined" / "conditioned_prov.tif")
+    report = {
+        "authoritative_base": {"status": "applied", "outputs": {"conditioned_depth": str(final_native)}},
+        "candidate_generation": {"mode": "direct_guidance_artifacts_only", "backstop_policy": {"legacy_candidate_enabled": False}},
+    }
+    cfg = SimpleNamespace(out_dir=tmp_path, authoritative_base="")
+    contract = build_final_output_contract(cfg, report, final_native=final_native, final_for_user=None, final_provenance=final_prov)
+    assert contract["final_dem_contract"]["route_cleanup"]["legacy_candidate_enabled"] is False
+
+
+def test_final_output_contract_can_track_structured_river_guidance_inputs(tmp_path: Path):
+    final_native = _touch(tmp_path / "combined" / "conditioned_depth.tif")
+    final_prov = _touch(tmp_path / "combined" / "conditioned_prov.tif")
+    report = {
+        "authoritative_base": {"status": "applied", "outputs": {"conditioned_depth": str(final_native)}},
+        "candidate_generation": {"mode": "direct_guidance_artifacts_only", "backstop_policy": {"legacy_candidate_enabled": False, "river_guidance_source": "structured_sparse_guide_points_only"}},
+    }
+    cfg = SimpleNamespace(out_dir=tmp_path, authoritative_base="")
+    contract = build_final_output_contract(cfg, report, final_native=final_native, final_for_user=None, final_provenance=final_prov)
+    assert contract["final_dem_contract"]["route_cleanup"]["legacy_candidate_enabled"] is False

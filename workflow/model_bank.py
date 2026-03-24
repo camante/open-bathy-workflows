@@ -53,6 +53,7 @@ def _json_safe(obj: Any) -> Any:
             return obj.item()
         return str(obj)
     except Exception:
+        log.debug("_json_safe: suppressed exception", exc_info=True)
         return str(obj)
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -168,6 +169,7 @@ def _deterministic_row_order(df: pd.DataFrame) -> pd.DataFrame:
         try:
             return df.sort_values(by=cols).reset_index(drop=True)
         except Exception:
+            log.debug("_deterministic_row_order: suppressed exception", exc_info=True)
             return df.reset_index(drop=True)
     return df.reset_index(drop=True)
 

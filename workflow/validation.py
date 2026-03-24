@@ -375,6 +375,7 @@ def validate_file_path(
     try:
         p = Path(path)
     except Exception as err:
+        log.debug("validate_file_path: suppressed exception", exc_info=True)
         result.add_error(f"{name}: Invalid path '{path}': {err}")
         return result
     
@@ -430,6 +431,7 @@ def validate_directory(
     try:
         p = Path(path)
     except Exception as err:
+        log.debug("validate_directory: suppressed exception", exc_info=True)
         result.add_error(f"{name}: Invalid path '{path}': {err}")
         return result
     
@@ -443,6 +445,7 @@ def validate_directory(
             p.mkdir(parents=True, exist_ok=True)
             result.info[f"{name}_created"] = True
         except Exception as err:
+            log.debug("validate_directory: suppressed exception", exc_info=True)
             result.add_error(f"{name}: Could not create directory: {err}")
     
     return result
@@ -523,6 +526,7 @@ def validate_raster(
     except ImportError:
         result.add_warning(f"{name}: rasterio not available, skipping detailed validation")
     except Exception as err:
+        log.debug("validation: suppressed exception", exc_info=True)
         result.add_error(f"{name}: Could not read raster: {err}")
     
     return result

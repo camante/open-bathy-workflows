@@ -185,6 +185,7 @@ def step(name: str, **fields: Any):
         yield
         ok = True
     except Exception as e:
+        log.debug("step: suppressed exception", exc_info=True)
         ok = False
         if rec is not None:
             rec.record_exception(where=f"step:{name}", exc=e)

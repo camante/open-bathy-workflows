@@ -18,13 +18,14 @@ def test_final_output_contract_reports_gap_only_legacy_backstop(tmp_path: Path):
             "status": "applied",
             "outputs": {"conditioned_depth": str(final_native)},
             "candidate_generation": {
-                "mode": "support_aware_direct_sources_with_gap_only_legacy_backstop",
+                "mode": "support_aware_guidance_only_no_legacy_backstop",
                 "stats": {
-                    "legacy_fallback_pixels": 5,
+                    "legacy_fallback_pixels": 0,
                     "legacy_blocked_in_river_corridor_pixels": 8,
                 },
                 "backstop_policy": {
-                    "legacy_candidate_role": "gap_only_backstop",
+                    "legacy_candidate_enabled": False,
+                    "legacy_candidate_role": "disabled",
                     "disallow_legacy_in_river_corridor_outside_estuary": True,
                 },
             },
@@ -35,8 +36,8 @@ def test_final_output_contract_reports_gap_only_legacy_backstop(tmp_path: Path):
     cfg = SimpleNamespace(out_dir=tmp_path, authoritative_base="")
     contract = build_final_output_contract(cfg, report, final_native=final_native, final_for_user=None, final_provenance=final_prov)
     summary = contract["final_dem_contract"]
-    assert summary["invariants"]["legacy_candidate_gap_only_backstop"] is True
-    assert summary["route_cleanup"]["legacy_backstop_used"] is True
-    assert summary["route_cleanup"]["legacy_gap_only_backstop_pixels"] == 5
+    assert summary["invariants"]["no_legacy_candidate_backstop_in_final_route"] is True
+    assert summary["route_cleanup"]["legacy_backstop_used"] is False
+    assert summary["route_cleanup"]["legacy_gap_only_backstop_pixels"] == 0
     assert summary["route_cleanup"]["legacy_blocked_in_river_corridor_pixels"] == 8
     assert summary["guidance_roles"]["dense_sdb_depth"] == "diagnostic_only"

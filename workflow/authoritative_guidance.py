@@ -11,6 +11,10 @@ import numpy as np
 import rasterio
 from pyproj import Transformer
 
+from sign_semantics import raster_value_semantics
+log = logging.getLogger(__name__)
+
+
 
 def _parse_aoi(aoi: str) -> Tuple[float, float, float, float]:
     west, east, south, north = (float(v) for v in str(aoi).split('/'))
@@ -134,6 +138,7 @@ def _horizontal_epsg(path: Path | str) -> Optional[int]:
         try:
             return ds.crs.to_epsg() if ds.crs else None
         except Exception:
+            log.debug("_horizontal_epsg: suppressed exception", exc_info=True)
             return None
 
 
@@ -143,7 +148,7 @@ def export_raster_points_to_csv(
     *,
     out_crs: str,
     max_points: int = 250000,
-    negative_only: bool = True,
+    negative_only: Optional[bool] = True,
     source_tag: str = 'authoritative_base',
     source_vdatum: Optional[str] = None,
     target_vdatum: Optional[str] = None,
@@ -160,7 +165,10 @@ def export_raster_points_to_csv(
         valid = np.isfinite(arr)
         if nodata is not None:
             valid &= ~np.isclose(arr, np.float32(nodata))
-        if negative_only:
+        resolved_negative_only = negative_only
+        if resolved_negative_only is None:
+            resolved_negative_only = raster_value_semantics(ds.tags()) not in {"absolute_elevation"}
+        if resolved_negative_only:
             valid &= arr < 0.0
         rows, cols = np.nonzero(valid)
         n_total = int(rows.size)
@@ -183,6 +191,7 @@ def export_raster_points_to_csv(
             b = float(getattr(tf, 'b', 0.0) or 0.0)
             d = float(getattr(tf, 'd', 0.0) or 0.0)
         except Exception:
+            log.debug("export_raster_points_to_csv: suppressed exception", exc_info=True)
             tf_vals = tuple(tf)[:6]
             if len(tf_vals) < 6:
                 raise
@@ -202,7 +211,7 @@ def export_raster_points_to_csv(
                     f"Vertical transform produced invalid coordinates for {src_path}: {source_vdatum} -> {target_vdatum}"
                 )
             xs, ys, vals = txs, tys, tzs
-            if negative_only:
+            if resolved_negative_only:
                 keep = np.asarray(vals, dtype=float) < 0.0
                 xs = np.asarray(xs, dtype=float)[keep]
                 ys = np.asarray(ys, dtype=float)[keep]
@@ -225,8 +234,9 @@ def export_raster_points_to_csv(
         'stride': int(stride),
         'source_raster': str(src_path),
         'out_crs': str(out_crs),
+        'negative_only': bool(resolved_negative_only),
     }
-    log.info('[AUTHORITATIVE] Exported %d raster-derived support points to %s (stride=%d, negative_only=%s)', int(len(vals)), out_path, int(stride), bool(negative_only))
+    log.info('[AUTHORITATIVE] Exported %d raster-derived support points to %s (stride=%d, negative_only=%s)', int(len(vals)), out_path, int(stride), bool(resolved_negative_only))
     return info
 
 
@@ -278,23 +288,25 @@ def prepare_authoritative_river_soundings_points(
     *,
     out_crs: str,
     max_points: int = 250000,
-    negative_only: bool = True,
+    negative_only: Optional[bool] = False,
     logger: Optional[logging.Logger] = None,
 ) -> Dict[str, Any]:
-    """Export authoritative-base depths as river soundings-style XYZ support.
+    """Export authoritative-base support as river sounding-style XYZ support.
 
-    Unlike SDB support, river soundings stay in the workflow working CRS and
-    working vertical reference. This makes the authoritative base behave like
-    extra_xyz for river anchoring without introducing an extra datum hop.
+    River-guidance support is a bed-elevation support product, not an optical
+    depth-only training set, so inland positive NAVD88 values are valid by
+    default. Callers may still force negative_only=True for explicit depth-mode
+    exports, but the default for river support is role-aware bed-elevation use.
     """
     info = export_raster_points_to_csv(
         auth_raster,
         out_csv,
         out_crs=out_crs,
         max_points=int(max_points),
-        negative_only=bool(negative_only),
+        negative_only=negative_only,
         source_tag='authoritative_base',
         logger=logger,
     )
     info['target_role'] = 'river_soundings'
+    info['negative_only_resolved'] = bool(info.get('negative_only', False)) if 'negative_only' in info else bool(negative_only)
     return info

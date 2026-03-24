@@ -143,6 +143,7 @@ def _df_depth_summary(df: pd.DataFrame, depth_col: str = "depth_m") -> Dict[str,
         h, _ = np.histogram(v, bins=edges)
         out["hist_0_40_1m"] = h.tolist()
     except Exception:
+        log.debug("_df_depth_summary: suppressed exception", exc_info=True)
         return out
     return out
 
@@ -305,6 +306,7 @@ def _maybe_load_cached_training_points(
             try:
                 code_fp = fingerprint_code(Path(__file__), strict=bool(cache_code_strict))
             except Exception:
+                log.debug("_maybe_load_cached_training_points: suppressed exception", exc_info=True)
                 code_fp = ""
             payload = {
                 "cache_key": key,
@@ -355,6 +357,7 @@ def _write_cached_training_points(
         try:
             code_fp = fingerprint_code(Path(__file__), strict=bool(cache_code_strict))
         except Exception:
+            log.debug("_write_cached_training_points: suppressed exception", exc_info=True)
             code_fp = ""
         payload = meta_payload(
             cache_key=key,
@@ -524,20 +527,16 @@ def _filter_points_by_mask(
                         keep_v = sampled_v == wv
 
 
-            # Sanity rescue: if we kept nothing, try a safe fallback for common continuous masks.
             if int(np.count_nonzero(keep_v)) == 0 and sampled_v.size > 0:
                 sv_min = float(np.nanmin(sampled_v))
                 sv_max = float(np.nanmax(sampled_v))
-                # If the mask looks like 0..1 and user didn't explicitly request a binary convention,
-                # treat it as land probability (keep <= threshold) as a last resort.
-                if (sv_min >= -1e-6) and (sv_max <= 1.0 + 1e-6) and (mtype not in ("land_probability", "land_prob", "probability")):
-                    keep_v = sampled_v <= float(threshold)
-                    log.warning(
-                        "[ATL-MASK] Kept 0 points with initial semantics; "
-                        "falling back to land_probability keep<=threshold (%.2f).",
-                        float(threshold),
-                    )
-                    _rr_add(rr, "atl.mask_filter.auto.fallback_land_probability", True)
+                diag_msg = (
+                    "ATL mask filtering kept 0 points; mask semantics are inconsistent with the provided "
+                    f"mask_type={mtype!r}, water_val={water_val}, invert={invert}, threshold={float(threshold):.3f}, "
+                    f"sampled_range=[{sv_min:.6f}, {sv_max:.6f}]"
+                )
+                _rr_add(rr, "atl.mask_filter.error", diag_msg)
+                raise ValueError(diag_msg)
 # Map keep_v back onto full-length mask
             keep = np.zeros(len(df), dtype=bool)
             keep_idx = np.flatnonzero(valid)
@@ -1627,6 +1626,7 @@ def collect_training_points_from_atl03(
                 try:
                     (lat, lon, h_ph, conf, ref_elev, _, _, _, _) = read_atl03_basic(atl03_path, laser_num)
                 except Exception: continue
+                log.debug("atl: suppressed exception", exc_info=True)
 
                 photons_total += int(np.size(lat))
                 m_geo = (np.isfinite(lat) & np.isfinite(lon) & np.isfinite(h_ph) & np.isfinite(conf))
@@ -1947,6 +1947,7 @@ def build_atl03_track_lines(atl03_files: List[str], aoi_str: str, out_shp: str):
         import geopandas as gpd
         from shapely.geometry import LineString
     except Exception as e:
+        log.debug("build_atl03_track_lines: suppressed exception", exc_info=True)
         raise RuntimeError("build_atl03_track_lines requires geopandas + shapely") from e
 
     # This visualizes where the tracks are

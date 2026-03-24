@@ -79,6 +79,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List
 
+from xs_contracts import (
+    coerce_truthy_series as _coerce_truthy_series,
+    load_validated_xs_artifacts,
+    read_gpkg_layer_strict,
+    require_columns,
+    safe_float as _safe_float,
+    summarize_bank_contract,
+    validate_soundings_subset_parquet,
+    validate_xs_artifacts,
+)
+
+
 import math
 
 import numpy as np
@@ -143,6 +155,53 @@ def _union_all(geoms):
         return geoms.unary_union
 if not log.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+
+def _pick_bank_dists_from_points(xsp: pd.DataFrame) -> Tuple[Optional[float], Optional[float], str]:
+    """Recover bank distances from XS point records.
+
+    Primary recovery uses explicit bank flags emitted by ``xs_builder``. If one or
+    both bank flags are missing, fall back to the sampled profile extent so the
+    caller can distinguish a true flag recovery from a broader extent recovery.
+    """
+    if xsp is None or len(xsp) == 0:
+        return None, None, "none"
+
+    dist = pd.to_numeric(xsp.get("dist_m", xsp.get("s_m")), errors="coerce")
+    if dist is None:
+        return None, None, "none"
+    finite = dist[np.isfinite(dist)]
+    if finite.empty:
+        return None, None, "none"
+
+    left = None
+    right = None
+    used_extent = False
+
+    if "is_bank_left" in xsp.columns:
+        left_mask = _coerce_truthy_series(xsp["is_bank_left"])
+        left_vals = dist[left_mask & np.isfinite(dist)]
+        if not left_vals.empty:
+            left = float(left_vals.min())
+
+    if "is_bank_right" in xsp.columns:
+        right_mask = _coerce_truthy_series(xsp["is_bank_right"])
+        right_vals = dist[right_mask & np.isfinite(dist)]
+        if not right_vals.empty:
+            right = float(right_vals.max())
+
+    if left is None:
+        left = float(finite.min())
+        used_extent = True
+    if right is None:
+        right = float(finite.max())
+        used_extent = True
+
+    if np.isfinite(left) and np.isfinite(right) and left > right:
+        left, right = right, left
+
+    method = "profile_extent" if used_extent else "bank_flags"
+    return left, right, method
 
 
 # --------------------------------------------------------------------------------------
@@ -377,127 +436,50 @@ class InferConfig:
 # --------------------------------------------------------------------------------------
 
 def _read_layer(gpkg: Path, layer: str) -> gpd.GeoDataFrame:
-    gdf = gpd.read_file(gpkg, layer=layer)
-    if gdf.empty:
-        raise RuntimeError(f"Layer '{layer}' is empty in {gpkg}")
-    if gdf.crs is None:
-        raise RuntimeError(f"Layer '{layer}' has no CRS: {gpkg}")
-    return gdf
+    return read_gpkg_layer_strict(gpkg, layer)
+
+
+def _rolling_smooth(vals, window: int):
+    arr = np.asarray(vals, dtype="float64")
+    if window is None or int(window) <= 1 or arr.size == 0:
+        return arr
+    w = max(1, int(window))
+    if w % 2 == 0:
+        w += 1
+    s = pd.Series(arr)
+    return s.rolling(window=w, center=True, min_periods=1).median().to_numpy(dtype="float64")
 
 
 def _read_layer_with_fallback(gpkg: Path, preferred_layer: str, purpose: str = "rivers") -> Tuple[gpd.GeoDataFrame, str]:
-    """Read a layer from a GeoPackage, with deterministic fallback.
+    """Read an explicitly requested layer from a GeoPackage.
 
-    Why: different river-network builders may write different layer names.
-    We try the requested layer name first; if missing, we scan layers and pick
-    the first plausible candidate.
+    This path is intentionally strict. The workflow should provide the correct
+    layer name instead of scanning for a plausible substitute.
     """
-    try:
-        gdf = gpd.read_file(gpkg, layer=preferred_layer)
-        if gdf is not None and len(gdf) > 0:
-            if gdf.crs is None:
-                raise RuntimeError(f"Layer '{preferred_layer}' has no CRS: {gpkg}")
-            return gdf, preferred_layer
-    except RuntimeError:
-        raise
-    except Exception:
-        log.debug("layer not found; falling through to scan", exc_info=True)
-
     try:
         import fiona
-
         layers = list(fiona.listlayers(gpkg))
     except Exception as e:
+        log.debug("_read_layer_with_fallback: suppressed exception", exc_info=True)
         raise RuntimeError(f"Failed to list layers in {gpkg} ({e})")
 
-    # Deterministic candidate ordering: prefer explicit names, then substring matches.
-    preferred = [
-        preferred_layer,
-        "rivers_clip",
-        "rivers",
-        "river",
-        "flowlines",
-        "flowline",
-        "nhd_flowline",
-        "nhdflowline",
-        "network",
-    ]
+    if preferred_layer not in layers:
+        raise RuntimeError(
+            f"Required {purpose} layer '{preferred_layer}' not found in {gpkg}. "
+            f"Available layers={layers}"
+        )
 
-    ordered = []
-    seen = set()
-    for name in preferred + layers:
-        if name in seen:
-            continue
-        if name in layers:
-            ordered.append(name)
-            seen.add(name)
-
-    last_err = None
-    for lyr in ordered:
-        try:
-            gdf = gpd.read_file(gpkg, layer=lyr)
-            if gdf is None or len(gdf) == 0:
-                continue
-            if gdf.crs is None:
-                continue
-            return gdf, lyr
-        except Exception as e:
-            last_err = e
-            continue
-
-    raise RuntimeError(f"No usable '{purpose}' layer found in {gpkg} (tried {len(ordered)} candidates; last_err={last_err})")
-
-
-def _safe_float(x) -> float:
     try:
-        return float(x)
-    except Exception:
-        return float("nan")
+        gdf = gpd.read_file(gpkg, layer=preferred_layer)
+    except Exception as e:
+        log.debug("_read_layer_with_fallback: suppressed exception", exc_info=True)
+        raise RuntimeError(f"Failed reading layer '{preferred_layer}' from {gpkg}: {e}") from e
+    if gdf is None or len(gdf) == 0:
+        raise RuntimeError(f"Layer '{preferred_layer}' is empty in {gpkg}")
+    if gdf.crs is None:
+        raise RuntimeError(f"Layer '{preferred_layer}' has no CRS: {gpkg}")
+    return gdf, preferred_layer
 
-
-def _rolling_smooth(series: pd.Series, window: int) -> pd.Series:
-    w = int(max(1, window))
-    if w % 2 == 0:
-        w += 1
-    s_med = series.rolling(window=w, center=True, min_periods=max(1, w // 3)).median()
-    s_mean = s_med.rolling(window=w, center=True, min_periods=max(1, w // 3)).mean()
-    return s_mean
-
-
-def _default_uncertainty_m(calib_n: int) -> float:
-    return 0.5 if calib_n and calib_n > 0 else 1.5
-
-
-def _coerce_truthy_series(series: pd.Series) -> pd.Series:
-    """Return a robust boolean mask for bank-flag style columns.
-
-    GeoPackage / parquet round-trips can surface booleans as bool, int, float,
-    or strings like "true"/"1". XS inference should treat those consistently.
-    """
-    if series is None:
-        return pd.Series(dtype=bool)
-    s = series.copy()
-    if getattr(s, "dtype", None) == bool:
-        return s.fillna(False)
-    if pd.api.types.is_numeric_dtype(s):
-        vals = pd.to_numeric(s, errors="coerce")
-        return vals.fillna(0).astype(float) != 0.0
-    vals = s.astype(str).str.strip().str.lower()
-    return vals.isin({"1", "true", "t", "yes", "y"})
-
-
-def _pick_bank_dists_from_points(xsp: pd.DataFrame) -> Tuple[Optional[float], Optional[float]]:
-    left = None
-    right = None
-    if "is_bank_left" in xsp.columns:
-        left_mask = _coerce_truthy_series(xsp["is_bank_left"])
-        if bool(left_mask.any()):
-            left = float(pd.to_numeric(xsp.loc[left_mask, "dist_m"], errors="coerce").dropna().iloc[0])
-    if "is_bank_right" in xsp.columns:
-        right_mask = _coerce_truthy_series(xsp["is_bank_right"])
-        if bool(right_mask.any()):
-            right = float(pd.to_numeric(xsp.loc[right_mask, "dist_m"], errors="coerce").dropna().iloc[0])
-    return left, right
 
 
 def _recover_banks_from_profile_extent(xsp: pd.DataFrame) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
@@ -763,6 +745,7 @@ def _local_quad_derivatives(
     try:
         coef, *_ = np.linalg.lstsq(A, vv, rcond=None)
     except Exception:
+        log.debug("_local_quad_derivatives: suppressed exception", exc_info=True)
         return (float("nan"), float("nan"))
 
     d1 = float(coef[1])
@@ -850,6 +833,7 @@ def _attach_curvature_asymmetry(
     try:
         centers["geometry"] = centers.geometry.interpolate(0.5, normalized=True)
     except Exception:
+        log.debug("_attach_curvature_asymmetry: suppressed exception", exc_info=True)
         centers["geometry"] = centers.geometry.centroid
     centers = gpd.GeoDataFrame(centers, geometry="geometry", crs=xs_lines.crs)
 
@@ -869,6 +853,7 @@ def _attach_curvature_asymmetry(
             utm = _utm_crs_from_lonlat(float(c.x), float(c.y))
             g_m = g.to_crs(utm)
         except Exception:
+            log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
             g_m = g
     else:
         g_m = g
@@ -983,6 +968,7 @@ def _guess_field(columns, candidates):
         if len(columns) == 0:
             return None
     except Exception:
+        log.debug("_guess_field: suppressed exception", exc_info=True)
         return None
     lower = {str(c).lower(): str(c) for c in list(columns)}
     for c in candidates:
@@ -1580,6 +1566,7 @@ def _uncertainty_for_row(row: pd.Series, cfg: InferConfig) -> float:
     try:
         n = int(row.get("calib_n", 0) or 0)
     except Exception:
+        log.debug("_uncertainty_for_row: suppressed exception", exc_info=True)
         n = 0
 
     # Base uncertainties
@@ -1732,6 +1719,7 @@ def _fit_width_stage_beta(ws: pd.DataFrame) -> Tuple[Optional[float], int, float
     try:
         beta, alpha = np.polyfit(wv, hv, 1)
     except Exception:
+        log.debug("_fit_width_stage_beta: suppressed exception", exc_info=True)
         return None, n, float("nan")
 
     if (not np.isfinite(beta)) or beta <= 0:
@@ -1744,6 +1732,7 @@ def _fit_width_stage_beta(ws: pd.DataFrame) -> Tuple[Optional[float], int, float
         ss_tot = float(((hv - hv.mean()) ** 2).sum())
         r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else float("nan")
     except Exception:
+        log.debug("_fit_width_stage_beta: suppressed exception", exc_info=True)
         r2 = float("nan")
 
     return float(beta), n, float(r2)
@@ -2018,7 +2007,9 @@ def _write_soundings_subset(path: Path, soundings: gpd.GeoDataFrame) -> Path | N
     Preferred output is **Parquet** (fast + small). If the target path ends with
     .parquet (or has no suffix), a flat table is written with explicit x/y.
 
-    Fallback output is GPKG (geometry-preserving) if parquet isn't available.
+    This path is intentionally strict for reproducibility. If parquet writing is
+    unavailable or the subset cannot be represented faithfully, the workflow
+    should fail with diagnostics instead of silently switching formats.
     """
     if soundings is None or soundings.empty:
         return None
@@ -2056,55 +2047,43 @@ def _write_soundings_subset(path: Path, soundings: gpd.GeoDataFrame) -> Path | N
     except Exception:
         log.debug("Could not remove existing subset file %s; will overwrite.", str(path), exc_info=True)
 
-    if ext == ".parquet":
-        # Parquet: store explicit x/y + z + src + crs.
-        try:
-            import pyarrow  # noqa: F401
-            # Coalesce vertical values: prefer depth (positive-down) when valid, fall back to
-            # z_m/z (elevation). This is critical for elevation-only sources like eHydro XYZ
-            # where _depth_m is NaN and the elevation lives in _z_m.
-            # BUG FIX: the old code did `out["depth"] if "depth" in columns` which always triggered
-            # (depth column is always created above, just set to NaN for elevation-only data),
-            # resulting in an all-NaN z column and an empty parquet after the isfinite filter.
-            _depth_s = pd.to_numeric(out["depth"], errors="coerce") if "depth" in out.columns else pd.Series(np.nan, index=out.index, dtype="float64")
-            _z_s = (
-                pd.to_numeric(out["z_m"], errors="coerce") if "z_m" in out.columns
-                else pd.to_numeric(out["z"], errors="coerce") if "z" in out.columns
-                else pd.Series(np.nan, index=out.index, dtype="float64")
-            )
-            # z = coalesced primary filter column (depth if valid, else elevation)
-            _z_coalesced = _depth_s.combine_first(_z_s)
-            tbl = pd.DataFrame({
-                "x": out.geometry.x.astype("float64"),
-                "y": out.geometry.y.astype("float64"),
-                # Canonical coalesced column for the isfinite filter (never all-NaN).
-                "z": _z_coalesced,
-                # Explicit semantic columns so _load_soundings finds the right one by name:
-                # depth_m  -> _depth_m (positive-down; NaN when source is elevation-only)
-                # z_m      -> _z_m (elevation in vertical datum; NaN when source is depth-only)
-                "depth_m": _depth_s,
-                "z_m": _z_s,
-                "_src_file": out.get("_src_file", "unknown"),
-                "crs": str(out.crs) if out.crs is not None else "",
-            })
-            tbl = tbl[np.isfinite(tbl["x"]) & np.isfinite(tbl["y"]) & np.isfinite(tbl["z"])].copy()
-            if tbl.empty:
-                log.warning(
-                    "[SOUNDINGS] Subset parquet would be empty after finite filter "
-                    "(all rows had NaN for both depth and z_m). Check sounding vertical datum. "
-                    "Falling back to GPKG to preserve raw geometry."
-                )
-                raise ValueError("empty after finite filter")
-            tbl.to_parquet(path, index=False)
-            log.debug("Subset parquet written: %d rows, columns=%s", len(tbl), list(tbl.columns))
-            return path
-        except Exception as e:
-            log.warning("Parquet write failed (%s); falling back to GPKG.", e)
-            path = path.with_suffix(".gpkg")
+    if ext != ".parquet":
+        raise RuntimeError(
+            f"Soundings subset output must be parquet for deterministic reuse; got suffix '{ext or '<none>'}' at {path}"
+        )
 
-    # GPKG fallback
-    out.to_file(path, driver="GPKG")
-    return path
+    # Parquet: store explicit x/y + z + src + crs.
+    _depth_s = pd.to_numeric(out["depth"], errors="coerce") if "depth" in out.columns else pd.Series(np.nan, index=out.index, dtype="float64")
+    _z_s = (
+        pd.to_numeric(out["z_m"], errors="coerce") if "z_m" in out.columns
+        else pd.to_numeric(out["z"], errors="coerce") if "z" in out.columns
+        else pd.Series(np.nan, index=out.index, dtype="float64")
+    )
+    _z_coalesced = _depth_s.combine_first(_z_s)
+    _depth_canonical = _depth_s.combine_first(_z_coalesced)
+    _z_m_canonical = _z_s.combine_first(_z_coalesced)
+    tbl = pd.DataFrame({
+        "x": out.geometry.x.astype("float64"),
+        "y": out.geometry.y.astype("float64"),
+        "z": _z_coalesced,
+        "depth_m": _depth_canonical,
+        "z_m": _z_m_canonical,
+        "_src_file": out.get("_src_file", "unknown"),
+        "crs": str(out.crs) if out.crs is not None else "",
+    })
+    tbl = tbl[np.isfinite(tbl["x"]) & np.isfinite(tbl["y"]) & np.isfinite(tbl["z"]) & np.isfinite(tbl["depth_m"]) & np.isfinite(tbl["z_m"])].copy()
+    if tbl.empty:
+        raise RuntimeError(
+            "[SOUNDINGS] Subset parquet would be empty after finite filter; check sounding vertical datum and required columns."
+        )
+    try:
+        import pyarrow  # noqa: F401
+        tbl.to_parquet(path, index=False)
+        log.debug("Subset parquet written: %d rows, columns=%s", len(tbl), list(tbl.columns))
+        return path
+    except Exception as e:
+        log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
+        raise RuntimeError(f"Parquet write failed for soundings subset {path}: {e}") from e
 
 
 def _soundings_one_line(path: Path, n_out: int, n_in: int, by_src: dict[str, int] | None = None) -> str:
@@ -2262,6 +2241,7 @@ def _project_for_distance(
     try:
         union_geom = a.geometry.union_all()
     except Exception:
+        log.debug("_project_for_distance: suppressed exception", exc_info=True)
         union_geom = unary_union(list(a.geometry))
     c = union_geom.centroid
     utm = _utm_crs_from_lonlat(float(c.x), float(c.y))
@@ -2296,6 +2276,7 @@ def _attach_swot_wse_to_xs(
     try:
         xsc["geometry"] = xsc.geometry.interpolate(0.5, normalized=True)
     except Exception:
+        log.debug("_attach_swot_wse_to_xs: suppressed exception", exc_info=True)
         xsc["geometry"] = xsc.geometry.centroid
 
     xsc = gpd.GeoDataFrame(xsc, geometry="geometry", crs=xs_lines.crs)
@@ -2313,6 +2294,7 @@ def _attach_swot_wse_to_xs(
     try:
         from scipy.spatial import cKDTree
     except Exception:
+        log.debug("_attach_swot_wse_to_xs: suppressed exception", exc_info=True)
         cKDTree = None
 
     max_d = float(cfg.swot_max_dist_m)
@@ -2331,6 +2313,7 @@ def _attach_swot_wse_to_xs(
             sw = sw.rename(columns={"_wse_m": "swot_wse_m", "_dist_m": "swot_dist_m"})
             sw["swot_wse_m"] = pd.to_numeric(sw["swot_wse_m"], errors="coerce")
         except Exception as e:
+            log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
             raise RuntimeError(
                 "SWOT WSE attachment failed. Install SciPy for KDTree support, or install a GeoPandas spatial index backend (rtree/pygeos). "
                 f"Original error: {e}"
@@ -2451,6 +2434,7 @@ def _calibrate_dmax_from_soundings(
             distance_col="_dist_to_xs",
         )
     except Exception as e:
+        log.debug("_calibrate_dmax_from_soundings: suppressed exception", exc_info=True)
         raise RuntimeError(
             "Spatial join nearest failed. Install a spatial index backend (rtree) or use shapely>=2. "
             f"Original error: {e}"
@@ -2602,6 +2586,7 @@ def _template_pixel_size_m(template_ds: rasterio.DatasetReader) -> float:
         m_per_deg_lon = 111_320.0 * np.cos(np.deg2rad(lat))
         return float(np.mean([px * m_per_deg_lon, py * m_per_deg_lat]))
     except Exception:
+        log.debug("_template_pixel_size_m: suppressed exception", exc_info=True)
         return 30.0
 
 
@@ -2667,6 +2652,7 @@ def _build_corridor_mask_from_points(
         try:
             union_geom = pts_t.geometry.union_all()
         except Exception:
+            log.debug("_build_corridor_mask_from_points: suppressed exception", exc_info=True)
             union_geom = unary_union(list(pts_t.geometry))
         c = union_geom.centroid
         lon, lat = float(c.x), float(c.y)
@@ -2728,6 +2714,7 @@ def _build_corridor_mask_from_lines(
         centroid = _union_all(g.geometry).centroid
         utm_crs = _utm_crs_for_point(float(centroid.x), float(centroid.y), g.crs)
     except Exception:
+        log.debug("_build_corridor_mask_from_lines: suppressed exception", exc_info=True)
         # Fall back to buffering in raster CRS units if UTM inference fails.
         utm_crs = None
 
@@ -2877,6 +2864,7 @@ def _build_thalweg_lines_from_points(
         return result
 
     except Exception:
+        log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
         return None
 
 
@@ -3142,6 +3130,7 @@ def _continuous_surface(
         try:
             union_geom = pts_t.geometry.union_all()
         except Exception:
+            log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
             union_geom = unary_union(list(pts_t.geometry))
         c = union_geom.centroid
         utm_crs_obj = _utm_crs_from_lonlat(float(c.x), float(c.y))
@@ -3174,12 +3163,14 @@ def _continuous_surface(
                 if pd.notna(s).any():
                     pts_group = pd.factorize(s.astype(str), sort=False)[0].astype("int32")
     except Exception:
+        log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
         pts_group = None
 
     if "stream_order" in pts_t.columns:
         try:
             pts_priority = pd.to_numeric(pts_t["stream_order"], errors="coerce").to_numpy(dtype="float64")
         except Exception:
+            log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
             pts_priority = None
 
 
@@ -3277,6 +3268,7 @@ def _continuous_surface(
         try:
             maxd = float(max_query_dist_m)
         except Exception:
+            log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
             maxd = float('nan')
         if np.isfinite(maxd) and maxd > 0:
             Tree, which = _kd_tree()
@@ -3327,6 +3319,7 @@ def _continuous_surface(
     try:
         river_gpkg = getattr(_continuous_surface, "_river_gpkg", None)
     except Exception:
+        log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
         river_gpkg = None
 
     do_junction_fix = False
@@ -3338,6 +3331,7 @@ def _continuous_surface(
             and Path(str(river_gpkg)).exists()
         )
     except Exception:
+        log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
         do_junction_fix = False
 
     if do_junction_fix:
@@ -3354,6 +3348,7 @@ def _continuous_surface(
                         nodes = g
                         break
                 except Exception:
+                    log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
                     continue
             if nodes is None or len(nodes) == 0:
                 raise RuntimeError("no nodes")
@@ -3379,6 +3374,7 @@ def _continuous_surface(
             try:
                 px = float(abs(template_ds.transform.a))
             except Exception:
+                log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
                 px = 10.0
             r_m = max(40.0, 4.0 * px)
 
@@ -3482,6 +3478,7 @@ def _continuous_surface(
                         lines = g
                         break
                 except Exception:
+                    log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
                     continue
             if lines is None or len(lines) == 0:
                 raise RuntimeError("no river linework")
@@ -3492,6 +3489,7 @@ def _continuous_surface(
             try:
                 px = float(abs(template_ds.transform.a))
             except Exception:
+                log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
                 px = 10.0
             buf_m = max(30.0, 3.0 * px)
 
@@ -3563,9 +3561,11 @@ def _continuous_surface(
                         try:
                             coords = list(g.coords)
                         except Exception:
+                            log.debug("_get_nid: suppressed exception", exc_info=True)
                             try:
                                 coords = list(list(g.geoms[0].coords)) + list(list(g.geoms[-1].coords))
                             except Exception:
+                                log.debug("_get_nid: suppressed exception", exc_info=True)
                                 continue
                         if len(coords) < 2:
                             continue
@@ -3621,6 +3621,7 @@ def _continuous_surface(
                         q = np.nanquantile(len_arr[m], 0.80)
                         keep_edge |= (m & (len_arr >= q))
                 except Exception:
+                    log.debug("_dijkstra: suppressed exception", exc_info=True)
                     q = np.nanquantile(len_arr[m], 0.80)
                     keep_edge |= (m & (len_arr >= q))
 
@@ -3664,10 +3665,12 @@ def _continuous_surface(
                 try:
                     px = float(abs(template_ds.transform.a))
                 except Exception:
+                    log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
                     px = 10.0
                 try:
                     py = float(abs(template_ds.transform.e))
                 except Exception:
+                    log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
                     py = px
 
                 # Distance to mainstem line (meters)
@@ -3683,12 +3686,14 @@ def _continuous_surface(
 
                 mmask = (mask_out == 1) & (dist_to_line <= rad)
             except Exception:
+                log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
                 # Fallback: fixed-width geometric buffer
                 geoms = []
                 for geom in line_geoms:
                     try:
                         geoms.append(geom.buffer(buf_m))
                     except Exception:
+                        log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
                         continue
                 if not geoms:
                     raise RuntimeError("no buffered mainstem geometries")
@@ -3765,10 +3770,12 @@ def _continuous_surface(
                     try:
                         px = float(abs(template_ds.transform.a))
                     except Exception:
+                        log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
                         px = 10.0
                     try:
                         py = float(abs(template_ds.transform.e))
                     except Exception:
+                        log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
                         py = px
 
                     feather_m = max(20.0, 2.0 * px)
@@ -3799,6 +3806,7 @@ def _continuous_surface(
                         out = out_blend.astype("float32", copy=False)
                         out[~np.isfinite(out)] = nodata
                 except Exception:
+                    log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
                     out[overwrite] = out_m[overwrite]
         except Exception:
             log.debug("ignored", exc_info=True)
@@ -3836,6 +3844,7 @@ def _fsync_dir(path: Path) -> None:
         finally:
             os.close(fd)
     except Exception:
+        log.debug("_fsync_dir: suppressed exception", exc_info=True)
         return
 
 
@@ -3844,6 +3853,7 @@ def _write_geotiff_gdal(path: Path, arr: np.ndarray, tmpl: rasterio.io.DatasetRe
     try:
         from osgeo import gdal  # type: ignore
     except Exception as e:
+        log.debug("_write_geotiff_gdal: suppressed exception", exc_info=True)
         raise RuntimeError(f"GDAL python bindings not available for fallback write: {e}") from e
 
     gdal.UseExceptions()
@@ -3880,6 +3890,7 @@ def _write_geotiff_gdal(path: Path, arr: np.ndarray, tmpl: rasterio.io.DatasetRe
     try:
         ds.SetGeoTransform(tmpl.transform.to_gdal())
     except Exception:
+        log.debug("_write_geotiff_gdal: suppressed exception", exc_info=True)
         # As a fallback, try the tuple form
         ds.SetGeoTransform(tuple(tmpl.transform)[:6])
 
@@ -3910,6 +3921,7 @@ def _write_geotiff(path: Path, arr: np.ndarray, tmpl: rasterio.io.DatasetReader,
     try:
         arr = arr.astype(dtype, copy=False)
     except Exception:
+        log.debug("_write_geotiff: suppressed exception", exc_info=True)
         arr = arr.astype("float32", copy=False)
         dtype = "float32"
 
@@ -3941,6 +3953,7 @@ def _write_geotiff(path: Path, arr: np.ndarray, tmpl: rasterio.io.DatasetReader,
         # Existence is the reliable signal here; size thresholds cause false negatives.
         wrote = _exists_with_retry(tmp, tries=8, sleep_s=0.15, min_size_bytes=1)
     except Exception as e:
+        log.debug("_write_geotiff: suppressed exception", exc_info=True)
         last_err = e
         wrote = False
 
@@ -3962,6 +3975,7 @@ def _write_geotiff(path: Path, arr: np.ndarray, tmpl: rasterio.io.DatasetReader,
         try:
             parent_files = ", ".join(sorted([f.name for f in path.parent.iterdir() if f.is_file()])[:50])
         except Exception:
+            log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
             parent_files = "<unavailable>"
         raise RuntimeError(f"GeoTIFF write produced no file: tmp={tmp} | parent_files={parent_files}")
 
@@ -3974,6 +3988,7 @@ def _write_geotiff(path: Path, arr: np.ndarray, tmpl: rasterio.io.DatasetReader,
         try:
             parent_files = ", ".join(sorted([f.name for f in path.parent.iterdir() if f.is_file()])[:50])
         except Exception:
+            log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
             parent_files = "<unavailable>"
         raise RuntimeError(f"GeoTIFF missing after atomic replace: {path} | parent_files={parent_files}")
 
@@ -4033,6 +4048,47 @@ def _dominant_xs_rejection_reason(acct: Dict[str, object]) -> str:
     }
     return mapping.get(best_key or '', 'no_valid_cross_sections')
 
+def _load_validated_xs_stage_inputs(xs_gpkg: Path, xs_lines_layer: str, xs_points_layer: str):
+    xs_lines, xs_pts, info = load_validated_xs_artifacts(
+        xs_gpkg,
+        xs_lines_layer=xs_lines_layer,
+        xs_points_layer=xs_points_layer,
+    )
+    log.info(
+        "XS stage contract validated: gpkg=%s lines_layer=%s points_layer=%s xs_lines=%d xs_points=%d",
+        xs_gpkg,
+        xs_lines_layer,
+        xs_points_layer,
+        info["xs_lines_n"],
+        info["xs_points_n"],
+    )
+    return xs_lines, xs_pts, info
+
+
+def _validate_soundings_subset_stage(path: Path) -> dict:
+    info = validate_soundings_subset_parquet(path)
+    log.info(
+        "Soundings subset contract validated: path=%s rows=%d depth_col=%s crs=%s",
+        path,
+        info["rows"],
+        info["depth_col"],
+        info["crs"],
+    )
+    return info
+
+
+def _write_bank_contract_receipt(base_path: Path, summary: dict) -> Path:
+    out = Path(base_path).with_name("xs_bank_contract_receipt.json")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        _json.dump(summary, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(str(tmp), str(out))
+    _fsync_dir(out.parent)
+    return out
+
+
 def infer_bathy(
     xs_gpkg: Path,
     out_gpkg: Path,
@@ -4085,11 +4141,11 @@ def infer_bathy(
     out_accounting_json: Optional[Path] = None,
     out_meta_json: Optional[Path] = None,
 ) -> None:
-    xs_lines = _read_layer(xs_gpkg, xs_lines_layer)
-    xs_pts = _read_layer(xs_gpkg, xs_points_layer)
-
-    if "xs_id" not in xs_lines.columns or "xs_id" not in xs_pts.columns:
-        raise RuntimeError("xs_lines/xs_points must have 'xs_id' column (from xs_builder.py).")
+    xs_lines, xs_pts, xs_contract_info = _load_validated_xs_stage_inputs(xs_gpkg, xs_lines_layer, xs_points_layer)
+    require_columns(xs_lines, ["xs_id"], label="xs_lines")
+    require_columns(xs_pts, ["xs_id", "s_m", "z_m"], label="xs_points")
+    bank_contract_summary = summarize_bank_contract(xs_lines, xs_pts)
+    bank_contract_summary["xs_contract"] = xs_contract_info
 
     # Fast-path for Pass 1 subset generation used by bathy_main.py.
     # This path must not depend on downstream XS validity, because its purpose is
@@ -4182,7 +4238,7 @@ def infer_bathy(
         left_mask = _coerce_truthy_series(xsp["is_bank_left"]) if "is_bank_left" in xsp.columns else pd.Series(False, index=xsp.index)
         right_mask = _coerce_truthy_series(xsp["is_bank_right"]) if "is_bank_right" in xsp.columns else pd.Series(False, index=xsp.index)
         if not np.isfinite(bank_left_dist) or not np.isfinite(bank_right_dist):
-            bl, br = _pick_bank_dists_from_points(xsp)
+            bl, br, recovery_mode = _pick_bank_dists_from_points(xsp)
             recovered = False
             if not np.isfinite(bank_left_dist) and bl is not None:
                 bank_left_dist = bl
@@ -4191,7 +4247,10 @@ def infer_bathy(
                 bank_right_dist = br
                 recovered = True
             if recovered:
-                acct["n_xs_bank_flag_recovered"] = int(acct.get("n_xs_bank_flag_recovered", 0)) + 1
+                if recovery_mode == "profile_extent":
+                    acct["n_xs_profile_extent_recovered"] = int(acct.get("n_xs_profile_extent_recovered", 0)) + 1
+                else:
+                    acct["n_xs_bank_flag_recovered"] = int(acct.get("n_xs_bank_flag_recovered", 0)) + 1
 
         bank_left_z = _safe_float(xsl.get("bank_left_z_m", np.nan))
         bank_right_z = _safe_float(xsl.get("bank_right_z_m", np.nan))
@@ -4208,22 +4267,14 @@ def infer_bathy(
             or (not np.isfinite(bank_left_z))
             or (not np.isfinite(bank_right_z))
         ):
-            fb_l, fb_r, fb_lz, fb_rz = _recover_banks_from_profile_extent(xsp)
-            recovered_profile = False
-            if not np.isfinite(bank_left_dist) and fb_l is not None:
-                bank_left_dist = fb_l
-                recovered_profile = True
-            if not np.isfinite(bank_right_dist) and fb_r is not None:
-                bank_right_dist = fb_r
-                recovered_profile = True
-            if not np.isfinite(bank_left_z) and fb_lz is not None:
-                bank_left_z = fb_lz
-                recovered_profile = True
-            if not np.isfinite(bank_right_z) and fb_rz is not None:
-                bank_right_z = fb_rz
-                recovered_profile = True
-            if recovered_profile:
-                acct["n_xs_profile_extent_recovered"] = int(acct.get("n_xs_profile_extent_recovered", 0)) + 1
+            acct["n_xs_missing_bank_contract"] = int(acct.get("n_xs_missing_bank_contract", 0)) + 1
+            if cfg.only_with_banks:
+                acct["n_xs_rejected_missing_banks"] = int(acct.get("n_xs_rejected_missing_banks", 0)) + 1
+                continue
+            raise RuntimeError(
+                "Cross-section bank contract violated: explicit/corridor-derived bank distances and bank elevations "
+                f"were not resolvable for xs_id={xsl.get('xs_id', '<unknown>')}"
+            )
 
         if cfg.only_with_banks and (not np.isfinite(bank_left_dist) or not np.isfinite(bank_right_dist)):
             acct["n_xs_rejected_missing_banks"] = int(acct.get("n_xs_rejected_missing_banks", 0)) + 1
@@ -4259,6 +4310,20 @@ def infer_bathy(
         )
 
     xs_param = pd.DataFrame(xs_records)
+    bank_contract_summary.update({
+        "xs_with_valid_param_rows": int(len(xs_param)),
+        "n_xs_missing_points": int(acct.get("n_xs_missing_points", 0)),
+        "n_xs_bank_flag_recovered": int(acct.get("n_xs_bank_flag_recovered", 0)),
+        "n_xs_missing_bank_contract": int(acct.get("n_xs_missing_bank_contract", 0)),
+        "n_xs_rejected_missing_banks": int(acct.get("n_xs_rejected_missing_banks", 0)),
+        "n_xs_rejected_bad_width": int(acct.get("n_xs_rejected_bad_width", 0)),
+        "n_xs_rejected_bad_wse": int(acct.get("n_xs_rejected_bad_wse", 0)),
+    })
+    try:
+        _bank_receipt = _write_bank_contract_receipt((out_meta_json if out_meta_json is not None else out_gpkg), bank_contract_summary)
+        log.info("XS bank contract receipt written: %s", _bank_receipt)
+    except Exception:
+        log.debug("Failed to write XS bank contract receipt", exc_info=True)
     if xs_param.empty:
         dominant_reason = _dominant_xs_rejection_reason(acct)
         receipt_base = ((out_meta_json if out_meta_json is not None else out_gpkg).with_name("xs_rejection_receipt"))
@@ -4393,22 +4458,19 @@ def infer_bathy(
 # If provided, blend/replace the DEM/topo-derived WSE proxy with observed WSE (e.g., SWOT)
     # BEFORE we fit a longitudinal WSE profile and BEFORE any anchor that uses WSE.
     if cfg.swot_wse is not None:
-        try:
-            swot = _load_wse_obs(
-                path=Path(cfg.swot_wse),
-                target_crs=xs_lines.crs,
-                wse_col=cfg.swot_wse_col,
-                x_col=cfg.swot_x_col,
-                y_col=cfg.swot_y_col,
-                csv_crs=cfg.swot_csv_crs,
-            )
-            if swot is not None and not swot.empty:
-                xs_param, wse_by_xs = _attach_swot_wse_to_xs(xs_lines, xs_param, swot, cfg)
-                log.info("Attached/blended WSE observations: n_xs=%d", int(np.isfinite(xs_param["swot_wse_m"]).sum()))
-            else:
-                log.info("WSE observations empty; using DEM/topo proxy.")
-        except Exception as e:
-            log.warning("Failed to load/attach WSE observations (%s). Using DEM/topo proxy.", e)
+        swot = _load_wse_obs(
+            path=Path(cfg.swot_wse),
+            target_crs=xs_lines.crs,
+            wse_col=cfg.swot_wse_col,
+            x_col=cfg.swot_x_col,
+            y_col=cfg.swot_y_col,
+            csv_crs=cfg.swot_csv_crs,
+        )
+        if swot is not None and not swot.empty:
+            xs_param, wse_by_xs = _attach_swot_wse_to_xs(xs_lines, xs_param, swot, cfg)
+            log.info("Attached/blended WSE observations: n_xs=%d", int(np.isfinite(xs_param["swot_wse_m"]).sum()))
+        else:
+            raise RuntimeError(f"Configured WSE observations are empty: {cfg.swot_wse}")
 
     # Record the *anchoring* WSE source for downstream logic (e.g., energy solver gating).
     # This is intentionally conservative: unless we have actual observed stage values
@@ -4420,6 +4482,7 @@ def infer_bathy(
                 wse_anchor_source = "swot"
         acct["wse_anchor_source"] = str(wse_anchor_source)
     except Exception:
+        log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
         acct["wse_anchor_source"] = "unknown"
 
     # --------------------------------------------------------------------------------------
@@ -4540,6 +4603,7 @@ def infer_bathy(
         try:
             acct["regional_curve_weight_mean"] = float(np.nanmean(w[use])) if np.any(use) else 0.0
         except Exception:
+            log.debug("_rc_apply: suppressed exception", exc_info=True)
             acct["regional_curve_weight_mean"] = 0.0
 
     # 2) Manning inversion prior (requires Q, width, slope)
@@ -4747,24 +4811,14 @@ def infer_bathy(
             )
             raise SystemExit(2)
         try:
-            import pandas as _pd_check
-            _n_check = len(_pd_check.read_parquet(_subset_p))
+            _subset_info = _validate_soundings_subset_stage(_subset_p)
         except Exception as _e_check:
             log.error(
-                "[CALIB][HARD-FAIL] --soundings-subset (%s) could not be read: %s. Aborting.",
+                "[CALIB][HARD-FAIL] --soundings-subset (%s) failed contract validation: %s. Aborting.",
                 _subset_path, _e_check,
             )
             raise SystemExit(2)
-        if _n_check == 0:
-            log.error(
-                "[CALIB][HARD-FAIL] --soundings-subset (%s) contains 0 rows after loading. "
-                "The parquet was written empty — most likely the z/depth column was all-NaN "
-                "after the finite filter in _write_soundings_subset (eHydro elevation-only data). "
-                "Fix _write_soundings_subset so depth_m/z_m are coalesced before filtering. "
-                "Aborting to prevent a silent prior-only run.",
-                _subset_path,
-            )
-            raise SystemExit(2)
+        _n_check = int(_subset_info["rows"])
         log.info("--soundings-subset validated: n=%d rows. Using subset instead of raw --soundings.", _n_check)
         # Override soundings_path so the rest of the function uses the validated subset.
         soundings_path = [_subset_path]
@@ -4839,6 +4893,7 @@ def infer_bathy(
             _sn = pd.to_numeric(xs_param.get("soundings_n", 0), errors="coerce").fillna(0)
             _soundings_effective = bool((_sn > 0).any())
         except Exception:
+            log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
             _soundings_effective = False
         _soundings_gate = soundings_path if _soundings_effective else None
         try:
@@ -4910,6 +4965,7 @@ def infer_bathy(
                                         else:
                                             run = 0
                                 except Exception:
+                                    log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
                                     max_run = 0
                             acct["energy_solver_changed_max_run"] = int(max_run)
                         except Exception:
@@ -5310,9 +5366,9 @@ def infer_bathy(
 
     # Smooth along stationing within component
     xs_param = xs_param.sort_values(["component_id", "s_center_m", "xs_id"]).reset_index(drop=True)
-    xs_param["dmax_smooth_m"] = xs_param.groupby("component_id", dropna=False)["dmax_raw_m"].apply(
-        lambda s: _rolling_smooth(s, cfg.smooth_window)
-    ).reset_index(level=0, drop=True)
+    xs_param["dmax_smooth_m"] = xs_param.groupby("component_id", dropna=False)["dmax_raw_m"].transform(
+        lambda s: pd.Series(_rolling_smooth(s.to_numpy(dtype="float64"), cfg.smooth_window), index=s.index)
+    )
     xs_param["dmax_smooth_m"] = xs_param["dmax_smooth_m"].where(np.isfinite(xs_param["dmax_smooth_m"]), xs_param["dmax_raw_m"])
 
     xs_param["uncert_m"] = xs_param.apply(
@@ -5358,6 +5414,7 @@ def infer_bathy(
             try:
                 geom = xs.geometry.interpolate(t, normalized=True)
             except Exception:
+                log.debug("xs_infer_bathy_raster: suppressed exception", exc_info=True)
                 continue
             dist_from_left = float(np.clip(t, 0.0, 1.0)) * W
             d = left + dist_from_left
@@ -5462,13 +5519,17 @@ def infer_bathy(
                 )
             )
 
-    pred_gdf = gpd.GeoDataFrame(pred_rows, crs=xs_pts.crs)
+    out_crs = xs_pts.crs or xs_lines.crs
+    if out_crs is None:
+        raise RuntimeError("XS inference outputs have undefined CRS; xs_points/xs_lines must carry a valid CRS.")
+
+    pred_gdf = gpd.GeoDataFrame(pred_rows, crs=out_crs)
     if pred_gdf.empty:
         raise RuntimeError("No predicted points generated (check bank picks and WSE estimation).")
 
     # XS summary
     xs_summary = xs_param.merge(xs_lines[["xs_id", "geometry"]], on="xs_id", how="left")
-    xs_summary_gdf = gpd.GeoDataFrame(xs_summary, geometry="geometry", crs=xs_lines.crs)
+    xs_summary_gdf = gpd.GeoDataFrame(xs_summary, geometry="geometry", crs=out_crs)
 
     # Write GPKG
     out_gpkg = Path(out_gpkg)
@@ -6058,8 +6119,10 @@ def main() -> None:
                 if np.isfinite(fv) and fv > 0:
                     manning_n_by_region[k] = fv
             except Exception:
+                log.debug("main: suppressed exception", exc_info=True)
                 continue
     except Exception:
+        log.debug("main: suppressed exception", exc_info=True)
         manning_n_by_region = {}
 
     # Geomorphic envelope toggles (defaults are conservative)

@@ -152,6 +152,8 @@ def cached_scaffold_paths(*, cache_root: str | Path, domains: RiverAoiDomains, h
     return {
         "cache_dir": str(cache_dir),
         "network_gpkg": str(cache_dir / "river_network.gpkg"),
+        "network_manifest": str(cache_dir / "river_network_manifest.json"),
+        "hydrologic_solve_domain": str(cache_dir / "hydrologic_solve_domain.json"),
         "manifest": str(cache_dir / "river_scaffold_manifest.json"),
     }
 
@@ -325,6 +327,7 @@ def persist_scaffold_products(*, network_gpkg: str | Path, product_paths: Dict[s
         "graph_edges_gpkg": str(edges_path),
         "graph_nodes_gpkg": str(nodes_path),
         "mainstem_edges_gpkg": str(mainstem_path),
+        "mainstem_solve_layer_name": "mainstem_solve_network",
         "stationing_json": str(station_path),
         "summary_json": str(summary_path),
         "graph_edges_count": int(len(edges)),
@@ -357,6 +360,8 @@ def build_scaffold_manifest(*, domains: RiverAoiDomains, network_gpkg: str | Non
         'provenance_lock': str(provenance_lock) if provenance_lock else None,
         'scaffold_artifacts_definition': {
             'network_gpkg': 'stable halo-domain river network product generated on scaffold_aoi when available',
+            'network_manifest': 'explicit receipt for export/solve/scaffold AOIs, halo rationale, named mainstem_solve_network layer, and hydrologic solve-domain linkage used by river_network.py',
+            'hydrologic_solve_domain': 'explicit hydrologic solve-domain contract including outlet anchors, estuary handoff proxies, major-system selection, and deterministic tie-break rules',
             'provenance_lock': 'hashable provenance lock for the scaffold-domain network build',
             'trusted_export_role': payload['trusted_export_role'],
             'scaffold_products': 'cached downstream products exported from the canonical scaffold network (graph edges/nodes, dominant-component edges, stationing basis, topology summary)',

@@ -21,6 +21,9 @@ from __future__ import annotations
 import math
 import re
 from typing import Optional, Tuple
+import logging
+log = logging.getLogger(__name__)
+
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +141,7 @@ def expand_bbox_frac(
     try:
         frac = float(frac)
     except Exception:
+        log.debug("expand_bbox_frac: suppressed exception", exc_info=True)
         return bbox
     if frac <= 0:
         return bbox

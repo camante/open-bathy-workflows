@@ -63,6 +63,7 @@ def _n_water_index(temp_c: float = 20.0, wavelength_nm: float = 532.0) -> float:
                      - 0.000160475520686 * wavelength_nm
                      + 1.398067112092424)
     except Exception:
+        log.debug("_n_water_index: suppressed exception", exc_info=True)
         return 1.333
 
 # Optional: write GeoPackages
@@ -70,6 +71,7 @@ try:
     import geopandas as gpd
     from shapely.geometry import Point
 except Exception:
+    log.debug("_n_water_index: suppressed exception", exc_info=True)
     gpd = None
     Point = None
 
@@ -151,8 +153,10 @@ def _resolve_max_depth_sdb(
                         if fv > 0:
                             return fv
                     except Exception:
+                        log.debug("vis: suppressed exception", exc_info=True)
                         continue
         except Exception:
+            log.debug("vis: suppressed exception", exc_info=True)
             continue
 
     return default

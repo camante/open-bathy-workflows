@@ -35,7 +35,6 @@ Provenance Codes:
 
 
 import logging
-log = logging.getLogger(__name__)
 import argparse
 import json
 import sys
@@ -46,6 +45,8 @@ from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 
 import rasterio
+
+from sign_semantics import raster_value_semantics, should_expect_negative_depth
 from rasterio.windows import Window
 from pyproj import CRS, Geod
 
@@ -136,6 +137,8 @@ def _validate_depth_raster(path: Optional[Path], *, name: str, expect_negative: 
         tags = ds.tags() or {}
         depth_reference = str(tags.get("DEPTH_REFERENCE", "") or "").strip().lower()
         value_type = str(tags.get("VALUE_TYPE", "") or "").strip().lower()
+        declared_semantics = raster_value_semantics(tags)
+        expect_negative = should_expect_negative_depth(tags, default=expect_negative)
 
     vals = _sample_raster_values(p, max_samples=20000)
     if vals.size == 0:
@@ -146,6 +149,10 @@ def _validate_depth_raster(path: Optional[Path], *, name: str, expect_negative: 
     vmax = float(np.nanmax(vals))
     frac_neg = float(np.mean(vals < 0.0))
     frac_pos = float(np.mean(vals > 0.0))
+
+    skip_negative_depth_checks = declared_semantics == 'absolute_elevation'
+    if skip_negative_depth_checks:
+        log.info("%s raster is tagged as absolute elevation; skipping negative-depth sign warnings: %s", name, p)
 
     # Strong imagery smell: values in [0,1] or [0,10000] and almost all positive
     if frac_neg < 0.01 and frac_pos > 0.95 and ((0.0 <= vmin and vmax <= 1.5) or (0.0 <= vmin and vmax >= 500 and vmax <= 20000)):
@@ -161,7 +168,7 @@ def _validate_depth_raster(path: Optional[Path], *, name: str, expect_negative: 
         and vmax <= 0.5
     )
 
-    if expect_negative and frac_neg < 0.20:
+    if (not skip_negative_depth_checks) and expect_negative and frac_neg < 0.20:
         if zero_dominated_relative_patch:
             log.info(
                 "%s raster is zero-dominated but tagged as relative terrain depth (frac_neg=%.3f; min=%.3f max=%.3f). Treating this as an authoritative-locked diagnostic patch, not a sign error: %s",
@@ -263,7 +270,7 @@ class FusionResult:
 def _read_raster(path: Path) -> Tuple[np.ndarray, dict, Any]:
     """Read a raster and return (data, profile, nodata)."""
     import rasterio
-    
+
     with rasterio.open(path) as ds:
         data = ds.read(1).astype(np.float32)
         profile = ds.profile.copy()
@@ -279,7 +286,7 @@ def _read_raster(path: Path) -> Tuple[np.ndarray, dict, Any]:
 def _write_raster(path: Path, data: np.ndarray, profile: dict, nodata: float = -9999.0):
     """Write a raster."""
     import rasterio
-    
+
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     
     # Handle NaN → nodata
@@ -378,6 +385,7 @@ def _reproject_to_template(
         CRS validation is performed before reprojection.
     """
     import rasterio
+
     from rasterio.warp import reproject, Resampling
     
     # Validate CRS compatibility
@@ -470,6 +478,7 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
         try:
             d = int(dim)
         except Exception:
+            log.debug("_safe_tiff_blocksize: suppressed exception", exc_info=True)
             d = int(preferred)
         d = max(16, d)
         cand = min(int(preferred), d)
@@ -632,6 +641,7 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
         from chunked_processing import should_use_chunked_processing, generate_tiles, count_tiles, TQDM_AVAILABLE
         use_chunked = should_use_chunked_processing(height, width)
     except Exception:
+        log.debug("bathy_fusion: suppressed exception", exc_info=True)
         use_chunked = False
         generate_tiles = None
         count_tiles = None
@@ -698,6 +708,7 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
         try:
             tiles_iter = tqdm(tiles, total=ntiles, desc="Fusing", unit="tile")
         except Exception:
+            log.debug("__init__: suppressed exception", exc_info=True)
             tiles_iter = tiles
 
     # Stats counters
@@ -877,6 +888,7 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
                                     alpha = np.clip(dist_px / float(max(1, taper_px)), 0.0, 1.0)
                                     w_r = (base_river + alpha * (1.0 - base_river)).astype(np.float32)
                                 except Exception:
+                                    log.debug("bathy_fusion: suppressed exception", exc_info=True)
                                     w_r = None
 
                             if w_r is None:
@@ -996,6 +1008,7 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
                                 dist_m = dist_px * float(pixel_size_m)
                                 w_sdb = np.clip(dist_m / max(taper_m, 1e-6), 0.0, 1.0).astype(np.float32)
                             except Exception:
+                                log.debug("bathy_fusion: suppressed exception", exc_info=True)
                                 w_sdb = None
 
                         if w_sdb is None:
@@ -1071,6 +1084,7 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
                                 try:
                                     b = float(np.nanmedian(d[overlap]))
                                 except Exception:
+                                    log.debug("bathy_fusion: suppressed exception", exc_info=True)
                                     b = 0.0
 
                                 # Adjust SDB locally toward river
@@ -1091,6 +1105,7 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
                                         # If we cannot define a meaningful taper direction, default to river.
                                         w_riv = np.ones(shape, dtype=np.float32)
                                 except Exception:
+                                    log.debug("bathy_fusion: suppressed exception", exc_info=True)
                                     w_riv = np.ones(shape, dtype=np.float32)
 
                                 w_sdb = (1.0 - w_riv).astype(np.float32)

@@ -752,6 +752,7 @@ def load_hq_points(
                     try:
                         df = pd.read_csv(fp)
                     except Exception:
+                        log.debug("gapfill_intelligent: suppressed exception", exc_info=True)
                         df = pd.read_csv(fp, sep=r'\s+', comment="#")
                     
                     if df.empty:
@@ -772,6 +773,7 @@ def load_hq_points(
                     try:
                         data = np.loadtxt(fp, delimiter=',', skiprows=1)
                     except Exception:
+                        log.debug("gapfill_intelligent: suppressed exception", exc_info=True)
                         data = np.loadtxt(fp, skiprows=1)
                     
                     if data.ndim == 1:

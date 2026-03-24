@@ -190,6 +190,7 @@ def _load_q2_registry() -> dict:
                 cfg = json.load(f)
             _Q2_REGISTRY = ((cfg.get('river') or {}).get('registry') or {}).get('q2_regressions') or {}
     except Exception:
+        log.debug("_load_q2_registry: suppressed exception", exc_info=True)
         _Q2_REGISTRY = {}
     return _Q2_REGISTRY
 
@@ -277,6 +278,7 @@ def load_state_region_map(json_path: str) -> dict:
                 out[kk] = vv
         return out
     except Exception:
+        log.debug("load_state_region_map: suppressed exception", exc_info=True)
         return {}
 
 def _census_state_from_latlon(lat: float, lon: float, timeout_s: float = 10.0) -> Optional[str]:
@@ -306,6 +308,7 @@ def _census_state_from_latlon(lat: float, lon: float, timeout_s: float = 10.0) -
         if isinstance(st, str) and len(st.strip()) == 2:
             return st.strip().upper()
     except Exception:
+        log.debug("_census_state_from_latlon: suppressed exception", exc_info=True)
         return None
     return None
 
@@ -328,6 +331,7 @@ def infer_manning_region_from_aoi(
         lon_c = 0.5 * (lon0 + lon1)
         lat_c = 0.5 * (lat0 + lat1)
     except Exception:
+        log.debug("infer_manning_region_from_aoi: suppressed exception", exc_info=True)
         return (default_region, None)
 
     st = _census_state_from_latlon(lat_c, lon_c, timeout_s=timeout_s)

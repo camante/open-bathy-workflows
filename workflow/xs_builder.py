@@ -71,12 +71,31 @@ class XSConfig:
 # --------------------------------------------------------------------------------------
 
 def _read_layer(gpkg: Path, layer: str) -> gpd.GeoDataFrame:
-    gdf = gpd.read_file(gpkg, layer=layer)
-    if gdf.empty:
-        raise RuntimeError(f"Layer '{layer}' is empty in {gpkg}")
-    if gdf.crs is None:
-        raise RuntimeError(f"Layer '{layer}' has no CRS: {gpkg}")
-    return gdf
+    preferred = str(layer)
+    fallbacks = {
+        "major_system_network": ["mainstem_solve_network", "rivers_aoi", "rivers_clip"],
+        "mainstem_solve_network": ["rivers_aoi", "rivers_clip"],
+    }
+    tried = [preferred] + fallbacks.get(preferred, [])
+    last_exc = None
+    for candidate in tried:
+        try:
+            gdf = gpd.read_file(gpkg, layer=candidate)
+        except Exception as exc:
+            log.debug("_read_layer: suppressed exception", exc_info=True)
+            last_exc = exc
+            continue
+        if gdf.empty:
+            last_exc = RuntimeError(f"Layer '{candidate}' is empty in {gpkg}")
+            continue
+        if gdf.crs is None:
+            raise RuntimeError(f"Layer '{candidate}' has no CRS: {gpkg}")
+        if candidate != preferred:
+            log.warning("Requested rivers layer %s unavailable/empty; using %s instead.", preferred, candidate)
+        return gdf
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"Could not read layer '{preferred}' from {gpkg}")
 
 
 def _explode_lines(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -102,6 +121,7 @@ def _ensure_single_linestring(geom) -> Optional[LineString]:
                 parts = sorted(parts, key=lambda g: g.length, reverse=True)
                 return parts[0] if parts else None
         except Exception:
+            log.debug("_ensure_single_linestring: suppressed exception", exc_info=True)
             parts = list(geom.geoms)
             parts = sorted(parts, key=lambda g: g.length, reverse=True)
             return parts[0] if parts else None
@@ -218,8 +238,41 @@ def filter_centerlines(
 
     if col_order:
         before = len(gdf)
-        gdf = gdf[pd.to_numeric(gdf[col_order], errors="coerce").fillna(-1) >= int(min_stream_order)]
-        log.info("min_stream_order=%d (%s): %d → %d", int(min_stream_order), col_order, before, len(gdf))
+        order_vals = pd.to_numeric(gdf[col_order], errors="coerce")
+        gdf_order = gdf[order_vals.fillna(-1) >= int(min_stream_order)]
+        used_order = int(min_stream_order)
+        if gdf_order.empty and before > 0:
+            finite_orders = sorted({int(v) for v in order_vals.dropna().astype(int).tolist() if int(v) >= 1}, reverse=True)
+            for fallback_order in range(int(min_stream_order) - 1, 0, -1):
+                cand = gdf[order_vals.fillna(-1) >= fallback_order]
+                if not cand.empty:
+                    log.warning(
+                        "min_stream_order=%d (%s): %d → 0; relaxing to %d for this AOI (%d kept)",
+                        int(min_stream_order),
+                        col_order,
+                        before,
+                        fallback_order,
+                        len(cand),
+                    )
+                    gdf_order = cand
+                    used_order = int(fallback_order)
+                    break
+            if gdf_order.empty and finite_orders:
+                fallback_order = max(1, min(finite_orders))
+                cand = gdf[order_vals.fillna(-1) >= fallback_order]
+                if not cand.empty:
+                    log.warning(
+                        "min_stream_order=%d (%s): %d → 0 and fallback sweep still empty; using lowest available order %d (%d kept)",
+                        int(min_stream_order),
+                        col_order,
+                        before,
+                        fallback_order,
+                        len(cand),
+                    )
+                    gdf_order = cand
+                    used_order = int(fallback_order)
+        gdf = gdf_order
+        log.info("min_stream_order=%d (%s): %d → %d (used_order=%d)", int(min_stream_order), col_order, before, len(gdf), used_order)
     else:
         log.info("No stream order field found; skipping stream order filter.")
 
@@ -383,6 +436,7 @@ def _compute_junction_points(lines: List[LineString], snap_m: float, min_degree:
             c0 = Point(ln.coords[0])
             c1 = Point(ln.coords[-1])
         except Exception:
+            log.debug("_key: suppressed exception", exc_info=True)
             continue
         for pt in (c0, c1):
             k = _key(pt)
@@ -487,6 +541,7 @@ def _global_deconflict_xs_all(xs_lines_records: List[Dict], tol_m: float) -> Lis
         try:
             hits = tree.query(g)
         except Exception:
+            log.debug("_score: suppressed exception", exc_info=True)
             hits = []
 
         hit_geom_indices: List[int] = []
@@ -516,6 +571,7 @@ def _global_deconflict_xs_all(xs_lines_records: List[Dict], tol_m: float) -> Lis
                     conflict = True
                     break
             except Exception:
+                log.debug("xs_builder: suppressed exception", exc_info=True)
                 continue
 
         if conflict:
@@ -798,7 +854,7 @@ def pick_banks(
     bank_smooth_window_m: float = 8.0,
 ) -> Tuple[Optional[int], Optional[int], Dict[str, Any]]:
     meta: Dict[str, Any] = {
-        "method": "endpoint_peak_fallback",
+        "method": "expected_bank_edges_required",
         "expected_left_dist_m": float(expected_left_dist_m) if expected_left_dist_m is not None else np.nan,
         "expected_right_dist_m": float(expected_right_dist_m) if expected_right_dist_m is not None else np.nan,
     }
@@ -830,19 +886,17 @@ def pick_banks(
     left_mask = d <= min(bank_search_m, L)
     right_mask = d >= max(0.0, L - bank_search_m)
 
-    if idx_left is None and np.any(left_mask):
-        zl = z[left_mask]
-        if np.isfinite(zl).any():
-            j = int(np.nanargmax(zl))
-            idx_left = int(np.where(left_mask)[0][j])
-    if idx_right is None and np.any(right_mask):
-        zr = z[right_mask]
-        if np.isfinite(zr).any():
-            j = int(np.nanargmax(zr))
-            idx_right = int(np.where(right_mask)[0][j])
+    if idx_left is None and expected_left_dist_m is not None:
+        meta["left_error"] = "no_bank_found_near_expected_left_edge"
+    if idx_right is None and expected_right_dist_m is not None:
+        meta["right_error"] = "no_bank_found_near_expected_right_edge"
 
     if refined and (idx_left is not None or idx_right is not None):
         meta["method"] = "corridor_edge_refined"
+    elif expected_left_dist_m is None and expected_right_dist_m is None:
+        meta["method"] = "missing_bank_domain_expectations"
+    else:
+        meta["method"] = "corridor_edge_refinement_failed"
     meta["source"] = "topo" if use_topo else "dem"
     return idx_left, idx_right, meta
 
@@ -1095,7 +1149,9 @@ def build_xs_for_river(
                             "river_id": pr["river_id"],
                             "component_id": int(pr["component_id"]),
                             "dist_m": float(pr["dist_m"]),
+                            "s_m": float(pr["dist_m"]),
                             "z_dem": float(pr["z_dem"]) if pd.notna(pr["z_dem"]) else np.nan,
+                            "z_m": float(pr["z_dem"]) if pd.notna(pr["z_dem"]) else np.nan,
                             "z_topo": float(pr["z_topo"]) if pd.notna(pr["z_topo"]) else np.nan,
                             "is_bank_left": bool(pr["is_bank_left"]),
                             "is_bank_right": bool(pr["is_bank_right"]),

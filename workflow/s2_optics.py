@@ -35,6 +35,7 @@ try:
     )
     _CACHE_UTILS_AVAILABLE = True
 except Exception:  # pragma: no cover
+    log.debug("s2_optics: suppressed exception", exc_info=True)
     _CACHE_UTILS_AVAILABLE = False
 
 import shutil
@@ -104,6 +105,7 @@ try:
     from rasterio.enums import Resampling
     from rasterio.warp import reproject
 except Exception:  # pragma: no cover - optional in lightweight test environments
+    log.debug("apply_stumpf_residual_filter: suppressed exception", exc_info=True)
     rasterio = None  # type: ignore
     from_bounds = None  # type: ignore
     Resampling = None  # type: ignore
@@ -115,11 +117,13 @@ try:
     from shapely.geometry import shape, box, Polygon, MultiPolygon
     from shapely.ops import unary_union
 except Exception:  # pragma: no cover - optional in lightweight test environments
+    log.debug("apply_stumpf_residual_filter: suppressed exception", exc_info=True)
     shape = box = Polygon = MultiPolygon = unary_union = None  # type: ignore
 
 try:
     from pyproj import Geod, Transformer
 except Exception:  # pragma: no cover - optional in lightweight test environments
+    log.debug("apply_stumpf_residual_filter: suppressed exception", exc_info=True)
     Geod = Transformer = None  # type: ignore
 
 # -------------------------
@@ -164,6 +168,54 @@ def parse_aoi(aoi_str: str) -> Tuple[float, float, float, float]:
     from pipeline.aoi import parse_aoi_wesn
     return parse_aoi_wesn(aoi_str, strict=True)
 
+
+def prepare_user_land_mask(mask_path: str, ref_raster: str, out_path: str) -> str:
+    """Align a user-provided land/water mask to the reference raster grid.
+
+    This helper preserves the user's original mask values and only performs
+    nearest-neighbor reprojection/resampling onto the Sentinel-2 reference grid.
+    It intentionally avoids interpreting the mask semantics here; downstream code
+    already uses the explicit land-mask-type / water value arguments.
+    """
+    if rasterio is None or reproject is None or Resampling is None:
+        raise RuntimeError("rasterio is required to prepare a user land mask")
+
+    src_path = Path(mask_path)
+    ref_path = Path(ref_raster)
+    dst_path = Path(out_path)
+    if not src_path.exists():
+        raise FileNotFoundError(f"User land mask not found: {src_path}")
+    if not ref_path.exists():
+        raise FileNotFoundError(f"Reference raster not found: {ref_path}")
+
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(ref_path) as ref_ds, rasterio.open(src_path) as src_ds:
+        profile = ref_ds.profile.copy()
+        dtype = src_ds.dtypes[0]
+        dst = np.zeros((ref_ds.height, ref_ds.width), dtype=np.dtype(dtype))
+        src_nodata = src_ds.nodata
+        if src_nodata in (0, 1):
+            src_nodata = None
+        dst_nodata = src_ds.nodata
+        reproject(
+            source=rasterio.band(src_ds, 1),
+            destination=dst,
+            src_transform=src_ds.transform,
+            src_crs=src_ds.crs,
+            src_nodata=src_nodata,
+            dst_transform=ref_ds.transform,
+            dst_crs=ref_ds.crs,
+            dst_nodata=dst_nodata,
+            resampling=Resampling.nearest,
+        )
+        profile.pop("blockxsize", None)
+        profile.pop("blockysize", None)
+        profile.pop("tiled", None)
+        profile.update(dtype=dtype, count=1, nodata=dst_nodata, compress="deflate")
+        with rasterio.open(dst_path, "w", **profile) as dst_ds:
+            dst_ds.write(dst, 1)
+    return str(dst_path)
+
 # -------------------------
 # Cache key helpers (AOI + time frame)
 # -------------------------
@@ -183,6 +235,7 @@ def _read_composite_meta(out_dir: Path) -> Optional[dict]:
     try:
         return json.loads(meta_path.read_text())
     except Exception:
+        log.debug("_read_composite_meta: suppressed exception", exc_info=True)
         return None
 
 def _write_composite_meta(out_dir: Path, meta: dict) -> None:
@@ -255,6 +308,7 @@ def _s2_exact_cache_key(
         try:
             code_fp = fingerprint_code(Path(__file__), strict=bool(cache_code_strict))
         except Exception:
+            log.debug("_s2_exact_cache_key: suppressed exception", exc_info=True)
             code_fp = ""
     
     return artifact_cache_key(stage="s2_composite", params=params, inputs=inputs, code_fp=code_fp, key_len=20)
@@ -296,6 +350,7 @@ def acquire_run_lock(lock_path: Path, stale_hours: float = 6.0) -> None:
             if start_t > 0:
                 age_hours = (now - start_t) / 3600.0
         except Exception:
+            log.debug("acquire_run_lock: suppressed exception", exc_info=True)
             age_hours = 1e9
 
         if age_hours < float(stale_hours):
@@ -319,6 +374,7 @@ def acquire_run_lock(lock_path: Path, stale_hours: float = 6.0) -> None:
     try:
         lock_path.write_text(json.dumps(meta, indent=2))
     except Exception:
+        log.debug("s2_optics: suppressed exception", exc_info=True)
         # last resort: plain text
         lock_path.write_text(f"pid={os.getpid()}\nstart={now}\n")
 
@@ -348,6 +404,7 @@ def extract_cloud(item: dict) -> float:
     try:
         return float(v) if v is not None else 100.0
     except Exception:
+        log.debug("extract_cloud: suppressed exception", exc_info=True)
         return 100.0
 
 def extract_tile(item: dict) -> str:
@@ -711,12 +768,14 @@ def compute_tile_weights(items_by_tile: Dict[str, List[Scene]], aoi_poly_ll) -> 
             try:
                 geoms.append(shape(sc.geometry))
             except Exception:
+                log.debug("compute_tile_weights: suppressed exception", exc_info=True)
                 continue
         if not geoms:
             continue
         try:
             union_geom = unary_union(geoms)
         except Exception:
+            log.debug("compute_tile_weights: suppressed exception", exc_info=True)
             continue
         inter = union_geom.intersection(aoi_poly_ll)
         raw[tile] = _geodesic_area_m2(inter)
@@ -853,6 +912,7 @@ def resolve_and_download_scene(scene: Scene, cache_dir: Path, max_workers: int =
             try:
                 fut.result()
             except Exception:
+                log.debug("resolve_and_download_scene: suppressed exception", exc_info=True)
                 all_ok = False
 
     if not all_ok:
@@ -1004,6 +1064,7 @@ def score_date_quality(
         scl_bad = {3, 8, 9, 10, 11}
         dm = _compute_date_metrics(b02, b03, b04, b08, scl_int, water_mask, water_mask, scl_bad, v_scl)
     except Exception:
+        log.debug("score_date_quality: suppressed exception", exc_info=True)
         dm = {"coverage": valid_frac, "bad_frac": glint_frac, "nir_med": float("nan"), "red_med": float("nan")}
 
     finite = np.isfinite(b02) & np.isfinite(b03) & np.isfinite(b04) & np.isfinite(b08)
@@ -1275,6 +1336,7 @@ def _hedley_glint_correct(
     try:
         nir_min = float(np.percentile(nir_s, float(nir_min_percentile)))
     except Exception:
+        log.debug("s2_optics: suppressed exception", exc_info=True)
         nir_min = float(np.nanmin(nir_s))
     meta["nir_min"] = nir_min
 

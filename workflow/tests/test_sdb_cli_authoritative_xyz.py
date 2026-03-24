@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from sdb_cli import augment_sdb_command
+from sdb_cli import augment_sdb_command, build_sdb_command
 
 
 def test_augment_sdb_command_includes_authoritative_xyz_without_duplicates():
@@ -21,3 +21,24 @@ def test_augment_sdb_command_includes_authoritative_xyz_without_duplicates():
     xyz = cmd[idx + 1: idx + 4]
     assert xyz == ['a.csv', 'b.csv', 'c.csv']
     assert '--extra-xyz-crs=EPSG:4326' in cmd
+
+
+
+def test_build_sdb_command_uses_precomputed_guidance_domain_mask():
+    cfg = SimpleNamespace(
+        aoi='-71/-70/42/43',
+        start_date='2025-01-01',
+        end_date='2025-12-31',
+        cloud='10',
+        icesat='auto',
+        sdb_mode='train',
+        cache_root='cache',
+        align_mode='auto',
+        working_srs='EPSG:26919',
+        working_vcrs_epsg=5703,
+        sdb_guidance_domain_mask='cache/domains/sdb_guidance_domain_mask.tif',
+    )
+    cmd = build_sdb_command(cfg, out_dir='out/sdb')
+    assert '--land-mask=cache/domains/sdb_guidance_domain_mask.tif' in cmd
+    assert '--land-mask-type=land_binary' in cmd
+    assert '--land-mask-water-val=0' in cmd

@@ -39,6 +39,7 @@ def _try_import(name: str):
     try:
         return __import__(name)
     except Exception:
+        log.debug("_try_import: suppressed exception", exc_info=True)
         return None
 
 
@@ -164,6 +165,7 @@ def _connected_components(mask: Any) -> Optional[int]:
     try:
         from scipy import ndimage as scipy_nd  # type: ignore
     except Exception:
+        log.debug("_connected_components: suppressed exception", exc_info=True)
         return None
     struct = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8)
     labeled, n = scipy_nd.label(mask.astype(np.uint8), structure=struct)
@@ -198,11 +200,13 @@ def _skeleton_max_slope(
         import geopandas as gpd  # type: ignore
         from shapely.geometry import LineString  # type: ignore
     except Exception:
+        log.debug("_skeleton_max_slope: suppressed exception", exc_info=True)
         return None
 
     try:
         gdf = gpd.read_file(line_path)
     except Exception:
+        log.debug("_skeleton_max_slope: suppressed exception", exc_info=True)
         return None
     if gdf.empty or "geometry" not in gdf:
         return None
@@ -382,6 +386,7 @@ def main() -> int:
         try:
             m = compute_run_metrics(d)
         except Exception as e:
+            log.debug("main: suppressed exception", exc_info=True)
             m = {"run_dir": str(d.resolve()), "error": f"{type(e).__name__}: {e}"}
         results.append(m)
         # per-run json

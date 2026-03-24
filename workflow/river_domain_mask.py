@@ -36,6 +36,8 @@ from rasterio.warp import reproject, Resampling
 from scipy.ndimage import distance_transform_edt, label, binary_closing, binary_fill_holes
 from shapely.ops import unary_union
 
+from dominant_trunk import select_dominant_trunks
+
 log = logging.getLogger("river_domain_mask")
 
 LOG = logging.getLogger("river_domain_mask")
@@ -55,6 +57,7 @@ def _union_all_geoms(geos):
     try:
         return geos.unary_union
     except Exception:
+        log.debug("_union_all_geoms: suppressed exception", exc_info=True)
         # list-like
         return unary_union(list(geos))
 
@@ -131,6 +134,17 @@ def _save_f32(path: Path, arr_f32: np.ndarray, template_profile: dict, nodata: f
         dst.write(out, 1)
 
 
+def _derive_output_mainstem_mask(corridor_main: np.ndarray, channel: np.ndarray) -> np.ndarray:
+    """Return the hybrid-use mainstem mask constrained to the retained channel.
+
+    river_domain_mask internally uses a broader connected mainstem corridor for width-policy
+    and continuity. The exported mainstem mask, however, is consumed downstream as the active
+    region where XS should dominate over the skeleton solution. That output must therefore be
+    a subset of the retained river channel rather than the full buffered corridor.
+    """
+    return corridor_main & channel
+
+
 def _get_stream_order_col(gdf: gpd.GeoDataFrame) -> Optional[str]:
     candidates = ["streamorde", "StreamOrde", "STREAMORDE", "streamorde_", "stream_order", "streamorder", "Strahler"]
     for c in candidates:
@@ -139,13 +153,61 @@ def _get_stream_order_col(gdf: gpd.GeoDataFrame) -> Optional[str]:
     return None
 
 
+def _load_mainstem_solve_rivers(args: argparse.Namespace, target_crs) -> Tuple[gpd.GeoDataFrame, str]:
+    """Load the network used for dominant-trunk solving.
+
+    Default behavior prefers the explicit mainstem_solve_network layer when available,
+    then falls back to rivers_aoi, so the canonical trunk is solved on a larger,
+    unclipped network and only then
+    rasterized/clipped to the output grid. That reduces AOI-edge drift while
+    keeping standalone runs deterministic.
+    """
+    requested = str(getattr(args, "mainstem_solve_layer", "auto") or "auto").strip()
+    if requested == "same":
+        requested = str(getattr(args, "rivers_layer", "rivers_clip") or "rivers_clip").strip()
+
+    candidates = []
+    if requested == "auto":
+        candidates = ["major_system_network", "mainstem_solve_network", "rivers_aoi", str(getattr(args, "rivers_layer", "rivers_clip") or "rivers_clip")]
+    else:
+        candidates = [requested]
+
+    last_err = None
+    for layer in candidates:
+        try:
+            gdf = gpd.read_file(args.river_gpkg, layer=layer)
+        except Exception as exc:
+            log.debug("_load_mainstem_solve_rivers: suppressed exception", exc_info=True)
+            last_err = exc
+            continue
+        if gdf is None or gdf.empty:
+            continue
+        gdf = gdf[gdf.geometry.notnull() & (~gdf.geometry.is_empty)].copy()
+        if gdf.empty:
+            continue
+        gdf = gdf.to_crs(target_crs)
+        return gdf, layer
+
+    if requested == "auto":
+        raise SystemExit(
+            "Dominant trunk solve could not load a usable river layer from the GeoPackage. "
+            "Expected major_system_network, mainstem_solve_network, rivers_aoi, or the active rivers layer to exist and contain non-empty geometries."
+        ) from last_err
+    raise SystemExit(
+        f"Dominant trunk solve layer '{requested}' could not be loaded or was empty. "
+        "Fix the river network artifact rather than degrading to an implicit fallback."
+    ) from last_err
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Build river-only raster mask from NHD flowlines + water mask.")
     p.add_argument("--river-gpkg", required=True, help="river_network.gpkg from river_network.py")
     p.add_argument("--rivers-layer", default="rivers_clip", help="Layer name inside gpkg (default rivers_clip)")
     p.add_argument("--template-raster", required=True, help="Template raster defining output grid (e.g., river_dem.tif)")
     p.add_argument("--water-mask", default=None,
-                   help="Optional water/land mask raster. For waffles mask: water=0 land=1.")
+                   help="Optional water/land mask raster. For WAFFLES coastline masks: water=0 land=1.")
+    p.add_argument("--water-mask-role", default="generic", choices=["generic", "waffles_with_nhd", "river_support"],
+                   help="Interpretation of --water-mask. 'waffles_with_nhd' means the mask already contains the full water domain (including inland NHD water), so it must not be ocean-subtracted when building the river domain. 'river_support' means a template-aligned inland river support mask built from river structure; it is not a coastal full-water mask and must not be validated against coastal/ocean overlap semantics.")
     p.add_argument("--ocean-mask", default=None,
                    help="Optional ocean-only waffles coastline mask (land=1, water=0). Used to prevent ocean bleed and to build fallback river domain when NHD water mask is unavailable.")
     p.add_argument("--ocean-keep-dist-m", type=float, default=0.0,
@@ -179,8 +241,12 @@ def main() -> int:
                    help="Buffer around flowlines to define candidate corridor (meters).")
     p.add_argument("--max-channel-width-m", type=float, default=600.0,
                    help="Max allowed width inside corridor (meters).")
+    p.add_argument("--mainstem-method", default="dominant_trunk", choices=["dominant_trunk", "stream_order"],
+                   help="How to identify the mainstem corridor. dominant_trunk solves an outlet-connected weighted trunk path on the river network; stream_order uses the legacy stream-order threshold seed.")
+    p.add_argument("--mainstem-solve-layer", default="auto",
+                   help="River layer used for dominant-trunk solving. 'auto' prefers major_system_network, then mainstem_solve_network, then rivers_aoi, then --rivers-layer for AOI-stable trunk selection. 'same' forces the active rivers layer.")
     p.add_argument("--mainstem-min-order", type=int, default=5,
-                   help="Stream order threshold for mainstem corridor (if stream order attribute exists).")
+                   help="Legacy stream order threshold for mainstem corridor when --mainstem-method=stream_order.")
     p.add_argument("--max-mainstem-width-m", type=float, default=2500.0,
                    help="Max allowed width for mainstem corridor pixels (meters).")
     p.add_argument("--write-debug", action="store_true", default=False,
@@ -202,6 +268,12 @@ def main() -> int:
 
     pix = _pixel_size_m(transform)
     LOG.info("Template grid: %s x %s | pixel_size≈%.3fm", shape[1], shape[0], pix)
+
+    ocean = None
+    if args.ocean_mask:
+        om = _warp_mask_to_template(Path(args.ocean_mask), template_profile)
+        ocean = (om == 0)  # waffles convention: water=0 (ocean-only mask)
+        LOG.info("Ocean-only mask loaded: %s (waffles convention water=0 land=1)", args.ocean_mask)
 
     # This script assumes the template CRS is projected in meters. If it is geographic
     # (degrees), buffers and distances will be wrong. We still run (best-effort) but
@@ -225,8 +297,6 @@ def main() -> int:
     # Optional: NHDArea polygons to constrain channel predictions.
     # Extract river/stream polygons only (exclude lakes/reservoirs).
     nhdarea_mask = None
-    fallback_reason = None
-    nhdarea_pixels = 0
     fallback_reason = None
     nhdarea_pixels = 0
     if args.nhdarea_gpkg and (args.channel_source in ("auto", "nhdarea")):
@@ -347,77 +417,66 @@ def main() -> int:
 
     stream_col = _get_stream_order_col(rivers)
 
-    # Mainstem corridor: ensure continuity across tile/AOI cuts and stream-order 'dips'
-    # by expanding a seed mainstem mask to the connected corridor component(s) it touches.
-    #
-    # Why: A pure stream-order threshold can fragment the mainstem (order dips along the same channel,
-    # or short clipped stubs near AOI boundaries). If the river domain mask has holes, river prediction
-    # becomes nodata there and fusion may fall back to SDB inside the true river corridor.
-    if stream_col:
-        main = rivers[rivers[stream_col].fillna(0).astype(float) >= float(args.mainstem_min_order)]
-    else:
-        main = rivers.iloc[0:0]
-
-    if not main.empty:
+    mainstem_method = str(getattr(args, "mainstem_method", "dominant_trunk") or "dominant_trunk").strip().lower()
+    mainstem_diag = {"method": mainstem_method}
+    if mainstem_method == "dominant_trunk":
+        solve_rivers, solve_layer = _load_mainstem_solve_rivers(args, crs)
+        trunk_reaches, trunk_diag = select_dominant_trunks(
+            solve_rivers,
+            ocean_mask=ocean,
+            ocean_transform=transform,
+            endpoint_tolerance=max(float(pix) * 1.5, 5.0),
+            logger=LOG,
+        )
+        mainstem_diag.update(trunk_diag)
+        mainstem_diag["solve_layer"] = solve_layer
+        mainstem_diag["solve_reach_count"] = int(len(solve_rivers))
+        main = trunk_reaches.copy()
+        if main.empty:
+            raise SystemExit("Dominant trunk solve returned no reaches. Fix the network topology or geometry instead of degrading to a heuristic mainstem.")
         main_geom = _union_all_geoms(_buffer_geoms_safe(main.geometry, float(args.channel_buffer_m)))
-        seed_main = rasterize(
+        corridor_main = rasterize(
             [(main_geom, 1)],
             out_shape=shape,
             transform=transform,
             fill=0,
             all_touched=True,
             dtype='uint8',
-        ).astype(bool)
+        ).astype(bool) & corridor
+        LOG.info(
+            "Mainstem derived from dominant trunk solve using layer %s (selected_reaches=%d, solve_reaches=%d, corridor_pixels=%d)",
+            mainstem_diag.get("solve_layer", "unknown"),
+            len(main),
+            int(mainstem_diag.get("solve_reach_count", len(main))),
+            int(corridor_main.sum()),
+        )
+    else:
+        # Legacy stream-order mainstem proxy. Kept only as an explicit opt-in path.
+        if stream_col:
+            main = rivers[rivers[stream_col].fillna(0).astype(float) >= float(args.mainstem_min_order)]
+        else:
+            main = rivers.iloc[0:0]
+
+        if main.empty:
+            raise SystemExit(
+                "Legacy stream-order mainstem method found no eligible reaches. Use --mainstem-method=dominant_trunk or fix the stream-order attributes."
+            )
+        main_geom = _union_all_geoms(_buffer_geoms_safe(main.geometry, float(args.channel_buffer_m)))
+        corridor_main = rasterize(
+            [(main_geom, 1)],
+            out_shape=shape,
+            transform=transform,
+            fill=0,
+            all_touched=True,
+            dtype='uint8',
+        ).astype(bool) & corridor
         LOG.info(
             "Mainstem seed enabled using '%s' >= %s (n=%d)",
             stream_col,
             args.mainstem_min_order,
             len(main),
         )
-    else:
-        seed_main = np.zeros(shape, dtype=bool)
-        if stream_col:
-            LOG.info(
-                "No mainstem features found at '%s' >= %s; mainstem will be derived from corridor connectivity only.",
-                stream_col,
-                args.mainstem_min_order,
-            )
-        else:
-            LOG.info(
-                "No stream order column found; mainstem seed unavailable; using only default corridor width limits."
-            )
 
-    # Expand seed_main to the corridor component(s) it intersects, so the 'mainstem corridor'
-    # is continuous even when order dips or flowlines are clipped.
-    if np.any(seed_main):
-        lbl, _nlbl = label(corridor.astype(np.uint8), structure=np.ones((3, 3), dtype=np.uint8))
-        hit = np.unique(lbl[seed_main & corridor])
-        hit = hit[hit != 0]
-        if hit.size > 0:
-            corridor_main = corridor & np.isin(lbl, hit)
-        else:
-            corridor_main = seed_main & corridor
-    else:
-        # No mainstem seed available (missing/empty stream order). For hybrid workflows,
-        # we still want a continuous 'mainstem' corridor so XS can be applied reliably.
-        # Fall back to the largest connected corridor component (by pixel area).
-        try:
-            lbl, _nlbl = label(corridor.astype(np.uint8), structure=np.ones((3, 3), dtype=np.uint8))
-            if _nlbl > 0:
-                # Count pixels per component label (exclude background 0)
-                counts = np.bincount(lbl.ravel())
-                counts[0] = 0
-                main_lbl = int(np.argmax(counts))
-                corridor_main = corridor & (lbl == main_lbl)
-                LOG.info("Mainstem seed unavailable; using largest corridor component (label=%d, pixels=%d).", main_lbl, int(counts[main_lbl]))
-            else:
-                corridor_main = np.zeros(shape, dtype=bool)
-        except Exception as e:
-            LOG.warning("Mainstem fallback (largest corridor component) failed: %s", str(e))
-            corridor_main = np.zeros(shape, dtype=bool)
-
-    # Morphological cleanup: close small gaps and fill interior holes within the mainstem corridor.
-    # Constrain to the corridor to avoid expanding into large estuaries/open water.
     if np.any(corridor_main):
         corridor_main = binary_closing(corridor_main, structure=np.ones((3, 3), dtype=bool))
         corridor_main = binary_fill_holes(corridor_main)
@@ -438,15 +497,9 @@ def main() -> int:
     inv[skel] = 0
     d_center = distance_transform_edt(inv, sampling=pix).astype("float32")
 
-    # Water mask
     # Water mask(s)
-    ocean = None
     keep_ocean = np.zeros(shape, dtype=bool)  # ocean water pixels we explicitly keep near flowlines
-    if args.ocean_mask:
-        om = _warp_mask_to_template(Path(args.ocean_mask), template_profile)
-        ocean = (om == 0)  # waffles convention: water=0 (ocean-only mask)
-        LOG.info("Ocean-only mask loaded: %s (waffles convention water=0 land=1)", args.ocean_mask)
-
+    if ocean is not None:
         # Optionally keep ocean-connected pixels that lie close to river flowlines.
         # This is critical for tidal river mouths/estuaries where the mainstem
         # is classified as ocean water by the coastline mask.
@@ -468,62 +521,52 @@ def main() -> int:
 
     if args.water_mask:
         wm = _warp_mask_to_template(Path(args.water_mask), template_profile)
-        water_all = (wm == 0)  # waffles convention: water=0
-        if ocean is not None:
-            # Inland-water = (rivers+lakes+ocean) minus ocean-only water
-            water = water_all & (~ocean_exclude)
-            LOG.info("Derived inland-water mask: water_mask & ~ocean_mask")
-
-            # Water-mask sanity check: some masks (e.g., coastline ocean-only) may classify
-            # inland rivers as land. If the provided water mask yields ~no water inside the
-            # buffered flowline corridor, fall back to using the corridor itself as 'water'
-            # (still respecting ocean exclusion/keep rules).
-            if corridor.sum() > 0:
-                frac = float((water & corridor).sum()) / float(corridor.sum())
-                if frac < 0.02:
-                    LOG.warning(
-                        "Water mask appears to exclude most corridor pixels (water∩corridor=%.2f%%). "
-                        "Falling back to corridor-based water mask; check --water-mask input.",
-                        100.0 * frac,
-                    )
-                    water = corridor & (~ocean_exclude)
-                    water_mask_harmonization_applied = True
-                    water_mask_harmonization_reason = "low_water_corridor_overlap"
+        if args.water_mask_role == "waffles_with_nhd":
+            # This mask already represents the intended full water domain for river delivery.
+            # Do not subtract the ocean-only WAFFLES mask here; that was the source of the
+            # false zero-overlap failure in estuarine/tidal mainstems. Ocean separation is
+            # handled later by channel-width / NHDArea / estuary logic, not by erasing the
+            # river-capable water mask up front.
+            water = (wm == 0)
+            LOG.info("Water mask loaded as WAFFLES with-NHD full water domain: %s", args.water_mask)
         else:
-            water = water_all
-            LOG.info("Water mask loaded: %s (waffles convention water=0 land=1)", args.water_mask)
+            water_all = (wm == 0)  # explicit convention: water=0
 
-            # Water-mask sanity check (no ocean mask): if the provided water mask yields
-            # ~no water inside the corridor, fall back to corridor-based water.
-            if corridor.sum() > 0:
-                frac = float((water & corridor).sum()) / float(corridor.sum())
-                if frac < 0.02:
-                    LOG.warning(
-                        "Water mask appears to exclude most corridor pixels (water∩corridor=%.2f%%). "
-                        "Falling back to corridor-based water mask; check --water-mask input.",
-                        100.0 * frac,
-                    )
-                    water = corridor.copy()
-                    water_mask_harmonization_applied = True
-                    water_mask_harmonization_reason = "low_water_corridor_overlap"
+            def _corridor_overlap(mask_bool: np.ndarray) -> float:
+                if corridor.sum() <= 0:
+                    return 0.0
+                return float((mask_bool & corridor).sum()) / float(corridor.sum())
+
+            if ocean is not None:
+                water = water_all & (~ocean_exclude)
+                LOG.info("Derived inland-water mask: water_mask & ~ocean_mask")
+            else:
+                water = water_all
+                LOG.info("Water mask loaded: %s (explicit convention water=0)", args.water_mask)
+
+        # Provided water masks must agree with the river corridor. If they do not, fail closed
+        # instead of silently replacing them with a synthetic corridor-based mask.
+        if corridor.sum() > 0:
+            overlap_frac = float((water & corridor).sum()) / float(corridor.sum())
+            water_corridor_overlap_frac = overlap_frac
+            min_overlap = 0.01 if args.water_mask_role == "river_support" else 0.02
+            if overlap_frac < min_overlap:
+                raise SystemExit(
+                    "Provided water mask is inconsistent with the river corridor "
+                    f"(water∩corridor={100.0 * overlap_frac:.2f}%). Fix the water-mask path/semantics instead of falling back. "
+                    f"water_mask={args.water_mask} role={args.water_mask_role} ocean_mask={args.ocean_mask}"
+                )
     else:
-        if ocean is not None:
-            # Fallback when NHD water mask is unavailable: restrict corridor to non-ocean areas
-            water = corridor & (~ocean_exclude)
-            water_mask_harmonization_applied = True
-            water_mask_harmonization_reason = "missing_water_mask"
-            LOG.warning("No --water-mask supplied; using corridor constrained to non-ocean areas from --ocean-mask.")
-        else:
-            # Last-resort fallback: treat corridor as water
-            water = corridor.copy()
-            water_mask_harmonization_applied = True
-            water_mask_harmonization_reason = "missing_water_and_ocean_masks"
-            LOG.warning("No --water-mask or --ocean-mask supplied; using buffered corridor as 'water' (ocean separation degraded).")
+        raise SystemExit("--water-mask is required for river domain construction; refusing to synthesize water from corridor/ocean fallbacks.")
 
-    if args.water_mask and ocean is not None:
-        water_source_effective = "with_nhd_minus_ocean" if not water_mask_harmonization_applied else "with_nhd_corridor_fallback"
+    if args.water_mask and args.water_mask_role == "waffles_with_nhd":
+        water_source_effective = "with_nhd"
+    elif args.water_mask and args.water_mask_role == "river_support":
+        water_source_effective = "river_support"
+    elif args.water_mask and ocean is not None:
+        water_source_effective = "generic_minus_ocean" if not water_mask_harmonization_applied else "generic_harmonized"
     elif args.water_mask:
-        water_source_effective = "with_nhd" if not water_mask_harmonization_applied else "with_nhd_corridor_fallback"
+        water_source_effective = "generic" if not water_mask_harmonization_applied else "generic_harmonized"
     elif ocean is not None:
         water_source_effective = "corridor_minus_ocean"
     else:
@@ -558,31 +601,40 @@ def main() -> int:
         # nhdarea/auto: constrain by NHDArea river polygons when available, but allow
         # mainstem corridor continuity and (optionally) ocean-kept pixels near flowlines.
         if (nhdarea_mask is not None) and bool(nhdarea_mask.any()):
-            # If NHDArea exists but barely overlaps the flowline corridor, it's almost certainly
-            # "wrong" polygons for our purpose (e.g., lakes/wetlands only). In that case, ignore
-            # NHDArea and fall back to corridor-based channel selection.
+            # NHDArea river polygons must overlap the flowline corridor. If they do not,
+            # the polygon extraction/filtering is wrong and the workflow should fail closed
+            # rather than silently degrading to a corridor-only river domain.
             if corridor.sum() > 0:
                 ov = float((nhdarea_mask & corridor).sum()) / float(corridor.sum())
                 if ov < 0.01:
-                    LOG.warning(
-                        "NHDArea mask has very low overlap with corridor (%.2f%%). "
-                        "Ignoring NHDArea and falling back to corridor-only channel mask.",
-                        100.0 * ov,
+                    raise SystemExit(
+                        "NHDArea river polygons have very low overlap with the flowline corridor "
+                        f"({100.0 * ov:.2f}%). Fix NHDArea extraction/filtering instead of degrading to corridor-only."
                     )
-                    nhdarea_mask = None
         if (nhdarea_mask is not None) and bool(nhdarea_mask.any()):
             channel &= (nhdarea_mask | corridor_main | keep_ocean)
         else:
-            if args.channel_source == "nhdarea":
-                raise SystemExit(
-                    "--channel-source=nhdarea requested, but no usable river/stream polygons were extracted from NHDArea. "
-                    "Check FType/FCode filtering or use --channel-source=corridor."
-                )
-            LOG.warning("NHDArea river polygons missing/empty; auto mode falling back to corridor-only channel mask.")
+            raise SystemExit(
+                "No usable NHDArea river polygons were extracted for river domain construction. "
+                "Fix NHDArea extraction/filtering or explicitly request --channel-source=corridor if that is scientifically intended."
+            )
 
 
-    # Open water = water but not channel
-    open_water = water & (~channel)
+    # Open water is the ocean/bay subset of the effective water mask, not arbitrary inland
+    # disconnected residual water. Restrict strictly to water components that directly
+    # touch the ocean mask; do not use dilation here because that can spuriously connect
+    # disconnected inland fragments into the ocean/open-water domain.
+    if ocean is not None:
+        from scipy.ndimage import label as _label
+        labeled_water, _nw = _label(water)
+        ocean_touch_labels = set(np.unique(labeled_water[ocean & (labeled_water > 0)]))
+        if ocean_touch_labels:
+            ocean_connected_water = np.isin(labeled_water, list(ocean_touch_labels)) & water
+        else:
+            ocean_connected_water = np.zeros_like(water, dtype=bool)
+        open_water = ocean_connected_water & (~channel)
+    else:
+        open_water = water & (~channel)
 
     out_channel = Path(args.out_channel_mask)
     out_open = Path(args.out_open_water_mask)
@@ -592,6 +644,8 @@ def main() -> int:
     nhd_overlap_frac = None
     if (nhdarea_mask is not None) and bool(nhdarea_mask.any()) and corridor.sum() > 0:
         nhd_overlap_frac = float((nhdarea_mask & corridor).sum()) / float(corridor.sum())
+    mainstem_mask = _derive_output_mainstem_mask(corridor_main, channel)
+
     policy_summary = {
         "channel_source_requested": str(args.channel_source),
         "channel_source_effective": channel_source_effective,
@@ -604,6 +658,7 @@ def main() -> int:
         "nhdarea_effective": bool(channel_source_effective == "nhdarea"),
         "corridor_pixels": int(corridor.sum()),
         "mainstem_corridor_pixels": int(corridor_main.sum()),
+        "mainstem_output_pixels": int(mainstem_mask.sum()),
         "effective_water_pixels": int(water.sum()),
         "channel_pixels": int(channel.sum()),
         "open_water_pixels": int(open_water.sum()),
@@ -612,8 +667,11 @@ def main() -> int:
         "nhdarea_pixels": int(nhdarea_mask.sum()) if (nhdarea_mask is not None) else 0,
         "effective_water_corridor_overlap_frac": water_corridor_overlap_frac,
         "channel_corridor_overlap_frac": float((channel & corridor).sum()) / float(corridor.sum()) if corridor.sum() > 0 else None,
+        "mainstem_channel_overlap_frac": float((mainstem_mask & channel).sum()) / float(mainstem_mask.sum()) if mainstem_mask.sum() > 0 else None,
         "open_water_corridor_overlap_frac": float((open_water & corridor).sum()) / float(corridor.sum()) if corridor.sum() > 0 else None,
         "nhdarea_corridor_overlap_frac": nhd_overlap_frac,
+        "mainstem_method": mainstem_method,
+        "mainstem_diagnostics": mainstem_diag,
     }
 
     _save_u8(out_channel, channel.astype("uint8"), template_profile, nodata=0)
@@ -621,7 +679,7 @@ def main() -> int:
     if args.out_mainstem_mask:
         out_main = Path(args.out_mainstem_mask)
         out_main.parent.mkdir(parents=True, exist_ok=True)
-        _save_u8(out_main, corridor_main.astype("uint8"), template_profile, nodata=0)
+        _save_u8(out_main, mainstem_mask.astype("uint8"), template_profile, nodata=0)
         LOG.info("Wrote: %s", out_main)
     if args.out_effective_water_mask:
         out_eff = Path(args.out_effective_water_mask)

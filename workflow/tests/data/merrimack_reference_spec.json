@@ -1,0 +1,79 @@
+{
+  "description": "Reference spec for Merrimack workflow output validation. Provide MERRIMACK_REFERENCE_OUTPUT_DIR pointing at a completed run, or MERRIMACK_REFERENCE_FINAL_RASTER for a direct raster path. Override with MERRIMACK_REFERENCE_SPEC_JSON to use a different spec file. Tight bounds use authoritative sounding coordinates; loose bounds are sanity checks.",
+  "final_raster_candidates": [
+    "combined/bathy_combined_depth_conditioned.tif",
+    "combined/final_depth_native.tif",
+    "bathy_combined_depth_conditioned.tif"
+  ],
+  "checks": [
+    {
+      "name": "estuary_channel_deep",
+      "x": -70.9345,
+      "y": 42.8120,
+      "min": -18.0,
+      "max": -2.0,
+      "note": "Main estuary channel near mouth — should be negative (below datum). A positive value here means sign flip or depth cap regression."
+    },
+    {
+      "name": "estuary_channel_mid",
+      "x": -70.9400,
+      "y": 42.8150,
+      "min": -15.0,
+      "max": -1.0,
+      "note": "Mid-estuary channel — expects submerged bed elevation."
+    },
+    {
+      "name": "nearshore_shallow",
+      "x": -70.9200,
+      "y": 42.8080,
+      "min": -8.0,
+      "max": 2.0,
+      "note": "Nearshore shallow zone — should be close to datum. Catches cases where deep predictions bleed into shallows."
+    },
+    {
+      "name": "upstream_river_bed",
+      "x": -70.9650,
+      "y": 42.8600,
+      "min": -5.0,
+      "max": 15.0,
+      "note": "Upstream river bed — positive NAVD88 allowed for elevated rivers. Should NOT be deeper than -5m at this location."
+    },
+    {
+      "name": "upstream_inland",
+      "x": -70.9750,
+      "y": 42.8700,
+      "min": -3.0,
+      "max": 25.0,
+      "note": "Inland reach — expects shallow river channel or positive bed."
+    },
+    {
+      "name": "sign_consistency_estuary",
+      "x": -70.9350,
+      "y": 42.8130,
+      "min": -25.0,
+      "max": 0.0,
+      "note": "Estuary must have negative (submerged) bed elevation. Positive value = sign convention failure."
+    }
+  ],
+  "sign_checks": [
+    {
+      "name": "estuary_below_datum",
+      "points": [
+        {"x": -70.9345, "y": 42.8120},
+        {"x": -70.9400, "y": 42.8150},
+        {"x": -70.9350, "y": 42.8130}
+      ],
+      "expect_negative": true,
+      "note": "All estuary channel points must have negative (submerged) bed elevation in NAVD88."
+    }
+  ],
+  "monotonicity_checks": [
+    {
+      "name": "channel_deepens_downstream",
+      "upstream": {"x": -70.9650, "y": 42.8600},
+      "downstream": {"x": -70.9345, "y": 42.8120},
+      "expect_downstream_deeper": true,
+      "note": "Estuary channel should generally deepen toward the ocean (downstream elevation < upstream elevation)."
+    }
+  ]
+}

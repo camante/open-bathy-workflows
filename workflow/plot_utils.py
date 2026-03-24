@@ -14,9 +14,12 @@ Use:
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Optional
+
+log = logging.getLogger(__name__)
 
 def _ensure_mplconfigdir() -> None:
     # Avoid ~/.config/matplotlib permission issues by forcing a writable cache dir.
@@ -28,6 +31,7 @@ def _ensure_mplconfigdir() -> None:
         tmp.mkdir(parents=True, exist_ok=True)
         os.environ["MPLCONFIGDIR"] = str(tmp)
     except Exception:
+        log.debug("_ensure_mplconfigdir: suppressed exception", exc_info=True)
         # Best effort only
         return
 
@@ -39,6 +43,7 @@ def lazy_pyplot(backend: str = "Agg"):
         try:
             matplotlib.use(backend)
         except Exception:
+            log.debug("lazy_pyplot: suppressed exception", exc_info=True)
             pass  # best-effort backend switch
     import matplotlib.pyplot as plt
     return plt

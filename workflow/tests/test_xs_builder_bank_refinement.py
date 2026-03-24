@@ -74,7 +74,7 @@ def test_pick_banks_prefers_corridor_edge_refinement_over_endpoint_peak():
     assert abs(profile.loc[idx_r, "dist_m"] - 80.0) <= 2.0
 
 
-def test_pick_banks_falls_back_when_no_expected_edges_available():
+def test_pick_banks_requires_bank_domain_expectations_when_no_expected_edges_available():
     dist = np.arange(0.0, 51.0, 1.0)
     z = np.zeros(dist.shape, dtype=float)
     z[5] = 4.0
@@ -85,6 +85,6 @@ def test_pick_banks_falls_back_when_no_expected_edges_available():
         "z_topo": np.full(dist.shape, np.nan, dtype=float),
     })
     idx_l, idx_r, meta = pick_banks(profile, bank_search_m=10.0)
-    assert meta["method"] == "endpoint_peak_fallback"
-    assert idx_l == 5
-    assert idx_r == len(dist) - 6
+    assert meta["method"] == "missing_bank_domain_expectations"
+    assert idx_l is None
+    assert idx_r is None

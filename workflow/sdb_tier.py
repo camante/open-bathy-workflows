@@ -216,6 +216,7 @@ def assess_training_data(
                 if aoi_area > 0:
                     q.spatial_coverage_frac = min(1.0, hull_area / aoi_area)
         except Exception:
+            log.debug("sdb_tier: suppressed exception", exc_info=True)
             # ConvexHull can fail for collinear points
             q.spatial_coverage_frac = 0.0
 

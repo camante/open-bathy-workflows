@@ -11,6 +11,9 @@ from typing import Optional, Sequence, Mapping, Any
 import subprocess
 import json
 from pathlib import Path
+import logging
+log = logging.getLogger(__name__)
+
 
 def _tail(s: str, n: int = 4000) -> str:
     if not s:
@@ -77,6 +80,7 @@ def find_sdb_depth_raster(sdb_dir: Path) -> Optional[Path]:
     try:
         data = json.loads(manifest.read_text(encoding="utf-8"))
     except Exception:
+        log.debug("find_sdb_depth_raster: suppressed exception", exc_info=True)
         return None
     rel = data.get("depth_raster")
     if not isinstance(rel, str) or not rel.strip():

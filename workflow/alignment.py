@@ -24,6 +24,8 @@ from typing import Dict, Optional, Tuple, Sequence, Any
 
 import numpy as np
 
+from sign_semantics import raster_value_semantics, semantics_from_depth_positive_down_flag
+
 log = logging.getLogger("sdb.align")
 
 
@@ -162,6 +164,7 @@ def read_tie_points(
     try:
         import geopandas as gpd
     except Exception as exc:
+        log.debug("read_tie_points: suppressed exception", exc_info=True)
         raise ImportError("geopandas is required to read vector tie point formats") from exc
 
     if ext == ".gpkg":
@@ -176,6 +179,7 @@ def read_tie_points(
                     layer = lyr
                     break
             except Exception as exc:
+                log.debug("alignment: suppressed exception", exc_info=True)
                 last_exc = exc
                 continue
         if gdf is None or len(gdf) == 0:
@@ -282,25 +286,54 @@ def _sample_raster_at_lonlat(raster_path: str, lon: np.ndarray, lat: np.ndarray)
             "crs": str(crs),
             "nodata": (None if nod is None else float(nod)),
             "bounds": [float(ds.bounds.left), float(ds.bounds.bottom), float(ds.bounds.right), float(ds.bounds.top)],
+            "tags": {str(k): str(v) for k, v in (ds.tags() or {}).items()},
         }
         return vals, info
 
-def _ensure_positive_down(depth: np.ndarray) -> Tuple[np.ndarray, float]:
-    """Return depth as positive-down and a flip factor to recover original sign."""
+def _ensure_positive_down(depth: np.ndarray, known_positive_down: Optional[bool] = None) -> Tuple[np.ndarray, float]:
+    """Return depth as positive-down and a flip factor to recover original sign.
+
+    When known_positive_down is provided, honor that explicit semantic instead of guessing from the median sign.
+    """
     d = np.asarray(depth, dtype=np.float64)
     m = np.isfinite(d)
     if not np.any(m):
         return d, 1.0
-    flip = -1.0 if np.nanmedian(d[m]) < 0 else 1.0
+    if known_positive_down is True:
+        flip = 1.0
+    elif known_positive_down is False:
+        flip = -1.0
+    else:
+        flip = -1.0 if np.nanmedian(d[m]) < 0 else 1.0
     return d * flip, flip
 
 def residuals_against_points(raster_path: str, pts: TiePoints) -> Dict[str, Any]:
     pred_raw, info = _sample_raster_at_lonlat(raster_path, pts.lon, pts.lat)
 
     ref_raw = pts.depth_m.astype(np.float64)
+    pred_semantics = raster_value_semantics((info or {}).get("tags"))
+    ref_semantics = semantics_from_depth_positive_down_flag(pts.depth_positive_down)
+    semantic_contract = {
+        "expected": "depth_raster_for_alignment",
+        "observed": pred_semantics,
+        "tie_points": ref_semantics,
+        "status": "pass",
+        "message": "Alignment inputs have compatible depth semantics.",
+    }
+    if pred_semantics == "absolute_elevation":
+        semantic_contract.update({
+            "status": "error",
+            "message": "Alignment raster is tagged as absolute elevation; residual alignment expects a depth raster.",
+        })
+        return {"status": "skip", "reason": "semantic_mismatch", "n": 0, "raster_info": info, "semantic_contract": semantic_contract}
+    if ref_semantics == "depth_unknown_sign":
+        semantic_contract.update({
+            "status": "warning",
+            "message": "Tie points do not declare depth sign explicitly; residual alignment fell back to sign inference for the reference points.",
+        })
 
     pred_pd, pred_flip = _ensure_positive_down(pred_raw)
-    ref_pd, ref_flip = _ensure_positive_down(ref_raw)
+    ref_pd, ref_flip = _ensure_positive_down(ref_raw, known_positive_down=pts.depth_positive_down)
 
     # If both already positive-down, flips are 1. If one is negative-down, we normalize.
     m = np.isfinite(pred_pd) & np.isfinite(ref_pd)
@@ -317,6 +350,7 @@ def residuals_against_points(raster_path: str, pts: TiePoints) -> Dict[str, Any]
         "pred_pd_m": pred_pd[m],
         "ref_pd_m": ref_pd[m],
         "raster_info": info,
+        "semantic_contract": semantic_contract,
     }
     return out
 
@@ -374,6 +408,7 @@ def _detect_bimodal(residuals: np.ndarray, min_samples: int = 50) -> Dict[str, A
     except ImportError:
         return {"is_bimodal": False, "n_modes": 0, "reason": "scipy_not_available"}
     except Exception as e:
+        log.debug("alignment: suppressed exception", exc_info=True)
         return {"is_bimodal": False, "n_modes": 0, "reason": f"error: {str(e)}"}
 
 
@@ -495,6 +530,7 @@ def fit_planar_shift_xy(
         try:
             coef_new, *_ = np.linalg.lstsq(Aw, rw, rcond=None)
         except Exception:
+            log.debug("fit_planar_shift_xy: suppressed exception", exc_info=True)
             break
         u = r - (A @ coef_new)
         # robust scale (MAD)
@@ -738,6 +774,7 @@ def align_raster_to_tie_points(
             else:
                 gate["planar_allowed"] = True
         except Exception as exc:
+            log.debug("alignment: suppressed exception", exc_info=True)
             gate["planar_allowed"] = False
             gate["planar_reason"] = f"planar gate failed: {exc}; falling back to median"
             mode = "median"
@@ -794,6 +831,7 @@ def align_raster_to_tie_points(
         "post": {"summary": post_summary},
         "fit": {k: v for k, v in fit.items() if k not in ("status",)},
         "gate": gate,
+        "semantic_contract": pre.get("semantic_contract"),
         "outputs": {
             "aligned_raster": str(out_r),
             "residual_plot": plot_path,

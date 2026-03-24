@@ -97,7 +97,7 @@ def prepare_river_support_from_authoritative(
     cache_dir = ensure_dir_fn(Path(cfg.cache_root) / "authoritative_support")
     out_csv = cache_dir / (
         "authoritative_river_soundings_"
-        f"{hash_key_fn(str(auth_path), cfg.aoi, out_crs, getattr(cfg, 'working_vcrs_epsg', 5703), 'river')}.csv"
+        f"{hash_key_fn(str(auth_path), cfg.aoi, out_crs, getattr(cfg, 'working_vcrs_epsg', 5703), 'river_roleaware_v2')}.csv"
     )
     section = report.setdefault("authoritative_base", {}).setdefault("river_guidance", {})
     if out_csv.exists() and out_csv.stat().st_size > 0:
@@ -110,6 +110,7 @@ def prepare_river_support_from_authoritative(
             auth_path,
             out_csv,
             out_crs=out_crs,
+            negative_only=False,
             logger=log,
         )
         section.update(info)

@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 
 from final_dem_contract import build_final_dem_contract_summary
 from final_dem_contract_validator import summarize_written_precedence_audit, validate_written_final_dem_contract
+from final_route_contract import allowed_final_route_inputs, forbidden_structural_inputs, validate_final_route_contract
 
 
 def _runtime_state(report: Dict[str, Any]) -> Dict[str, Any]:
@@ -65,6 +66,7 @@ def _guidance_artifacts(report: Dict[str, Any]) -> Dict[str, Optional[str]]:
         "river_xs_support_points": _existing_path(river_outputs.get("xs_support_points")),
         "river_centerline_elevation": _existing_path(river_outputs.get("centerline_elevation")),
         "river_centerline_influence": _existing_path(river_outputs.get("centerline_influence")),
+        "river_centerline_stationing": _existing_path(river_outputs.get("centerline_stationing")),
         "river_xs_support_elevation": _existing_path(river_outputs.get("xs_support_elevation")),
         "river_xs_support_weight": _existing_path(river_outputs.get("xs_support_weight")),
         "river_retained_network": _existing_path(river_outputs.get("retained_network")),
@@ -80,7 +82,7 @@ def _guidance_artifacts(report: Dict[str, Any]) -> Dict[str, Optional[str]]:
 
 
 _SDB_GUIDANCE_CORE = ("sdb_guide_points", "sdb_guidance_weight", "sdb_admissibility")
-_RIVER_GUIDANCE_CORE = ("river_guide_points", "river_corridor_mask", "river_bank_influence", "river_bank_elevation_xs", "river_centerline_elevation", "river_centerline_influence", "river_xs_support_elevation", "river_xs_support_weight", "river_bank_continuity_weight", "river_bank_graph_confidence", "river_bank_confluence_damping", "river_bank_estuary_side_decay")
+_RIVER_GUIDANCE_CORE = ("river_guide_points", "river_corridor_mask", "river_bank_influence", "river_bank_elevation_xs", "river_centerline_elevation", "river_centerline_influence", "river_centerline_stationing", "river_xs_support_elevation", "river_xs_support_weight", "river_bank_continuity_weight", "river_bank_graph_confidence", "river_bank_confluence_damping", "river_bank_estuary_side_decay")
 
 
 def _guidance_readiness(artifacts: Dict[str, Optional[str]]) -> Dict[str, Any]:
@@ -101,6 +103,7 @@ def _guidance_contract(report: Dict[str, Any]) -> Dict[str, Any]:
     manifests = _guidance_manifests(report)
     artifacts = _guidance_artifacts(report)
     readiness = _guidance_readiness(artifacts)
+    route_validation = validate_final_route_contract(report)
     return {
         "mode": "guidance_first",
         "dense_sdb_depth_role": "diagnostic_only",
@@ -112,9 +115,12 @@ def _guidance_contract(report: Dict[str, Any]) -> Dict[str, Any]:
             "river_guidance_artifacts",
             "support_aware_terrain_interpolator",
         ],
+        "allowed_final_route_inputs": allowed_final_route_inputs(),
+        "forbidden_structural_inputs": forbidden_structural_inputs(),
         "manifests_present": {k: bool(v) for k, v in manifests.items()},
         "artifacts_present": {k: bool(v) for k, v in artifacts.items()},
         "guidance_readiness": readiness,
+        "route_validation": route_validation,
     }
 
 
@@ -219,6 +225,10 @@ def build_final_output_contract(
             "authoritative_conditioning_applied": authoritative_conditioning_applied,
             "gapfill_applied": explicit_gapfill_applied if explicit_gapfill_applied is not None else bool(gapfill.get("status") == "applied" and gapfill_depth),
         },
+        "validation_outputs": {
+            "validation_invariance_summary": _existing_path((report.get("outputs", {}) if isinstance(report.get("outputs", {}), dict) else {}).get("validation_invariance_summary")),
+            "scientific_validation_summary": _existing_path((report.get("outputs", {}) if isinstance(report.get("outputs", {}), dict) else {}).get("scientific_validation_summary")),
+        },
         "guidance_manifests": _guidance_manifests(report),
         "guidance_artifacts": _guidance_artifacts(report),
         "guidance_contract": _guidance_contract(report),
@@ -228,6 +238,13 @@ def build_final_output_contract(
             "support_distance": _existing_path(ab_out.get("support_distance")),
             "support_density": _existing_path(ab_out.get("support_density")),
             "guidance_influence": _existing_path(ab_out.get("guidance_influence")),
+            "anchor_uncertainty": _existing_path(ab_out.get("anchor_uncertainty")),
+            "guidance_uncertainty": _existing_path(ab_out.get("guidance_uncertainty")),
+            "conditioned_uncertainty": _existing_path(ab_out.get("conditioned_uncertainty")),
+            "conditioning_audit": _existing_path(ab_out.get("conditioning_audit")),
+            "guidance_uncertainty_contract": _existing_path(ab_out.get("guidance_uncertainty_contract")),
+            "final_output_layer_contract": _existing_path(ab_out.get("final_output_layer_contract")),
+            "final_vertical_semantics_contract": _existing_path(ab_out.get("final_vertical_semantics_contract")),
             "coastal_sdb_confidence": _existing_path(ab_out.get("coastal_sdb_confidence")),
             "river_anchor_distance": _existing_path(ab_out.get("river_anchor_distance")),
             "river_anchor_density": _existing_path(ab_out.get("river_anchor_density")),
@@ -240,6 +257,10 @@ def build_final_output_contract(
             "river_bank_estuary_side_decay": _existing_path(ab_out.get("river_bank_estuary_side_decay")),
             "sdb_regime_class": _existing_path((report.get("sdb", {}) if isinstance(report.get("sdb", {}), dict) else {}).get("artifacts", {}).get("regime_class_raster")),
             "river_regime_class": _existing_path((report.get("river", {}) if isinstance(report.get("river", {}), dict) else {}).get("outputs", {}).get("regime_class")),
+            "river_longitudinal_profile_contract": _existing_path((report.get("river", {}) if isinstance(report.get("river", {}), dict) else {}).get("outputs", {}).get("longitudinal_profile_contract")),
+            "river_longitudinal_profile": _existing_path((report.get("river", {}) if isinstance(report.get("river", {}), dict) else {}).get("outputs", {}).get("longitudinal_profile")),
+            "river_longitudinal_profile_elevation": _existing_path((report.get("river", {}) if isinstance(report.get("river", {}), dict) else {}).get("outputs", {}).get("longitudinal_profile_elevation")),
+            "river_longitudinal_profile_uncertainty": _existing_path((report.get("river", {}) if isinstance(report.get("river", {}), dict) else {}).get("outputs", {}).get("longitudinal_profile_uncertainty")),
         },
         "regime_artifacts": {
             "final": _existing_path(ab_out.get("regime_class")),
@@ -258,6 +279,8 @@ def build_final_output_contract(
             "hard_lock_finite_authoritative_cells": True,
             "continuous_output": True,
         },
+        "final_dem_route_receipt": (report.get("final_dem_route", {}) if isinstance(report.get("final_dem_route", {}), dict) else {}),
+        "legacy_cleanup_receipt": _existing_path((report.get("authoritative_base", {}) if isinstance(report.get("authoritative_base", {}), dict) else {}).get("outputs", {}).get("legacy_cleanup_receipt")),
         "final_dem_contract": build_final_dem_contract_summary(report),
         "final_dem_validation": validate_written_final_dem_contract(
             final_depth=selected_native or selected_user,

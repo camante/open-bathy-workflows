@@ -67,3 +67,95 @@ def test_interpolator_uses_river_support_depth_as_anchor_surface():
     )
     assert np.isfinite(out["conditioned"][2, 1])
     assert out["conditioned"][2, 1] < candidate[2, 1]
+
+
+def test_interpolator_can_run_without_prebuilt_candidate():
+    from terrain_interpolator import TerrainInterpolationConfig, TerrainInterpolationInputs, interpolate_support_aware_surface
+    auth = np.array([[1.0, np.nan, 3.0],[1.5, np.nan, 3.5],[2.0, np.nan, 4.0]], dtype=np.float32)
+    sdb_ok = np.array([[False, True, False],[False, True, False],[False, True, False]], dtype=bool)
+    river_ok = np.zeros_like(sdb_ok, dtype=bool)
+    sdb_depth = np.array([[np.nan, 2.0, np.nan],[np.nan, 2.5, np.nan],[np.nan, 3.0, np.nan]], dtype=np.float32)
+    out = interpolate_support_aware_surface(
+        inputs=TerrainInterpolationInputs(
+            auth=auth,
+            candidate=None,
+            sdb_depth_guidance=sdb_depth,
+            sdb_ok=sdb_ok,
+            river_ok=river_ok,
+            sdb_gw=np.ones_like(sdb_depth, dtype=np.float32),
+        ),
+        config=TerrainInterpolationConfig(pixel_size_m=3.0),
+    )
+    assert np.isfinite(out["guidance_surface"][1, 1])
+    assert np.isfinite(out["conditioned"][1, 1])
+
+
+def test_interpolator_can_rasterize_native_guide_points_inside_engine(monkeypatch, tmp_path):
+    import terrain_interpolator as ti
+
+    def _fake_sdb(path, template_raster, logger=None):
+        return np.array([[np.nan, 2.0, np.nan],[np.nan, 2.5, np.nan],[np.nan, 3.0, np.nan]], dtype=np.float32)
+
+    monkeypatch.setattr(ti, "log", ti.log)
+    import sdb_guidance
+    monkeypatch.setattr(sdb_guidance, "rasterize_sdb_guide_points_to_template", _fake_sdb)
+
+    auth = np.array([[1.0, np.nan, 3.0],[1.5, np.nan, 3.5],[2.0, np.nan, 4.0]], dtype=np.float32)
+    sdb_ok = np.array([[False, True, False],[False, True, False],[False, True, False]], dtype=bool)
+    river_ok = np.zeros_like(sdb_ok, dtype=bool)
+    (tmp_path / "template.tif").write_text("template")
+    out = ti.interpolate_support_aware_surface(
+        inputs=ti.TerrainInterpolationInputs(
+            auth=auth,
+            candidate=None,
+            sdb_guide_points_path="fake.gpkg",
+            guidance_template_raster=str((tmp_path / "template.tif").resolve()),
+            sdb_ok=sdb_ok,
+            river_ok=river_ok,
+            sdb_gw=np.ones_like(auth, dtype=np.float32),
+        ),
+        config=ti.TerrainInterpolationConfig(pixel_size_m=3.0),
+    )
+    assert np.isfinite(out["guidance_surface"][1, 1])
+    assert np.isfinite(out["conditioned"][1, 1])
+
+
+def test_interpolator_requires_template_for_native_guide_points():
+    auth = np.array([[1.0, np.nan], [2.0, np.nan]], dtype=np.float32)
+    with pytest.raises(ValueError, match="guidance_template_raster is required"):
+        interpolate_support_aware_surface(
+            inputs=TerrainInterpolationInputs(
+                auth=auth,
+                sdb_guide_points_path="fake.gpkg",
+                sdb_ok=np.array([[False, True], [False, True]], dtype=bool),
+                river_ok=np.zeros((2, 2), dtype=bool),
+            ),
+            config=TerrainInterpolationConfig(pixel_size_m=3.0),
+        )
+
+
+def test_interpolator_rejects_resolved_native_guidance_shape_mismatch(monkeypatch, tmp_path):
+    import terrain_interpolator as ti
+
+    template = tmp_path / "template.tif"
+    template.write_text("placeholder", encoding="utf-8")
+
+    def _fake_sdb(path, template_raster, logger=None):
+        return np.ones((3, 3), dtype=np.float32)
+
+    import sdb_guidance
+    monkeypatch.setattr(sdb_guidance, "rasterize_sdb_guide_points_to_template", _fake_sdb)
+
+    auth = np.array([[1.0, np.nan], [2.0, np.nan]], dtype=np.float32)
+    with pytest.raises(ValueError, match="resolved shape"):
+        ti.interpolate_support_aware_surface(
+            inputs=ti.TerrainInterpolationInputs(
+                auth=auth,
+                sdb_guide_points_path="fake.gpkg",
+                guidance_template_raster=str(template),
+                sdb_ok=np.array([[False, True], [False, True]], dtype=bool),
+                river_ok=np.zeros((2, 2), dtype=bool),
+                sdb_gw=np.ones((2, 2), dtype=np.float32),
+            ),
+            config=ti.TerrainInterpolationConfig(pixel_size_m=3.0),
+        )

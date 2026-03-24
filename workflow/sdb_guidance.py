@@ -62,6 +62,83 @@ def write_sdb_guidance_bounds(depth_path: str | Path, uncertainty_path: str | Pa
     return {"lower_bound_raster": str(lower_path), "upper_bound_raster": str(upper_path)}
 
 
+
+
+def _pick_sdb_guide_value_column(columns: list[str]) -> Optional[str]:
+    preferred = [
+        "depth_m",
+        "bottom_elevation",
+        "bed_elev",
+        "elevation_m",
+        "elevation",
+        "depth",
+        "z",
+        "value",
+    ]
+    lowered = {str(c).lower(): c for c in columns}
+    for name in preferred:
+        if name in lowered:
+            return lowered[name]
+    return None
+
+
+def rasterize_sdb_guide_points_to_template(guide_points_path: str | Path, template_raster: str | Path, *, logger: Optional[logging.Logger] = None) -> Optional[np.ndarray]:
+    import rasterio
+    from rasterio.transform import rowcol
+    try:
+        import geopandas as gpd
+    except Exception:
+        log.debug("rasterize_sdb_guide_points_to_template: suppressed exception", exc_info=True)
+        return None
+
+    gp = Path(guide_points_path)
+    tmpl = Path(template_raster)
+    if (not gp.exists()) or (not tmpl.exists()):
+        return None
+
+    try:
+        gdf = gpd.read_file(gp)
+    except Exception:
+        log.debug("rasterize_sdb_guide_points_to_template: suppressed exception", exc_info=True)
+        return None
+    if gdf is None or gdf.empty or 'geometry' not in gdf.columns:
+        return None
+    value_col = _pick_sdb_guide_value_column(list(gdf.columns))
+    if value_col is None:
+        return None
+    gdf = gdf[gdf.geometry.notnull()].copy()
+    if gdf.empty:
+        return None
+
+    with rasterio.open(tmpl) as ds:
+        if gdf.crs is not None and ds.crs is not None and str(gdf.crs) != str(ds.crs):
+            try:
+                gdf = gdf.to_crs(ds.crs)
+            except Exception:
+                log.debug("rasterize_sdb_guide_points_to_template: suppressed exception", exc_info=True)
+                return None
+        arr = np.full((ds.height, ds.width), np.nan, dtype=np.float32)
+        sums = np.zeros((ds.height, ds.width), dtype=np.float64)
+        counts = np.zeros((ds.height, ds.width), dtype=np.uint32)
+        vals = np.asarray(gdf[value_col], dtype=float)
+        for geom, val in zip(gdf.geometry, vals):
+            if geom is None or not np.isfinite(val):
+                continue
+            try:
+                r, c = rowcol(ds.transform, geom.x, geom.y)
+            except Exception:
+                log.debug("rasterize_sdb_guide_points_to_template: suppressed exception", exc_info=True)
+                continue
+            if 0 <= int(r) < ds.height and 0 <= int(c) < ds.width:
+                sums[int(r), int(c)] += float(val)
+                counts[int(r), int(c)] += 1
+        valid = counts > 0
+        if not np.any(valid):
+            return None
+        arr[valid] = (sums[valid] / counts[valid]).astype(np.float32)
+    (logger or log).info('Rasterized SDB guide points onto template grid: %s -> %s populated cells', gp, int(np.sum(np.isfinite(arr))))
+    return arr
+
 def build_sdb_guidance_manifest(*, out_root: str | Path, depth_raster: str | Path, args: Any) -> Dict[str, Any]:
     out_root = Path(out_root)
     paths = guidance_artifact_paths(depth_raster)
@@ -91,7 +168,7 @@ def build_sdb_guidance_manifest(*, out_root: str | Path, depth_raster: str | Pat
         artifacts["authoritative_base_auto"] = getattr(args, "_authoritative_base_auto_report")
 
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "artifact_family": "sdb_guidance",
         "guidance_only": True,
         "artifacts": artifacts,
@@ -107,10 +184,32 @@ def build_sdb_guidance_manifest(*, out_root: str | Path, depth_raster: str | Pat
             "lower_bound_raster": "plausible_lower_bound",
             "upper_bound_raster": "plausible_upper_bound",
         },
+        "final_route_contract": {
+            "route_role": "subordinate_guidance_artifacts_only",
+            "allowed_structural_artifacts": [
+                "admissibility_raster",
+                "confidence_raster",
+                "guide_points",
+                "guidance_weight_raster",
+                "lower_bound_raster",
+                "provenance_raster",
+                "regime_class_raster",
+                "trusted_interior_raster",
+                "upper_bound_raster",
+            ],
+            "diagnostic_only_artifacts": ["depth_raster"],
+            "forbidden_structural_inputs": [
+                "legacy_fused_candidate_raster",
+                "dense_river_depth_raster_as_peer_surface",
+                "dense_sdb_depth_raster_as_peer_surface",
+                "weighted_overlap_blended_bathymetry_as_structural_input",
+            ],
+        },
         "notes": {
             "depth_raster": "Dense SDB surface is diagnostic and should not be treated as peer authoritative terrain.",
             "guide_points": "Spatially thinned pseudo-soundings for confidence-weighted interpolation guidance.",
             "bounds": "Lower/upper bounds are uncertainty-derived plausible guidance envelopes, not hard truth.",
+            "final_route_contract": "Only the listed subordinate guidance artifacts may structurally enter the final DEM route; dense SDB depth remains diagnostic-only.",
         },
     }
     return manifest
