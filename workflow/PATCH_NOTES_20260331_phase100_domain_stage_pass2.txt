@@ -1,0 +1,1 @@
+Phase 100: pass 2 switches top-level water-method activation to shared-domain outputs. WAFFLES-only gating is no longer the main activation authority in main(); later runner-specific skip logic remains for the next pass.

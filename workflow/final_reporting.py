@@ -4,6 +4,7 @@ Extracted from bathy_main.py to reduce orchestration-file size and isolate outpu
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -12,6 +13,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
+from nodata_utils import sanitize_array
 from core.json_io import write_json
 from core.paths import ensure_dir
 from output_products import build_final_output_contract
@@ -59,23 +61,17 @@ def _link_or_copy_file(src: Path, dst: Path, *, logger: Optional[logging.Logger]
 
 
 def resolve_baseline_cudem_interpolation(cfg: Any, report: Dict[str, Any], *, logger: Optional[logging.Logger] = None) -> Optional[Path]:
-    log = logger or logging.getLogger(__name__)
-    info = report.get("authoritative_base_auto", {}) if isinstance(report.get("authoritative_base_auto"), dict) else {}
-    cand = info.get("baseline_cudem_interpolation")
-    if cand:
-        p = Path(str(cand))
-        if p.exists():
-            return p
-    auth = getattr(cfg, "authoritative_base", None)
-    if auth:
-        try:
-            sibling = Path(auth).with_name("cudem_baseline_interpolation.tif")
-        except (TypeError, ValueError, OSError):
-            log.debug("[COMPARE] Failed resolving baseline sibling next to authoritative_base", exc_info=True)
-        else:
-            if sibling.exists():
-                return sibling
-    return None
+    """Delegate baseline-CUDEM resolution to the canonical final-route helper."""
+    from final_route_inputs_stage import resolve_baseline_cudem_interpolation as _canonical
+
+    try:
+        return _canonical(cfg=cfg, report=report, auth_src=None)
+    except Exception:
+        (logger or logging.getLogger(__name__)).debug(
+            "[COMPARE] Failed resolving baseline CUDEM interpolation via canonical helper",
+            exc_info=True,
+        )
+        return None
 
 
 def write_authoritative_cache_receipt(cfg: Any, report: Dict[str, Any]) -> Optional[Path]:
@@ -159,17 +155,15 @@ def write_comparison_summary(cfg: Any, report: Dict[str, Any], packaged: Dict[st
             return None
 
         with rasterio.open(final_path) as final_ds:
-            final_arr = final_ds.read(1).astype("float32")
+            final_arr = sanitize_array(final_ds.read(1), final_ds.nodata, dtype="float32")
             final_nodata = np.float32(final_ds.nodata if final_ds.nodata is not None else -9999.0)
-            final_arr[np.isclose(final_arr, final_nodata)] = np.nan
             ref_lat = (cfg.tile_bbox[1] + cfg.tile_bbox[3]) / 2.0 if getattr(cfg, "tile_bbox", None) else None
             pixel_size_m = _grid_pixel_size_m(final_ds.transform, final_ds.crs, ref_lat_deg=ref_lat)
             pixel_area_m2 = float(max(pixel_size_m, 1.0) ** 2)
 
             with rasterio.open(diff_path) as diff_ds:
-                diff_arr = diff_ds.read(1).astype("float32")
+                diff_arr = sanitize_array(diff_ds.read(1), diff_ds.nodata, dtype="float32")
                 diff_nodata = np.float32(diff_ds.nodata if diff_ds.nodata is not None else -9999.0)
-                diff_arr[np.isclose(diff_arr, diff_nodata)] = np.nan
 
             has_diff = bool(np.any(np.isfinite(diff_arr)))
             summary: Dict[str, Any] = {
@@ -330,9 +324,7 @@ def write_comparison_package(cfg: Any, report: Dict[str, Any], *, final_native: 
                     with rasterio.open(baseline_aligned_path, "w", **prof) as dst:
                         dst.write(out_write.astype("float32"), 1)
 
-                    final_arr = ref_ds.read(1).astype("float32")
-                    final_nodata = np.float32(ref_ds.nodata if ref_ds.nodata is not None else -9999.0)
-                    final_arr[np.isclose(final_arr, final_nodata)] = np.nan
+                    final_arr = sanitize_array(ref_ds.read(1), ref_ds.nodata, dtype="float32")
                     diff = final_arr - out
                     diff[~np.isfinite(final_arr) | ~np.isfinite(out)] = np.nan
                     diff_write = diff.copy()
@@ -393,10 +385,24 @@ def write_explicit_final_outputs_manifest(cfg: Any, report: Dict[str, Any], *, f
         "river_trusted_interior": report.get("outputs", {}).get("river_trusted_interior") if isinstance(report.get("outputs", {}), dict) else None,
         "river_scaffold_domains": report.get("outputs", {}).get("river_scaffold_domains") if isinstance(report.get("outputs", {}), dict) else None,
         "river_trusted_interior_summary": report.get("outputs", {}).get("river_trusted_interior_summary") if isinstance(report.get("outputs", {}), dict) else None,
+        "river_channel_surface_graph_mode": (report.get("river", {}).get("outputs", {}) if isinstance(report.get("river", {}), dict) else {}).get("channel_surface_graph_mode"),
+        "river_channel_surface_support_class": (report.get("river", {}).get("outputs", {}) if isinstance(report.get("river", {}), dict) else {}).get("channel_surface_support_class"),
+        "river_channel_surface_uncertainty": (report.get("river", {}).get("outputs", {}) if isinstance(report.get("river", {}), dict) else {}).get("channel_surface_uncertainty"),
+        "river_channel_surface_hard_lock": (report.get("river", {}).get("outputs", {}) if isinstance(report.get("river", {}), dict) else {}).get("channel_surface_hard_lock"),
+        "river_channel_surface_junction_constrained": (report.get("river", {}).get("outputs", {}) if isinstance(report.get("river", {}), dict) else {}).get("channel_surface_junction_constrained"),
+        "river_channel_surface_unsupported_span": (report.get("river", {}).get("outputs", {}) if isinstance(report.get("river", {}), dict) else {}).get("channel_surface_unsupported_span"),
+        "river_channel_surface_unsupported_regime": (report.get("river", {}).get("outputs", {}) if isinstance(report.get("river", {}), dict) else {}).get("channel_surface_unsupported_regime"),
+        "river_channel_surface_residual_to_candidate": (report.get("river", {}).get("outputs", {}) if isinstance(report.get("river", {}), dict) else {}).get("channel_surface_residual_to_candidate"),
+        "river_graph_backbone_diagnostics": (report.get("river", {}).get("outputs", {}) if isinstance(report.get("river", {}), dict) else {}).get("graph_backbone_diagnostics"),
+        "river_graph_physical_plausibility_contract": (report.get("river", {}).get("outputs", {}) if isinstance(report.get("river", {}), dict) else {}).get("graph_physical_plausibility_contract"),
+        "river_support_uncertainty_contract": (report.get("river", {}).get("outputs", {}) if isinstance(report.get("river", {}), dict) else {}).get("support_uncertainty_contract"),
         "final_depth_native": contract.get("selected_final_native"),
         "final_depth_user": contract.get("selected_final_user"),
         "final_provenance_native": contract.get("selected_final_provenance"),
         "selected_final_depth": contract.get("selected_final_depth"),
+        "selected_final_invariant": contract.get("selected_final_invariant"),
+        "selected_final_invariant_lock_validation": contract.get("selected_final_invariant_lock_validation"),
+        "selected_final_invariant_lock_validation_target": contract.get("selected_final_invariant_lock_validation_target"),
         "selected_final_provenance": contract.get("selected_final_provenance"),
     })
     write_json(out_path, payload)
@@ -405,6 +411,9 @@ def write_explicit_final_outputs_manifest(cfg: Any, report: Dict[str, Any], *, f
     report.setdefault("outputs", {})["final_depth_user"] = payload["final_depth_user"]
     report.setdefault("outputs", {})["final_provenance_native"] = payload["final_provenance_native"]
     report.setdefault("outputs", {})["selected_final_depth"] = payload["selected_final_depth"]
+    report.setdefault("outputs", {})["selected_final_invariant"] = payload["selected_final_invariant"]
+    report.setdefault("outputs", {})["selected_final_invariant_lock_validation"] = payload["selected_final_invariant_lock_validation"]
+    report.setdefault("outputs", {})["selected_final_invariant_lock_validation_target"] = payload["selected_final_invariant_lock_validation_target"]
     report.setdefault("outputs", {})["selected_final_provenance"] = payload["selected_final_provenance"]
     report.setdefault("final_dem_runtime", {}).update({
         "final_generation_route": contract.get("final_generation_route"),
@@ -420,6 +429,21 @@ def write_validation_invariance_summary(cfg: Any, report: Dict[str, Any], *, fin
     try:
         manifest_path = Path(cfg.out_dir) / "final_outputs.json"
         if not manifest_path.exists():
+            return None
+        try:
+            manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            log.debug("[VALIDATION] Failed reading final outputs manifest", exc_info=True)
+            return None
+        if not isinstance(manifest_payload, dict):
+            return None
+        selected_final = manifest_payload.get("selected_final_depth") or manifest_payload.get("final_depth_user") or manifest_payload.get("final_depth_native")
+        if not selected_final:
+            log.info("[VALIDATION] Skipping validation/invariance summary because no selected final depth exists in final_outputs manifest.")
+            report.setdefault("validation", {}).update({
+                "status": "skipped_no_selected_final_depth",
+                "final_outputs_manifest": str(manifest_path),
+            })
             return None
         payload = run_validation_invariance_framework(
             final_outputs_manifest=manifest_path,
@@ -454,7 +478,7 @@ def write_validation_invariance_summary(cfg: Any, report: Dict[str, Any], *, fin
             reasons = "; ".join(payload.get("hard_failures", []))
             if enforce_hard_fail:
                 raise RuntimeError(f"Validation/invariance framework hard-failed: {reasons}")
-            log.warning("[VALIDATION] Deferred hard-fail until post-seam evaluation: %s", reasons)
+            log.info("[VALIDATION] Recorded pre-seam hard invariant failure for later enforcement: %s", reasons)
         return out_path
     except RuntimeError:
         raise
@@ -470,9 +494,12 @@ def evaluate_overlap_identity_checks(overlap_checks: list[dict] | None, *, toler
     """Evaluate overlap identity results and decide whether they pass the stability contract."""
     checks = list(overlap_checks or [])
     failures = []
+    ok_count = 0
+    skipped_no_valid_count = 0
     for check in checks:
         status = check.get('status')
         if status == 'no_valid':
+            skipped_no_valid_count += 1
             continue
         if status != 'ok':
             failures.append({
@@ -482,6 +509,7 @@ def evaluate_overlap_identity_checks(overlap_checks: list[dict] | None, *, toler
                 'reason': f'non-ok status: {status}',
             })
             continue
+        ok_count += 1
         max_abs = check.get('max_abs')
         if max_abs is not None and float(max_abs) > float(tolerance):
             failures.append({
@@ -492,10 +520,15 @@ def evaluate_overlap_identity_checks(overlap_checks: list[dict] | None, *, toler
                 'tolerance': float(tolerance),
                 'reason': f'max_abs {float(max_abs):.12g} exceeds tolerance {float(tolerance):.12g}',
             })
+    all_ok = None
+    if ok_count > 0:
+        all_ok = len(failures) == 0
     return {
         'checked': len(checks),
+        'ok_count': int(ok_count),
+        'skipped_no_valid_count': int(skipped_no_valid_count),
         'tolerance': float(tolerance),
-        'all_ok': len(failures) == 0 if checks else None,
+        'all_ok': all_ok,
         'failures': failures,
     }
 
@@ -514,8 +547,10 @@ def write_river_stability_summary(cfg: Any, report: Dict[str, Any], *, logger: O
             trusted_payload = __import__('json').loads(Path(trusted_summary_path).read_text(encoding='utf-8'))
         seam_results = report.get('seams', {}).get('adjacent_tile_comparisons', []) if isinstance(report.get('seams', {}), dict) else []
         overlap_checks = report.get('seams', {}).get('overlap_identity_checks', []) if isinstance(report.get('seams', {}), dict) else []
+        trusted_checks = report.get('seams', {}).get('trusted_interior_identity_checks', []) if isinstance(report.get('seams', {}), dict) else []
         nested = nested_aoi_relationship(str(cfg.aoi), scaffold_payload.get('solve_aoi')) if scaffold_payload and scaffold_payload.get('solve_aoi') else None
         overlap_eval = evaluate_overlap_identity_checks(overlap_checks)
+        trusted_eval = evaluate_overlap_identity_checks(trusted_checks)
         payload = {
             'aoi': str(cfg.aoi),
             'scaffold_contract': scaffold_payload,
@@ -525,6 +560,9 @@ def write_river_stability_summary(cfg: Any, report: Dict[str, Any], *, logger: O
             'overlap_identity_checks': overlap_checks,
             'overlap_identity_evaluation': overlap_eval,
             'all_overlap_identity_ok': overlap_eval.get('all_ok'),
+            'trusted_interior_identity_checks': trusted_checks,
+            'trusted_interior_identity_evaluation': trusted_eval,
+            'all_trusted_interior_identity_ok': trusted_eval.get('all_ok'),
         }
         out = Path(cfg.out_dir) / 'river_stability_summary.json'
         write_json(out, payload)

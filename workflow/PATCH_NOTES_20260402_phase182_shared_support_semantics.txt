@@ -1,0 +1,14 @@
+Phase 182: unify river support/protection/rebuild semantics across active stages
+
+Summary
+- Added shared river_support_semantics.py so longitudinal tendency, XS realism,
+  primary-surface rebuild, and effectiveness receipts use the same station-level
+  support/protection/rebuild interpretation.
+- Replaced parallel threshold copies with shared station_semantics(...).
+- Propagated station_support_regime, station_protection_regime, and
+  station_rebuild_regime through the active river path.
+
+Key effect
+- The same station should now be interpreted consistently across longitudinal
+  smoothing, support-aware XS classification, rebuild eligibility, and post-run
+  effectiveness receipts.

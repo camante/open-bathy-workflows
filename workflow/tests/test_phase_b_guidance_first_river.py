@@ -53,9 +53,8 @@ def test_river_guidance_manifest_includes_centerline_stationing(tmp_path: Path):
 
 
 def test_guidance_assembly_loads_centerline_stationing(tmp_path: Path):
-    template = _write_raster(tmp_path / "combined" / "template.tif", np.full((3, 3), -9999.0, dtype=np.float32))
     auth = np.array([[1.0, -9999.0, 3.0], [1.5, -9999.0, 3.5], [2.0, -9999.0, 4.0]], dtype=np.float32)
-    _write_raster(tmp_path / "combined" / "auth.tif", auth)
+    template = _write_raster(tmp_path / "combined" / "auth.tif", auth)
     _touch(tmp_path / "river" / "river_guide_points.gpkg")
     _write_raster(tmp_path / "river" / "river_centerline_stationing_m.tif", np.array([[0.0, 1.0, 2.0], [0.0, 1.0, 2.0], [0.0, 1.0, 2.0]], dtype=np.float32))
     _write_raster(tmp_path / "river" / "river_centerline_elevation.tif", np.array([[5.0, 5.5, 6.0], [5.0, 5.5, 6.0], [5.0, 5.5, 6.0]], dtype=np.float32))
@@ -73,7 +72,7 @@ def test_guidance_assembly_loads_centerline_stationing(tmp_path: Path):
 
     paths = SimpleNamespace(
         template_path=template,
-        auth_src=tmp_path / "combined" / "auth.tif",
+        auth_src=template,
         guidance_receipt_path=tmp_path / "combined" / "guidance_receipt.json",
     )
     cfg = SimpleNamespace(out_dir=tmp_path, tile_bbox=None)
@@ -157,10 +156,91 @@ def test_deterministic_terrain_stage_passes_centerline_stationing(monkeypatch, t
         },
         source_candidate={},
         candidate_prov=np.zeros((2, 2), dtype=np.uint8),
+        baseline_background=None,
+        baseline_cudem_path=None,
     )
     run_deterministic_terrain_stage(guidance=guidance, template_path=str(tmp_path / "template.tif"))
     assert "river_centerline_stationing" in captured
     assert captured["river_centerline_stationing"] is not None
+
+
+
+def test_deterministic_terrain_stage_allows_direct_primary_surface_handoff_without_legacy_primary_surface(monkeypatch, tmp_path: Path):
+    def _fake_support_weighted_condition_arrays(**kwargs):
+        auth = kwargs["auth"]
+        conditioned = np.where(np.isfinite(auth), auth, np.float32(0.0)).astype(np.float32)
+        conditioned[0, 1] = np.float32(5.0)
+        conditioned[1, 1] = np.float32(6.0)
+        return {
+            "locked": np.isfinite(auth),
+            "gap": ~np.isfinite(auth),
+            "eligible": np.zeros_like(auth, dtype=bool),
+            "conditioned": conditioned,
+            "support": np.zeros_like(auth, dtype=np.uint8),
+            "provenance": np.zeros_like(auth, dtype=np.uint8),
+            "support_note": "ok",
+            "memory_diagnostics": [{"river_guidance_finite": 4}],
+            "river_primary_guidance_summary": {"primary_surface_finite_pixels": 0},
+        }
+
+    monkeypatch.setattr("deterministic_terrain_stage.support_weighted_condition_arrays", _fake_support_weighted_condition_arrays)
+
+    guidance = SimpleNamespace(
+        arrays={
+            "sdb_adm": np.zeros((2, 2), dtype=np.uint8),
+            "river_adm": np.zeros((2, 2), dtype=np.uint8),
+            "sdb_gw": None,
+            "sdb_ti": None,
+            "river_gw": None,
+            "river_ti": None,
+            "river_support": None,
+            "river_support_depth": None,
+            "river_estuary_transition": None,
+            "river_corridor": np.ones((2, 2), dtype=np.uint8),
+            "river_bank_influence": None,
+            "river_bank_elevation_xs": None,
+            "river_bank_pair_weight": None,
+            "river_bank_continuity_weight": None,
+            "river_bank_graph_confidence": None,
+            "river_bank_confluence_damping": None,
+            "river_bank_estuary_side_decay": None,
+            "river_centerline_elevation": None,
+            "river_centerline_influence": None,
+            "river_centerline_stationing": np.array([[0.0, 1.0], [0.0, 1.0]], dtype=np.float32),
+            "river_channel_surface": None,
+            "primary_river_guidance_surface": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+            "river_longitudinal_profile_elevation": None,
+            "river_longitudinal_profile_uncertainty": None,
+            "river_longitudinal_profile_influence": None,
+            "river_xs_support_elevation": None,
+            "river_xs_support_weight": None,
+        },
+        auth=np.array([[1.0, np.nan], [2.0, np.nan]], dtype=np.float32),
+        sdb_guide_points_path=None,
+        river_guide_points_path=None,
+        support_params={
+            "pixel_size_m": 1.0,
+            "support_decay_m": 10.0,
+            "support_density_radius_m": 10.0,
+            "coastal_sdb_support_transition_m": 10.0,
+            "river_anchor_density_radius_m": 10.0,
+            "river_scaffold_transition_m": 10.0,
+            "river_contract_mode": "canonical_v322",
+        },
+        source_candidate={"river_primary_surface": "x"},
+        candidate_prov=np.zeros((2, 2), dtype=np.uint8),
+        baseline_background=np.zeros((2, 2), dtype=np.float32),
+        baseline_cudem_path=None,
+    )
+    receipt_path = tmp_path / "terrain_receipt.json"
+    result = run_deterministic_terrain_stage(guidance=guidance, template_path=str(tmp_path / "template.tif"), receipt_path=str(receipt_path))
+    assert result is not None
+    uptake = (tmp_path / "river_primary_surface_uptake_receipt.json").read_text(encoding="utf-8")
+    assert '"status": "uptake_ok"' in uptake
+    effect = (tmp_path / "river_primary_surface_conditioning_effect_receipt.json").read_text(encoding="utf-8")
+    assert '"status": "effect_detected"' in effect
+    assert '"changed_vs_background_pixels": 4' in effect
+    assert '"changed_vs_background_unlocked_pixels": 2' in effect
 
 
 def test_anisotropic_river_nearest_prefers_along_channel_stationing():
@@ -194,15 +274,14 @@ def test_anisotropic_river_nearest_prefers_along_channel_stationing():
 
 
 def test_guidance_assembly_fails_loudly_when_critical_river_artifacts_missing(tmp_path: Path):
-    template = _write_raster(tmp_path / "combined" / "template.tif", np.full((3, 3), -9999.0, dtype=np.float32))
     auth = np.full((3, 3), -9999.0, dtype=np.float32)
-    _write_raster(tmp_path / "combined" / "auth.tif", auth)
+    template = _write_raster(tmp_path / "combined" / "auth.tif", auth)
     _write_raster(tmp_path / "river" / "river_admissibility.tif", np.ones((3, 3), dtype=np.uint8), nodata=0)
     _write_raster(tmp_path / "river" / "river_corridor_mask.tif", np.ones((3, 3), dtype=np.uint8), nodata=0)
 
     paths = SimpleNamespace(
         template_path=template,
-        auth_src=tmp_path / "combined" / "auth.tif",
+        auth_src=template,
         guidance_receipt_path=tmp_path / "combined" / "guidance_receipt.json",
     )
     cfg = SimpleNamespace(out_dir=tmp_path, tile_bbox=None)
@@ -222,8 +301,7 @@ def test_guidance_assembly_fails_loudly_when_critical_river_artifacts_missing(tm
 
 
 def test_guidance_assembly_fails_loudly_when_sdb_structural_semantics_are_invalid(tmp_path: Path):
-    template = _write_raster(tmp_path / "combined" / "template.tif", np.full((3, 3), -9999.0, dtype=np.float32))
-    _write_raster(tmp_path / "combined" / "auth.tif", np.full((3, 3), -9999.0, dtype=np.float32))
+    template = _write_raster(tmp_path / "combined" / "auth.tif", np.full((3, 3), -9999.0, dtype=np.float32))
     sdb_dir = tmp_path / "sdb"
     sdb_dir.mkdir(parents=True, exist_ok=True)
     (sdb_dir / "artifacts_sdb.json").write_text('{"depth_raster":"pred_depth.tif","admissibility_raster":"pred_depth_admissibility.tif","guidance_weight_raster":"pred_depth_guidance_weight.tif","guide_points":"pred_depth_guide_points.gpkg"}', encoding="utf-8")
@@ -234,7 +312,7 @@ def test_guidance_assembly_fails_loudly_when_sdb_structural_semantics_are_invali
 
     paths = SimpleNamespace(
         template_path=template,
-        auth_src=tmp_path / "combined" / "auth.tif",
+        auth_src=template,
         guidance_receipt_path=tmp_path / "combined" / "guidance_receipt.json",
     )
     cfg = SimpleNamespace(out_dir=tmp_path, tile_bbox=None)
@@ -246,3 +324,73 @@ def test_guidance_assembly_fails_loudly_when_sdb_structural_semantics_are_invali
         assert "sdb_guidance_weight_out_of_0_1_range" in msg
     else:
         raise AssertionError("Expected assemble_guidance_inputs to fail on invalid SDB structural semantics")
+
+
+def test_deterministic_terrain_stage_writes_primary_surface_uptake_receipt(monkeypatch, tmp_path: Path):
+    def _fake_support_weighted_condition_arrays(**kwargs):
+        auth = kwargs["auth"]
+        return {
+            "locked": np.isfinite(auth),
+            "gap": ~np.isfinite(auth),
+            "eligible": np.zeros_like(auth, dtype=bool),
+            "conditioned": np.where(np.isfinite(auth), auth, np.float32(0.0)).astype(np.float32),
+            "support": np.zeros_like(auth, dtype=np.uint8),
+            "provenance": np.zeros_like(auth, dtype=np.uint8),
+            "support_note": "ok",
+            "memory_diagnostics": [{"river_guidance_finite": 4}],
+            "river_primary_guidance_summary": {"primary_surface_finite_pixels": 0},
+        }
+
+    monkeypatch.setattr("deterministic_terrain_stage.support_weighted_condition_arrays", _fake_support_weighted_condition_arrays)
+
+    receipt_path = tmp_path / "terrain_receipt.json"
+    guidance = SimpleNamespace(
+        arrays={
+            "sdb_adm": np.zeros((2, 2), dtype=np.uint8),
+            "river_adm": np.zeros((2, 2), dtype=np.uint8),
+            "sdb_gw": None,
+            "sdb_ti": None,
+            "river_gw": None,
+            "river_ti": None,
+            "river_support": None,
+            "river_support_depth": None,
+            "river_estuary_transition": None,
+            "river_corridor": np.ones((2, 2), dtype=np.uint8),
+            "river_bank_influence": None,
+            "river_bank_elevation_xs": None,
+            "river_bank_pair_weight": None,
+            "river_bank_continuity_weight": None,
+            "river_bank_graph_confidence": None,
+            "river_bank_confluence_damping": None,
+            "river_bank_estuary_side_decay": None,
+            "river_centerline_elevation": None,
+            "river_centerline_influence": None,
+            "river_centerline_stationing": np.array([[0.0, 1.0], [0.0, 1.0]], dtype=np.float32),
+            "river_channel_surface": None,
+            "primary_river_guidance_surface": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+            "river_longitudinal_profile_elevation": None,
+            "river_longitudinal_profile_uncertainty": None,
+            "river_longitudinal_profile_influence": None,
+            "river_xs_support_elevation": None,
+            "river_xs_support_weight": None,
+        },
+        auth=np.array([[1.0, np.nan], [2.0, np.nan]], dtype=np.float32),
+        sdb_guide_points_path=None,
+        river_guide_points_path=None,
+        support_params={
+            "pixel_size_m": 1.0,
+            "support_decay_m": 10.0,
+            "support_density_radius_m": 10.0,
+            "coastal_sdb_support_transition_m": 10.0,
+            "river_anchor_density_radius_m": 10.0,
+            "river_scaffold_transition_m": 10.0,
+        },
+        source_candidate={},
+        candidate_prov=np.zeros((2, 2), dtype=np.uint8),
+        baseline_background=None,
+        baseline_cudem_path=None,
+    )
+
+    run_deterministic_terrain_stage(guidance=guidance, template_path=str(tmp_path / "template.tif"), receipt_path=str(receipt_path))
+    uptake = (tmp_path / "river_primary_surface_uptake_receipt.json").read_text(encoding="utf-8")
+    assert '"status": "uptake_ok"' in uptake

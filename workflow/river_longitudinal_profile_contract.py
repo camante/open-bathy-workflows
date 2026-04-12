@@ -18,6 +18,17 @@ OPTIONAL = {
     "xs_support_elevation": "cross_stream_support_elevation",
     "authoritative_support_depth": "authoritative_anchor_depth",
     "bank_elevation_xs": "xs_longitudinal_bank_elevation",
+    "bank_longitudinal_fit_points": "component_and_side_specific_monotone_bank_fit_points",
+    "bank_longitudinal_fit_summary": "component_and_side_specific_monotone_bank_fit_summary",
+    "left_bank_fit_elevation": "left_bank_longitudinal_fit_elevation",
+    "right_bank_fit_elevation": "right_bank_longitudinal_fit_elevation",
+    "bank_pair_fit_elevation": "bank_pair_longitudinal_fit_elevation",
+    "authoritative_bed_anchor_curve": "stationized_authoritative_bed_anchor_curve",
+    "authoritative_bed_anchor_curve_summary": "stationized_authoritative_bed_anchor_curve_summary",
+    "longitudinal_profile_coverage": "station_level_longitudinal_profile_support_coverage",
+    "active_core_support_elevation": "explicit_fluvial_active_channel_core_support",
+    "active_core_support_uncertainty": "explicit_fluvial_active_channel_core_support_uncertainty",
+    "active_core_support_influence": "explicit_fluvial_active_channel_core_support_influence",
 }
 
 

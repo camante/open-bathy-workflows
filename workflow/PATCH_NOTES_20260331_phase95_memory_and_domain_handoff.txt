@@ -1,0 +1,4 @@
+Phase 95
+- Reduced deterministic terrain-stage memory pressure by compacting large guidance-side arrays before terrain interpolation.
+- Added explicit shared handoff enforcement/validation so river guidance excludes the estuary/coastal handoff and SDB inherits it.
+- Preserved Sea/Ocean connectivity ordering from phase93 while making the handoff auditable in guidance domain diagnostics.

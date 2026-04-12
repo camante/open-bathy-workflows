@@ -5,6 +5,7 @@ from typing import Optional
 
 import numpy as np
 
+from nodata_utils import resolve_reproject_nodata_value
 from support_classes import RegimeClass, SupportClass
 
 
@@ -17,12 +18,13 @@ def _align_raster_to_template(*, template_path: Path, src_path: Optional[Path], 
     with rasterio.open(template_path) as tmpl:
         arr = np.full((tmpl.height, tmpl.width), nodata_value, dtype=dtype)
         with rasterio.open(src_path) as src:
+            src_nodata = resolve_reproject_nodata_value(src.nodata, default=float(nodata_value))
             reproject(
                 source=rasterio.band(src, 1),
                 destination=arr,
                 src_transform=src.transform,
                 src_crs=src.crs,
-                src_nodata=src.nodata,
+                src_nodata=src_nodata,
                 dst_transform=tmpl.transform,
                 dst_crs=tmpl.crs,
                 dst_nodata=nodata_value,
@@ -77,8 +79,8 @@ def build_contract_target_mask_array(
         regime_mask = np.isin(
             np.asarray(regime, dtype=np.uint8),
             [
-                int(RegimeClass.NEARSHORE_WATER),
                 int(RegimeClass.ESTUARY_TRANSITION),
+                int(RegimeClass.NEARSHORE_WATER),
                 int(RegimeClass.RIVER_CHANNEL),
             ],
         )
@@ -86,49 +88,10 @@ def build_contract_target_mask_array(
     if support is None:
         support_mask = np.ones_like(eligible_mask, dtype=bool)
     else:
-        allowed = [
-            int(SupportClass.ANCHORED_INTERPOLATION),
-            int(SupportClass.GUIDANCE_CONDITIONED_SDB),
-            int(SupportClass.GUIDANCE_CONDITIONED_RIVER),
-            int(SupportClass.SCAFFOLD_INFERRED),
-        ]
-        if allow_low_confidence_fill:
-            allowed.append(int(SupportClass.LOW_CONFIDENCE_CONTINUOUS_FILL))
-        support_mask = np.isin(np.asarray(support, dtype=np.uint8), allowed)
+        support_arr = np.asarray(support, dtype=np.uint8)
+        blocked = {int(SupportClass.AUTHORITATIVE_LOCKED)}
+        if not allow_low_confidence_fill:
+            blocked.add(int(SupportClass.LOW_CONFIDENCE_CONTINUOUS_FILL))
+        support_mask = ~np.isin(support_arr, list(blocked))
 
-    mask = eligible_mask & regime_mask & support_mask
-    return np.asarray(mask, dtype=bool)
-
-
-def write_contract_target_mask(
-    *,
-    template_path: Path,
-    out_path: Path,
-    eligible_fill_mask_path: Optional[Path] = None,
-    support_class_path: Optional[Path] = None,
-    regime_class_path: Optional[Path] = None,
-    allow_low_confidence_fill: bool = True,
-) -> Optional[Path]:
-    mask = build_contract_target_mask_array(
-        template_path=template_path,
-        eligible_fill_mask_path=eligible_fill_mask_path,
-        support_class_path=support_class_path,
-        regime_class_path=regime_class_path,
-        allow_low_confidence_fill=allow_low_confidence_fill,
-    )
-    if mask is None:
-        return None
-    import rasterio
-
-    with rasterio.open(template_path) as tmpl:
-        prof = tmpl.profile.copy()
-        prof.update(dtype="uint8", nodata=0, count=1, compress="deflate")
-        with rasterio.open(out_path, "w", **prof) as dst:
-            dst.write(mask.astype("uint8"), 1)
-    return out_path
-
-
-__all__ = [
-    "build_contract_target_mask_array",
-    "write_contract_target_mask",
-]
+    return eligible_mask & regime_mask & support_mask

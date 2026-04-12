@@ -7,6 +7,8 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 import rasterio
+
+from nodata_utils import valid_mask
 from rasterio.enums import Resampling
 from rasterio.warp import reproject
 
@@ -34,9 +36,7 @@ def _read_mask_bool(path: Path) -> Tuple[np.ndarray, Dict[str, Any]]:
     with rasterio.open(path) as ds:
         arr = ds.read(1)
         profile = ds.profile.copy()
-    nod = profile.get("nodata", None)
-    if nod is not None:
-        arr = np.where(arr == nod, 0, arr)
+    arr = np.where(valid_mask(arr, profile.get("nodata", None)), arr, 0)
     return (arr == 1), profile
 
 
@@ -44,9 +44,7 @@ def _read_water_land_mask(path: Path) -> Tuple[np.ndarray, Dict[str, Any]]:
     with rasterio.open(path) as ds:
         arr = ds.read(1)
         profile = ds.profile.copy()
-    nod = profile.get("nodata", None)
-    if nod is not None:
-        arr = np.where(arr == nod, 1, arr)
+    arr = np.where(valid_mask(arr, profile.get("nodata", None)), arr, 1)
     # fixed semantics for canonical WAFFLES masks: water=0 land=1
     return (arr == 0), profile
 
@@ -75,9 +73,7 @@ def _read_water_land_mask_aligned(path: Path, ref_profile: Dict[str, Any]) -> Tu
             dst_nodata=dst_nodata,
             resampling=Resampling.nearest,
         )
-    nod = src_profile.get("nodata", None)
-    if nod is not None:
-        dst = np.where(dst == nod, 1, dst)
+    dst = np.where(valid_mask(dst, src_profile.get("nodata", None)), dst, 1)
     dst = np.where(dst == dst_nodata, 1, dst)
     return (dst == 0), dict(ref_profile)
 

@@ -113,6 +113,15 @@ def augment_sdb_command(cfg: Any, cmd: List[str], *, sdb_main_path: Optional[str
     auth_xyz = getattr(cfg, 'sdb_authoritative_extra_xyz', None)
     if auth_xyz:
         xyz_list.extend(_normalize_multi_path_value(auth_xyz))
+    for attr, flag in [
+        ('sdb_authoritative_support_mask', '--sdb-authoritative-support-mask'),
+        ('sdb_authoritative_support_values', '--sdb-authoritative-support-values'),
+        ('sdb_authoritative_support_points', '--sdb-authoritative-support-points'),
+        ('sdb_authoritative_support_contract', '--sdb-authoritative-support-contract'),
+    ]:
+        val = getattr(cfg, attr, None)
+        if val:
+            cmd.append(f"{flag}={val}")
     if xyz_list:
         # de-dup while preserving order
         seen = set()

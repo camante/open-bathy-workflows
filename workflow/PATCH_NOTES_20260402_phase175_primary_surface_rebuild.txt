@@ -1,0 +1,27 @@
+Phase 175: primary river surface rebuild from longitudinal + support-aware XS controls
+
+What changed
+- Added river_primary_surface_rebuild.py
+- The active river channel-surface path now includes a deterministic primary-surface rebuild pass after:
+  1) longitudinal tendency
+  2) XS realism
+  3) prediction confidence
+- XS realism now propagates station-level support/template metadata back onto node rows so downstream surface construction can use it directly.
+
+Behavior
+- Only acts on weak-support, non-authoritative, non-measured stations.
+- Uses the longitudinal backbone target when available.
+- Uses support-aware template classes/types from the XS realism phase.
+- Rebuilds low-support sections toward smoother generic targets instead of preserving noisy raw scaffold shape.
+- Keeps measured and authoritative structure untouched.
+
+New outputs
+- river_primary_surface_rebuild_profile.csv
+- river_primary_surface_rebuild_summary.json
+
+Verification
+- python -m py_compile passed
+- pytest -q tests/test_river_xs_realism.py tests/test_river_channel_surface.py passed (19 tests)
+
+Recommended commit
+phase175 rebuild primary river surface from longitudinal backbone and generic XS controls

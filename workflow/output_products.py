@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from final_dem_contract import build_final_dem_contract_summary
-from final_dem_contract_validator import summarize_written_precedence_audit, validate_written_final_dem_contract
+from final_dem_contract_validator import summarize_written_precedence_audit, validate_written_final_dem_contract, validate_written_final_dem_lineage
 from final_route_contract import allowed_final_route_inputs, forbidden_structural_inputs, validate_final_route_contract
 
 
@@ -72,6 +72,20 @@ def _guidance_artifacts(report: Dict[str, Any]) -> Dict[str, Optional[str]]:
         "river_retained_network": _existing_path(river_outputs.get("retained_network")),
         "river_authoritative_support": _existing_path(river_outputs.get("authoritative_support")),
         "river_authoritative_support_depth": _existing_path(river_outputs.get("authoritative_support_depth")),
+        "river_channel_frame_points": _existing_path(river_outputs.get("channel_frame_points")),
+        "river_generalized_longitudinal_bed_base": _existing_path(river_outputs.get("generalized_longitudinal_bed_base")),
+        "river_generalized_longitudinal_bed_reconciled": _existing_path(river_outputs.get("generalized_longitudinal_bed_reconciled")),
+        "river_channel_frame_contract": _existing_path(river_outputs.get("channel_frame_contract")),
+        "river_channel_scaffold_nodes": _existing_path(river_outputs.get("channel_scaffold_nodes")),
+        "river_channel_scaffold_contract": _existing_path(river_outputs.get("channel_scaffold_contract")),
+        "river_authoritative_centerline_anchors": _existing_path(river_outputs.get("authoritative_centerline_anchors")),
+        "river_authoritative_xs_anchors": _existing_path(river_outputs.get("authoritative_xs_anchors")),
+        "river_channel_surface": _existing_path(river_outputs.get("channel_surface")),
+        "river_channel_surface_confidence": _existing_path(river_outputs.get("channel_surface_confidence")),
+        "river_channel_surface_source_class": _existing_path(river_outputs.get("channel_surface_source_class")),
+        "river_channel_surface_support_count": _existing_path(river_outputs.get("channel_surface_support_count")),
+        "river_channel_surface_contract": _existing_path(river_outputs.get("channel_surface_contract")),
+        "river_runtime_diagnostics": _existing_path(river_outputs.get("runtime_diagnostics")),
         "river_effective_water_mask": _existing_path(river_outputs.get("river_effective_water_mask")),
         "river_domain_policy_json": _existing_path(river_outputs.get("river_domain_policy_json")),
         "river_corridor_mask_debug": _existing_path(river_outputs.get("river_corridor_mask_debug")),
@@ -149,9 +163,26 @@ def build_final_output_contract(
     final_native_existing = _existing_path(native_path)
     final_user_existing = _existing_path(user_path)
     final_prov_existing = _existing_path(prov_path)
+    report_outputs = report.get("outputs", {}) if isinstance(report.get("outputs", {}), dict) else {}
+    stable_user_existing = _existing_path(report_outputs.get("final_depth_user_stable"))
+    legacy_user_existing = _existing_path(report_outputs.get("final_depth_user_legacy_alias"))
+    report_user_existing = _existing_path(
+        report_outputs.get("final_depth_user")
+        or stable_user_existing
+        or report_outputs.get("combined_warped")
+        or legacy_user_existing
+    )
+    comparison_user = _existing_path(report_outputs.get("final_comparison_navd88") or report_outputs.get("combined_comparison_navd88"))
+    comparison_all = _existing_path(report_outputs.get("final_comparison_navd88_all") or report_outputs.get("combined_comparison_navd88_all"))
 
     selected_native = final_native_existing
-    selected_user = final_user_existing
+    # The user-facing selected final must prefer the conditioned final delivery path. Comparison
+    # overlays are diagnostics only and may be used only when no conditioned user/native output exists.
+    final_user_candidate = final_user_existing
+    if final_user_candidate and (comparison_all and Path(final_user_candidate) == Path(comparison_all) or comparison_user and Path(final_user_candidate) == Path(comparison_user)):
+        final_user_candidate = None
+    selected_user = stable_user_existing or final_user_candidate or report_user_existing or legacy_user_existing
+    selected_depth = selected_user or selected_native or comparison_all or comparison_user
     selected_prov = final_prov_existing
 
     runtime_state = _runtime_state(report)
@@ -172,14 +203,24 @@ def build_final_output_contract(
         stage = "authoritative_conditioned"
         route = "support_aware_terrain_interpolator"
     elif selected_native and fusion_depth and Path(selected_native) == Path(fusion_depth):
-        stage = "fusion"
+        stage = "legacy_fusion"
         route = "legacy_fusion_only"
+    elif (not selected_native) and comparison_all and selected_depth and Path(selected_depth) == Path(comparison_all):
+        stage = "authoritative_aligned_comparison_all"
+        route = "authoritative_cudem_comparison_delivery_all_aoi"
+    elif (not selected_native) and comparison_user and selected_depth and Path(selected_depth) == Path(comparison_user):
+        stage = "authoritative_aligned_comparison"
+        route = "authoritative_cudem_comparison_delivery"
     elif selected_native:
         stage = "final_native"
         route = "explicit_final_native"
 
     if selected_user:
         delivery_stage = "user_delivery"
+    elif comparison_all and selected_depth and Path(selected_depth) == Path(comparison_all):
+        delivery_stage = "authoritative_aligned_comparison_all"
+    elif comparison_user and selected_depth and Path(selected_depth) == Path(comparison_user):
+        delivery_stage = "authoritative_aligned_comparison"
     else:
         delivery_stage = stage
 
@@ -211,10 +252,18 @@ def build_final_output_contract(
     runtime_engine_module = explicit_engine_module if explicit_engine_module is not None else ("terrain_interpolator" if engine_active else None)
 
     payload: Dict[str, Any] = {
-        "selected_final_depth": selected_user or selected_native,
+        "selected_final_depth": selected_depth,
         "selected_final_native": selected_native,
         "selected_final_user": selected_user,
+        # Invariance / authoritative-lock validation must always prefer the conditioned native final
+        # when it exists, even if the user-facing delivery is a reprojected alias.
+        "selected_final_invariant": selected_native or selected_user,
         "selected_final_provenance": selected_prov,
+        "selected_final_invariant_lock_validation": _existing_path(
+            ab_out.get("final_route_authoritative_lock_validation")
+            or report_outputs.get("final_route_authoritative_lock_validation")
+        ),
+        "selected_final_invariant_lock_validation_target": selected_native or selected_user,
         "selected_final_stage": stage,
         "delivery_stage": delivery_stage,
         "final_generation_route": route,
@@ -260,6 +309,8 @@ def build_final_output_contract(
             "river_longitudinal_profile_contract": _existing_path((report.get("river", {}) if isinstance(report.get("river", {}), dict) else {}).get("outputs", {}).get("longitudinal_profile_contract")),
             "river_longitudinal_profile": _existing_path((report.get("river", {}) if isinstance(report.get("river", {}), dict) else {}).get("outputs", {}).get("longitudinal_profile")),
             "river_longitudinal_profile_elevation": _existing_path((report.get("river", {}) if isinstance(report.get("river", {}), dict) else {}).get("outputs", {}).get("longitudinal_profile_elevation")),
+            "river_generalized_longitudinal_bed_base": _existing_path((report.get("river", {}) if isinstance(report.get("river", {}), dict) else {}).get("outputs", {}).get("generalized_longitudinal_bed_base")),
+            "river_generalized_longitudinal_bed_reconciled": _existing_path((report.get("river", {}) if isinstance(report.get("river", {}), dict) else {}).get("outputs", {}).get("generalized_longitudinal_bed_reconciled")),
             "river_longitudinal_profile_uncertainty": _existing_path((report.get("river", {}) if isinstance(report.get("river", {}), dict) else {}).get("outputs", {}).get("longitudinal_profile_uncertainty")),
         },
         "regime_artifacts": {
@@ -271,8 +322,12 @@ def build_final_output_contract(
             "fusion_depth": fusion_depth,
             "authoritative_conditioned_depth": conditioned_depth,
             "gapfill_depth": gapfill_depth,
-            "final_depth_native": selected_native,
-            "final_depth_user": selected_user,
+            "final_depth_native": final_native_existing,
+            "final_depth_user": final_user_existing,
+            "final_comparison_navd88": comparison_user,
+            "final_comparison_navd88_all": comparison_all,
+            "baseline_comparison_navd88": _existing_path(report_outputs.get("baseline_comparison_navd88")),
+            "baseline_comparison_navd88_all": _existing_path(report_outputs.get("baseline_comparison_navd88_all")),
             "final_provenance_native": selected_prov,
         },
         "authoritative_policy": {
@@ -283,16 +338,20 @@ def build_final_output_contract(
         "legacy_cleanup_receipt": _existing_path((report.get("authoritative_base", {}) if isinstance(report.get("authoritative_base", {}), dict) else {}).get("outputs", {}).get("legacy_cleanup_receipt")),
         "final_dem_contract": build_final_dem_contract_summary(report),
         "final_dem_validation": validate_written_final_dem_contract(
-            final_depth=selected_native or selected_user,
+            final_depth=selected_user or selected_native or comparison_all or comparison_user,
             aligned_authoritative_base=ab_out.get("aligned_authoritative_base"),
             support_class=ab_out.get("support_class"),
         ),
         "written_precedence_audit": summarize_written_precedence_audit(
-            final_depth=selected_native or selected_user,
+            final_depth=selected_user or selected_native or comparison_all or comparison_user,
             aligned_authoritative_base=ab_out.get("aligned_authoritative_base"),
             support_class=ab_out.get("support_class"),
             final_provenance=selected_prov,
             guidance_influence=ab_out.get("guidance_influence"),
+        ),
+        "final_dem_lineage_validation": validate_written_final_dem_lineage(
+            report=report,
+            final_depth=selected_user or selected_native or comparison_all or comparison_user,
         ),
         "river_trusted_interior": _existing_path((report.get("outputs", {}) if isinstance(report.get("outputs", {}), dict) else {}).get("river_trusted_interior")) or _existing_path((report.get("river", {}) if isinstance(report.get("river", {}), dict) else {}).get("outputs", {}).get("trusted_interior")),
         "river_channel_mask": _existing_path((report.get("river", {}) if isinstance(report.get("river", {}), dict) else {}).get("outputs", {}).get("river_channel_mask")) or _existing_path((report.get("outputs", {}) if isinstance(report.get("outputs", {}), dict) else {}).get("river_channel_mask")),

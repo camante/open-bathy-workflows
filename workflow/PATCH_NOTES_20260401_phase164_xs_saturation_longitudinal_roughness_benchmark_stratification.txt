@@ -1,0 +1,140 @@
+PATCH NOTES — Phase 164: XS Saturation Fix + Longitudinal Roughness Guard + Benchmark Stratification
+======================================================================================================
+Date: 2026-04-01
+
+Overview
+--------
+Three interconnected fixes addressing the three most critical issues identified in the
+latest Merrimack run: (1) wall-to-wall XS participation saturation in the channel surface,
+(2) longitudinal science worsening roughness instead of reducing it, and (3) benchmark
+holdout scoring only authoritative-locked cells.
+
+Changes
+-------
+
+### Improvement #1: Tighten XS/profile support classification
+
+ROOT CAUSE: _graph_source_code() in river_channel_surface.py assigned source code
+`xs_profile_resampled` (code 3) to ALL nodes matching the broad _is_xs_like_row() check,
+including nodes with only residual/indirect XS influence (station_support_mode in
+{xs_residual_only, xs_supported}).  Since nearly every station had one of these modes,
+xs_participates was True for ~93% of the river corridor.
+
+FIX:
+- Added _is_measured_xs() / _is_measured_xs_row() / _measured_xs_mask() — strict classifiers
+  that only match z_source == 'xs_profile_resampled' (actual measured XS profile data).
+- _graph_source_code() now assigns xs_profile_resampled source code ONLY for measured XS
+  nodes.  Residual/indirect XS-influenced nodes get graph_backbone (code 6) instead.
+- This directly fixes xs_participates (unchanged logic at the cell level) so that XS
+  participation now reflects actual measured cross-section coverage.
+- Broad _is_xs_like() retained for blend-weight decisions and node counting diagnostics.
+- Contract and audit payloads now report both measured_xs and broad xs node counts.
+
+Files: river_longitudinal_tendency.py, river_channel_surface.py, river_xs_realism.py,
+       river_prediction_confidence.py, river_channel_scaffold.py
+
+Expected on next run:
+- xs_participation should drop dramatically (from ~282K to a fraction of that)
+- xs_like_nodes in scaffold log shows both broad and measured counts
+- source_class_counts in channel surface contract reflects the new classification
+
+
+### Improvement #2: Fix longitudinal science so it reduces roughness
+
+ROOT CAUSE: The longitudinal tendency pass ran 2 iterations of local weighted averaging
+with a baseline blend of 0.20 even for well-supported stations.  The smoothing targets
+were local averages of noisy XS-derived values, and since nearly all stations were marked
+station_xs=True (due to the broad _is_xs_like), the blend was 0.20-0.30 everywhere.
+Two iterations amplified local variation, making the surface rougher than baseline.
+
+FIX:
+- _blend_weight_from_row(): Baseline lowered from 0.20 → 0.05.  Blend now increases
+  with authoritative_fraction (smoothing only effective near measured anchors) and
+  decays in XS-dense reaches (the XS structure IS the signal).  Measured XS stations
+  get blend=0 (never smoothed).  Max capped from 0.80 → 0.50.
+- _smooth_station_profile(): Reduced from 2 iterations to 1 (two passes amplified noise).
+  Added anchor-distance decay on blend (smoothing fades away from measured anchors).
+  Added ROUGHNESS GUARD: after smoothing, compares local step magnitude before/after
+  and attenuates deltas that would increase local roughness by >10%.
+  Protects both authoritative and measured XS nodes from modification.
+- apply_longitudinal_tendency_to_nodes(): Computes station_measured_xs via _is_measured_xs.
+  Reports station_source with 4 classes (authoritative/measured_xs/xs_supported/structural).
+  Protects measured XS nodes from delta application.
+
+Files: river_longitudinal_tendency.py
+
+Expected on next run:
+- final mean_abs_step ≤ baseline mean_abs_step
+- final p95_abs_step ≤ baseline p95_abs_step
+- final mean_abs_curvature ≤ baseline mean_abs_curvature
+- longitudinal_tendency_adjusted_node_count should be lower (conservative application)
+
+
+### Improvement #2b: Fix XS realism so adjusted_nodes becomes nonzero
+
+ROOT CAUSE: _blend_weight_from_row() in river_xs_realism.py had `blend *= 0.20` when
+station_xs=True (nearly all stations), making effective blend ~0.024.  Combined with
+the misleading _is_measured_xs_supported() function (which actually checked authoritative
+support, not measured XS), station_protected was set based on authoritative lock, and
+blend weights were too small to produce measurable deltas.
+
+FIX:
+- Imported _is_measured_xs from river_longitudinal_tendency for actual measured XS check.
+- station_measured_xs now uses _is_measured_xs (not the misleading authoritative check).
+- _blend_weight_from_row() now returns 0 for authoritative and measured XS (immutable),
+  but gives meaningful blend (0.15 baseline) for XS-informed-but-not-measured stations.
+  Mild reduction (blend *= 0.55) for broad XS-informed, vs former severe (blend *= 0.20).
+- _smooth_ratio_profile() accepts station_measured_xs_mask parameter.
+
+Files: river_xs_realism.py
+
+Expected on next run:
+- xs_realism_adjusted_node_count > 0
+
+
+### Improvement #2c: Prediction confidence distinguishes measured vs broad XS
+
+FIX:
+- Imported _is_measured_xs for strict XS classification.
+- _support_confidence_from_row() gives +0.18 for measured XS, +0.06 for broad XS-informed
+  (was flat +0.02 + 0.12*xs_fraction for all).
+- _confidence_regime_from_row() reports "measured_xs_supported" vs "xs_informed" instead
+  of collapsing both to "xs_supported".
+- _admissible_from_row() uses measured_xs for lower admission threshold (0.40 vs 0.45).
+
+Files: river_prediction_confidence.py
+
+Expected on next run:
+- admissible station count should increase meaningfully
+- confidence regime counts show measured_xs_supported vs xs_informed split
+
+
+### Improvement #3: Benchmark science evaluation grid
+
+ROOT CAUSE: Auto-holdout drew exclusively from authoritative_river_soundings CSV.  All
+holdout points fell in authoritative-locked cells where baseline==final, so the benchmark
+measured only authoritative invariance (which passed) but could not evaluate river science.
+
+FIX:
+- Added _build_science_evaluation_grid() function that samples a regular grid of points
+  from the final and baseline rasters in NON-authoritative river corridor zones.
+- These points don't have ground truth (no accuracy metric), but they measure
+  baseline-vs-final divergence — i.e., whether the river science is active.
+- Reports per-support-class breakdown of mean/median/p95 abs delta.
+- Exports benchmark_science_evaluation_grid.csv and benchmark_science_evaluation_summary.json.
+- Integrated into benchmark payload and report outputs.
+
+Files: benchmark_workflow_stage.py
+
+Expected on next run:
+- benchmark_science_evaluation_summary.json shows non-zero active_count
+- by_support_class breakdown shows which support classes have science-driven changes
+- The benchmark can now tell you whether the river science is active in guidance zones
+
+No regressions
+--------------
+- All 352 Python files compile clean (zero errors).
+- Authoritative-first enforcement is STRENGTHENED: measured XS nodes now explicitly
+  protected from longitudinal tendency and XS realism modification.
+- No threshold values changed without physical justification.
+- Broad _is_xs_like() preserved for backwards compatibility in blend-weight decisions.

@@ -1,0 +1,12 @@
+workflow v317
+
+This pass simplifies the science-side diagnosis story by generating one new primary receipt:
+- river_active_shape_summary.json
+
+That receipt summarizes the active river-shape story for a run from the existing drilldown receipts:
+- river_backbone_smoothing_summary.json
+- river_centerline_width_propagation_summary.json
+- river_role_agreement_summary.json
+- river_section_target_agreement_summary.json
+
+Those older receipts remain available, but they are now explicitly treated as diagnostic drilldowns rather than peer primary narratives in reports/.

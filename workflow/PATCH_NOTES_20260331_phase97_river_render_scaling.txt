@@ -1,0 +1,4 @@
+phase97 river render scaling
+- add adaptive retained-network sampling spacing based on retained flow count, component count, and retained length
+- add authoritative-fast-path channel surface rendering mode using reduced role set for authoritative-dominant components without active XS-like support
+- record adaptive spacing and component render mode metrics in run artifacts

@@ -265,3 +265,44 @@ def test_estuary_side_decay_reduces_bank_constraint_near_transition():
         config=TerrainInterpolationConfig(pixel_size_m=10.0),
     )
     assert decayed["river_bank_influence"][1, 1] < base["river_bank_influence"][1, 1]
+
+
+def test_background_preserved_in_river_corridor_outside_active_longitudinal_guidance():
+    auth = np.array([
+        [6.0, 6.0, 6.0, 6.0, 6.0],
+        [6.0, np.nan, np.nan, np.nan, 6.0],
+        [6.0, np.nan, np.nan, np.nan, 6.0],
+        [6.0, np.nan, np.nan, np.nan, 6.0],
+        [6.0, 6.0, 6.0, 6.0, 6.0],
+    ], dtype=np.float32)
+    background = np.array([
+        [6.0, 6.0, 6.0, 6.0, 6.0],
+        [6.0, 4.0, 4.0, 4.0, 6.0],
+        [6.0, 4.0, 2.0, 4.0, 6.0],
+        [6.0, 4.0, 4.0, 4.0, 6.0],
+        [6.0, 6.0, 6.0, 6.0, 6.0],
+    ], dtype=np.float32)
+    river_ok = np.zeros((5, 5), dtype=bool)
+    river_ok[1:4, 1:4] = True
+    river_corridor = river_ok.astype(np.uint8)
+    lp = np.full((5, 5), np.nan, dtype=np.float32)
+    lp[:, 2] = np.array([np.nan, 1.5, 1.0, 1.5, np.nan], dtype=np.float32)
+    lp_inf = np.zeros((5, 5), dtype=np.float32)
+    lp_inf[:, 2] = np.array([0.0, 0.9, 1.0, 0.9, 0.0], dtype=np.float32)
+
+    out = interpolate_support_aware_surface(
+        inputs=TerrainInterpolationInputs(
+            auth=auth,
+            background_surface=background,
+            sdb_ok=np.zeros((5, 5), dtype=bool),
+            river_ok=river_ok,
+            river_corridor_mask=river_corridor,
+            river_longitudinal_profile_elevation=lp,
+            river_longitudinal_profile_influence=lp_inf,
+            river_centerline_stationing=np.where(river_ok, np.tile(np.arange(5, dtype=np.float32), (5, 1)), np.nan),
+        ),
+        config=TerrainInterpolationConfig(pixel_size_m=10.0),
+    )
+    assert np.isclose(out['conditioned'][2, 1], 4.0, atol=1e-6)
+    assert np.isclose(out['conditioned'][2, 3], 4.0, atol=1e-6)
+    assert out['conditioned'][2, 2] < 2.1

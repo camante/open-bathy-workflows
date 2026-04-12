@@ -1,0 +1,26 @@
+Phase 336 - simplify canonical v1 river conditioning take domain
+
+What changed
+- Simplified canonical direct-primary river conditioning to one explicit unlocked river take domain.
+- Removed the dead non-gap direct-primary take branch in terrain_interpolator.py.
+- In canonical mode, when primary_river_guidance_surface is the active river input, river_primary_guidance_domain is now built directly from:
+  - unlocked river gap cells
+  - river_ok
+  - finite primary_river_guidance_surface
+- Background exact fill now applies only outside that active river take domain.
+- eligible now reports the actual active guidance take mask.
+- Added runtime counters to the terrain memory receipt:
+  - river_guidance_take_domain_pixels
+  - river_guidance_taken_pixels
+  - background_taken_pixels
+  - authoritative_locked_pixels
+- Added a regression test proving that canonical direct-primary guidance remains eligible even when background_surface exists.
+
+Why
+- The old path was too branchy and allowed the direct v1 primary surface to reach conditioning while still being rejected from eligibility.
+- The old river_direct_non_gap_take branch was structurally dead because gap = ~locked, so (~gap) and (~locked) could never both be true.
+
+Validation run
+- pytest -q tests/test_terrain_interpolator.py
+- pytest -q tests/test_phase_b_guidance_first_river.py tests/test_support_class_regression.py tests/test_terrain_interpolator_regime.py tests/test_conditioning_inverse_variance_phase2.py tests/test_conditioning_uncertainty_physical_models.py
+- python -m py_compile terrain_interpolator.py deterministic_terrain_stage.py tests/test_terrain_interpolator.py tests/test_phase_b_guidance_first_river.py

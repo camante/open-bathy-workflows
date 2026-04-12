@@ -1,0 +1,5 @@
+Phase v328 fixes the new v1 surface handoff into staged final conditioning.
+- guidance_assembly_stage now loads primary_river_guidance_surface from river outputs
+- deterministic_terrain_stage passes that explicit surface into the active conditioning slot
+- terrain_interpolator accepts the direct primary surface as the canonical primary builder when structured channel_surface is absent
+- deterministic terrain now hard-fails if a finite direct primary surface disappears before conditioning

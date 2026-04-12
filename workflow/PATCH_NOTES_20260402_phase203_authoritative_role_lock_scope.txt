@@ -1,0 +1,33 @@
+Phase 203: authoritative role-aware lock scope and channel-surface provenance
+
+Summary
+- Reviewed phase 202 and found the next construction-stage bug: bank-margin-only authoritative support could still leak into the hard-lock/backbone path in the channel frame, scaffold, and final channel surface.
+- Added role-aware hard-bed vs bank-margin separation in the active surface-construction path.
+- Preserved backward compatibility when no authoritative role raster is present by falling back to the legacy authoritative-in-channel behavior.
+
+Key changes
+- river_channel_frame.py
+  - Added authoritative_hard_bed_z_m and authoritative_bank_margin_z_m.
+  - Only interior bed roles now feed authoritative backbone/hard-lock fields.
+  - Bank-margin-only stations now keep a separate channel_support_class/backbone_mode instead of being promoted to authoritative_in_channel.
+  - Added fallback: when authoritative role rasters are absent, authoritative support defaults to legacy bed-support behavior so older runs/tests do not regress.
+- river_graph_backbone_solver.py
+  - Uses authoritative_hard_bed_z_m for solver hard locks rather than any authoritative sample.
+- river_channel_scaffold.py
+  - Bank-margin-only stations now keep bank authority on bank nodes without promoting inner/channel-core nodes to authoritative_in_channel.
+  - Local authoritative node sampling distinguishes hard bed support from bank-margin support.
+- river_channel_surface.py
+  - Added authoritative_bank_margin source class.
+  - Added authoritative_role_code_path input.
+  - Raster-level hard lock now only applies when the authoritative role raster says the pixel is interior bed support.
+  - Bank-margin-only pixels no longer get hard-locked to authoritative depth.
+- river_guidance.py
+  - Passes the authoritative role-code raster into channel-surface construction.
+
+Validation
+- Full python -m py_compile passed across the workflow tree.
+- Targeted tests passed for channel frame, scaffold, channel surface, support semantics, XS realism, longitudinal tendency, and primary rebuild.
+- Added regression tests for:
+  - bank-margin-only scaffold stations staying out of channel-core authoritative status
+  - channel-surface role-aware lock skipping bank-margin pixels
+  - channel-surface role-aware lock preserving interior-bed hard locks

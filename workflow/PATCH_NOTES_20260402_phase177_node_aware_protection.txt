@@ -1,0 +1,15 @@
+Phase 177: role-aware / node-aware protection
+
+Changes:
+- Replaced coarse whole-station protection in XS realism with role-aware station protection flags:
+  - station_bank_protected
+  - station_channel_protected
+  - station_inner_rebuildable
+- Narrowed support/template classification so true measured XS and channel-authoritative support protect strongly, while bank-only authoritative support no longer freezes the whole section.
+- Propagated the new protection flags onto node rows for downstream river surface rebuild.
+- Updated primary surface rebuild so measured XS remains protected, but bank-only authoritative sections can still rebuild unsupported inner/channel nodes.
+- Added targeted test coverage for bank-protected but channel-rebuildable sections.
+
+Verification:
+- pytest -q tests/test_river_xs_realism.py tests/test_river_channel_surface.py
+- compileall compile_dir('.') == True

@@ -647,9 +647,17 @@ def _sample_dataset(ds: rasterio.DatasetReader, coords_in_ds_crs: List[Tuple[flo
         if nodata is not None and np.isfinite(nodata) and z == float(nodata):
             vals.append(np.nan)
             continue
-        if z <= -1e20 or z >= 1e20:
+        if not np.isfinite(z) or z < -1000.0 or z > 10000.0:
             vals.append(np.nan)
             continue
+        if nodata is not None and np.isfinite(nodata):
+            nd = float(nodata)
+            if nd < -100 and z < nd * 0.5:
+                vals.append(np.nan)
+                continue
+            if nd > 100 and z > nd * 0.5:
+                vals.append(np.nan)
+                continue
         vals.append(z)
     return np.asarray(vals, dtype="float64")
 
@@ -843,6 +851,152 @@ def _pick_bank_in_window(
     return int(cand[0])
 
 
+def _pick_bank_in_end_window(
+    z: np.ndarray,
+    z_smooth: np.ndarray,
+    d: np.ndarray,
+    mask: np.ndarray,
+    *,
+    side: str,
+    quantile: float,
+) -> Optional[int]:
+    """Fallback bank picker using the XS end window itself.
+
+    This is intentionally conservative: prefer the higher-quality samples within
+    the end window, then choose the outermost candidate on the requested side so
+    the selected bank remains near the true profile extent rather than drifting
+    inward to a local shoulder.
+    """
+    if d.size == 0 or mask is None or not np.any(mask):
+        return None
+    idxs = np.where(mask)[0]
+    if idxs.size == 0:
+        return None
+    zc = z[idxs]
+    zsc = z_smooth[idxs]
+    primary_quality = np.where(np.isfinite(zc), zc, zsc)
+    secondary_quality = np.where(np.isfinite(zsc), zsc, zc)
+    valid = np.isfinite(primary_quality) | np.isfinite(secondary_quality)
+    if not np.any(valid):
+        return None
+    idxs = idxs[valid]
+    primary_quality = primary_quality[valid]
+    secondary_quality = secondary_quality[valid]
+    if idxs.size == 0:
+        return None
+    finite_primary = primary_quality[np.isfinite(primary_quality)]
+    if finite_primary.size:
+        q = float(np.nanquantile(finite_primary, min(max(float(quantile), 0.5), 0.99)))
+        cand = idxs[np.where(np.isfinite(primary_quality), primary_quality, -np.inf) >= q]
+    else:
+        cand = idxs
+    if cand.size == 0:
+        cand = idxs
+    if cand.size == 0:
+        return None
+    cand_primary = np.where(np.isfinite(z[cand]), z[cand], z_smooth[cand])
+    cand_secondary = np.where(np.isfinite(z_smooth[cand]), z_smooth[cand], z[cand])
+    if str(side).lower().startswith('l'):
+        order = np.lexsort((d[cand], -cand_secondary, -cand_primary))
+    else:
+        order = np.lexsort((-d[cand], -cand_secondary, -cand_primary))
+    return int(cand[order[0]])
+
+
+def _expand_end_window_mask(d: np.ndarray, L: float, bank_search_m: float, *, side: str) -> np.ndarray:
+    if d.size == 0 or not np.isfinite(L) or L <= 0:
+        return np.zeros_like(d, dtype=bool)
+    search = max(float(bank_search_m), 1.0)
+    search = min(max(search * 1.75, search + 8.0), max(search, 0.35 * float(L)))
+    if str(side).lower().startswith("l"):
+        return d <= min(search, L)
+    return d >= max(0.0, L - search)
+
+
+def _pick_bank_elevation_from_candidates(values: np.ndarray) -> Optional[float]:
+    vals = np.asarray(values, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return None
+    if vals.size == 1:
+        return float(vals[0])
+    # Channel-margin aware but conservative: avoid levee/terrace highs by using a lower-middle
+    # quantile rather than the maximum bank-side elevation.
+    return float(np.nanquantile(vals, 0.20))
+
+
+def _compute_bank_candidates(profile: pd.DataFrame, *, idx: Optional[int], cfg: XSConfig) -> Dict[str, float | str]:
+    """Capture a conservative bank-candidate stack around the picked bank index.
+
+    This intentionally biases the selected value toward lower water-edge-like
+    candidates rather than steep upland highs at the immediate cross-section
+    endpoint.  Downstream stages can then use the raw and local candidates to
+    detect contaminated bank picks longitudinally and across the river.
+    """
+    out: Dict[str, float | str] = {
+        "picked_z_m": np.nan,
+        "raw_z_m": np.nan,
+        "inner_min_z_m": np.nan,
+        "local_q25_z_m": np.nan,
+        "local_median_z_m": np.nan,
+        "selected_z_m": np.nan,
+        "selected_source": "missing",
+    }
+    if idx is None:
+        return out
+
+    picked_dist = pd.to_numeric(pd.Series([profile.loc[idx, "dist_m"]]), errors="coerce").iloc[0]
+    z_topo = pd.to_numeric(profile.get("z_topo"), errors="coerce") if "z_topo" in profile.columns else pd.Series(np.nan, index=profile.index)
+    z_dem = pd.to_numeric(profile.get("z_dem"), errors="coerce") if "z_dem" in profile.columns else pd.Series(np.nan, index=profile.index)
+    candidate_series = z_topo.where(np.isfinite(z_topo), z_dem)
+    picked_z = pd.to_numeric(pd.Series([candidate_series.loc[idx]]), errors="coerce").iloc[0]
+    out["picked_z_m"] = float(picked_z) if np.isfinite(picked_z) else np.nan
+    out["raw_z_m"] = float(picked_z) if np.isfinite(picked_z) else np.nan
+
+    if np.isfinite(picked_dist):
+        radius = max(float(cfg.bank_edge_refine_m), 3.0)
+        local = profile.loc[
+            np.abs(pd.to_numeric(profile["dist_m"], errors="coerce") - float(picked_dist)) <= radius
+        ].copy()
+        inner_radius = max(0.5 * float(cfg.bank_edge_refine_m), 2.0)
+        inner = profile.loc[
+            np.abs(pd.to_numeric(profile["dist_m"], errors="coerce") - float(picked_dist)) <= inner_radius
+        ].copy()
+    else:
+        local = profile.copy()
+        inner = profile.copy()
+    if local.empty:
+        local = profile.copy()
+    if inner.empty:
+        inner = local.copy()
+
+    local_vals = pd.to_numeric(candidate_series.loc[local.index], errors="coerce")
+    local_vals = local_vals[np.isfinite(local_vals)].to_numpy(dtype="float64")
+    inner_vals = pd.to_numeric(candidate_series.loc[inner.index], errors="coerce")
+    inner_vals = inner_vals[np.isfinite(inner_vals)].to_numpy(dtype="float64")
+    if local_vals.size:
+        out["local_q25_z_m"] = float(np.nanquantile(local_vals, 0.25))
+        out["local_median_z_m"] = float(np.nanmedian(local_vals))
+    if inner_vals.size:
+        out["inner_min_z_m"] = float(np.nanmin(inner_vals))
+
+    candidates = {
+        "inner_min": float(out["inner_min_z_m"]) if np.isfinite(out["inner_min_z_m"]) else np.nan,
+        "local_q25": float(out["local_q25_z_m"]) if np.isfinite(out["local_q25_z_m"]) else np.nan,
+        "local_median": float(out["local_median_z_m"]) if np.isfinite(out["local_median_z_m"]) else np.nan,
+        "picked": float(out["picked_z_m"]) if np.isfinite(out["picked_z_m"]) else np.nan,
+    }
+    finite_items = [(name, val) for name, val in candidates.items() if np.isfinite(val)]
+    if finite_items:
+        selected_source, selected_z = min(finite_items, key=lambda item: item[1])
+        out["selected_z_m"] = float(selected_z)
+        out["selected_source"] = str(selected_source)
+    elif np.isfinite(picked_z):
+        out["selected_z_m"] = float(picked_z)
+        out["selected_source"] = "picked"
+    return out
+
+
 def pick_banks(
     profile: pd.DataFrame,
     bank_search_m: float,
@@ -886,18 +1040,49 @@ def pick_banks(
     left_mask = d <= min(bank_search_m, L)
     right_mask = d >= max(0.0, L - bank_search_m)
 
+    used_end_window_fallback = False
+    if idx_left is None and np.any(left_mask):
+        idx_left = _pick_bank_in_end_window(z, z_smooth, d, left_mask, side="left", quantile=bank_quantile)
+        used_end_window_fallback = used_end_window_fallback or (idx_left is not None)
+    if idx_right is None and np.any(right_mask):
+        idx_right = _pick_bank_in_end_window(z, z_smooth, d, right_mask, side="right", quantile=bank_quantile)
+        used_end_window_fallback = used_end_window_fallback or (idx_right is not None)
+
+    used_expanded_end_window = False
+    if idx_left is None:
+        left_mask_expanded = _expand_end_window_mask(d, L, bank_search_m, side="left")
+        if np.any(left_mask_expanded):
+            idx_left = _pick_bank_in_end_window(z, z_smooth, d, left_mask_expanded, side="left", quantile=max(0.65, bank_quantile - 0.10))
+            used_expanded_end_window = used_expanded_end_window or (idx_left is not None)
+    if idx_right is None:
+        right_mask_expanded = _expand_end_window_mask(d, L, bank_search_m, side="right")
+        if np.any(right_mask_expanded):
+            idx_right = _pick_bank_in_end_window(z, z_smooth, d, right_mask_expanded, side="right", quantile=max(0.65, bank_quantile - 0.10))
+            used_expanded_end_window = used_expanded_end_window or (idx_right is not None)
+
     if idx_left is None and expected_left_dist_m is not None:
         meta["left_error"] = "no_bank_found_near_expected_left_edge"
     if idx_right is None and expected_right_dist_m is not None:
         meta["right_error"] = "no_bank_found_near_expected_right_edge"
+    if idx_left is None:
+        meta["left_fallback_error"] = "no_bank_found_in_left_end_window"
+    if idx_right is None:
+        meta["right_fallback_error"] = "no_bank_found_in_right_end_window"
 
-    if refined and (idx_left is not None or idx_right is not None):
+    if refined and idx_left is not None and idx_right is not None:
         meta["method"] = "corridor_edge_refined"
+    elif (used_end_window_fallback or used_expanded_end_window) and idx_left is not None and idx_right is not None:
+        meta["method"] = "end_window_refined_expanded" if used_expanded_end_window else "end_window_refined"
+    elif refined and (idx_left is not None or idx_right is not None):
+        meta["method"] = "partial_corridor_edge_refined"
+    elif (used_end_window_fallback or used_expanded_end_window) and (idx_left is not None or idx_right is not None):
+        meta["method"] = "partial_end_window_refined_expanded" if used_expanded_end_window else "partial_end_window_refined"
     elif expected_left_dist_m is None and expected_right_dist_m is None:
         meta["method"] = "missing_bank_domain_expectations"
     else:
         meta["method"] = "corridor_edge_refinement_failed"
     meta["source"] = "topo" if use_topo else "dem"
+    meta["used_expanded_end_window"] = bool(used_expanded_end_window)
     return idx_left, idx_right, meta
 
 # --------------------------------------------------------------------------------------
@@ -1103,22 +1288,26 @@ def build_xs_for_river(
                     bank_smooth_window_m=cfg.bank_smooth_window_m,
                 )
 
-                def _bank_z(idx: Optional[int]) -> float:
-                    if idx is None:
-                        return np.nan
-                    zt = prof.loc[idx, "z_topo"]
-                    if pd.notna(zt):
-                        return float(zt)
-                    zd = prof.loc[idx, "z_dem"]
-                    return float(zd) if pd.notna(zd) else np.nan
+                left_bank_candidates = _compute_bank_candidates(prof, idx=idx_l, cfg=cfg)
+                right_bank_candidates = _compute_bank_candidates(prof, idx=idx_r, cfg=cfg)
                 
                 # Add to lines result
                 rec.update({
                     "xs_len_m": float(xs_line.length),
                     "bank_left_dist_m": float(prof.loc[idx_l, "dist_m"]) if idx_l is not None else np.nan,
                     "bank_right_dist_m": float(prof.loc[idx_r, "dist_m"]) if idx_r is not None else np.nan,
-                    "bank_left_z_m": _bank_z(idx_l),
-                    "bank_right_z_m": _bank_z(idx_r),
+                    "bank_left_z_m": float(left_bank_candidates.get("selected_z_m", np.nan)),
+                    "bank_right_z_m": float(right_bank_candidates.get("selected_z_m", np.nan)),
+                    "bank_left_raw_z_m": float(left_bank_candidates.get("raw_z_m", np.nan)),
+                    "bank_right_raw_z_m": float(right_bank_candidates.get("raw_z_m", np.nan)),
+                    "bank_left_inner_min_z_m": float(left_bank_candidates.get("inner_min_z_m", np.nan)),
+                    "bank_right_inner_min_z_m": float(right_bank_candidates.get("inner_min_z_m", np.nan)),
+                    "bank_left_local_q25_z_m": float(left_bank_candidates.get("local_q25_z_m", np.nan)),
+                    "bank_right_local_q25_z_m": float(right_bank_candidates.get("local_q25_z_m", np.nan)),
+                    "bank_left_local_median_z_m": float(left_bank_candidates.get("local_median_z_m", np.nan)),
+                    "bank_right_local_median_z_m": float(right_bank_candidates.get("local_median_z_m", np.nan)),
+                    "bank_left_selected_source": str(left_bank_candidates.get("selected_source", "missing")),
+                    "bank_right_selected_source": str(right_bank_candidates.get("selected_source", "missing")),
                     "bank_left_expected_dist_m": float(expected_left_dist_m) if expected_left_dist_m is not None else np.nan,
                     "bank_right_expected_dist_m": float(expected_right_dist_m) if expected_right_dist_m is not None else np.nan,
                     "bank_pick_method": str(bank_pick_meta.get("method", "unknown")),

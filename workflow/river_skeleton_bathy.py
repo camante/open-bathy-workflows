@@ -27,12 +27,61 @@ Optionally (--debug-dir), writes:
 """
 
 import argparse
+import json
 import logging
 import math
-import json
+from pathlib import Path
+from typing import Optional, Tuple
+
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+import rasterio
+from pyproj import CRS, Transformer
+from rasterio.features import rasterize
+from rasterio.transform import array_bounds, rowcol
+from rasterio.warp import Resampling, reproject, transform_bounds
+from scipy.ndimage import binary_dilation, distance_transform_edt, gaussian_filter
 from shapely.geometry import LineString, MultiLineString
 
+from sign_semantics import maybe_warn_auto_depth_mode, semantics_from_soundings_mode
+
 log = logging.getLogger("river_skeleton_bathy")
+
+STAGE_CLASS_NONE = 0
+STAGE_CLASS_WEAK_DEM_PROXY = 5
+STAGE_CLASS_BANK_STAGE = 10
+STAGE_CLASS_BANK_PROFILE = 20
+
+
+def _write_stage_support_products(base_out_bed: "Path", stage_class: np.ndarray, template_profile: dict) -> tuple["Path", "Path"]:
+    stage_tif = base_out_bed.with_name(base_out_bed.stem + "_stage_support_class.tif")
+    stage_json = base_out_bed.with_name(base_out_bed.stem + "_stage_support_receipt.json")
+    prof = template_profile.copy()
+    prof.update(dtype="uint8", nodata=0, count=1, compress="deflate")
+    prof.pop("blockxsize", None)
+    prof.pop("blockysize", None)
+    prof["tiled"] = False
+    stage_tif.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(stage_tif, "w", **prof) as dst:
+        dst.write(stage_class.astype("uint8"), 1)
+    counts = {
+        "none": int(np.count_nonzero(stage_class == STAGE_CLASS_NONE)),
+        "weak_dem_proxy": int(np.count_nonzero(stage_class == STAGE_CLASS_WEAK_DEM_PROXY)),
+        "bank_stage": int(np.count_nonzero(stage_class == STAGE_CLASS_BANK_STAGE)),
+        "bank_profile": int(np.count_nonzero(stage_class == STAGE_CLASS_BANK_PROFILE)),
+    }
+    stage_json.write_text(json.dumps({
+        "stage_support_class_raster": str(stage_tif),
+        "codes": {
+            "none": STAGE_CLASS_NONE,
+            "weak_dem_proxy": STAGE_CLASS_WEAK_DEM_PROXY,
+            "bank_stage": STAGE_CLASS_BANK_STAGE,
+            "bank_profile": STAGE_CLASS_BANK_PROFILE,
+        },
+        "counts": counts,
+    }, indent=2, sort_keys=True), encoding="utf-8")
+    return stage_tif, stage_json
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -67,32 +116,31 @@ def _read_template(template_raster: Path) -> Tuple[dict, rasterio.Affine, raster
 def _warp_to_template(src_path: Path, template_profile: dict, dtype: str = "float32") -> Tuple[np.ndarray, Optional[float]]:
     """Warp a raster to the template grid.
 
-    IMPORTANT correctness note:
-      Rasterio's reproject does not necessarily overwrite destination pixels that are not touched
-      by the source. If we initialize the destination with zeros, "outside-coverage" pixels can
-      become *valid zeros* (a real elevation), which is catastrophic for DEM-driven inference.
-
-    We therefore initialize floating outputs with a deterministic nodata fill.
+    CRITICAL fixes applied:
+      1. Uses rasterio.band() for streamed reprojection (avoids OOM on large rasters).
+      2. Initializes float destination with NaN (not nodata sentinel) so untouched pixels
+         are unambiguously invalid.
+      3. Post-warp sanitization catches bilinear-resampling contamination: when bilinear
+         interpolation operates near nodata boundaries, it blends nodata sentinels (e.g., -9999)
+         with valid values, producing intermediate values (e.g., -5628) that are neither NaN
+         nor exactly equal to the nodata sentinel.  These contaminated values propagate into
+         WSE, depth, and bed computations, producing the -76615 artifacts seen in outputs.
     """
     with rasterio.open(src_path) as src:
-        src_arr = src.read(1)
         src_nodata = src.nodata
 
         is_float = np.issubdtype(np.dtype(dtype), np.floating)
         if is_float:
-            # Choose a deterministic dst nodata fill.
-            fill = float(src_nodata) if (src_nodata is not None and np.isfinite(src_nodata)) else -9999.0
-            dst = np.full((template_profile["height"], template_profile["width"]), fill, dtype=dtype)
-            dst_nodata = fill
+            dst = np.full((template_profile["height"], template_profile["width"]), np.nan, dtype=dtype)
+            fill_nodata = float(src_nodata) if (src_nodata is not None and np.isfinite(src_nodata)) else -9999.0
             resamp = Resampling.bilinear
         else:
-            # For masks, default to 0 outside coverage (non-channel/non-water).
             dst = np.zeros((template_profile["height"], template_profile["width"]), dtype=dtype)
-            dst_nodata = src_nodata
+            fill_nodata = src_nodata
             resamp = Resampling.nearest
 
         reproject(
-            source=src_arr,
+            source=rasterio.band(src, 1),
             destination=dst,
             src_transform=src.transform,
             src_crs=src.crs,
@@ -100,8 +148,23 @@ def _warp_to_template(src_path: Path, template_profile: dict, dtype: str = "floa
             dst_crs=template_profile["crs"],
             resampling=resamp,
             src_nodata=src_nodata,
-            dst_nodata=dst_nodata,
+            dst_nodata=np.nan if is_float else fill_nodata,
         )
+
+    if is_float:
+        # Sanitize bilinear resampling contamination.
+        contaminated = ~np.isfinite(dst)
+        if src_nodata is not None and np.isfinite(src_nodata):
+            nd = float(src_nodata)
+            # Values within 50% of the nodata sentinel are contamination artifacts
+            if nd < -100:
+                contaminated |= (dst < nd * 0.5)
+            elif nd > 100:
+                contaminated |= (dst > nd * 0.5)
+        # Physical plausibility: no terrain/bathymetry value should exceed ±1000m
+        contaminated |= (dst < -1000.0) | (dst > 10000.0)
+        dst[contaminated] = np.nan
+
     return dst, src_nodata
 
 
@@ -2545,6 +2608,11 @@ def main(
     p.add_argument("--mv-eps-a", type=float, default=1.0)
     p.add_argument("--mv-eps-s", type=float, default=1e-4)
 
+    # Channel template (learned from XS pipeline, applied to skeleton depth prior)
+    p.add_argument("--channel-template-json", default=None,
+                   help="Path to channel_template.json from the XS template pipeline. "
+                        "When provided, the learned width→depth coefficients override --mv-a0/--mv-bw.")
+
     # WSE (water surface elevation) proxy
     p.add_argument(
         "--wse-mode",
@@ -2817,9 +2885,8 @@ def main(
 
     dem, dem_nodata = _warp_to_template(Path(args.dem), template_profile, dtype="float32")
     dem = dem.astype("float32")
+    # After _warp_to_template fix, nodata pixels are already NaN — no sentinel comparison needed.
     valid_dem = np.isfinite(dem)
-    if dem_nodata is not None:
-        valid_dem &= (dem != float(dem_nodata))
 
     authoritative_bed = None
     authoritative_bed_nodata = None
@@ -2866,11 +2933,119 @@ def main(
     # Width proxy (m)
     width = (2.0 * np.maximum(d_bank, 0.0)).astype("float32")
 
+    # Optional: load learned channel template (from XS pipeline) to override depth prior.
+    _tpl_a0 = float(args.mv_a0)
+    _tpl_bw = float(args.mv_bw)
+    _tpl_shape_exp = float(args.shape_exp)
+    _tpl_source = "cli_default"
+    if getattr(args, "channel_template_json", None):
+        try:
+            import json as _json
+            _tpl_path = Path(args.channel_template_json)
+            if _tpl_path.exists():
+                _tpl_data = _json.loads(_tpl_path.read_text(encoding="utf-8"))
+                _t_src = str(_tpl_data.get("depth_fit_source", ""))
+                _t_a = float(_tpl_data.get("depth_a", _tpl_a0))
+                _t_b = float(_tpl_data.get("depth_b", _tpl_bw))
+                _t_r2 = float(_tpl_data.get("depth_fit_r2", 0.0))
+                _t_n = int(_tpl_data.get("n_profiles", 0))
+                _t_exp = float(_tpl_data.get("shape_exponent", _tpl_shape_exp))
+                # Only override if the template has a local fit (not a fallback)
+                if _t_src == "local_power_law" and _t_n >= 3 and _t_r2 > 0.2:
+                    _tpl_a0 = _t_a
+                    _tpl_bw = _t_b
+                    _tpl_shape_exp = _t_exp
+                    _tpl_source = f"channel_template(n={_t_n},R²={_t_r2:.3f})"
+                    log.info(
+                        "Channel template loaded: Dmax = %.4f × W^%.3f, shape_exp=%.3f (R²=%.3f, n=%d) from %s",
+                        _t_a, _t_b, _t_exp, _t_r2, _t_n, _tpl_path,
+                    )
+                else:
+                    log.info(
+                        "Channel template loaded but using fallback (%s, n=%d, R²=%.3f); keeping CLI prior.",
+                        _t_src, _t_n, _t_r2,
+                    )
+            else:
+                log.warning("Channel template JSON not found: %s", _tpl_path)
+        except Exception:
+            log.warning("Failed to load channel template JSON; using CLI prior.", exc_info=True)
+
+    # Per-component template selection: if the template JSON contains per_component
+    # entries and rivers have a component_id attribute, build per-pixel a/b/exp grids
+    # so each tributary gets its own depth prior.
+    _per_comp_a = None
+    _per_comp_b = None
+    _per_comp_exp = None
+    if getattr(args, "channel_template_json", None) and _tpl_source != "cli_default":
+        try:
+            import json as _json
+            _tpl_path = Path(args.channel_template_json)
+            _tpl_data = _json.loads(_tpl_path.read_text(encoding="utf-8"))
+            _pc = _tpl_data.get("per_component", {})
+            # Check rivers have a component_id column
+            _comp_col = next((c for c in ("component_id", "comp_id", "ComponentID") if c in rivers.columns), None)
+            if _pc and _comp_col is not None:
+                # Build lookup: component_id → (a, b, exp)
+                _comp_lookup = {}
+                for cid_str, cdata in _pc.items():
+                    _cs = str(cdata.get("depth_fit_source", ""))
+                    if _cs == "local_power_law" and int(cdata.get("n_profiles", 0)) >= 3 and float(cdata.get("depth_fit_r2", 0)) > 0.2:
+                        _comp_lookup[int(cid_str)] = (
+                            float(cdata.get("depth_a", _tpl_a0)),
+                            float(cdata.get("depth_b", _tpl_bw)),
+                            float(cdata.get("shape_exponent", _tpl_shape_exp)),
+                        )
+
+                if _comp_lookup:
+                    # Rasterize component_id onto skeleton using rivers
+                    comp_vals = rivers[_comp_col].fillna(-1).astype(int).to_numpy()
+                    comp_raster = rasterize(
+                        [(geom, int(cv)) for geom, cv in zip(rivers.geometry, comp_vals)],
+                        out_shape=shape,
+                        transform=transform,
+                        fill=-1,
+                        all_touched=True,
+                        dtype="int32",
+                    )
+                    # Propagate from skeleton to channel via nearest-neighbor (EDT)
+                    comp_field = comp_raster[ny, nx]
+
+                    # Build per-pixel coefficient grids
+                    _per_comp_a = np.full(shape, _tpl_a0, dtype="float32")
+                    _per_comp_b = np.full(shape, _tpl_bw, dtype="float32")
+                    _per_comp_exp = np.full(shape, _tpl_shape_exp, dtype="float32")
+                    _n_comp_applied = 0
+                    for cid, (ca, cb, cexp) in _comp_lookup.items():
+                        cmask = (comp_field == cid) & channel
+                        n_cm = int(cmask.sum())
+                        if n_cm > 0:
+                            _per_comp_a[cmask] = ca
+                            _per_comp_b[cmask] = cb
+                            _per_comp_exp[cmask] = cexp
+                            _n_comp_applied += 1
+                    log.info(
+                        "Per-component templates applied: %d components (%s), %d total channel pixels affected.",
+                        _n_comp_applied,
+                        ", ".join(f"C{k}:a={v[0]:.3f}/b={v[1]:.3f}/exp={v[2]:.3f}" for k, v in _comp_lookup.items()),
+                        int(channel.sum()),
+                    )
+        except Exception:
+            log.debug("Per-component template selection failed; using global.", exc_info=True)
+
     # Estimate Dmax on skeleton pixels:
-    # 1) default powerlaw from width at skeleton
-    dmax_skel = _dmax_from_powerlaw(width, float(args.mv_a0), float(args.mv_bw),
-                                    float(args.dmax_min_m), float(args.dmax_max_m))
-    dmax_skel = np.where(skeleton, dmax_skel, np.nan).astype("float32")
+    # 1) powerlaw from width at skeleton (using per-component or global template coefficients)
+    if _per_comp_a is not None:
+        dmax_skel = np.clip(
+            _per_comp_a * np.power(np.maximum(width, 1e-3), _per_comp_b),
+            float(args.dmax_min_m), float(args.dmax_max_m),
+        ).astype("float32")
+        dmax_skel = np.where(skeleton, dmax_skel, np.nan).astype("float32")
+        log.info("Dmax prior: per-component (global fallback a=%.4f b=%.3f source=%s)", _tpl_a0, _tpl_bw, _tpl_source)
+    else:
+        dmax_skel = _dmax_from_powerlaw(width, _tpl_a0, _tpl_bw,
+                                        float(args.dmax_min_m), float(args.dmax_max_m))
+        dmax_skel = np.where(skeleton, dmax_skel, np.nan).astype("float32")
+        log.info("Dmax prior: a=%.4f b=%.3f source=%s", _tpl_a0, _tpl_bw, _tpl_source)
 
     # 2) optional multivariate factor if attributes exist
     if args.prior_mode == "multivariate":
@@ -2974,6 +3149,7 @@ def main(
     # Water surface elevation (WSE) proxy:
     # For correctness, default to a bank-derived WSE (banks are usually better represented than in-channel DEM).
     wse_map = None
+    stage_support_class = np.zeros(shape, dtype=np.uint8)
     mode = (args.wse_mode or "").strip().lower()
     if mode == "bank_profile":
         # Build a bank-derived WSE field first, then enforce longitudinal consistency along flowlines.
@@ -3064,6 +3240,7 @@ def main(
             )
             if wse_prof is not None:
                 wse_map = wse_prof
+                stage_support_class[channel & np.isfinite(wse_prof)] = STAGE_CLASS_BANK_PROFILE
             else:
                 log.warning("wse-mode=bank_profile could not build a longitudinal WSE profile; falling back to wse-mode=bank")
         else:
@@ -3079,6 +3256,8 @@ def main(
         )
         if wse_map is None:
             log.warning("wse-mode=bank could not build WSE from bank samples; falling back to skeleton-derived WSE.")
+        else:
+            stage_support_class[channel & np.isfinite(wse_map)] = STAGE_CLASS_BANK_STAGE
 
     if wse_map is None:
         # Legacy behavior: use DEM values along the skeleton and fill outward.
@@ -3098,6 +3277,7 @@ def main(
             log.warning("No valid DEM samples on skeleton; using fallback WSE=%.3f", wse_med)
 
         wse_map = wse_skel[ny, nx].astype("float32")
+        stage_support_class[channel & np.isfinite(wse_map)] = STAGE_CLASS_WEAK_DEM_PROXY
 
     # Optional: Incorporate external soundings (extra XYZ) to refine the Dmax prior and/or enforce bed/depth anchors.
     snd_depth_grid = None
@@ -3114,7 +3294,7 @@ def main(
                 transform=transform,
                 channel=channel,
                 r=r,
-                shape_exp=float(args.shape_exp),
+                shape_exp=_tpl_shape_exp,
                 dmax_min_m=float(args.dmax_min_m),
                 dmax_max_m=float(args.dmax_max_m),
                 mode=str(args.soundings_mode),
@@ -3167,7 +3347,13 @@ def main(
 
 
     # Depth field (m, positive downward)
-    depth = (dmax_map * np.power(r, float(args.shape_exp))).astype("float32")
+    # Depth field (m, positive downward) — use per-component shape exponent when available
+    _eff_exp = _per_comp_exp if _per_comp_exp is not None else _tpl_shape_exp
+    depth = (dmax_map * np.power(r, _eff_exp)).astype("float32")
+    if _per_comp_exp is not None:
+        log.info("Depth profile: per-component shape_exp (global fallback=%.3f source=%s)", _tpl_shape_exp, _tpl_source)
+    else:
+        log.info("Depth profile: shape_exp=%.3f source=%s", _tpl_shape_exp, _tpl_source)
 
     # Optional: enforce observed depths at sounding grid cells (depth modes only).
     if (snd_depth_grid is not None) and (str(getattr(args, "soundings_mode", "auto")).strip().lower() != "bed_elev") and bool(getattr(args, "soundings_enforce", True)):
@@ -3364,6 +3550,18 @@ def main(
     bed = (wse_map - depth).astype("float32")
     bed = np.where(channel, bed, np.nan).astype("float32")
 
+    # Physical plausibility clamp: catch any remaining nodata contamination or
+    # arithmetic overflow from upstream steps.  No river bed on Earth is 500m
+    # below or 500m above the local terrain surface.
+    _bed_extreme = np.isfinite(bed) & ((bed < -500.0) | (bed > 500.0))
+    _depth_extreme = np.isfinite(depth) & ((depth < -100.0) | (depth > 100.0))
+    if np.any(_bed_extreme):
+        log.warning("Clamped %d physically implausible bed values (outside ±500m) to nodata.", int(np.count_nonzero(_bed_extreme)))
+        bed[_bed_extreme] = np.nan
+    if np.any(_depth_extreme):
+        log.warning("Clamped %d physically implausible depth values (outside ±100m) to nodata.", int(np.count_nonzero(_depth_extreme)))
+        depth[_depth_extreme] = np.nan
+
     # Optional: anchor/blend using authoritative bed raster
     if authoritative_bed is not None:
         m_auth = np.isfinite(authoritative_bed) & channel
@@ -3401,7 +3599,7 @@ def main(
 
     out_bed = Path(args.out_bed)
     out_bed.parent.mkdir(parents=True, exist_ok=True)
-    
+    stage_support_tif, stage_support_receipt_json = _write_stage_support_products(out_bed, np.where(channel, stage_support_class, np.uint8(0)), template_profile)
 
     # Optional: longitudinal bed profile constraints (slope/curvature)
     try:

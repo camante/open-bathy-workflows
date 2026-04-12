@@ -587,10 +587,12 @@ def build_fused_training_dataframe(
     _log_funnel('fusion.atl_fuse.post', atl_fused, rr)
 
     # Step 3: Final combination
-    if not xyz_df.empty:
-        final_df = pd.concat([atl_fused, xyz_df], ignore_index=True)
-    else:
+    if atl_fused.empty:
+        final_df = xyz_df.copy() if not xyz_df.empty else atl_fused
+    elif xyz_df.empty:
         final_df = atl_fused
+    else:
+        final_df = pd.concat([atl_fused, xyz_df], ignore_index=True)
 
     log.info("Stage 3: Combined ATL (fused) + XYZ -> total points: %s.", len(final_df))
     _log_funnel('fusion.combined.post', final_df, rr)

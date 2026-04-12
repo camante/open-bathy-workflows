@@ -1,0 +1,4 @@
+Phase 184 review+next
+- Reviewed phase 183 and confirmed the channel-core rebuild/render path was wired into the active river surface path.
+- Main remaining gap was observability: there was no single top-level receipt or run-log block answering whether the recent river science actually engaged.
+- Added river_science_effect_summary.json plus concise science summary log lines and wired the new artifact through channel-surface contracts/final outputs.

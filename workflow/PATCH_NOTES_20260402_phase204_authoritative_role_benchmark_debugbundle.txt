@@ -1,0 +1,38 @@
+Phase 204 — authoritative role benchmark + debug bundle diagnostics
+
+Summary
+- Reviewed phase203 and fixed a real benchmark/reporting brittleness: the benchmark stage only looked for one measured-anchor/structure-only raster naming path even though some runs still report the older prediction-prefixed names.
+- Added role-aware benchmark sampling and summaries so interior authoritative bed support and bank-margin support can be audited directly in scored holdout points and benchmark receipts.
+- Extended debug bundle collection so the authoritative river role contract, role-aware support CSV, and new benchmark receipts are copied into one place.
+
+Main code changes
+- benchmark_workflow_stage.py
+  - resolves authoritative role rasters from report, config, or role-contract artifacts
+  - samples authoritative role code, confidence, distance-to-bank, and normalized channel position at benchmark holdout points
+  - writes role-aware scored columns:
+    - authoritative_role_code
+    - authoritative_role_label
+    - authoritative_bed_support_present
+    - authoritative_bank_margin_present
+    - authoritative_role_confidence
+    - authoritative_distance_to_bank_m
+    - authoritative_normalized_channel_position
+  - writes new receipt:
+    - benchmark_authoritative_role_validation_summary.json
+  - extends support-aware validation with authoritative-role groupings
+  - extends hard-river benchmark grouping with authoritative role stratification
+  - extends longitudinal-profile scientific summary with authoritative-role coverage counts and authoritative-role-binned roughness
+  - accepts both modern and prediction-prefixed measured-anchor / structure-only raster keys
+- debug_bundle.py
+  - copies authoritative river role contract and authoritative river support CSV
+  - copies benchmark summary/support-aware/hard-river/role-validation/river-science receipts
+  - references authoritative role rasters in the bundle manifest
+
+Verification
+- Full repository py_compile passed
+- pytest passed:
+  - tests/test_benchmark_workflow_stage.py
+  - tests/test_debug_bundle.py
+
+Recommended commit message
+Add authoritative-role benchmark diagnostics and include them in debug bundles

@@ -9,6 +9,7 @@ What it checks:
 - Key CLIs respond to `--help`.
 - Model bank reservoir update works and stays bounded.
 - Unified report writer works.
+- Bundle A contract wiring is internally consistent.
 
 Run:
   python smoke_test.py
@@ -33,7 +34,7 @@ def main() -> int:
     failures: list[str] = []
 
     # 1) Syntax compile sweep (fast, avoids importing heavyweight geo stacks)
-    print("[SMOKE] Step 1/3: py_compile sweep", flush=True)
+    print("[SMOKE] Step 1/5: py_compile sweep", flush=True)
     py_files = sorted(glob.glob(str(here / "*.py")))
     for fn in py_files:
         mod = os.path.splitext(os.path.basename(fn))[0]
@@ -45,7 +46,7 @@ def main() -> int:
             failures.append(f"PY_COMPILE FAIL: {mod}: {type(e).__name__}: {e}")
 
     # 2) Model bank bounded update
-    print("[SMOKE] Step 2/3: model bank bounded update", flush=True)
+    print("[SMOKE] Step 2/5: model bank bounded update", flush=True)
     try:
         import numpy as np
         import pandas as pd
@@ -101,7 +102,7 @@ def main() -> int:
         failures.append(f"MODEL_BANK EXCEPTION: {type(e).__name__}: {e}")
 
     # 3) Unified report writer
-    print("[SMOKE] Step 3/3: unified report writer", flush=True)
+    print("[SMOKE] Step 3/5: unified report writer", flush=True)
     try:
         from river_diagnostics import create_unified_bathy_report
 
@@ -110,11 +111,58 @@ def main() -> int:
             out_dir.mkdir(parents=True, exist_ok=True)
             # minimal bathy_report.json so the writer can summarize
             (out_dir / "bathy_report.json").write_text('{"sdb":{"status":"ok"},"river":{"status":"ok"},"fusion":{"status":"ok"}}')
-            p = create_unified_bathy_report(out_dir, methods=["sdb", "river", "fuse"], priority="river")
+            p = create_unified_bathy_report(out_dir, methods=["sdb", "river", "fuse"], priority="river", write_json=True)
             if not Path(p).exists():
                 failures.append("UNIFIED_REPORT FAIL: unified report not created")
     except Exception as e:
         failures.append(f"UNIFIED_REPORT EXCEPTION: {type(e).__name__}: {e}")
+
+
+    # 4) Bundle A contract wiring
+    print("[SMOKE] Step 4/5: bundle A contract wiring", flush=True)
+    try:
+        from final_dem_contract import build_final_dem_contract_summary
+        from final_dem_policy import default_final_dem_policy
+        from simple_river_stage_contract import simple_river_stage_status_placeholder
+
+        policy = default_final_dem_policy()
+        stage_status = simple_river_stage_status_placeholder()
+        summary = build_final_dem_contract_summary({
+            "simple_river_stage_status": stage_status,
+            "legacy_transitional_artifacts_present": [],
+        }, policy=policy)
+        if summary.get("current_route_mode") != policy.current_route_mode:
+            failures.append("BUNDLE_A_CONTRACT FAIL: current_route_mode mismatch")
+        if summary.get("target_route_mode") != policy.target_route_mode:
+            failures.append("BUNDLE_A_CONTRACT FAIL: target_route_mode mismatch")
+        if summary.get("final_dem_filename") != policy.final_dem_filename:
+            failures.append("BUNDLE_A_CONTRACT FAIL: final_dem_filename mismatch")
+        if not summary.get("simple_river_stage_status"):
+            failures.append("BUNDLE_A_CONTRACT FAIL: missing simple_river_stage_status")
+    except Exception as e:
+        failures.append(f"BUNDLE_A_CONTRACT EXCEPTION: {type(e).__name__}: {e}")
+
+
+    # 5) Bundle B phase 1 centerline contract wiring
+    print("[SMOKE] Step 5/5: bundle B phase 1 centerline contract", flush=True)
+    try:
+        from simple_river_stage_contract import simple_river_stage_status_placeholder, STAGE_RIVER_CENTERLINE, mark_stage_implemented
+
+        stage_status = simple_river_stage_status_placeholder()
+        updated = mark_stage_implemented(
+            stage_status,
+            stage_id=STAGE_RIVER_CENTERLINE,
+            output_artifact="river_centerline_points.gpkg",
+            record_count=1,
+            receipt_path="river_centerline_points_receipt.json",
+        )
+        item = updated.get(STAGE_RIVER_CENTERLINE, {})
+        if not item.get("implemented"):
+            failures.append("BUNDLE_B_PHASE1 FAIL: river_centerline not marked implemented")
+        if item.get("receipt_path") != "river_centerline_points_receipt.json":
+            failures.append("BUNDLE_B_PHASE1 FAIL: receipt path mismatch")
+    except Exception as e:
+        failures.append(f"BUNDLE_B_PHASE1 EXCEPTION: {type(e).__name__}: {e}")
 
     if failures:
         sys.stderr.write("\n".join(failures) + "\n")
@@ -126,3 +174,9 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def _bundle_b_phase1_centerline_contract_smoke():
+    status = simple_river_stage_status_placeholder()
+    updated = mark_stage_implemented(status, stage_id=STAGE_RIVER_CENTERLINE, output_artifact="river_centerline_points.gpkg")
+    assert updated[STAGE_RIVER_CENTERLINE]["implemented"] is True

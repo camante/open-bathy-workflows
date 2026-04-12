@@ -1,0 +1,10 @@
+Phase 326: river_v1 backbone inertness criterion fix
+
+Problem fixed:
+- river_v1 failed too aggressively whenever unsupported centerline stations existed and backbone-adjusted station count was zero.
+- In real AOIs, unsupported stations can exist even when the base DEM is already longitudinally consistent with the backbone implied by nearby authoritative anchors.
+
+Fix:
+- distinguish unsupported stations with a real requested nonzero backbone change from unsupported stations whose base profile is already consistent with the inferred backbone.
+- only fail when unsupported_requested_adjustment_count > 0 and backbone_adjusted_station_count == 0.
+- record unsupported_noop_consistent_base_count and unsupported_missing_base_count in the backbone summary.

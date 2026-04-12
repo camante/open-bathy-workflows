@@ -1,0 +1,26 @@
+Phase 171: nested-AOI AOI-stability contract pass
+
+What changed
+- Added nested_aoi_contracts.py to turn the regression harness into explicit AOI-stability contract evaluation.
+- Added required-artifact checks for nested-AOI overlap/trusted comparisons:
+  - selected_final_depth
+  - support_class
+  - final_provenance_native
+  - river_trusted_interior (trusted scope)
+- Added support-class-specific selected_final_depth identity checks so regression receipts show which support class fails first.
+- Updated postrun_regression_stage.py to write:
+  - nested_aoi_contract_evaluation.json
+  - richer nested_aoi_regression_metrics.csv rows with contract scope/status/tolerance and support class columns.
+- Added targeted tests for missing required artifacts, class-specific failure reporting, and postrun contract-output writing.
+
+What this phase does not change
+- No terrain/interpolation science changes.
+- No channel-core preservation rule changes.
+- No seam metric math changes.
+
+Verification
+- python -m py_compile passed for modified regression modules.
+- Targeted tests passed:
+  - tests/test_nested_aoi_regression.py
+  - tests/test_nested_aoi_contracts.py
+  - tests/test_postrun_regression_stage.py

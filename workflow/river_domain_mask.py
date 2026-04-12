@@ -92,11 +92,21 @@ def _read_template(template_raster: Path) -> Tuple[dict, rasterio.Affine, raster
     return profile, transform, crs, shape
 
 
-def _warp_mask_to_template(mask_path: Path, template_profile: dict) -> np.ndarray:
-    """Warp an input mask raster to the template grid using nearest neighbor."""
-    dst = np.ones((template_profile["height"], template_profile["width"]), dtype=np.uint8)  # default to land
+def _warp_mask_to_template(mask_path: Path, template_profile: dict) -> Tuple[np.ndarray, np.ndarray]:
+    """Warp an input mask raster to the template grid using nearest neighbor.
+
+    Returns
+    -------
+    warped_mask : np.ndarray
+        Warped semantic mask values on the template grid.
+    footprint : np.ndarray[bool]
+        True where the source raster actually contributed coverage after reprojection.
+        This prevents projected edge nodata from being misinterpreted as real water/land.
+    """
+    shape = (template_profile["height"], template_profile["width"])
+    dst = np.ones(shape, dtype=np.uint8)  # semantic default to land outside coverage
+    footprint = np.zeros(shape, dtype=np.uint8)
     with rasterio.open(mask_path) as src:
-        src_arr = src.read(1)
 
         # Some mask rasters use semantic values (0/1) for water/land and may also
         # set nodata to 0 or 1. If we pass that through as src_nodata, rasterio
@@ -106,7 +116,7 @@ def _warp_mask_to_template(mask_path: Path, template_profile: dict) -> np.ndarra
             src_nodata = None
 
         reproject(
-            source=src_arr,
+            source=rasterio.band(src, 1),
             destination=dst,
             src_transform=src.transform,
             src_crs=src.crs,
@@ -114,9 +124,20 @@ def _warp_mask_to_template(mask_path: Path, template_profile: dict) -> np.ndarra
             dst_crs=template_profile["crs"],
             resampling=Resampling.nearest,
             src_nodata=src_nodata,
-            dst_nodata=1,  # land by default
+            dst_nodata=1,  # semantic fill only; real validity comes from footprint
         )
-    return dst
+        reproject(
+            source=np.ones((src.height, src.width), dtype=np.uint8),
+            destination=footprint,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=template_profile["transform"],
+            dst_crs=template_profile["crs"],
+            resampling=Resampling.nearest,
+            src_nodata=0,
+            dst_nodata=0,
+        )
+    return dst, footprint.astype(bool)
 
 
 def _save_u8(path: Path, arr_u8: np.ndarray, template_profile: dict, nodata: int = 0) -> None:
@@ -199,6 +220,36 @@ def _load_mainstem_solve_rivers(args: argparse.Namespace, target_crs) -> Tuple[g
     ) from last_err
 
 
+
+def _resolve_channel_source_policy(requested: str, *, has_usable_nhdarea: bool, nhdarea_overlap_frac: Optional[float] = None, min_nhdarea_overlap_frac: float = 0.01) -> Tuple[str, Optional[str]]:
+    """Resolve the effective channel-source policy.
+
+    The documented contract for ``channel_source=auto`` is to prefer NHDArea when
+    usable and otherwise use the buffered flowline corridor. That is not a
+    fallback/glue path; it is the explicit automatic policy. ``channel_source=nhdarea``
+    remains strict and must fail closed when NHDArea is unavailable or unusable.
+
+    A non-empty NHDArea raster is still not *usable* for ``auto`` if it has almost
+    no overlap with the flowline corridor on the template grid. That condition
+    means the NHDArea extraction/filtering is not representative enough to drive
+    automatic channel construction for this AOI, so ``auto`` must stay on its
+    documented corridor path rather than aborting early.
+    """
+    req = str(requested or 'auto').strip().lower()
+    if req == 'corridor':
+        return 'corridor', None
+    if req == 'nhdarea':
+        return 'nhdarea', None
+
+    overlap_ok = True
+    if nhdarea_overlap_frac is not None:
+        overlap_ok = float(nhdarea_overlap_frac) >= float(min_nhdarea_overlap_frac)
+    if has_usable_nhdarea and overlap_ok:
+        return 'nhdarea', None
+    if has_usable_nhdarea and not overlap_ok:
+        return 'corridor', 'nhdarea_low_corridor_overlap'
+    return 'corridor', 'nhdarea_unusable_or_empty'
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Build river-only raster mask from NHD flowlines + water mask.")
     p.add_argument("--river-gpkg", required=True, help="river_network.gpkg from river_network.py")
@@ -271,8 +322,8 @@ def main() -> int:
 
     ocean = None
     if args.ocean_mask:
-        om = _warp_mask_to_template(Path(args.ocean_mask), template_profile)
-        ocean = (om == 0)  # waffles convention: water=0 (ocean-only mask)
+        om, ocean_footprint = _warp_mask_to_template(Path(args.ocean_mask), template_profile)
+        ocean = (om == 0) & ocean_footprint  # waffles convention: water=0 (ocean-only mask)
         LOG.info("Ocean-only mask loaded: %s (waffles convention water=0 land=1)", args.ocean_mask)
 
     # This script assumes the template CRS is projected in meters. If it is geographic
@@ -520,17 +571,17 @@ def main() -> int:
     water_corridor_overlap_frac = None
 
     if args.water_mask:
-        wm = _warp_mask_to_template(Path(args.water_mask), template_profile)
+        wm, water_footprint = _warp_mask_to_template(Path(args.water_mask), template_profile)
         if args.water_mask_role == "waffles_with_nhd":
             # This mask already represents the intended full water domain for river delivery.
             # Do not subtract the ocean-only WAFFLES mask here; that was the source of the
             # false zero-overlap failure in estuarine/tidal mainstems. Ocean separation is
             # handled later by channel-width / NHDArea / estuary logic, not by erasing the
             # river-capable water mask up front.
-            water = (wm == 0)
+            water = (wm == 0) & water_footprint
             LOG.info("Water mask loaded as WAFFLES with-NHD full water domain: %s", args.water_mask)
         else:
-            water_all = (wm == 0)  # explicit convention: water=0
+            water_all = (wm == 0) & water_footprint  # explicit convention: water=0 only inside footprint
 
             def _corridor_overlap(mask_bool: np.ndarray) -> float:
                 if corridor.sum() <= 0:
@@ -583,27 +634,41 @@ def main() -> int:
 
 
 
-    maxw = float(args.max_channel_width_m)
-    maxw_main = float(args.max_mainstem_width_m)
-    width_limit = np.where(corridor_main, maxw_main, maxw).astype("float32")
+    # Candidate river domain.
+    # Do not apply per-pixel width thresholds here. They are too arbitrary for domain construction
+    # and can punch holes through the interior of broad river reaches because the center of the river
+    # has the largest bank-distance values. Estuary/wide-water separation is handled later by the
+    # estuary clip logic using along-channel widening diagnostics.
+    channel_candidate = water & corridor
+    channel = channel_candidate.copy()
 
-    # Candidate river domain
-    channel = water & corridor & (width <= width_limit)
-
-    # Also require "not too far from a flowline" (helps when water mask has large bays inside corridor buffer)
-    channel &= (d_center <= (float(args.channel_buffer_m) + 0.5 * width_limit + 2.0 * pix))
-
-    # Apply channel-source policy
-    if args.channel_source == "corridor":
-        # corridor-only: do not constrain by NHDArea
-        pass
+    # Apply channel-source policy.
+    # The critical rule here is: once a connected water-in-corridor component is accepted as
+    # structurally supported by NHDArea/mainstem/ocean-keep, retain the full connected interior
+    # of that component. Do NOT intersect pixelwise with the structure seed, which erodes broad
+    # rivers into bank-parallel ribbons and creates interior holes.
+    structure_seed = np.zeros(shape, dtype=bool)
+    candidate_component_count = 0
+    accepted_component_count = 0
+    nhd_overlap_frac = None
+    if (nhdarea_mask is not None) and bool(nhdarea_mask.any()) and corridor.sum() > 0:
+        nhd_overlap_frac = float((nhdarea_mask & corridor).sum()) / float(corridor.sum())
+    has_usable_nhdarea = (nhdarea_mask is not None) and bool(nhdarea_mask.any())
+    effective_channel_source, channel_source_reason = _resolve_channel_source_policy(
+        args.channel_source,
+        has_usable_nhdarea=has_usable_nhdarea,
+        nhdarea_overlap_frac=nhd_overlap_frac,
+    )
+    if effective_channel_source == "corridor":
+        if str(args.channel_source).strip().lower() == 'auto' and not has_usable_nhdarea:
+            LOG.info(
+                "Channel-source auto resolved to corridor because NHDArea river polygons were empty or unusable on the template grid."
+            )
+        structure_seed = channel_candidate.copy()
+        candidate_component_count = int(label(channel_candidate)[1]) if np.any(channel_candidate) else 0
+        accepted_component_count = candidate_component_count
     else:
-        # nhdarea/auto: constrain by NHDArea river polygons when available, but allow
-        # mainstem corridor continuity and (optionally) ocean-kept pixels near flowlines.
         if (nhdarea_mask is not None) and bool(nhdarea_mask.any()):
-            # NHDArea river polygons must overlap the flowline corridor. If they do not,
-            # the polygon extraction/filtering is wrong and the workflow should fail closed
-            # rather than silently degrading to a corridor-only river domain.
             if corridor.sum() > 0:
                 ov = float((nhdarea_mask & corridor).sum()) / float(corridor.sum())
                 if ov < 0.01:
@@ -611,14 +676,30 @@ def main() -> int:
                         "NHDArea river polygons have very low overlap with the flowline corridor "
                         f"({100.0 * ov:.2f}%). Fix NHDArea extraction/filtering instead of degrading to corridor-only."
                     )
-        if (nhdarea_mask is not None) and bool(nhdarea_mask.any()):
-            channel &= (nhdarea_mask | corridor_main | keep_ocean)
+            structure_seed = (nhdarea_mask | corridor_main | keep_ocean) & channel_candidate
         else:
             raise SystemExit(
                 "No usable NHDArea river polygons were extracted for river domain construction. "
                 "Fix NHDArea extraction/filtering or explicitly request --channel-source=corridor if that is scientifically intended."
             )
 
+        from scipy.ndimage import label as _label
+        labeled_cc, n_cc = _label(channel_candidate)
+        candidate_component_count = int(n_cc)
+        seed_labels = np.unique(labeled_cc[structure_seed & (labeled_cc > 0)])
+        accepted_component_count = int(seed_labels.size)
+        if seed_labels.size > 0:
+            channel = np.isin(labeled_cc, seed_labels) & channel_candidate
+        else:
+            channel = np.zeros_like(channel_candidate, dtype=bool)
+
+    channel_after_structure = channel.copy()
+    if np.any(channel):
+        # Remove rasterization pinholes and fill interior water holes while preserving the
+        # accepted wetted component interior. Clip back to water so islands/land stay excluded.
+        channel = binary_closing(channel, structure=np.ones((3, 3), dtype=bool))
+        channel = binary_fill_holes(channel)
+        channel &= water
 
     # Open water is the ocean/bay subset of the effective water mask, not arbitrary inland
     # disconnected residual water. Restrict strictly to water components that directly
@@ -640,16 +721,17 @@ def main() -> int:
     out_open = Path(args.out_open_water_mask)
     out_channel.parent.mkdir(parents=True, exist_ok=True)
 
-    channel_source_effective = "nhdarea" if ((args.channel_source != "corridor") and (nhdarea_mask is not None) and bool(nhdarea_mask.any()) and nhdarea_pixels > 0 and np.any(channel & nhdarea_mask)) else "corridor"
-    nhd_overlap_frac = None
-    if (nhdarea_mask is not None) and bool(nhdarea_mask.any()) and corridor.sum() > 0:
-        nhd_overlap_frac = float((nhdarea_mask & corridor).sum()) / float(corridor.sum())
+    channel_source_effective = effective_channel_source
     mainstem_mask = _derive_output_mainstem_mask(corridor_main, channel)
 
     policy_summary = {
         "channel_source_requested": str(args.channel_source),
+        "channel_source_resolution_reason": channel_source_reason,
         "channel_source_effective": channel_source_effective,
         "effective_water_source": water_source_effective,
+        "mask_value_convention": "1=inside,0=outside",
+        "domain_width_filter_applied": False,
+        "estuary_widening_is_handled_downstream": True,
         "water_mask_harmonization_applied": bool(water_mask_harmonization_applied),
         "water_mask_harmonization_reason": water_mask_harmonization_reason,
         "ocean_mask_available": bool(args.ocean_mask),
@@ -660,11 +742,15 @@ def main() -> int:
         "mainstem_corridor_pixels": int(corridor_main.sum()),
         "mainstem_output_pixels": int(mainstem_mask.sum()),
         "effective_water_pixels": int(water.sum()),
+        "water_mask_footprint_pixels": int(water_footprint.sum()) if "water_footprint" in locals() else None,
         "channel_pixels": int(channel.sum()),
         "open_water_pixels": int(open_water.sum()),
         "ocean_pixels": int(ocean.sum()) if ocean is not None else 0,
         "kept_ocean_pixels": int(keep_ocean.sum()) if "keep_ocean" in locals() else 0,
         "nhdarea_pixels": int(nhdarea_mask.sum()) if (nhdarea_mask is not None) else 0,
+        "structure_seed_pixels": int(structure_seed.sum()),
+        "candidate_component_count": int(candidate_component_count),
+        "accepted_component_count": int(accepted_component_count),
         "effective_water_corridor_overlap_frac": water_corridor_overlap_frac,
         "channel_corridor_overlap_frac": float((channel & corridor).sum()) / float(corridor.sum()) if corridor.sum() > 0 else None,
         "mainstem_channel_overlap_frac": float((mainstem_mask & channel).sum()) / float(mainstem_mask.sum()) if mainstem_mask.sum() > 0 else None,
@@ -706,8 +792,14 @@ def main() -> int:
         dbg = out_channel.parent
         _save_f32(dbg / "debug_width_proxy_m.tif", np.where(water, width, np.nan), template_profile)
         _save_f32(dbg / "debug_d_center_m.tif", np.where(water, d_center, np.nan), template_profile)
+        _save_u8(dbg / "debug_effective_water_mask.tif", water.astype("uint8"), template_profile)
+        if "water_footprint" in locals():
+            _save_u8(dbg / "debug_water_mask_footprint.tif", water_footprint.astype("uint8"), template_profile)
         _save_u8(dbg / "debug_corridor_mask.tif", corridor.astype("uint8"), template_profile)
         _save_u8(dbg / "debug_mainstem_corridor_mask.tif", corridor_main.astype("uint8"), template_profile)
+        _save_u8(dbg / "debug_channel_candidate_from_water_corridor.tif", channel_candidate.astype("uint8"), template_profile)
+        _save_u8(dbg / "debug_channel_after_structure_filter.tif", channel_after_structure.astype("uint8"), template_profile)
+        _save_u8(dbg / "debug_channel_final.tif", channel.astype("uint8"), template_profile)
         _save_u8(dbg / "debug_skeleton_mask.tif", skel.astype("uint8"), template_profile)
 
     LOG.info("Wrote: %s", out_channel)

@@ -143,10 +143,27 @@ def _clip_guide_points_to_mask(guide_points_path: Path, depth_raster: Path, keep
 
 def load_sdb_artifacts_into_report(*, sdb_dir: Path, report: Dict[str, Any]) -> Dict[str, Any]:
     _, data = _load_manifest(sdb_dir)
-    report.setdefault("sdb", {})["artifacts"] = dict(data)
+    sdb = report.setdefault("sdb", {})
+    sdb["artifacts"] = dict(data)
+    active = _resolve_manifest_path(sdb_dir, data.get("sdb_guidance_active") or data.get("depth_raster"))
+    raw = _resolve_manifest_path(sdb_dir, data.get("raw_prediction_raster"))
+    locked = _resolve_manifest_path(sdb_dir, data.get("sdb_locked_guidance_raster"))
+    if active is not None:
+        sdb["guidance_active"] = str(active)
+        report.setdefault("outputs", {})["sdb_guidance_active"] = str(active)
+    if raw is not None:
+        sdb["raw_prediction_raster"] = str(raw)
+        report.setdefault("outputs", {})["sdb_raw_prediction_raster"] = str(raw)
+    if locked is not None:
+        sdb["locked_guidance_raster"] = str(locked)
+        report.setdefault("outputs", {})["sdb_locked_guidance_raster"] = str(locked)
+    if isinstance(data.get("guidance_mode"), str):
+        sdb["guidance_mode"] = data.get("guidance_mode")
+    if isinstance(data.get("depth_raster_role"), str):
+        sdb["depth_raster_role"] = data.get("depth_raster_role")
     guidance_manifest = _resolve_manifest_path(sdb_dir, data.get("guidance_manifest"))
     if guidance_manifest is not None:
-        report.setdefault("sdb", {})["guidance_manifest"] = str(guidance_manifest)
+        sdb["guidance_manifest"] = str(guidance_manifest)
     return data
 
 

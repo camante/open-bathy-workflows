@@ -1,0 +1,13 @@
+workflow_v319 simplification pass
+
+Main change:
+- adds one primary river-level receipt in reports/: river_active_summary.json
+
+What it does:
+- rolls up the active river runtime/product summary, active river shape summary, and active river evaluation summary into one primary river story
+- demotes the runtime, shape, and evaluation receipts to river drilldowns in the reports manifest and README
+- keeps the deterministic withheld-support receipt as a drilldown/action artifact rather than a peer primary narrative
+
+Why:
+- simplify the reports folder so one river receipt tells the main story for the run
+- reduce competing near-peer river narratives in reports/

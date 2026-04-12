@@ -1,0 +1,14 @@
+Phase 174: support-aware generic XS templates
+
+Summary
+- Added support/template classification to river_xs_realism stations.
+- In low-support bank-only reaches, inner-node targets are now forced toward simple symmetric/generic cross-section ratios instead of preserving noisy local bank-driven shapes.
+- Measured/authoritative XS stations remain protected.
+
+Key files changed
+- river_xs_realism.py
+- tests/test_river_xs_realism.py
+
+Verification
+- python -m py_compile river_xs_realism.py river_channel_surface.py
+- pytest -q tests/test_river_xs_realism.py tests/test_river_channel_surface.py

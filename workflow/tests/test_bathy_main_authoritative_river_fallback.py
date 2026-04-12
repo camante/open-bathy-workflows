@@ -77,3 +77,28 @@ def test_load_river_authoritative_support_points_prefers_river_soundings_crs():
     assert list(out.columns) == ['lon', 'lat', 'depth_m', 'source']
     assert out.iloc[0]['lon'] == -70.9
     assert out.iloc[0]['lat'] == 42.8
+
+
+def test_load_river_authoritative_support_points_direct_preserves_role_columns(tmp_path: Path):
+    csv_path = tmp_path / "river_roleaware.csv"
+    csv_path.write_text(
+        "x,y,depth_m,source,authoritative_role,role_confidence,distance_to_bank_m,normalized_channel_position,inside_channel_mask\n"
+        "1,2,3,embedded_source_name,authoritative_bed_core,0.9,4.0,0.8,1\n",
+        encoding="utf-8",
+    )
+    cfg = SimpleNamespace(
+        river_soundings=None,
+        river_authoritative_soundings=str(csv_path),
+        extra_xyz_files=None,
+        river_soundings_crs='EPSG:32619',
+        working_srs='EPSG:32619',
+        extra_xyz_crs='EPSG:4326',
+        aoi='-71/-70/42/43',
+    )
+    out = bathy_main._load_river_authoritative_support_points(cfg)
+    assert out is not None
+    assert 'authoritative_role' in out.columns
+    assert 'role_confidence' in out.columns
+    assert out.iloc[0]['authoritative_role'] == 'authoritative_bed_core'
+    assert float(out.iloc[0]['role_confidence']) == 0.9
+    assert out.iloc[0]['source'] == 'embedded_source_name'

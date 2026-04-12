@@ -1,0 +1,25 @@
+Phase 172: bank diagnostics + contamination filtering (prediction pass 1)
+
+Main goal
+- Improve upstream river prediction inputs by reducing bad XS bank elevations before they shape downstream bank guidance and XS-driven river structure.
+
+What changed
+- xs_builder.py
+  - Added conservative bank candidate stack capture around each picked bank index.
+  - XS lines now retain raw bank elevation, inner-min, local q25, local median, and selected-source fields for both left and right banks.
+- river_bank_guidance.py
+  - load_xs_bank_points now carries the new XS bank candidate fields.
+  - build_persistent_bank_network_points now applies conservative contamination filtering using:
+    - same-side longitudinal reference,
+    - lower local candidate floor,
+    - opposite-bank raw elevation.
+  - Added bank contamination flags, final/adjusted bank elevations, adjustment reasons, and a bank QC summary helper.
+- bathy_main.py
+  - Writes river_xs_bank_qc_points.gpkg and river_xs_bank_qc_summary.csv when XS bank QC artifacts are available.
+  - Logs XS bank QC replacement/suspect counts.
+- tests
+  - Added focused tests for high-bank contamination clamping and QC summary receipts.
+
+Behavioral intent
+- Prefer lower-noise water-edge-biased bank controls over steep upland endpoint picks.
+- Keep this phase narrow: improve bank controls first without pretending to solve full longitudinal bed control yet.

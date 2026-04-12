@@ -1,0 +1,66 @@
+PATCH NOTES — Phase 197: Support-Distance-Aware Classification + Longitudinal Smoothing
+========================================================================================
+
+Root cause analysis from v196 run:
+  - All 3152 longitudinal stations classified as "supported" despite only 44 having
+    real authoritative data (~1.4%) — because geometric XS/centerline values (DEM
+    sampling at cross-section locations) were treated as measured support.
+  - Benchmark holdout contained only authoritative_locked points, making the
+    hard-problem evaluation completely blind.
+  - Longitudinal profile roughness (step, curvature) was worse than baseline because
+    the backbone solver smoothed too weakly in unsupported reaches and the
+    rebuild propagated that noise.
+
+Fix 1: Support classification (river_longitudinal_profile.py)
+-------------------------------------------------------------
+- NEW: _compute_measured_support_distance() computes per-station distance (metres)
+  to the nearest authoritative anchor within the same component.
+- _classify_longitudinal_profile_coverage() now uses a 500m threshold: stations
+  beyond 500m from any authoritative anchor with only geometric XS/centerline
+  support are reclassified as "unsupported" instead of "xs_supported".
+- New output columns: profile_measured_support_distance_m, profile_far_from_measured_support
+- Coverage summary now includes measured_support_distance_summary with median, p75,
+  p95, max, and fraction >500m / >1000m.
+- Coverage CSV now exports the distance columns for downstream consumers.
+
+Fix 2: Longitudinal smoothing (river_longitudinal_profile.py)
+-------------------------------------------------------------
+- _solve_component_profile() now uses per-station adaptive smoothing:
+  - smooth_scale ranges from 1.0x at authoritative anchors to 8.0x far away
+  - data_weight_scale reduces DEM-sampled "observation" fidelity far from anchors
+    (these are not real measurements — they're just DEM noise)
+  - Smoothing strength per pair uses max(adjacent smooth_scale) so the stronger-
+    smoothing station dominates
+- Monotonic tolerance now distance-adaptive: 0.005m/station far from anchors
+  (was 0.02m everywhere) — prevents cumulative oscillation in unsupported reaches
+- NEW: Post-solve Gaussian low-pass (sigma=4 stations, ~400m at 100m spacing)
+  applied to stations far from anchors (idx_dist > 3), blended smoothly to zero
+  near anchors.  Anchor values preserved exactly.
+
+Fix 3: Benchmark hard-problem evaluation (benchmark_workflow_stage.py)
+----------------------------------------------------------------------
+- Hard river benchmark now detects and explicitly flags when evaluation is blind
+  (all holdout points authoritative_locked) with hard_problem_evaluation_blind
+  flag and explanatory reason string.
+- NEW: support_distance_binned_roughness section in river science summary.
+  Bins: [0-100m near anchor], [100-300m transitional], [300-500m weak support],
+  [500-1000m unsupported], [1000m+ far unsupported].  Each bin reports
+  baseline/final mean_abs_step, delta, and roughness_improved boolean.
+  This is now the primary evaluator for the hard problem.
+- Coverage merge now includes profile_measured_support_distance_m and
+  profile_far_from_measured_support columns.
+- Benchmark CSV reader also computes measured_support_distance_summary from CSV.
+- Markdown report includes:
+  - WARNING when hard-problem evaluation is blind
+  - "Longitudinal Roughness by Distance to Authoritative Data" table showing
+    per-bin roughness improvement/regression
+
+What to look for in the next run:
+  1. coverage_by_class should now show many "unsupported" stations (most of the
+     upstream Merrimack) instead of 0.
+  2. support_distance_binned_roughness should show per-bin metrics — the 500m+
+     and 1000m+ bins are the hard problem.  Delta should be negative (smoother
+     than baseline) for the smoothing fix to be working.
+  3. The longitudinal profile should be visibly smoother in the hillshade —
+     less stairstepping / oscillation in unsupported reaches.
+  4. Authoritative-locked cells should remain exactly unchanged (zero delta).

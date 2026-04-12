@@ -42,4 +42,49 @@ def test_collect_final_route_inputs_supports_string_out_dir(tmp_path: Path):
     assert paths is not None
     assert paths.combined_dir == (out_dir / "combined")
     assert paths.auth_src == auth.resolve()
-    assert paths.template_path == depth.resolve()
+    assert paths.template_path == auth.resolve()
+
+
+def test_collect_final_route_inputs_prefers_authoritative_baseline_grid_when_available(tmp_path: Path):
+    out_dir = tmp_path / "run"
+    out_dir.mkdir()
+    auth = tmp_path / "auth.tif"
+    auth.write_bytes(b"x")
+    baseline = tmp_path / "cudem_baseline_interpolation.tif"
+    baseline.write_bytes(b"y")
+    river_dir = out_dir / "river"
+    river_dir.mkdir()
+    river_depth = river_dir / "river_depth_terrain_patch.tif"
+    river_depth.write_bytes(b"z")
+    cfg = SimpleNamespace(out_dir=str(out_dir), authoritative_base=str(auth))
+    report = {
+        "authoritative_base_auto": {"baseline_cudem_interpolation": str(baseline)},
+        "river": {"outputs": {"depth_terrain": str(river_depth)}},
+    }
+    paths = collect_final_route_inputs(cfg=cfg, candidate_path=None, report=report)
+    assert paths is not None
+    assert paths.template_path == auth.resolve()
+    assert paths.baseline_cudem_src == baseline.resolve()
+
+
+
+def test_collect_final_route_inputs_receipt_matches_actual_template_selection_order(tmp_path: Path):
+    out_dir = tmp_path / "run"
+    out_dir.mkdir()
+    auth = tmp_path / "auth.tif"
+    auth.write_bytes(b"x")
+    baseline = tmp_path / "cudem_baseline_interpolation.tif"
+    baseline.write_bytes(b"y")
+    cfg = SimpleNamespace(out_dir=str(out_dir), authoritative_base=str(auth))
+    report = {"authoritative_base_auto": {"baseline_cudem_interpolation": str(baseline)}}
+    paths = collect_final_route_inputs(cfg=cfg, candidate_path=None, report=report)
+    payload = json.loads(paths.inputs_receipt_path.read_text(encoding="utf-8"))
+    assert payload["template_role"] == "authoritative_base_canonical_grid"
+    assert payload["template_selection_order"] == [
+        "authoritative_base_canonical_grid",
+        "baseline_cudem_interpolation_background_only",
+        "dense_sdb_depth_raster_guidance_only",
+        "dense_river_depth_raster_guidance_only",
+        "legacy_candidate_diagnostic_only",
+    ]
+    assert payload["structural_inputs"]["canonical_final_grid_source"] == str(auth.resolve())

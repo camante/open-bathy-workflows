@@ -636,14 +636,53 @@ def _safe_unzip(z: Path, d: Path) -> List[str]:
 
 def _cmr_latest_concept_id(short_name: str) -> Optional[str]:
 
-    try:
-        url = "https://cmr.earthdata.nasa.gov/search/collections.json"
-        params = {"short_name": short_name, "page_size": 2000, "sort_key": "-version"}
-        r = _lazy_requests().get(url, params=params, timeout=30)
-        r.raise_for_status()
-        items = r.json().get("feed", {}).get("entry", [])
-        return items[0]["id"] if items else None
-    except (TypeError, ValueError, KeyError): return None
+    def _version_rank(value: object) -> tuple:
+        s = str(value or "").strip()
+        if not s:
+            return tuple()
+        parts = []
+        for token in s.replace('-', '.').split('.'):
+            token = token.strip()
+            if not token:
+                continue
+            if token.isdigit():
+                parts.append((0, int(token)))
+            else:
+                parts.append((1, token))
+        return tuple(parts)
+
+    def _entry_rank(entry: dict) -> tuple:
+        version = entry.get("version_id") or entry.get("version") or entry.get("dataset_id") or ""
+        revision = entry.get("revision_id") or 0
+        try:
+            revision = int(revision)
+        except Exception:
+            revision = 0
+        updated = entry.get("updated") or entry.get("revision_date") or ""
+        return (_version_rank(version), revision, str(updated))
+
+    requests_mod = _lazy_requests()
+    url = "https://cmr.earthdata.nasa.gov/search/collections.json"
+    query_variants = [
+        {"short_name": short_name, "page_size": 2000},
+        {"short_name": short_name, "page_size": 2000, "sort_key[]": "-revision_date"},
+    ]
+    for params in query_variants:
+        try:
+            r = requests_mod.get(url, params=params, timeout=30)
+            r.raise_for_status()
+            items = r.json().get("feed", {}).get("entry", [])
+            if not items:
+                continue
+            items = [it for it in items if isinstance(it, dict) and it.get("id")]
+            if not items:
+                continue
+            items.sort(key=_entry_rank, reverse=True)
+            return str(items[0].get("id"))
+        except Exception:
+            log.debug("_cmr_latest_concept_id query failed for %s params=%s", short_name, params, exc_info=True)
+            continue
+    return None
 
 def cmr_search_atl24_full(bbox, start, end, page_size=200) -> List[dict]:
     url = "https://cmr.earthdata.nasa.gov/search/granules.json"

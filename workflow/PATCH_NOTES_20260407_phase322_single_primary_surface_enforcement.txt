@@ -1,0 +1,10 @@
+workflow_v322 simplification pass
+
+This pass tightens the one-path river runtime contract in canonical mode.
+
+Main changes:
+- Canonical mode no longer builds river_primary_surface from legacy backbone/centerline/XS/bank fallback routing inside terrain_interpolator.py.
+- Canonical mode now rejects native river guide-point rasterization inside the interpolator as a deprecated active-path substitute.
+- Canonical mode no longer allows dense candidate rasters to become peer river-surface substitutes inside the interpolator.
+- The explicit primary_river_guidance_surface input remains allowed as the one direct active river-surface alias.
+- Runtime summaries now report deprecated native river guide-point rejection/allowance alongside legacy river-depth alias handling.

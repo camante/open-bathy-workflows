@@ -1,0 +1,35 @@
+Phase 168 - Channel-core preservation diagnostics (Phase 2)
+
+Reviewed prior phase
+- Reviewed Phase 167 postrun orchestration extraction first.
+- No additional phase-1 wiring bug required patching before this pass.
+
+What changed
+- Added channel_core_preservation.py to centralize the active channel-core preserve rule and produce preservation diagnostics from the terrain-stage outputs.
+- Updated terrain_interpolator.py so the same preserve rule that tunes river terrain response is also exported as explicit diagnostics instead of disappearing inside the primary-surface assembly.
+- Added new terrain-stage diagnostic outputs:
+  - river_primary_surface_channel_core_preserve.tif
+  - river_channel_core_preservation_zone.tif
+  - river_channel_core_prepost_delta.tif
+  - river_channel_core_bank_pull_risk.tif
+  - river_channel_core_preservation_receipt.json
+- Updated deterministic_terrain_stage.py receipt so terrain-stage summaries now include channel-core zone counts and delta/risk summary metrics.
+- Updated final_route_inputs_stage.py and final_route_outputs_stage.py so these diagnostics are written, recorded in receipts, and exposed through report/output contracts.
+- Added focused tests for the preserve rule, preservation diagnostics, terrain-interpolator export, and final-route output writing.
+
+Why this phase matters
+- This phase does not change the main river conditioning science yet.
+- It makes the current failure mode measurable: where the final conditioned surface diverges from the primary river surface inside the channel-core preserve zone, and where bank pull pressure is highest.
+- These diagnostics are the evidence base needed for the next pass that will harden terrain-stage channel-core preservation behavior.
+
+Verification
+- Full repo python compile check passed before packaging.
+- Focused tests passed:
+  - tests/test_channel_core_preservation.py
+  - tests/test_terrain_interpolator.py
+  - tests/test_final_route_outputs_stage_regressions.py
+  - tests/test_postrun_stages.py
+
+No AI-slop / glue cleanup
+- Removed duplicate inline channel-core preserve logic by centralizing the rule in channel_core_preservation.py.
+- Removed transient __pycache__ and pytest cache artifacts before packaging.

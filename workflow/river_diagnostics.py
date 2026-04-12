@@ -291,6 +291,9 @@ def create_unified_bathy_report(
     river_output: Optional[Union[str, Path]] = None,
     methods: Optional[List[str]] = None,
     priority: Optional[str] = None,
+    *,
+    write_json: bool = True,
+    write_markdown: bool = False,
 ) -> Path:
     """Create a unified, lightweight report that summarizes the *whole* bathy pipeline.
 
@@ -298,8 +301,8 @@ def create_unified_bathy_report(
     not installed. It is safe to call at the end of bathy_main.
 
     Outputs:
-      - <output_dir>/unified_bathy_report.json
-      - <output_dir>/unified_bathy_report.md
+      - <output_dir>/unified_bathy_report.json (optional legacy compact wrapper)
+      - <output_dir>/unified_bathy_report.md (optional legacy narrative summary)
     """
     import json
     from datetime import datetime, timezone
@@ -373,10 +376,11 @@ def create_unified_bathy_report(
     out_json = out_dir / "unified_bathy_report.json"
     out_md = out_dir / "unified_bathy_report.md"
 
-    try:
-        out_json.write_text(json.dumps(rep, indent=2), encoding="utf-8")
-    except Exception as e:
-        log.warning("Failed to write unified JSON report: %s", e)
+    if write_json:
+        try:
+            out_json.write_text(json.dumps(rep, indent=2), encoding="utf-8")
+        except Exception as e:
+            log.warning("Failed to write unified JSON report: %s", e)
 
     # Simple markdown mirror for humans
     try:

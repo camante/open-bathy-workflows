@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
+from nodata_utils import sanitize_array
 from precedence_audit import summarize_precedence_audit, validate_precedence_audit
 from sign_semantics import raster_value_semantics
 from support_classes import SupportClass
@@ -27,14 +28,11 @@ def _read_raster(path: Path):
     import rasterio
 
     with rasterio.open(path) as ds:
-        arr = ds.read(1)
         nodata = ds.nodata
-        if np.issubdtype(arr.dtype, np.floating):
-            arr = arr.astype(np.float32, copy=False)
-            if nodata is not None:
-                arr[np.isclose(arr, np.float32(nodata))] = np.nan
+        if np.issubdtype(np.dtype(ds.dtypes[0]), np.floating):
+            arr = sanitize_array(ds.read(1), nodata, dtype=np.float32)
         else:
-            arr = arr.astype(np.int32, copy=False)
+            arr = ds.read(1).astype(np.int32, copy=False)
         meta = {
             "shape": tuple(arr.shape),
             "crs": ds.crs.to_string() if ds.crs else None,
@@ -261,4 +259,53 @@ def validate_written_final_dem_contract(
     return payload
 
 
-__all__ = ["validate_written_final_dem_contract", "summarize_written_precedence_audit"]
+def validate_written_final_dem_lineage(*, report: Dict[str, Any], final_depth: Any) -> Dict[str, Any]:
+    final_path = _existing_path(final_depth)
+    river = report.get("river", {}) if isinstance(report.get("river", {}), dict) else {}
+    river_outputs = river.get("outputs", {}) if isinstance(river.get("outputs", {}), dict) else {}
+    final_dem_contract = report.get("final_dem_contract", {}) if isinstance(report.get("final_dem_contract", {}), dict) else {}
+    final_route_contract = final_dem_contract.get("final_route_contract", {}) if isinstance(final_dem_contract.get("final_route_contract", {}), dict) else {}
+    v2_contract = final_route_contract.get("river_v2_final_route_contract", {}) if isinstance(final_route_contract.get("river_v2_final_route_contract", {}), dict) else {}
+    payload: Dict[str, Any] = {
+        "validated": False,
+        "skipped": False,
+        "skip_reason": None,
+        "final_depth": str(final_path) if final_path else None,
+        "river_v2_active": bool(v2_contract.get("active", False)),
+        "active_stage": v2_contract.get("active_stage"),
+        "active_river_guidance_surface": v2_contract.get("active_river_guidance_surface"),
+        "primary_river_guidance_surface": river_outputs.get("primary_river_guidance_surface"),
+        "locked_surface_reported": river_outputs.get("river_primary_surface_authoritative_applied"),
+        "legacy_river_final_route_participation_blocked": bool(v2_contract.get("legacy_river_final_route_participation_blocked", False)),
+        "runtime_enforced": bool(v2_contract.get("runtime_enforced", False)),
+        "final_depth_exists": bool(final_path),
+        "all_ok": None,
+    }
+    if final_path is None:
+        payload["skipped"] = True
+        payload["skip_reason"] = "missing_final_depth"
+        return payload
+    if not payload["river_v2_active"]:
+        payload["skipped"] = True
+        payload["skip_reason"] = "river_v2_not_active"
+        return payload
+    active_surface = str(v2_contract.get("active_river_guidance_surface") or "")
+    primary_surface = str(river_outputs.get("primary_river_guidance_surface") or "")
+    locked_surface = str(river_outputs.get("river_primary_surface_authoritative_applied") or "")
+    expected_stage = "river_primary_surface_authoritative_applied"
+    payload["validated"] = True
+    payload["stage_ok"] = bool(v2_contract.get("active_stage") == expected_stage)
+    payload["active_surface_exists"] = bool(_existing_path(active_surface))
+    payload["primary_surface_matches_active"] = bool(primary_surface == active_surface and primary_surface != "")
+    payload["locked_surface_matches_active"] = bool(locked_surface == active_surface and locked_surface != "")
+    payload["all_ok"] = bool(
+        payload["stage_ok"]
+        and payload["active_surface_exists"]
+        and payload["primary_surface_matches_active"]
+        and payload["locked_surface_matches_active"]
+        and payload["legacy_river_final_route_participation_blocked"] is True
+    )
+    return payload
+
+
+__all__ = ["validate_written_final_dem_contract", "summarize_written_precedence_audit", "validate_written_final_dem_lineage"]

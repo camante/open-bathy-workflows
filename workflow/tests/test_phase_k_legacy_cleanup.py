@@ -25,7 +25,7 @@ def test_phase_k_template_selection_ignores_legacy_candidate_when_structural_exi
     cfg = _Cfg(out_dir=out_dir, authoritative_base=auth)
     paths = collect_final_route_inputs(cfg=cfg, candidate_path=legacy, report={})
     assert paths is not None
-    assert paths.template_path == depth
+    assert paths.template_path == auth
 
 
 def test_phase_k_legacy_cleanup_detects_no_structural_leakage():

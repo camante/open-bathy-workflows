@@ -1,0 +1,11 @@
+Phase 178: support-weakness classification and rebuild-eligibility correction.
+
+What changed
+- Reclassified XS support/template selection to depend on true measured fraction and channel-vs-bank authoritative support instead of broad XS-like provenance.
+- Narrowed the smoothing suppression mask so indirect/residual XS provenance no longer acts like measured support.
+- Propagated station provenance fractions back to node rows so downstream rebuild eligibility sees the real support split.
+- Broadened rebuild eligibility for weak-support sections with bank-only anchors while keeping true measured and channel-authoritative sections protected.
+- Added targeted tests for indirect-XS non-promotion and bank-only-authoritative rebuild behavior.
+
+Why
+- Recent phases were wired structurally but often inert because broad XS-like provenance kept weak-support sections in measured-like classes and rebuild did not see the provenance split on node rows.

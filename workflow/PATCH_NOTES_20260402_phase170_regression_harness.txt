@@ -1,0 +1,33 @@
+Phase 170: seam + nested-AOI regression harness
+
+What changed
+- Added explicit nested-AOI regression support against other runs' final_outputs.json manifests.
+- Added a dedicated postrun regression stage so seam and nested-AOI checks are no longer embedded inline in bathy_main.py.
+- Added CSV/JSON regression outputs for overlap and trusted-interior checks.
+- Added targeted tests for the new nested-AOI regression and postrun stage wiring.
+
+New files
+- nested_aoi_regression.py
+- postrun_regression_contract.py
+- postrun_regression_stage.py
+- tests/test_nested_aoi_regression.py
+- tests/test_postrun_regression_stage.py
+
+Key behavior
+- Existing adjacent seam comparison remains explicit-only via io_manifest.json inputs.
+- New nested-AOI comparisons are explicit-only via final_outputs.json inputs.
+- Writes:
+  - nested_aoi_regression.json
+  - nested_aoi_regression_metrics.csv
+  - postrun_regression_summary.json
+- Still writes seam_comparisons.json when seam neighbors are provided.
+
+New CLI args
+- --nested-aoi-compare-with-final-outputs
+- --nested-aoi-compare-with-final-outputs-list
+- --nested-aoi-overlap-tolerance
+- --nested-aoi-trusted-tolerance
+
+Verification
+- python -m py_compile passed for modified modules.
+- Targeted pytest suite passed, including new regression-harness tests.

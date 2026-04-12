@@ -1,0 +1,10 @@
+Phase 325: add minimal river_v1 support/backbone replacement path.
+
+This pass does not try to produce a final river surface yet.
+It adds a new river method (`--river-method=v1`) that:
+- builds a channel mask using the existing domain machinery,
+- writes authoritative/bank support points to river_support_points.gpkg,
+- builds centerline stations and one backbone summary,
+- fails honestly if unsupported interior exists but the backbone remains inert.
+
+The v1 pass is artifact-only for now and returns no raster for fusion.

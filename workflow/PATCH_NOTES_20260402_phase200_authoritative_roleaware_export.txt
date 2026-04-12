@@ -1,0 +1,26 @@
+Phase 200: authoritative river support role-aware export/handoff
+
+What changed
+- Added authoritative_river_roles.py to classify broad authoritative river-support cells as:
+  - authoritative_bed_core
+  - authoritative_bed_inner
+  - authoritative_bank_margin
+  - authoritative_overbank_or_ambiguous
+- Updated authoritative_guidance.py so prepare_authoritative_river_soundings_points now writes role-aware CSV exports plus a companion .role_contract.json file.
+- Updated authoritative_support.py to pass shared-domain masks into the authoritative river-support export and to persist the role-contract path on cfg/report.
+- Updated bathy_main.py direct authoritative-support loader to preserve role columns instead of flattening them away.
+
+Why
+- The previous river authoritative-support handoff flattened raster-derived support to x,y,depth_m,source, which lost the distinction between interior bed support and bank-margin support before downstream river logic could use it.
+
+Verification
+- python compile checks passed
+- targeted tests passed for:
+  - authoritative_river_roles
+  - authoritative_river_support
+  - bathy_main authoritative river fallback/loader
+  - authoritative_support
+  - authoritative_guidance
+
+Known limitation
+- This pass preserves role information at export/handoff time, but downstream river semantics/rebuild logic do not yet fully act on those new roles everywhere. That is the next pass.

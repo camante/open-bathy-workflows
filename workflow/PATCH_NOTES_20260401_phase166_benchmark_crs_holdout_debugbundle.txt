@@ -1,0 +1,34 @@
+Phase 166 patch notes
+
+Scope
+- Fix benchmark crash when science-evaluation grid receives a river mask in working CRS instead of final-grid CRS.
+- Fix auto-holdout spatial blocking so projected point sets are blocked in a metric CRS instead of using raster-degree units.
+- Fix debug bundle run-log path normalization so run_id values like bathy_20260401T... do not generate missing bathy_bathy filenames.
+
+Changes
+1. benchmark_workflow_stage.py
+   - Science-evaluation benchmark now aligns optional river_mask_raster to the baseline/final grid with nearest-neighbor reprojection instead of hard-failing on CRS mismatch.
+   - Auto-holdout now builds spatial blocks in a metric CRS:
+     - use source projected CRS directly when available;
+     - otherwise project lon/lat-like points to local UTM.
+   - Added template pixel-size estimation in meters so block sizing is physically meaningful even when the benchmark rasters are geographic.
+   - Added adaptive block shrink logic if the initial block size collapses the whole candidate pool into one block.
+   - Expanded holdout receipt fields with realized fraction, available block count, template pixel size, and block size in meters.
+   - Improved benchmark logging to report selected fraction and block counts.
+
+2. debug_bundle.py
+   - Normalize run_id to the actual run-log filename suffix before copying logs into the debug bundle.
+   - This fixes false missing-file entries such as screen_bathy_bathy_....log.
+
+Verification
+- python -m py_compile benchmark_workflow_stage.py debug_bundle.py
+- full repo compile walk via py_compile
+- synthetic science-evaluation test with baseline/final/support in EPSG:4269 and river mask in EPSG:32619
+- synthetic auto-holdout test confirming multiple metric spatial blocks and sub-100% holdout selection
+- synthetic debug bundle test confirming normalized run-log filename matching
+
+Known remaining notable run issue
+- The April 1 run still showed:
+  - [RIVER][XS] XS realism pass applied: adjusted_nodes=0
+  - [RIVER][FRAME] XS propagation audit: scaffold xs nodes were built but no populated non-authoritative-support cells show downstream XS participation
+- I did not patch that here because it needs a deeper code-path review in river channel-surface propagation rather than another benchmark/debug fix.

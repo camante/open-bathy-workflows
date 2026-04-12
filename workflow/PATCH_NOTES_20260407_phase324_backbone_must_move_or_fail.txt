@@ -1,0 +1,10 @@
+workflow_v324 narrow pass
+
+Scope:
+- river_primary_surface_rebuild.py
+- tests/test_river_primary_surface_rebuild.py
+
+Intent:
+- make unsupported-mainstem backbone smoothing apply nonzero adjustments or fail honestly
+- add explicit backbone action gate receipt
+- mark unsupported-mainstem active targets as degraded when backbone action stayed inert

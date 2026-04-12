@@ -1,0 +1,16 @@
+Phase 187: measured-XS activation audit pass
+
+What changed:
+- Added measured-XS audit receipts in river_channel_frame.py
+  - river_measured_xs_audit_support_points.gpkg
+  - river_measured_xs_station_audit.csv
+  - river_measured_xs_handoff_receipt.json
+- Added scaffold-side measured-XS propagation audit in river_channel_scaffold.py
+  - river_measured_xs_node_audit.gpkg
+  - river_measured_xs_node_propagation.csv
+  - river_measured_xs_scaffold_handoff_receipt.json
+- Added targeted scaffold test coverage for the new receipts.
+
+Purpose:
+- Trace where authoritative XS support collapses between support sample, frame station candidate, and scaffold node activation.
+- No river science behavior change yet; this is an audit/root-cause pass.

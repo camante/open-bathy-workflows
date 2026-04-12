@@ -6,6 +6,8 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
+from nodata_utils import array_valid_mask
+
 from provenance_schema import PROVENANCE_CLASS_CODE_TO_NAME, PROVENANCE_CLASS_FAMILY
 from support_classes import SUPPORT_CLASS_CODE_TO_NAME, SUPPORT_CLASS_FAMILY, class_is_authoritative_locked
 
@@ -54,9 +56,9 @@ def summarize_conditioning_audit(
     conditioned = np.asarray(conditioned, dtype="float32")
     support = np.asarray(support, dtype="uint8")
     provenance = np.asarray(provenance, dtype="uint8")
-    locked = np.isfinite(auth)
+    locked = array_valid_mask(auth)
     gap = ~locked
-    conditioned_valid = np.isfinite(conditioned)
+    conditioned_valid = array_valid_mask(conditioned)
     changed_locked = locked & conditioned_valid & (~np.isclose(auth, conditioned, equal_nan=True))
     guidance = np.asarray(guidance_influence, dtype="float32") if guidance_influence is not None else None
     sigma = np.asarray(conditioned_uncertainty, dtype="float32") if conditioned_uncertainty is not None else None

@@ -1,0 +1,12 @@
+Phase 7: river withheld-support benchmark plumbing
+
+What changed
+- Added deterministic river_withheld_support_points.csv planning in benchmark_workflow_stage.py.
+- Added river_withheld_support_receipt.json so blind hard-problem holdout cases now produce a concrete next-run benchmark plan.
+- Added optional --river-withheld-support-csv CLI argument so a future run can exclude those support points from authoritative river support generation.
+- Added filtering logic in authoritative_support.py to apply the withheld-support plan and emit a receipt.
+- Added shared support-point key utilities in river_withheld_support.py.
+- Surfaced the withheld-support receipt in reports/ priority outputs.
+
+Intent
+This pass does not yet rerun the workflow inside the benchmark stage. It creates the deterministic withheld-support plan and the runtime plumbing needed to execute that benchmark on the next run.

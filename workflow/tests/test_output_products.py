@@ -157,3 +157,141 @@ def test_build_final_output_contract_includes_written_precedence_audit_for_real_
     assert audit["all_ok"] is True
     assert audit["authoritative_lock"]["locked_cell_count"] == 2
     assert audit["gap_fill"]["continuous_fill_achieved"] is True
+
+
+
+def test_final_output_contract_prefers_user_final_over_comparison_deliverable(tmp_path):
+    final_native = _touch(tmp_path / "combined" / "conditioned_depth.tif")
+    final_user = _touch(tmp_path / "combined" / "conditioned_depth_user.tif")
+    comparison = _touch(tmp_path / "combined" / "bathy_cudem_enhanced_comparison_navd88_epsg4269.tif")
+    final_prov = _touch(tmp_path / "combined" / "conditioned_prov.tif")
+    report = {
+        "outputs": {"final_comparison_navd88": str(comparison)},
+        "authoritative_base": {"status": "applied", "outputs": {"conditioned_depth": str(final_native)}},
+    }
+    cfg = SimpleNamespace(out_dir=tmp_path, authoritative_base="")
+    contract = build_final_output_contract(cfg, report, final_native=final_native, final_for_user=final_user, final_provenance=final_prov)
+    assert contract["selected_final_depth"] == str(final_user)
+    assert contract["selected_final_user"] == str(final_user)
+    assert contract["selected_final_invariant"] == str(final_native)
+    assert contract["selected_final_stage"] == "authoritative_conditioned"
+    assert contract["delivery_stage"] == "user_delivery"
+    assert contract["candidates"]["final_depth_native"] == str(final_native)
+    assert contract["candidates"]["final_depth_user"] == str(final_user)
+    assert contract["candidates"]["final_comparison_navd88"] == str(comparison)
+
+
+def test_final_output_contract_uses_reported_user_delivery_and_lock_validation(tmp_path):
+    final_native = _touch(tmp_path / "combined" / "conditioned_depth.tif")
+    reported_user = _touch(tmp_path / "combined" / "bathy_cudem_conditioned_navd88_epsg4269_all.tif")
+    comparison_all = _touch(tmp_path / "combined" / "bathy_cudem_enhanced_comparison_navd88_epsg4269_all.tif")
+    lock_validation = _touch(tmp_path / "combined" / "final_route_authoritative_lock_validation.json")
+    final_prov = _touch(tmp_path / "combined" / "conditioned_prov.tif")
+    report = {
+        "outputs": {
+            "final_depth_user_stable": str(reported_user),
+            "final_comparison_navd88_all": str(comparison_all),
+        },
+        "authoritative_base": {
+            "status": "applied",
+            "outputs": {
+                "conditioned_depth": str(final_native),
+                "final_route_authoritative_lock_validation": str(lock_validation),
+            },
+        },
+    }
+    cfg = SimpleNamespace(out_dir=tmp_path, authoritative_base="")
+    contract = build_final_output_contract(cfg, report, final_native=final_native, final_for_user=None, final_provenance=final_prov)
+    assert contract["selected_final_depth"] == str(reported_user)
+    assert contract["selected_final_user"] == str(reported_user)
+    assert contract["selected_final_invariant"] == str(final_native)
+    assert contract["selected_final_invariant_lock_validation"] == str(lock_validation)
+    assert contract["selected_final_invariant_lock_validation_target"] == str(final_native)
+    assert contract["candidates"]["final_comparison_navd88_all"] == str(comparison_all)
+
+
+def test_explicit_final_outputs_manifest_carries_invariant_lock_validation(tmp_path):
+    final_native = _touch(tmp_path / "combined" / "conditioned_depth.tif")
+    final_prov = _touch(tmp_path / "combined" / "conditioned_prov.tif")
+    lock_validation = _touch(tmp_path / "combined" / "final_route_authoritative_lock_validation.json")
+    report = {
+        "authoritative_base": {
+            "status": "applied",
+            "outputs": {
+                "conditioned_depth": str(final_native),
+                "final_route_authoritative_lock_validation": str(lock_validation),
+            },
+        },
+        "outputs": {
+            "final_depth_user_stable": str(_touch(tmp_path / "combined" / "bathy_cudem_conditioned_navd88_epsg4269_all.tif")),
+        },
+        "sdb": {"artifacts": {}},
+        "river": {"outputs": {}},
+    }
+    cfg = SimpleNamespace(out_dir=tmp_path, authoritative_base="")
+    manifest_path = write_explicit_final_outputs_manifest(cfg, report, final_native=final_native, final_for_user=None, final_provenance=final_prov)
+    payload = __import__("json").loads(Path(manifest_path).read_text(encoding="utf-8"))
+    assert payload["selected_final_invariant"] == str(final_native)
+    assert payload["selected_final_invariant_lock_validation"] == str(lock_validation)
+    assert payload["selected_final_invariant_lock_validation_target"] == str(final_native)
+
+
+def test_final_output_contract_ignores_comparison_arg_when_stable_user_exists(tmp_path):
+    final_native = _touch(tmp_path / "combined" / "conditioned_depth.tif")
+    stable_user = _touch(tmp_path / "combined" / "bathy_cudem_conditioned_navd88_epsg4269_all.tif")
+    comparison_all = _touch(tmp_path / "combined" / "bathy_cudem_enhanced_comparison_navd88_epsg4269_all.tif")
+    report = {
+        "outputs": {
+            "final_depth_user_stable": str(stable_user),
+            "final_comparison_navd88_all": str(comparison_all),
+        },
+        "authoritative_base": {"status": "applied", "outputs": {"conditioned_depth": str(final_native)}},
+    }
+    cfg = SimpleNamespace(out_dir=tmp_path, authoritative_base="")
+    contract = build_final_output_contract(cfg, report, final_native=final_native, final_for_user=comparison_all, final_provenance=None)
+    assert contract["selected_final_user"] == str(stable_user)
+    assert contract["selected_final_depth"] == str(stable_user)
+    assert contract["selected_final_invariant"] == str(final_native)
+
+
+def test_final_output_manifest_includes_river_graph_artifacts(tmp_path: Path):
+    final_native = _touch(tmp_path / "combined" / "conditioned_depth.tif")
+    final_prov = _touch(tmp_path / "combined" / "conditioned_prov.tif")
+    graph_mode = _touch(tmp_path / "river" / "river_channel_surface_graph_mode.tif")
+    support_class = _touch(tmp_path / "river" / "river_channel_surface_support_class.tif")
+    uncertainty = _touch(tmp_path / "river" / "river_channel_surface_uncertainty.tif")
+    hard_lock = _touch(tmp_path / "river" / "river_channel_surface_hard_lock.tif")
+    junction = _touch(tmp_path / "river" / "river_channel_surface_junction_constrained.tif")
+    unsupported = _touch(tmp_path / "river" / "river_channel_surface_unsupported_span.tif")
+    residual = _touch(tmp_path / "river" / "river_channel_surface_residual_to_candidate.tif")
+    graph_diag = _touch(tmp_path / "river" / "river_graph_backbone_diagnostics.gpkg")
+    physical = _touch(tmp_path / "river" / "river_graph_physical_plausibility_contract.json")
+    support_contract = _touch(tmp_path / "river" / "river_support_uncertainty_contract.json")
+    report = {
+        "authoritative_base": {"status": "applied", "outputs": {"conditioned_depth": str(final_native)}},
+        "river": {"outputs": {
+            "channel_surface_graph_mode": str(graph_mode),
+            "channel_surface_support_class": str(support_class),
+            "channel_surface_uncertainty": str(uncertainty),
+            "channel_surface_hard_lock": str(hard_lock),
+            "channel_surface_junction_constrained": str(junction),
+            "channel_surface_unsupported_span": str(unsupported),
+            "channel_surface_residual_to_candidate": str(residual),
+            "graph_backbone_diagnostics": str(graph_diag),
+            "graph_physical_plausibility_contract": str(physical),
+            "support_uncertainty_contract": str(support_contract),
+        }},
+    }
+    cfg = SimpleNamespace(out_dir=tmp_path, authoritative_base="")
+    outputs_path = write_explicit_final_outputs_manifest(cfg, report, final_native=final_native, final_for_user=None, final_provenance=final_prov)
+    payload = __import__("json").loads(Path(outputs_path).read_text(encoding="utf-8"))
+    assert payload["river_channel_surface_graph_mode"] == str(graph_mode)
+    assert payload["river_channel_surface_support_class"] == str(support_class)
+    assert payload["river_channel_surface_uncertainty"] == str(uncertainty)
+    assert payload["river_channel_surface_hard_lock"] == str(hard_lock)
+    assert payload["river_channel_surface_junction_constrained"] == str(junction)
+    assert payload["river_channel_surface_unsupported_span"] == str(unsupported)
+    assert payload["river_channel_surface_residual_to_candidate"] == str(residual)
+    assert payload["river_graph_backbone_diagnostics"] == str(graph_diag)
+    assert payload["river_graph_physical_plausibility_contract"] == str(physical)
+    assert payload["river_support_uncertainty_contract"] == str(support_contract)

@@ -10,6 +10,11 @@ from typing import Dict, Any, List, Tuple
 log = logging.getLogger(__name__)
 
 
+from final_dem_contract import build_final_dem_contract_summary
+from final_dem_policy import default_final_dem_policy
+from simple_river_stage_contract import simple_river_stage_status_placeholder, STAGE_RIVER_CENTERLINE, mark_stage_implemented
+
+
 class ContractTest:
     """Base class for a contract test."""
     
@@ -335,6 +340,75 @@ class SufficientTrainingDataTest(ContractTest):
         return self.passed
 
 
+class BundleAContractWiringTest(ContractTest):
+    """Lightweight contract smoke test for Bundle A route/policy wiring."""
+
+    def __init__(self):
+        super().__init__("bundle_a_contract_wiring", critical=True)
+
+    def run(self, context: Dict[str, Any]) -> bool:
+        try:
+            policy = default_final_dem_policy()
+            placeholder = simple_river_stage_status_placeholder()
+            summary = build_final_dem_contract_summary({
+                "simple_river_stage_status": placeholder,
+                "legacy_transitional_artifacts_present": [],
+            }, policy=policy)
+        except Exception as e:
+            self.passed = False
+            self.message = f"Bundle A contract wiring exception: {type(e).__name__}: {e}"
+            return False
+
+        checks = [
+            summary.get("current_route_mode") == policy.current_route_mode,
+            summary.get("target_route_mode") == policy.target_route_mode,
+            summary.get("final_dem_filename") == policy.final_dem_filename,
+            summary.get("internal_final_dem_filename") == policy.internal_final_dem_filename,
+            bool(summary.get("simple_river_stage_status")),
+        ]
+        self.passed = all(checks)
+        if self.passed:
+            self.value = {
+                "current_route_mode": summary.get("current_route_mode"),
+                "target_route_mode": summary.get("target_route_mode"),
+                "stages": len(summary.get("simple_river_stage_status", {})),
+            }
+            self.message = (
+                f"Bundle A route/policy contract wired: current={summary.get('current_route_mode')} "
+                f"target={summary.get('target_route_mode')} stages={len(summary.get('simple_river_stage_status', {}))}"
+            )
+        else:
+            self.message = "Bundle A contract summary missing expected policy or stage fields"
+        return self.passed
+
+
+class BundleBPhase1CenterlineContractTest(ContractTest):
+    """Lightweight contract smoke test for Bundle B phase 1 stage transition."""
+
+    def __init__(self):
+        super().__init__("bundle_b_phase1_centerline_contract", critical=True)
+
+    def run(self, context: Dict[str, Any]) -> bool:
+        try:
+            placeholder = simple_river_stage_status_placeholder()
+            updated = mark_stage_implemented(
+                placeholder,
+                stage_id=STAGE_RIVER_CENTERLINE,
+                output_artifact="river_centerline_points.gpkg",
+                record_count=1,
+                receipt_path="river_centerline_points_receipt.json",
+            )
+        except Exception as e:
+            self.passed = False
+            self.message = f"Bundle B phase 1 contract exception: {type(e).__name__}: {e}"
+            return False
+        item = updated.get(STAGE_RIVER_CENTERLINE, {})
+        self.passed = bool(item.get("implemented")) and item.get("receipt_path") == "river_centerline_points_receipt.json"
+        self.message = "Bundle B phase 1 centerline stage contract wiring ok" if self.passed else "Bundle B phase 1 centerline stage contract wiring failed"
+        self.value = item
+        return self.passed
+
+
 class ContractTestSuite:
     """Suite of contract tests for pipeline validation."""
     
@@ -348,6 +422,8 @@ class ContractTestSuite:
     
     def add_standard_tests(self):
         """Add standard contract tests."""
+        self.add_test(BundleAContractWiringTest())
+        self.add_test(BundleBPhase1CenterlineContractTest())
         self.add_test(XYZInFusedDataTest())
         self.add_test(XYZInTrainingDataTest())
         self.add_test(SourceValidationTest())

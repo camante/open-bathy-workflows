@@ -208,3 +208,104 @@ def test_validation_uses_native_final_for_authoritative_invariant_when_user_deli
         assert payload["selected_final_depth"] == str(final_user_p)
         assert payload["invariant_evaluation_depth"] == str(final_native_p)
         assert payload["authoritative_lock_invariant"]["ok"] is True
+
+
+
+@pytest.mark.skipif(not _rasterio_available(), reason="rasterio required")
+def test_validation_prefers_selected_final_invariant_when_present():
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        auth = np.array([[1.0, np.nan], [np.nan, np.nan]], dtype=np.float32)
+        final_native = np.array([[99.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+        comparison = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+        final_user = np.array([[9.0, 9.0], [9.0, 9.0]], dtype=np.float32)
+        support = np.array([
+            [int(SupportClass.AUTHORITATIVE_LOCKED), int(SupportClass.GUIDANCE_CONDITIONED_SDB)],
+            [int(SupportClass.GUIDANCE_CONDITIONED_RIVER), int(SupportClass.GUIDANCE_CONDITIONED_RIVER)],
+        ], dtype=np.float32)
+        prov = np.array([
+            [int(ProvenanceClass.AUTHORITATIVE_LOCKED), int(ProvenanceClass.SDB_CONDITIONED_FILL)],
+            [int(ProvenanceClass.RIVER_CONDITIONED_FILL), int(ProvenanceClass.RIVER_CONDITIONED_FILL)],
+        ], dtype=np.float32)
+        final_native_p = _write_tif(td / "final_native.tif", final_native)
+        comparison_p = _write_tif(td / "comparison.tif", comparison)
+        final_user_p = _write_tif(td / "final_user.tif", final_user)
+        auth_p = _write_tif(td / "auth.tif", auth)
+        support_p = _write_tif(td / "support.tif", support)
+        prov_p = _write_tif(td / "prov.tif", prov)
+
+        cfg = SimpleNamespace(out_dir=td, authoritative_base=auth_p, aoi="-71/-69/41/43", tile_bbox=None)
+        report = {"authoritative_base": {"outputs": {"support_class": str(support_p), "aligned_authoritative_base": str(auth_p)}}, "outputs": {}}
+        write_explicit_final_outputs_manifest(cfg, report, final_native=final_native_p, final_for_user=final_user_p, final_provenance=prov_p)
+        payload = json.loads((td / "final_outputs.json").read_text())
+        payload["selected_final_invariant"] = str(comparison_p)
+        (td / "final_outputs.json").write_text(json.dumps(payload), encoding="utf-8")
+        result = run_validation_invariance_framework(final_outputs_manifest=td / "final_outputs.json")
+        assert result["selected_final_depth"] == str(final_user_p)
+        assert result["invariant_evaluation_depth"] == str(comparison_p)
+        assert result["authoritative_lock_invariant"]["ok"] is True
+
+
+@pytest.mark.skipif(not _rasterio_available(), reason="rasterio required")
+def test_write_validation_summary_skips_when_no_selected_final_depth_exists():
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        cfg = SimpleNamespace(
+            out_dir=td,
+            authoritative_base=None,
+            aoi="-71/-69/41/43",
+            tile_bbox=None,
+            validation_truth=None,
+            validation_case_specs=[],
+            validation_case_manifest=None,
+            validation_guidance_baseline_case="baseline_cudem_interpolation",
+            validation_guidance_target_case="selected_final",
+            validation_require_guidance_non_degradation=False,
+            validation_guidance_rmse_tolerance=0.0,
+        )
+        report = {"outputs": {}, "seams": {}}
+        write_explicit_final_outputs_manifest(cfg, report, final_native=None, final_for_user=None, final_provenance=None)
+        out = write_validation_invariance_summary(cfg, report, final_native=None, final_for_user=None, final_provenance=None)
+        assert out is None
+        assert report["validation"]["status"] == "skipped_no_selected_final_depth"
+
+
+@pytest.mark.skipif(not _rasterio_available(), reason="rasterio required")
+def test_validation_uses_nested_precomputed_lock_validation_receipt():
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        auth = np.array([[1.0, np.nan], [np.nan, np.nan]], dtype=np.float32)
+        final_native = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+        support = np.array([
+            [int(SupportClass.AUTHORITATIVE_LOCKED), int(SupportClass.GUIDANCE_CONDITIONED_RIVER)],
+            [int(SupportClass.GUIDANCE_CONDITIONED_RIVER), int(SupportClass.GUIDANCE_CONDITIONED_RIVER)],
+        ], dtype=np.float32)
+        final_native_p = _write_tif(td / "final_native.tif", final_native)
+        auth_p = _write_tif(td / "auth.tif", auth)
+        support_p = _write_tif(td / "support.tif", support)
+        receipt = td / "final_route_authoritative_lock_validation.json"
+        receipt.write_text(json.dumps({
+            "artifacts": {"conditioned_depth": str(final_native_p)},
+            "written_artifact_validation": {
+                "validated": True,
+                "skipped": False,
+                "authoritative_hard_lock": {
+                    "ok": True,
+                    "mismatch_pixels": 0,
+                    "max_abs_diff_m": 0.0,
+                    "locked_finite_authoritative_pixels": 1,
+                },
+            },
+        }), encoding="utf-8")
+        final_outputs = {
+            "selected_final_depth": str(final_native_p),
+            "selected_final_invariant": str(final_native_p),
+            "selected_final_invariant_lock_validation": str(receipt),
+            "selected_final_invariant_lock_validation_target": str(final_native_p),
+            "conditioned_authoritative_base": str(auth_p),
+            "support_class": str(support_p),
+        }
+        (td / "final_outputs.json").write_text(json.dumps(final_outputs), encoding="utf-8")
+        payload = run_validation_invariance_framework(final_outputs_manifest=td / "final_outputs.json")
+        assert payload["authoritative_lock_invariant"]["ok"] is True
+        assert payload["authoritative_lock_invariant"]["source"] == "final_dem_contract_validator"

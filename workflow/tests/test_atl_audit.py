@@ -65,3 +65,37 @@ def test_summarize_atl_raw_to_retained_audit_handles_missing_audits():
     assert summary["cudem_framework_assessment"]["recommended_use"] == "multi_source_atl"
     assert isinstance(rows, pd.DataFrame)
     assert set(rows["source"]) == {"atl03", "atl24"}
+
+
+def test_cmr_latest_concept_id_survives_bad_query_and_selects_latest_version(monkeypatch):
+    class _Resp:
+        def __init__(self, payload=None, error=False):
+            self._payload = payload or {}
+            self._error = error
+        def raise_for_status(self):
+            if self._error:
+                raise RuntimeError("400 bad request")
+        def json(self):
+            return self._payload
+
+    class _Requests:
+        def __init__(self):
+            self.calls = 0
+        def get(self, url, params=None, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                return _Resp(error=True)
+            return _Resp({
+                "feed": {
+                    "entry": [
+                        {"id": "C1-OLD", "version_id": "005", "revision_id": 3},
+                        {"id": "C1-NEW", "version_id": "006", "revision_id": 1},
+                    ]
+                }
+            })
+
+    req = _Requests()
+    monkeypatch.setattr(atl, "_lazy_requests", lambda: req)
+    cid = atl._cmr_latest_concept_id("ATL03")
+    assert cid == "C1-NEW"
+    assert req.calls == 2

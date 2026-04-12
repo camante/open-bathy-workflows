@@ -1,0 +1,9 @@
+Phase 198: measured-support-distance semantics propagation
+
+- Fixed river_longitudinal_profile.py so profile_support_present now reflects measured support, not raw geometric source count. Stations far from authoritative anchors with only bank/XS/centerline geometry are no longer counted as supported.
+- Reclassified far-from-measured bank-only stations to unsupported in profile coverage classes.
+- Added measured-support-distance reach statistics in river_reach_attributes.py: measured_support_distance_median_m, measured_support_distance_min_m, and far_from_measured_fraction.
+- Propagated those reach attributes through river_longitudinal_tendency.py and back onto node rows so downstream stages can use them directly.
+- Updated river_support_semantics.py to use measured-support distance when choosing support regime, template type, longitudinal regime, envelope class, and rebuild eligibility.
+- Boosted primary surface rebuild weights in far-from-measured reaches so unsupported upstream sections are no longer held back by distance-blind semantics.
+- Added targeted tests for distance-aware support semantics.

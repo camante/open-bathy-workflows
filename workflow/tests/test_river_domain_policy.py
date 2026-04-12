@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from river_domain_policy import evaluate_river_domain_summary, load_river_domain_summary
+from river_domain_mask import _resolve_channel_source_policy
 
 
 def test_evaluate_river_domain_summary_ok():
@@ -45,3 +46,21 @@ def test_load_river_domain_summary(tmp_path: Path):
     p.write_text('{"corridor_pixels": 5}', encoding='utf-8')
     out = load_river_domain_summary(p)
     assert out["corridor_pixels"] == 5
+
+
+def test_resolve_channel_source_policy_auto_prefers_corridor_when_nhdarea_empty():
+    effective, reason = _resolve_channel_source_policy('auto', has_usable_nhdarea=False)
+    assert effective == 'corridor'
+    assert reason == 'nhdarea_unusable_or_empty'
+
+
+def test_resolve_channel_source_policy_explicit_nhdarea_stays_strict():
+    effective, reason = _resolve_channel_source_policy('nhdarea', has_usable_nhdarea=False)
+    assert effective == 'nhdarea'
+    assert reason is None
+
+
+def test_resolve_channel_source_policy_auto_prefers_corridor_when_nhdarea_overlap_is_too_low():
+    effective, reason = _resolve_channel_source_policy('auto', has_usable_nhdarea=True, nhdarea_overlap_frac=0.002)
+    assert effective == 'corridor'
+    assert reason == 'nhdarea_low_corridor_overlap'

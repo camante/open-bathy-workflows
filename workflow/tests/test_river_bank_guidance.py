@@ -146,3 +146,42 @@ def test_graph_informed_bank_context_surfaces_damp_near_estuary_and_confluence(m
     assert np.nanmax(ctx["bank_graph_confidence"]) > 0.0
     assert np.nanmin(ctx["bank_confluence_damping"]) < 1.0
     assert ctx["bank_estuary_side_decay"][2, 2] < ctx["bank_estuary_side_decay"][0, 0]
+
+
+def test_xs_bank_guidance_prefers_lower_bank_when_sides_are_strongly_asymmetric(monkeypatch):
+    _install_fake_rasterio(monkeypatch)
+    bank_points = _BankPoints([
+        {"side": "left", "bank_z_m": 2.0, "continuity_weight": 1.0, "geometry": _Pt(5, 15)},
+        {"side": "right", "bank_z_m": 8.0, "continuity_weight": 1.0, "geometry": _Pt(15, 15)},
+    ])
+    corridor = np.ones((3, 3), dtype=bool)
+    surfaces = compute_xs_bank_guidance_surfaces(
+        corridor_mask=corridor,
+        transform=_Transform(),
+        auth=np.full((3, 3), np.nan, dtype=np.float32),
+        xs_gpkg="unused.gpkg",
+        bank_points_gdf=bank_points,
+    )
+    center = float(surfaces["bank_elevation"][1, 1])
+    assert np.isfinite(center)
+    assert center < 5.0
+
+
+def test_bank_edge_guidance_from_authoritative_is_edge_limited():
+    auth = np.array([
+        [10, 11, 12, 13, 14],
+        [15, 16, 17, 18, 19],
+        [20, 21, 22, 23, 24],
+        [25, 26, 27, 28, 29],
+        [30, 31, 32, 33, 34],
+    ], dtype=np.float32)
+    corridor = np.zeros((5, 5), dtype=bool)
+    corridor[:, 1:4] = True
+    edge, bank_distance_m, bank_influence, bank_surface = rbg.compute_bank_edge_guidance_from_authoritative(
+        auth, corridor, pixel_size_m=10.0, edge_guidance_distance_m=10.0, max_bank_distance_m=80.0
+    )
+    assert np.isfinite(bank_surface[:, 1]).all()
+    assert np.isfinite(bank_surface[:, 3]).all()
+    assert np.isnan(bank_surface[:, 2]).all()
+    assert np.all(bank_influence[:, 2] == 0.0)
+    assert np.all(edge[:, 1:4] >= 0)

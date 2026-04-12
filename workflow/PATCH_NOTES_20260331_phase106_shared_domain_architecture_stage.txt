@@ -1,0 +1,18 @@
+Phase 1 of river/SDB architectural consistency.
+
+What changed:
+- Promoted the shared-domain stage outputs to canonical config/report paths:
+  - base_water_mask
+  - ocean_connectivity_mask
+  - river_candidate_domain_mask
+  - estuary_handoff_mask
+  - river_active_domain_mask
+  - sdb_candidate_domain_mask
+- Added a dedicated shared_domain_stage section to the run report.
+- Recorded the canonical domain masks and review artifacts in report['outputs'].
+- Marked the shared-domain stage as ready via cfg.shared_domain_stage_ready.
+- Inlined domain_summary.json into the report when available for easier debugging.
+
+Intent:
+- Domains are now first-class workflow artifacts before river/SDB generation.
+- This is a non-disruptive architecture pass; later phases will make activation and downstream routing rely on these canonical products more strictly.

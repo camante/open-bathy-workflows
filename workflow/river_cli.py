@@ -16,6 +16,7 @@ def build_river_skeleton_command(
     out_bed: str | Path,
     authoritative_passthrough_args: Optional[Iterable[str]] = None,
     debug_dir: Optional[str | Path] = None,
+    channel_template_json: Optional[str | Path] = None,
 ) -> List[str]:
     """Build the common river_skeleton_bathy.py command used by bathy_main.
 
@@ -108,4 +109,8 @@ def build_river_skeleton_command(
         ])
     if debug_dir:
         cmd.append(f"--debug-dir={debug_dir}")
+    if channel_template_json:
+        _tp = Path(channel_template_json)
+        if _tp.exists():
+            cmd.append(f"--channel-template-json={_tp}")
     return cmd

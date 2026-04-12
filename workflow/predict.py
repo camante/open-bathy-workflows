@@ -18,6 +18,7 @@ import json
 import logging
 import argparse
 import subprocess
+from raster_contract import validate_gdal_output
 from process_utils import run_cmd
 import shlex
 from pathlib import Path
@@ -375,12 +376,15 @@ def _export_sdb_guide_points(
     *,
     min_confidence: float = 0.15,
     max_points: int = 5000,
-) -> None:
+) -> int:
     """Export spatially thinned SDB pseudo-soundings as a GeoPackage.
 
     Each point carries depth, confidence, guidance_weight, uncertainty, and
     provenance metadata.  Points are subordinate to authoritative survey data
     and must be treated as confidence-weighted interpolation guidance only.
+
+    Returns the number of points written (0 if no valid pixels).
+    Always writes the output file so downstream can find it.
     """
     import geopandas as gpd
     from shapely.geometry import Point
@@ -400,11 +404,15 @@ def _export_sdb_guide_points(
             conf = ds.read(1).astype("float32")
         valid &= np.isfinite(conf) & (conf != NODATA_VAL) & (conf >= min_confidence)
 
+    # NOTE: guidance_weight is attached as *metadata* on each point, not used
+    # as a selection filter.  In authoritative-dense areas the weight is near
+    # zero, but the points are still structurally required by the final-route
+    # stage.  Filtering on gw > 0 would produce an empty file and crash the
+    # downstream guidance assembly.
     gw = None
     if guidance_weight_path and os.path.exists(guidance_weight_path):
         with rasterio.open(guidance_weight_path) as ds:
             gw = ds.read(1).astype("float32")
-        valid &= np.isfinite(gw) & (gw != NODATA_VAL) & (gw > 0.05)
 
     unc = None
     if uncertainty_path and os.path.exists(uncertainty_path):
@@ -412,9 +420,22 @@ def _export_sdb_guide_points(
             unc = ds.read(1).astype("float32")
 
     rows, cols = np.where(valid)
+    out_p = Path(out_gpkg)
     if rows.size == 0:
-        log.info("No valid SDB pixels above confidence threshold for guide-point export.")
-        return
+        log.info("No valid SDB pixels above confidence threshold for guide-point export; writing empty GPKG.")
+        # Write an empty GPKG so downstream can find the file
+        gdf = gpd.GeoDataFrame(
+            {"depth_m": np.array([], dtype="float32"),
+             "artifact_role": [],
+             "authoritative": [],
+             "provenance": []},
+            geometry=[],
+            crs=crs,
+        )
+        if out_p.exists():
+            out_p.unlink()
+        gdf.to_file(out_gpkg, driver="GPKG")
+        return 0
 
     # Spatial thinning: subsample to max_points using stride
     step = max(int(np.sqrt(rows.size / max(max_points, 1))), 1)
@@ -440,11 +461,11 @@ def _export_sdb_guide_points(
         geometry=[Point(x, y) for x, y in zip(xs, ys)],
         crs=crs,
     )
-    out_p = Path(out_gpkg)
     if out_p.exists():
         out_p.unlink()
     gdf.to_file(out_gpkg, driver="GPKG")
     log.info("Exported %d SDB guide points to %s", len(gdf), out_gpkg)
+    return len(gdf)
 
 
 # -----------------------------------------------------------------------------
@@ -1693,7 +1714,7 @@ def predict_scene(
         # -------------------------------------------------------------------
         guide_points_path = str(Path(out_path).with_name(Path(out_path).stem + "_guide_points.gpkg"))
         try:
-            _export_sdb_guide_points(
+            n_guide = _export_sdb_guide_points(
                 depth_path=out_path,
                 confidence_path=conf_path,
                 guidance_weight_path=guidance_weight_path,
@@ -1703,7 +1724,11 @@ def predict_scene(
                 max_points=5000,
             )
             rep.setdefault("predict", {})["guide_points_path"] = guide_points_path
-            log.info("SDB guide points exported: %s", guide_points_path)
+            rep.setdefault("predict", {})["guide_points_count"] = n_guide
+            if n_guide > 0:
+                log.info("SDB guide points exported: %s (%d points)", guide_points_path, n_guide)
+            else:
+                log.info("SDB guide points file written (empty — no confident pixels in AOI): %s", guide_points_path)
         except (ImportError, ModuleNotFoundError, OSError, ValueError, RuntimeError):
             log.debug("SDB guide-point export skipped (optional dependency missing or no valid pixels)", exc_info=True)
 
@@ -1727,11 +1752,31 @@ def predict_scene(
     return {"status": "ok"}
 
 
+def _source_expected_nodata(path: str) -> float | None:
+    """Return the declared source nodata for contract-preserving GDAL outputs."""
+    try:
+        from raster_contract import collect_raster_spec
+        return collect_raster_spec(path).nodata
+    except Exception:
+        log.debug("Could not inspect source nodata for %s", path, exc_info=True)
+        return None
+
+
 def reproject_to_nad83(src_path: str, dst_path: str):
+    expected_nodata = _source_expected_nodata(src_path)
     cmd = f"gdalwarp -overwrite -t_srs EPSG:4269 -r bilinear -of GTiff {shlex.quote(src_path)} {shlex.quote(dst_path)}"
     log.info("Reprojecting with: %s", cmd)
     try:
         run_cmd(shlex.split(cmd), check=True)
+        validate_gdal_output(
+            dst_path,
+            operation='predict.reproject_to_nad83',
+            expected_crs='EPSG:4269',
+            expected_nodata=expected_nodata,
+            source_path=src_path,
+            min_allowed=-1000.0,
+            max_allowed=1000.0,
+        )
     except (OSError, subprocess.CalledProcessError):
         log.warning("gdalwarp failed.")
 

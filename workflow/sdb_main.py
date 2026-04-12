@@ -303,7 +303,7 @@ def _require_sdb_runtime_deps() -> None:
     require(gpd, "geopandas", "Needed for vector I/O/masking in SDB pipeline.")
 
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from sdb_guidance import build_sdb_guidance_manifest, write_sdb_guidance_manifest
+from sdb_guidance import build_sdb_guidance_manifest, write_sdb_guidance_manifest, write_sdb_authoritative_locked_guidance
 
 # Import new improvement modules
 try:
@@ -1622,32 +1622,54 @@ def _write_sdb_manifest(
         raster_quickstats = raster_quickstats or ctx.raster_quickstats
     else:
         args = ctx_or_args
-        fallback_registry = None
-
     out_tif_navd88 = None
+    lock_outputs: Dict[str, Any] = {}
+    lock_outputs_epsg4269: Dict[str, Any] = {}
     if out_tif is not None:
+        out_path = Path(out_tif)
+        navd_candidate = out_path.with_name(out_path.stem + "_bed_navd88" + out_path.suffix)
+        if navd_candidate.exists():
+            out_tif_navd88 = navd_candidate
         try:
-            out_path_for_navd = Path(out_tif)
-            candidate_navd88 = out_path_for_navd.with_name(f"{out_path_for_navd.stem}_bed_navd88{out_path_for_navd.suffix}")
-            if candidate_navd88.exists():
-                out_tif_navd88 = candidate_navd88
-        except (TypeError, ValueError, OSError):
-            out_tif_navd88 = None
+            lock_outputs = write_sdb_authoritative_locked_guidance(
+                out_path,
+                support_mask_path=getattr(args, 'sdb_authoritative_support_mask', None),
+                support_values_path=getattr(args, 'sdb_authoritative_support_values', None),
+                logger=log,
+            )
+            epsg4269_candidate = out_path.with_name(out_path.stem + '_epsg4269' + out_path.suffix)
+            if epsg4269_candidate.exists():
+                lock_outputs_epsg4269 = write_sdb_authoritative_locked_guidance(
+                    epsg4269_candidate,
+                    support_mask_path=getattr(args, 'sdb_authoritative_support_mask', None),
+                    support_values_path=getattr(args, 'sdb_authoritative_support_values', None),
+                    logger=log,
+                )
+        except Exception as exc:
+            log.warning('Failed to write authoritative-locked SDB guidance: %s', exc, exc_info=True)
     # -------------------------------------------------------------------------
     # Artifact manifest paths are derived from run_id, not guessed
     # -------------------------------------------------------------------------
     # Primary depth output (EPSG:4269 if NAD83 reprojection is enabled)
     try:
-        # Prefer the NAD83-reprojected depth if it was created, otherwise use the native output.
+        # Prefer authoritative-locked NAD83 guidance if it was created, otherwise locked native, otherwise raw depth.
         out_path = Path(out_tif)
-        depth_primary = out_path.with_name(out_path.stem + "_epsg4269" + out_path.suffix)
-        if not depth_primary.exists():
-            depth_primary = out_path
+        raw_depth_primary = out_path.with_name(out_path.stem + "_epsg4269" + out_path.suffix)
+        if not raw_depth_primary.exists():
+            raw_depth_primary = out_path
+        depth_primary = raw_depth_primary
+        locked_epsg = raw_depth_primary.with_name(raw_depth_primary.stem + "_authoritative_locked" + raw_depth_primary.suffix)
+        locked_native = out_path.with_name(out_path.stem + "_authoritative_locked" + out_path.suffix)
+        if locked_epsg.exists():
+            depth_primary = locked_epsg
+        elif locked_native.exists():
+            depth_primary = locked_native
 
         # Write manifest (relative paths, rooted at out_root)
         artifacts = {
             "run_id": run_id if run_id is not None else None,
             "depth_raster": str(depth_primary.relative_to(out_root)) if str(depth_primary).startswith(str(out_root)) else str(depth_primary),
+            "raw_prediction_raster": str(raw_depth_primary.relative_to(out_root)) if str(raw_depth_primary).startswith(str(out_root)) else str(raw_depth_primary),
         }
 
         # Optional artifacts (only if present)
@@ -1671,6 +1693,16 @@ def _write_sdb_manifest(
         prov_tif = Path(str(out_tif)).with_name(Path(str(out_tif)).stem + "_provenance.tif")
         if prov_tif.exists():
             artifacts["provenance_raster"] = str(prov_tif.relative_to(out_root)) if str(prov_tif).startswith(str(out_root)) else str(prov_tif)
+        lock_contract = depth_primary.with_name(depth_primary.stem.replace('_authoritative_locked','') + '_lock_contract.json')
+        if depth_primary.name.endswith('_authoritative_locked.tif'):
+            base_for_lock = Path(str(raw_depth_primary))
+            lock_contract = base_for_lock.with_name(base_for_lock.stem + '_lock_contract.json')
+            lock_diff = base_for_lock.with_name(base_for_lock.stem + '_lock_diff_before_overwrite' + base_for_lock.suffix)
+            if lock_diff.exists():
+                artifacts["lock_diff_before_overwrite_raster"] = str(lock_diff.relative_to(out_root)) if str(lock_diff).startswith(str(out_root)) else str(lock_diff)
+            if lock_contract.exists():
+                artifacts["sdb_lock_contract"] = str(lock_contract.relative_to(out_root)) if str(lock_contract).startswith(str(out_root)) else str(lock_contract)
+            artifacts["sdb_locked_guidance_raster"] = str(depth_primary.relative_to(out_root)) if str(depth_primary).startswith(str(out_root)) else str(depth_primary)
 
         guidance_manifest = build_sdb_guidance_manifest(out_root=out_root, depth_raster=out_tif, args=args)
         guidance_artifacts = guidance_manifest.get("artifacts", {})
@@ -1982,7 +2014,8 @@ def _filter_extra_xyz_for_sdb(df_xyz_local, args, ctx=None):
     authoritative_max_abs_depth_m = 60.0
     authoritative_tags = (
         "hydronos", "ehydro", "survey", "sonar", "sound", "lidar", "bag",
-        "multibeam", "singlebeam", "mbes", "usace", "usgs", "noaa"
+        "multibeam", "singlebeam", "mbes", "usace", "usgs", "noaa",
+        "authoritative_sdb_support", "authoritative_base"
     )
     try:
         _ctx_kd = getattr(ctx, 'kd_max_depth_m', None) if ctx is not None else None
@@ -2150,6 +2183,12 @@ def _run_fusion(
                 dmed = float(np.nanmedian(df_xyz["depth_m"])) if "depth_m" in df_xyz.columns else float("nan")
                 dmax = float(np.nanmax(df_xyz["depth_m"])) if "depth_m" in df_xyz.columns else float("nan")
                 log.info("Loaded extra XYZ points: n=%s depth(min/med/max)=%.3f/%.3f/%.3f m", n_xyz, dmin, dmed, dmax)
+                if "source" in df_xyz.columns:
+                    src_counts = df_xyz["source"].astype(str).str.lower().value_counts().to_dict()
+                    log.info("Loaded extra XYZ source breakdown: %s", src_counts)
+                    auth_sdb_n = int(sum(v for k, v in src_counts.items() if str(k).startswith("authoritative_sdb_support")))
+                    if auth_sdb_n > 0:
+                        log.info("Loaded authoritative_sdb_support points for SDB training/validation: n=%s", auth_sdb_n)
             else:
                 log.warning("Extra XYZ inputs were provided but produced 0 usable points after parsing/filtering.")
         except Exception:
@@ -2389,6 +2428,14 @@ def main():
     if config_settings:
         log.info("Applying regional configuration")
 
+        def _cli_flag_explicit(flag: str) -> bool:
+            if not flag:
+                return False
+            for arg in sys.argv[1:]:
+                if arg == flag or arg.startswith(flag + "="):
+                    return True
+            return False
+
         for key, value in config_settings.items():
             if key == "preferred_months":
                 setattr(args, "preferred_months", value)
@@ -2407,7 +2454,7 @@ def main():
             elif key == "refraction":
                 if not value: cli_flag = "--no-refraction"
 
-            if cli_flag in sys.argv:
+            if _cli_flag_explicit(cli_flag):
                 log.info("   [Override Skipped] User explicitly set %s. Keeping value: %s", cli_flag, getattr(args, key))
             else:
                 if key == "sdb_mode" and getattr(args, "extra_xyz", None):
@@ -2600,7 +2647,7 @@ def main():
             rr.add('model_bank.dir', str(model_bank_dir))
             rr.add('model_bank.max_samples', int(args.bank_max_samples))
     else:
-        log.info('disabled')
+        log.info('model bank: disabled')
         if rr is not None:
             rr.add('model_bank.enabled', False)
 
@@ -3705,6 +3752,14 @@ def parse_args():
                    help="Force rebuild of the cached authoritative-base entry for this AOI/settings.")
     p.add_argument("--authoritative-base-tile-url-field", default=None,
                    help="Optional explicit tile-index attribute containing the DEM download URL during authoritative-base auto-build.")
+    p.add_argument("--sdb-authoritative-support-mask", default=None,
+                   help="Template-aligned authoritative support mask for the SDB candidate domain.")
+    p.add_argument("--sdb-authoritative-support-values", default=None,
+                   help="Template-aligned authoritative support values raster for the SDB candidate domain.")
+    p.add_argument("--sdb-authoritative-support-points", default=None,
+                   help="Authoritative SDB support points used for training/validation anchoring.")
+    p.add_argument("--sdb-authoritative-support-contract", default=None,
+                   help="JSON contract describing authoritative SDB support products.")
     p.add_argument("--cache-strict", action="store_true", default=True,
                    help="Require exact-match (params+inputs) cache hits; otherwise rebuild.")
     p.add_argument("--no-cache-strict", dest="cache_strict", action="store_false",

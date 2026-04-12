@@ -1,0 +1,55 @@
+PATCH NOTES — Phase 165: Review cleanup of Phase 164 XS/benchmark changes
+=====================================================================
+Date: 2026-04-01
+
+Scope
+-----
+Review of the uploaded `workflow_phase164_xs_roughness_benchmark.zip` after the XS-saturation,
+longitudinal-roughness, and benchmark-stratification changes described in the pasted notes.
+This pass focused on concrete cleanup and contract hardening rather than adding new behavior.
+
+What was verified
+-----------------
+- All Python files compile clean with `python -m py_compile`.
+- The new benchmark science-evaluation path was exercised on a synthetic aligned raster case.
+- A synthetic misaligned-raster case now fails explicitly instead of silently producing a
+  misleading science-evaluation grid.
+
+Changes made
+------------
+1. benchmark_workflow_stage.py
+   - Added explicit grid-alignment validation for the science-evaluation benchmark:
+     baseline, final, support-class, and river-mask rasters must now match in CRS,
+     dimensions, and affine transform.
+   - Removed the broad catch-all fallback in `_build_science_evaluation_grid()` that used to
+     suppress benchmark errors and return `{"available": false, "reason": "exception"}`.
+     Invalid benchmark inputs now fail transparently.
+   - Replaced manual x/y center reconstruction with `rasterio.transform.xy(..., offset="center")`
+     so exported benchmark grid coordinates come directly from rasterio.
+   - Centralized authoritative-locked support-code lookup via `_support_class_code()` instead of
+     the previous inline ad hoc pattern.
+
+2. river_xs_realism.py
+   - Removed the dead and misleading `_is_measured_xs_supported()` helper. It was unused and
+     actually implemented authoritative-lock logic, not measured-XS logic.
+   - Removed an unused `_REQUIRED_ROLES` constant left behind in the file.
+
+Why these changes matter
+------------------------
+- The new science-evaluation benchmark is useful only if it compares truly co-registered rasters.
+  Before this cleanup, a misaligned support-class or river-mask raster could silently contaminate
+  the result.
+- The deleted helper in `river_xs_realism.py` was exactly the kind of transition-glue / naming
+  residue that makes later reviews harder and risks future misuse.
+
+Files changed in this pass
+--------------------------
+- benchmark_workflow_stage.py
+- river_xs_realism.py
+
+Verification notes
+------------------
+- Full compile check passed after edits.
+- Synthetic benchmark smoke test passed:
+  - aligned case produced a valid science-evaluation grid
+  - misaligned river-mask case raised a clear `ValueError`

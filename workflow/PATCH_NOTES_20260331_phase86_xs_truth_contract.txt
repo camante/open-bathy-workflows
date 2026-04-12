@@ -1,0 +1,11 @@
+Phase 86: XS participation truth contract
+
+Changes:
+- Reviewed phase85 centerline producer cleanup and confirmed the component-axis fallback fix is the right direction.
+- Tightened XS participation semantics so scaffold-side XS structure alone no longer counts as active bed support.
+- Added river_xs_participation_contract.json as an explicit artifact summarizing whether XS is inactive, structural_only, or active_bed_support.
+- XS status now distinguishes:
+  - sampled/authoritative XS support reaching frame/surface = active_bed_support
+  - scaffold-only or candidate-only XS structure without frame/surface support = structural_only
+- Added frame metric xs_candidate_station_count so guidance status can distinguish candidate XS presence from actual bed-support use.
+- Added regression coverage proving scaffold-only XS remains structural_only.

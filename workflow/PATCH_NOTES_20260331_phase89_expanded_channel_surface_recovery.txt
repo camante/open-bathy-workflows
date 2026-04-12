@@ -1,0 +1,16 @@
+Phase 89: Expanded channel-surface recovery before bank-derived fallback
+
+What changed
+- geo/raster_ops.py
+  - compute_depth_from_bed_and_dem() now adds another in-channel recovery step before bank fallback:
+    1. same_component_surface
+    2. adjacent_channel_surface
+    3. expanded_channel_surface
+    4. bank_ring_surface
+    5. unresolved
+  - expanded_channel_surface searches a limited wider channel neighborhood before using bank-derived WSE
+  - receipts now report expanded-channel support counts and component ids
+
+Why
+- Some components still used bank-derived fallback only because their nearest usable in-channel support was a few channel pixels farther away than the immediate adjacency halo.
+- This keeps recovery in-channel longer before using bank-derived support.

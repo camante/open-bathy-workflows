@@ -6,6 +6,7 @@ from typing import Any, Dict, Mapping, Optional
 
 import numpy as np
 
+from nodata_utils import sanitize_array
 from support_classes import SupportClass
 from validation_runner import (
     compute_provenance_class_metrics,
@@ -34,7 +35,6 @@ def _read_json(path: Path) -> Dict[str, Any]:
 def _load_float_raster(path: str | Path, *, reference: Optional[str | Path] = None) -> np.ndarray:
     try:
         import rasterio
-        from rasterio.warp import reproject, Resampling
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("rasterio is required for validation/invariance framework") from exc
 
@@ -43,11 +43,7 @@ def _load_float_raster(path: str | Path, *, reference: Optional[str | Path] = No
         raise FileNotFoundError(f"Raster not found: {src_path}")
     if reference is None:
         with rasterio.open(src_path) as src:
-            arr = src.read(1).astype(np.float32)
-            nodata = src.nodata
-            if nodata is not None:
-                arr[np.isclose(arr, np.float32(nodata))] = np.nan
-            return arr
+            return sanitize_array(src.read(1), src.nodata, dtype=np.float32)
 
     ref_path = Path(reference)
     if not ref_path.exists():
@@ -61,8 +57,14 @@ def _load_float_raster(path: str | Path, *, reference: Optional[str | Path] = No
             and src_ds.width == ref_ds.width
             and src_ds.height == ref_ds.height
         ):
-            out = src_ds.read(1).astype(np.float32)
+            out = sanitize_array(src_ds.read(1), src_ds.nodata, dtype=np.float32)
         else:
+            try:
+                import rasterio.warp as rio_warp
+                reproject = rio_warp.reproject
+                Resampling = rio_warp.Resampling
+            except (ImportError, AttributeError) as exc:  # pragma: no cover
+                raise RuntimeError("rasterio reproject support is required for validation/invariance framework") from exc
             reproject(
                 source=rasterio.band(src_ds, 1),
                 destination=out,
@@ -74,15 +76,12 @@ def _load_float_raster(path: str | Path, *, reference: Optional[str | Path] = No
                 dst_nodata=np.float32(np.nan),
                 resampling=Resampling.bilinear,
             )
-        if src_ds.nodata is not None:
-            out[np.isclose(out, np.float32(src_ds.nodata))] = np.nan
-        return out
+        return sanitize_array(out, src_ds.nodata, dtype=np.float32)
 
 
 def _load_class_raster(path: str | Path, *, reference: str | Path) -> np.ndarray:
     try:
         import rasterio
-        from rasterio.warp import reproject, Resampling
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("rasterio is required for validation/invariance framework") from exc
 
@@ -100,6 +99,12 @@ def _load_class_raster(path: str | Path, *, reference: str | Path) -> np.ndarray
         ):
             out = src_ds.read(1).astype(np.int32)
         else:
+            try:
+                import rasterio.warp as rio_warp
+                reproject = rio_warp.reproject
+                Resampling = rio_warp.Resampling
+            except (ImportError, AttributeError) as exc:  # pragma: no cover
+                raise RuntimeError("rasterio reproject support is required for validation/invariance framework") from exc
             reproject(
                 source=rasterio.band(src_ds, 1),
                 destination=out,
@@ -228,8 +233,8 @@ def run_validation_invariance_framework(*,
     tolerance: float = 1e-6,
 ) -> Dict[str, Any]:
     final_outputs = _read_json(Path(final_outputs_manifest))
-    selected_final = final_outputs.get("selected_final_depth") or final_outputs.get("final_depth_native") or final_outputs.get("final_depth_user")
-    invariant_final = final_outputs.get("selected_final_native") or final_outputs.get("final_depth_native") or selected_final
+    selected_final = final_outputs.get("selected_final_depth") or final_outputs.get("final_depth_user") or final_outputs.get("final_depth_native")
+    invariant_final = final_outputs.get("selected_final_invariant") or final_outputs.get("selected_final_native") or final_outputs.get("final_depth_native") or selected_final
     support_path = final_outputs.get("support_class")
     provenance_path = final_outputs.get("final_provenance_native") or final_outputs.get("selected_final_provenance")
     authoritative_base = final_outputs.get("conditioned_authoritative_base") or final_outputs.get("authoritative_base")
@@ -242,7 +247,27 @@ def run_validation_invariance_framework(*,
     provenance = _load_class_raster(provenance_path, reference=invariant_final) if provenance_path else None
 
     authoritative_contract = None
-    if authoritative_base and support_path and invariant_final:
+    precomputed_contract_path = final_outputs.get("selected_final_invariant_lock_validation")
+    precomputed_contract_target = final_outputs.get("selected_final_invariant_lock_validation_target")
+    if precomputed_contract_path and invariant_final and (not precomputed_contract_target or str(precomputed_contract_target) == str(invariant_final)):
+        try:
+            authoritative_contract = _read_json(Path(precomputed_contract_path))
+            if isinstance(authoritative_contract, dict) and isinstance(authoritative_contract.get("written_artifact_validation"), dict):
+                nested = authoritative_contract.get("written_artifact_validation")
+                artifacts = authoritative_contract.get("artifacts") if isinstance(authoritative_contract.get("artifacts"), dict) else {}
+                conditioned_depth = artifacts.get("conditioned_depth")
+                if (not conditioned_depth) or str(conditioned_depth) == str(invariant_final):
+                    authoritative_contract = dict(nested)
+                    authoritative_contract["source"] = "precomputed_selected_final_invariant_lock_validation"
+                else:
+                    authoritative_contract = None
+            elif isinstance(authoritative_contract, dict):
+                authoritative_contract["source"] = "precomputed_selected_final_invariant_lock_validation"
+            else:
+                authoritative_contract = None
+        except Exception:
+            authoritative_contract = None
+    if authoritative_contract is None and authoritative_base and support_path and invariant_final:
         authoritative_contract = validate_written_final_dem_contract(
             final_depth=invariant_final,
             aligned_authoritative_base=authoritative_base,

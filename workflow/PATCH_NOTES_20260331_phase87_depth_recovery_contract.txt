@@ -1,0 +1,31 @@
+Phase 87: per-component depth surface recovery contract
+
+Summary
+- Reviewed phase86 and confirmed XS truthfulness change was directionally correct and did not introduce a downstream contract regression in the targeted river path.
+- Implemented the next planned phase: make bank-derived WSE fallback more explicit and auditable by component instead of only reporting one lumped fallback count.
+
+Changes
+- geo/raster_ops.py
+  - Expanded compute_depth_from_bed_and_dem() receipts with:
+    - components_with_dem_gaps
+    - components_using_in_channel_surface_propagation
+    - components_using_bank_derived_wse_fallback
+    - component_fallback_summaries[]
+  - Each component summary now records:
+    - component_id
+    - gap_pixels
+    - in_channel_valid_pixels
+    - bank_ring_valid_pixels
+    - used_in_channel_surface_propagation
+    - used_bank_derived_wse_fallback
+    - unresolved_gap_pixels
+    - recovery_mode
+- bathy_main.py
+  - Writes river_depth_surface_recovery_contract.json for both helper-raster and cached-depth recovery paths.
+  - Records the contract path in report outputs/receipts so the new diagnostics survive reporting and debug review.
+- tests/test_river_depth_recovery.py
+  - Added regression coverage proving per-component summaries distinguish same-component recovery from true bank-ring fallback.
+
+Intent
+- This does not yet eliminate all bank-derived fallback.
+- It makes the remaining fallback localized, classified, and inspectable so the next cleanup can target the actual reaches/components still depending on surrogate surface recovery.

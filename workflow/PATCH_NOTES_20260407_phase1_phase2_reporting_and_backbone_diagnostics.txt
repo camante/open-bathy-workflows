@@ -1,0 +1,7 @@
+Phase 1 + Phase 2 first pass
+
+- Fixed run diagnosis active-stage status handling so success/applied stages count as active.
+- Deprioritized terminal/reporting orphan-output anomalies when choosing the first bad artifact.
+- Made channel-surface role and section-target agreement receipts always emit summary/profile files, including unavailable-with-reason receipts.
+- Expanded benchmark river triage to carry role/section unavailability reasons and richer backbone-smoothing receipt fields.
+- Expanded backbone-smoothing summary with eligibility/candidate/grouped rejection counts and effectiveness-warning messaging.

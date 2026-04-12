@@ -1,0 +1,1 @@
+Phase 196 review + next pass: strengthen unsupported-upstream generic reconstruction and channel-core rebuild weighting so far-upstream weak-support reaches become smoother and less bank-driven.

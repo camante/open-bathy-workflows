@@ -49,8 +49,23 @@ def support_class_name(code: int) -> str:
     return SUPPORT_CLASS_CODE_TO_NAME[int(code)]
 
 
+def support_class_code_from_name(name: str) -> int:
+    try:
+        return SUPPORT_CLASS_NAME_TO_CODE[str(name)]
+    except KeyError as exc:
+        raise ValueError(f"Unknown support class name: {name}") from exc
+
+
+def support_class_label_or_raise(code: int) -> str:
+    return support_class_name(validate_support_class_code(code))
+
+
 def support_class_family(code: int) -> str:
     return SUPPORT_CLASS_FAMILY[int(code)]
+
+
+def support_class_family_or_raise(code: int) -> str:
+    return support_class_family(validate_support_class_code(code))
 
 
 def regime_class_name(code: int) -> str:
@@ -72,6 +87,24 @@ def class_is_anchored_interpolation(code: int) -> bool:
     return validate_support_class_code(code) == int(SupportClass.ANCHORED_INTERPOLATION)
 
 
+def support_class_is_guidance_conditioned(code: int) -> bool:
+    return support_class_family_or_raise(code) == "guidance_conditioned"
+
+
+def support_class_is_final_authoritative(code: int) -> bool:
+    return class_is_authoritative_locked(code)
+
+
+def support_class_allows_final_dem_guidance(code: int) -> bool:
+    code = validate_support_class_code(code)
+    return code in {
+        int(SupportClass.GUIDANCE_CONDITIONED_SDB),
+        int(SupportClass.GUIDANCE_CONDITIONED_RIVER),
+        int(SupportClass.SCAFFOLD_INFERRED),
+        int(SupportClass.LOW_CONFIDENCE_CONTINUOUS_FILL),
+    }
+
+
 def class_allows_sdb_guidance(code: int) -> bool:
     code = validate_support_class_code(code)
     return code in {
@@ -91,6 +124,13 @@ def class_allows_river_guidance(code: int) -> bool:
 
 def class_requires_low_confidence(code: int) -> bool:
     return validate_support_class_code(code) == int(SupportClass.LOW_CONFIDENCE_CONTINUOUS_FILL)
+
+
+def support_schema_summary() -> dict:
+    return {
+        "codes": {str(k): v for k, v in SUPPORT_CLASS_CODE_TO_NAME.items()},
+        "families": {str(k): v for k, v in SUPPORT_CLASS_FAMILY.items()},
+    }
 
 
 def build_regime_masks(*, locked, sdb_ok, river_ok, estuary_transition=None):
@@ -161,7 +201,14 @@ __all__ = [
     "SUPPORT_CLASS_FAMILY",
     "REGIME_CLASS_CODE_TO_NAME",
     "support_class_name",
+    "support_class_code_from_name",
+    "support_class_label_or_raise",
     "support_class_family",
+    "support_class_family_or_raise",
+    "support_class_is_guidance_conditioned",
+    "support_class_is_final_authoritative",
+    "support_class_allows_final_dem_guidance",
+    "support_schema_summary",
     "regime_class_name",
     "validate_support_class_code",
     "class_is_authoritative_locked",

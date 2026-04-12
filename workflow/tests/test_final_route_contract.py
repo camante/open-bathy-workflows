@@ -48,7 +48,10 @@ def _sdb_artifact_mapping(sdb_dir: Path) -> dict:
         "admissibility_raster": str(sdb_dir / "pred_depth_admissibility.tif"),
         "trusted_interior_raster": str(sdb_dir / "pred_depth_trusted_interior.tif"),
         "regime_class_raster": str(sdb_dir / "pred_depth_regime_class.tif"),
+        "sdb_guidance_active": str(sdb_dir / "pred_depth.tif"),
         "depth_raster": str(sdb_dir / "pred_depth.tif"),
+        "raw_prediction_raster": str(sdb_dir / "pred_depth.tif"),
+        "lock_diff_before_overwrite_raster": str(sdb_dir / "pred_depth_lock_diff_before_overwrite.tif"),
     }
 
 def test_guidance_manifests_expose_allowed_structural_and_diagnostic_roles(tmp_path: Path):
@@ -57,7 +60,7 @@ def test_guidance_manifests_expose_allowed_structural_and_diagnostic_roles(tmp_p
     _touch(tmp_path / "sdb" / "pred_depth_admissibility.tif")
     args = SimpleNamespace(authoritative_base="")
     sdb_manifest = build_sdb_guidance_manifest(out_root=tmp_path, depth_raster=depth, args=args)
-    assert sdb_manifest["final_route_contract"]["diagnostic_only_artifacts"] == ["depth_raster"]
+    assert sdb_manifest["final_route_contract"]["diagnostic_only_artifacts"] == ["raw_prediction_raster", "lock_diff_before_overwrite_raster"] or sdb_manifest["final_route_contract"]["diagnostic_only_artifacts"] == ["lock_diff_before_overwrite_raster", "raw_prediction_raster"]
     assert "guide_points" in sdb_manifest["final_route_contract"]["allowed_structural_artifacts"]
 
     river_dir = tmp_path / "river"
@@ -242,3 +245,98 @@ def test_validate_final_route_contract_flags_missing_river_structural_outputs(tm
     assert river["valid"] is False
     assert "critical_structural_artifact_missing_on_disk" in river["errors"]
     assert "centerline_stationing" in river["missing_critical_artifacts"]
+
+
+
+def test_final_route_contract_allows_missing_sdb_manifest_when_sdb_inactive(tmp_path: Path):
+    river_dir = tmp_path / "river"
+    for name in [
+        "river_guidance_weight.tif",
+        "river_admissibility.tif",
+        "river_corridor_mask.tif",
+        "river_guide_points.gpkg",
+        "river_centerline_elevation.tif",
+        "river_centerline_influence.tif",
+        "river_xs_support_elevation.tif",
+        "river_xs_support_weight.tif",
+        "river_bank_influence.tif",
+        "river_bank_elevation_xs.tif",
+        "river_bank_continuity_weight.tif",
+        "river_bank_graph_confidence.tif",
+        "river_bank_confluence_damping.tif",
+        "river_bank_estuary_side_decay.tif",
+        "river_centerline_stationing_m.tif",
+    ]:
+        _touch(river_dir / name)
+    river_manifest = build_river_guidance_manifest(out_root=tmp_path, river_dir=river_dir, report={"river": {"outputs": {}}})
+    (river_dir / "river_guidance_manifest.json").write_text(json.dumps(river_manifest), encoding="utf-8")
+    report = {
+        "domain_inference": {"requested": ["sdb", "river", "fuse"], "effective": ["river", "fuse"], "skipped": {"sdb": "no_ocean_water_detected_by_waffles"}},
+        "sdb": {"artifacts": {}},
+        "river": {"outputs": _river_output_mapping(river_dir)},
+    }
+    validated = validate_final_route_contract(report)
+    assert validated["guidance_manifests"]["sdb"]["valid"] is True
+    assert "manifest_not_required_for_inactive_family" in validated["guidance_manifests"]["sdb"]["warnings"]
+    assert validated["guidance_manifests"]["river"]["valid"] is True
+    assert validated["strict_all_present_and_valid"] is True
+
+
+def test_build_river_guidance_manifest_marks_active_structural_outputs_required_even_if_missing(tmp_path: Path):
+    river_dir = tmp_path / "river"
+    for name in [
+        "river_guidance_weight.tif",
+        "river_admissibility.tif",
+        "river_corridor_mask.tif",
+        "river_guide_points.gpkg",
+    ]:
+        _touch(river_dir / name)
+    manifest = build_river_guidance_manifest(out_root=tmp_path, river_dir=river_dir, report={"river": {"outputs": {}}})
+    required = set(manifest["final_route_contract"]["required_structural_artifacts"])
+    assert "centerline_elevation" in required
+    assert "centerline_influence" in required
+    assert "centerline_stationing" in required
+
+
+def test_sdb_manifest_exposes_canonical_active_guidance_key(tmp_path: Path):
+    depth = _touch(tmp_path / "sdb" / "pred_depth.tif")
+    _touch(tmp_path / "sdb" / "pred_depth_guidance_weight.tif")
+    _touch(tmp_path / "sdb" / "pred_depth_admissibility.tif")
+    locked = _touch(tmp_path / "sdb" / "pred_depth_authoritative_locked.tif")
+    _touch(tmp_path / "sdb" / "pred_depth_lock_diff_before_overwrite.tif")
+    _touch(tmp_path / "sdb" / "pred_depth_lock_contract.json")
+    args = SimpleNamespace(authoritative_base="")
+    sdb_manifest = build_sdb_guidance_manifest(out_root=tmp_path, depth_raster=depth, args=args)
+    assert sdb_manifest["artifacts"]["sdb_guidance_active"].endswith(locked.name)
+    assert sdb_manifest["artifact_roles"]["sdb_guidance_active"] == "active_guidance"
+    assert sdb_manifest["artifact_roles"]["raw_prediction_raster"] == "diagnostic_only"
+
+
+def test_validate_guidance_manifest_accepts_anchor_policy_artifacts():
+    from final_route_contract import validate_guidance_manifest
+    manifest = {
+        "schema_version": 2,
+        "artifact_family": "river_guidance",
+        "guidance_only": True,
+        "artifact_roles": {
+            "guide_points": "structured_scaffold_points",
+            "anchor_table": "canonical_anchor_policy_table",
+            "anchor_summary": "canonical_anchor_policy_summary",
+            "depth_terrain": "diagnostic_only",
+            "bottom_elevation": "diagnostic_only",
+        },
+        "final_route_contract": {
+            "allowed_structural_artifacts": ["guide_points", "anchor_table", "anchor_summary"],
+            "required_structural_artifacts": ["guide_points"],
+            "optional_structural_artifacts": ["anchor_table", "anchor_summary"],
+            "diagnostic_only_artifacts": ["depth_terrain", "bottom_elevation"],
+            "forbidden_structural_inputs": [
+                "legacy_fused_candidate_raster",
+                "dense_river_depth_raster_as_peer_surface",
+                "dense_sdb_depth_raster_as_peer_surface",
+                "weighted_overlap_blended_bathymetry_as_structural_input",
+            ],
+        },
+    }
+    result = validate_guidance_manifest(manifest=manifest, family="river_guidance")
+    assert result["valid"] is True

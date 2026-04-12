@@ -1,0 +1,9 @@
+Phase 85: producer-stage centerline duplicate cleanup
+
+Changes:
+- Added deterministic fallback component-axis stationization for centerline branches that lack s_m_from/s_m_to.
+- Fallback stationization now uses topology-derived cumulative segment offsets when fromnode/tonode are available, instead of resetting station_m to 0..L on every segment.
+- Added per-component duplicate station contract metrics, duplicate fractions, and fallback method receipts.
+- bathy_main now writes river_centerline_station_contract.json and records duplicate fraction in retained network metadata.
+- Added warning/fail threshold support for elevated duplicate component/station collapse.
+- Added regression coverage for topology-based fallback stationization.

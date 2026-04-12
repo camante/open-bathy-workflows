@@ -1,0 +1,27 @@
+Phase 202: authoritative interior-bed vs bank-margin semantics and rebuild activation
+
+Summary
+- Reviewed phase 201 and fixed a real rebuild-mode handoff bug: the semantics-selected rebuild mode was being overwritten by a later availability default in river_primary_surface_rebuild.py.
+- Added explicit authoritative bed-support semantics so interior authoritative river-bed support is treated separately from authoritative bank-margin support.
+- Updated primary rebuild behavior so authoritative bed-supported sections are protected, while bank-only sections remain eligible for interior/channel-core rebuild with bank preservation.
+- Propagated the new authoritative bed-support class into XS realism and longitudinal tendency receipts.
+
+Key changes
+- river_support_semantics.py
+  - Added station_authoritative_bed_support_class.
+  - Added station_authoritative_bed_support_distance_m and far-from-authoritative-bed logic.
+  - Interior authoritative bed support now maps to protected / blocked-from-rebuild regimes.
+  - Bank-margin-only support now maps to boundary-only protection and weak longitudinal support.
+- river_primary_surface_rebuild.py
+  - Fixed semantics-selected rebuild mode being overwritten later in the active code path.
+  - Protects authoritative inner/channel nodes from rebuild, not just thalweg and bank nodes.
+  - Generic channel-core rebuild now actually targets inner nodes.
+  - Bank-only support routes to generic channel-core or thalweg-only generic rebuild instead of full-section rebuild.
+- river_xs_realism.py
+  - Propagates authoritative bed-support class and far-from-authoritative-bed flags to nodes/receipts.
+- river_longitudinal_tendency.py
+  - Carries authoritative bed-support class into station rows and summary outputs.
+
+Validation
+- Full python -m py_compile passed across workflow.
+- Targeted tests passed for support semantics, primary rebuild, longitudinal tendency, XS realism, channel surface, scaffold, frame, and benchmark workflow stage.

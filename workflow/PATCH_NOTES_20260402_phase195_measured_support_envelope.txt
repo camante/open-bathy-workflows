@@ -1,0 +1,1 @@
+Phase 195 review + next pass: add measured-support envelope distance/classification (inside_measured_support, near_measured_transition, weak_support_upstream, unsupported_upstream_generic) and use it to strengthen longitudinal smoothing/backbone pull and weak-support rebuild semantics upstream of the measured-support envelope.

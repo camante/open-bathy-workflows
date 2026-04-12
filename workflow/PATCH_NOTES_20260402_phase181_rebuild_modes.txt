@@ -1,0 +1,18 @@
+Phase 181: primary surface rebuild now degrades gracefully when station-role scaffolding is incomplete.
+
+Changes:
+- Added partial rebuild modes in river_primary_surface_rebuild.py:
+  - full_section_rebuild
+  - inner_nodes_only_rebuild
+  - thalweg_only_rebuild
+  - skip
+- Removed the old all-or-nothing requirement for left/right inner roles before rebuild can run.
+- Added per-node fields:
+  - primary_surface_rebuild_mode
+  - primary_surface_rebuild_skip_reason
+- Added profile outputs showing rebuild mode, available roles, and skip reasons.
+- Added targeted tests proving rebuild still works when inner roles are missing or only one inner role exists.
+
+Intent:
+- Prevent the recent rebuild science from silently skipping whole stations/components just because the scaffold is imperfect.
+- Keep authoritative and true measured nodes protected while still allowing weak-support channel interiors to change.

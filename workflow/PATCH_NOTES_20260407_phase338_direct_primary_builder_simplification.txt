@@ -1,0 +1,12 @@
+Phase 338: canonical direct-primary builder simplification
+
+What changed
+- In canonical direct-primary mode, terrain_interpolator now blanks legacy river builder inputs before calling _build_primary_river_surface.
+- The primary builder no longer sees channel_surface, longitudinal, centerline, XS, bank, or transport-centerline inputs in that mode.
+- The direct primary guidance surface remains the sole active primary river surface input for canonical direct-primary conditioning.
+- Added summary receipt field: primary_builder_inputs_simplified.
+- Added regression covering conflicting channel-surface input under canonical direct-primary mode.
+
+Why
+- The previous code still carried legacy builder machinery even after the take-domain simplification.
+- This pass makes the canonical direct-primary path easier to trace: one source, one builder path, one take domain.

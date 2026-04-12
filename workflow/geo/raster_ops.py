@@ -16,6 +16,8 @@ from typing import Any, Dict, Optional, Tuple
 
 from core.paths import ensure_dir
 from process_utils import run_cmd
+from raster_contract import validate_gdal_output
+from nodata_utils import nodata_mask
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +52,7 @@ def _raster_has_valid_pixels(p: Path, max_sample_pixels: int = 250000) -> bool:
             if nodata is None:
                 return bool(np.any(finite))
             return bool(np.any(finite & (arr != nodata)))
-    except Exception:
+    except (OSError, ValueError, RuntimeError):
         log.debug("_raster_has_valid_pixels: suppressed exception", exc_info=True)
         # Best-effort: if we cannot read, don't block the pipeline.
         return True
@@ -82,7 +84,7 @@ def sanitize_raster_values(
     try:
         import numpy as np
         import rasterio
-    except Exception:
+    except ImportError:
         log.debug("sanitize_raster_values: suppressed exception", exc_info=True)
         return stats
 
@@ -98,6 +100,7 @@ def sanitize_raster_values(
         with rasterio.open(tmp, 'w', **profile) as dst:
             for _, window in src.block_windows(1):
                 arr = src.read(1, window=window).astype('float32')
+                sentinel_bad = nodata_mask(arr, src.nodata if src.nodata is not None else nodata, extreme_abs=extreme_abs)
                 nonfinite = ~np.isfinite(arr)
                 extreme = np.isfinite(arr) & (np.abs(arr) >= float(extreme_abs))
                 out_of_range = np.zeros(arr.shape, dtype=bool)
@@ -105,11 +108,11 @@ def sanitize_raster_values(
                     out_of_range |= np.isfinite(arr) & (arr < float(min_valid))
                 if max_valid is not None:
                     out_of_range |= np.isfinite(arr) & (arr > float(max_valid))
-                bad = nonfinite | extreme | out_of_range
+                bad = sentinel_bad | nonfinite | extreme | out_of_range
                 arr = np.where(bad, float(nodata), arr).astype('float32')
                 valid = np.isfinite(arr) & (arr != float(nodata))
                 total_nf += int(nonfinite.sum())
-                total_ext += int(extreme.sum())
+                total_ext += int((extreme & ~nonfinite).sum())
                 total_rng += int(out_of_range.sum())
                 total_valid += int(valid.sum())
                 dst.write(arr, 1, window=window)
@@ -829,19 +832,48 @@ def compute_depth_from_bed_and_dem(
     dem_tif: Path,
     out_depth_tif: Path,
     depth_sign: str = "negative_down",
-) -> None:
-    """Compute depth relative to DEM surface: depth = bed_elev - dem (negative when bed below terrain).
+    channel_mask_tif: Path | None = None,
+) -> dict[str, object]:
+    """Compute depth relative to DEM surface: depth = bed_elev - dem.
 
-    Assumes rasters are co-registered (same grid/extent). Uses chunked IO.
+    When ``channel_mask_tif`` is provided and the DEM has nodata inside the
+    channel, depth recovery is now support-aware:
+
+    1. Fill DEM gaps from valid DEM pixels already present inside the same
+       connected channel component.
+    2. Only if a component has no usable in-channel DEM support, fall back to
+       nearest valid DEM pixels on the component bank ring.
+
+    All rasters must be on the same grid. The function fails explicitly when a
+    channel mask is provided on a different CRS/transform/shape so the first bad
+    artifact is identified at construction time.
     """
     import numpy as np
     import rasterio
+    from scipy.ndimage import binary_dilation, distance_transform_edt, label
 
     ensure_dir(out_depth_tif.parent)
+    receipt: dict[str, object] = {
+        "mode": "bed_minus_surface",
+        "channel_mask_used": bool(channel_mask_tif is not None),
+        "dem_gap_pixels": 0,
+        "in_channel_surface_propagation_pixels": 0,
+        "bank_derived_wse_fallback_pixels": 0,
+        "unresolved_dem_gap_pixels": 0,
+        "connected_channel_components": 0,
+        "components_with_dem_gaps": 0,
+        "components_using_in_channel_surface_propagation": 0,
+        "components_using_adjacent_channel_surface_propagation": 0,
+        "components_using_expanded_channel_surface_propagation": 0,
+        "components_using_bank_derived_wse_fallback": 0,
+        "component_fallback_summaries": [],
+    }
 
     with rasterio.open(bed_elev_tif) as bed, rasterio.open(dem_tif) as dem:
         if (bed.width != dem.width) or (bed.height != dem.height) or (bed.transform != dem.transform):
             raise ValueError("bed_elev_tif and dem_tif must be on the same grid to compute depth")
+        if bed.crs != dem.crs:
+            raise ValueError(f"bed_elev_tif and dem_tif CRS mismatch: {bed.crs} != {dem.crs}")
 
         profile = bed.profile.copy()
         profile.update(dtype="float32", count=1, compress="DEFLATE", predictor=2)
@@ -851,25 +883,150 @@ def compute_depth_from_bed_and_dem(
         nodata_out = -9999.0
         profile.update(nodata=float(nodata_out))
 
+        surface_fill = None
+        if channel_mask_tif is not None:
+            with rasterio.open(channel_mask_tif) as cm_ds:
+                if (cm_ds.width != bed.width) or (cm_ds.height != bed.height) or (cm_ds.transform != bed.transform):
+                    raise ValueError("channel_mask_tif must be on the same grid as bed_elev_tif/dem_tif")
+                if cm_ds.crs != bed.crs:
+                    raise ValueError(f"channel_mask_tif CRS mismatch: {cm_ds.crs} != {bed.crs}")
+                ch = cm_ds.read(1)
+            channel = ch > 0
+            if np.any(channel):
+                d_full = dem.read(1).astype("float32")
+                d_valid = np.isfinite(d_full)
+                if dem_nodata is not None:
+                    d_valid &= (d_full != dem_nodata)
+                d_valid &= (d_full > -1000.0) & (d_full < 10000.0)
+                dem_gaps = channel & (~d_valid)
+                receipt["dem_gap_pixels"] = int(np.count_nonzero(dem_gaps))
+                if int(receipt["dem_gap_pixels"]) > 0:
+                    surface_fill = np.full(channel.shape, np.nan, dtype="float32")
+                    labels, ncomp = label(channel, structure=np.ones((3, 3), dtype=np.uint8))
+                    receipt["connected_channel_components"] = int(ncomp)
+                    component_summaries: list[dict[str, int | str | bool]] = []
+                    channel_valid = channel & d_valid
+                    for comp_id in range(1, ncomp + 1):
+                        comp = labels == comp_id
+                        comp_gaps = comp & dem_gaps
+                        if not np.any(comp_gaps):
+                            continue
+                        receipt["components_with_dem_gaps"] = int(receipt["components_with_dem_gaps"]) + 1
+                        comp_gap_count = int(np.count_nonzero(comp_gaps))
+                        comp_valid = comp & d_valid
+                        comp_valid_count = int(np.count_nonzero(comp_valid))
+                        bank_ring = binary_dilation(comp, structure=np.ones((3, 3), dtype=bool)) & (~comp) & d_valid
+                        bank_ring_count = int(np.count_nonzero(bank_ring))
+                        comp_halo = binary_dilation(comp, structure=np.ones((3, 3), dtype=bool), iterations=2) & channel & (~comp)
+                        neighbor_valid = comp_halo & channel_valid
+                        neighbor_valid_count = int(np.count_nonzero(neighbor_valid))
+                        neighbor_component_ids = sorted({int(v) for v in np.unique(labels[neighbor_valid]) if int(v) not in (0, int(comp_id))})
+                        expanded_halo = binary_dilation(comp, structure=np.ones((3, 3), dtype=bool), iterations=6) & channel & (~comp)
+                        expanded_neighbor_valid = expanded_halo & channel_valid
+                        expanded_neighbor_valid_count = int(np.count_nonzero(expanded_neighbor_valid))
+                        expanded_neighbor_component_ids = sorted({int(v) for v in np.unique(labels[expanded_neighbor_valid]) if int(v) not in (0, int(comp_id))})
+                        summary: dict[str, int | str | bool | list[int]] = {
+                            "component_id": int(comp_id),
+                            "gap_pixels": comp_gap_count,
+                            "in_channel_valid_pixels": comp_valid_count,
+                            "adjacent_channel_valid_pixels": neighbor_valid_count,
+                            "adjacent_component_ids": neighbor_component_ids,
+                            "expanded_channel_valid_pixels": expanded_neighbor_valid_count,
+                            "expanded_adjacent_component_ids": expanded_neighbor_component_ids,
+                            "bank_ring_valid_pixels": bank_ring_count,
+                            "used_in_channel_surface_propagation": False,
+                            "used_adjacent_channel_surface_propagation": False,
+                            "used_expanded_channel_surface_propagation": False,
+                            "used_bank_derived_wse_fallback": False,
+                            "unresolved_gap_pixels": 0,
+                            "recovery_mode": "unresolved",
+                        }
+                        if comp_valid_count > 0:
+                            invalid_seed = ~comp_valid
+                            _, (iy, ix) = distance_transform_edt(invalid_seed, return_indices=True)
+                            comp_fill = d_full[iy, ix].astype("float32")
+                            surface_fill[comp_gaps] = comp_fill[comp_gaps]
+                            receipt["in_channel_surface_propagation_pixels"] = int(receipt["in_channel_surface_propagation_pixels"]) + comp_gap_count
+                            receipt["components_using_in_channel_surface_propagation"] = int(receipt["components_using_in_channel_surface_propagation"]) + 1
+                            summary["used_in_channel_surface_propagation"] = True
+                            summary["recovery_mode"] = "same_component_surface"
+                            component_summaries.append(summary)
+                            continue
+                        if neighbor_valid_count > 0:
+                            invalid_seed = ~neighbor_valid
+                            _, (iy, ix) = distance_transform_edt(invalid_seed, return_indices=True)
+                            comp_fill = d_full[iy, ix].astype("float32")
+                            surface_fill[comp_gaps] = comp_fill[comp_gaps]
+                            receipt["in_channel_surface_propagation_pixels"] = int(receipt["in_channel_surface_propagation_pixels"]) + comp_gap_count
+                            receipt["components_using_adjacent_channel_surface_propagation"] = int(receipt["components_using_adjacent_channel_surface_propagation"]) + 1
+                            summary["used_adjacent_channel_surface_propagation"] = True
+                            summary["recovery_mode"] = "adjacent_channel_surface"
+                            component_summaries.append(summary)
+                            continue
+                        if expanded_neighbor_valid_count > 0:
+                            invalid_seed = ~expanded_neighbor_valid
+                            _, (iy, ix) = distance_transform_edt(invalid_seed, return_indices=True)
+                            comp_fill = d_full[iy, ix].astype("float32")
+                            surface_fill[comp_gaps] = comp_fill[comp_gaps]
+                            receipt["in_channel_surface_propagation_pixels"] = int(receipt["in_channel_surface_propagation_pixels"]) + comp_gap_count
+                            receipt["components_using_expanded_channel_surface_propagation"] = int(receipt["components_using_expanded_channel_surface_propagation"]) + 1
+                            summary["used_expanded_channel_surface_propagation"] = True
+                            summary["recovery_mode"] = "expanded_channel_surface"
+                            component_summaries.append(summary)
+                            continue
+                        if bank_ring_count > 0:
+                            invalid_seed = ~bank_ring
+                            _, (iy, ix) = distance_transform_edt(invalid_seed, return_indices=True)
+                            comp_fill = d_full[iy, ix].astype("float32")
+                            surface_fill[comp_gaps] = comp_fill[comp_gaps]
+                            receipt["bank_derived_wse_fallback_pixels"] = int(receipt["bank_derived_wse_fallback_pixels"]) + comp_gap_count
+                            receipt["components_using_bank_derived_wse_fallback"] = int(receipt["components_using_bank_derived_wse_fallback"]) + 1
+                            summary["used_bank_derived_wse_fallback"] = True
+                            summary["recovery_mode"] = "bank_ring_surface"
+                            component_summaries.append(summary)
+                            continue
+                        summary["unresolved_gap_pixels"] = comp_gap_count
+                        component_summaries.append(summary)
+                    component_summaries.sort(key=lambda x: (-int(x["gap_pixels"]), int(x["component_id"])))
+                    receipt["component_fallback_summaries"] = component_summaries
+                    unresolved = dem_gaps & (~np.isfinite(surface_fill))
+                    receipt["unresolved_dem_gap_pixels"] = int(np.count_nonzero(unresolved))
+                    n_in = int(receipt["in_channel_surface_propagation_pixels"])
+                    n_bank = int(receipt["bank_derived_wse_fallback_pixels"])
+                    if n_in > 0:
+                        log.info("Depth surface recovery: %d in-channel pixels use same-component DEM propagation.", n_in)
+                    if n_bank > 0:
+                        log.info("Depth WSE fallback: %d in-channel pixels use bank-derived WSE.", n_bank)
+
         with rasterio.open(out_depth_tif, "w", **profile) as dst:
-            for ji, window in bed.block_windows(1):
+            for _, window in bed.block_windows(1):
                 b = bed.read(1, window=window).astype("float32")
                 d = dem.read(1, window=window).astype("float32")
 
                 mask = np.zeros(b.shape, dtype=bool)
                 if bed_nodata is not None:
                     mask |= (b == bed_nodata)
+                mask |= ~np.isfinite(b)
+
+                dem_bad = ~np.isfinite(d)
                 if dem_nodata is not None:
-                    mask |= (d == dem_nodata)
-                mask |= ~np.isfinite(b) | ~np.isfinite(d)
+                    dem_bad |= (d == dem_nodata)
 
-                depth = b - d  # negative when b < d (bed below terrain)
+                if surface_fill is not None:
+                    r0, c0 = window.row_off, window.col_off
+                    fb = surface_fill[r0:r0 + window.height, c0:c0 + window.width]
+                    fb_ok = np.isfinite(fb) & dem_bad & (~mask)
+                    d = np.where(fb_ok, fb, d).astype("float32")
+                    mask |= (dem_bad & ~fb_ok)
+                else:
+                    mask |= dem_bad
+
+                depth = b - d
                 depth[mask] = float(nodata_out)
-
                 dst.write(depth.astype("float32"), 1, window=window)
 
-    # Tag semantics
     apply_depth_metadata(out_depth_tif, depth_sign=depth_sign, depth_reference="terrain_surface")
+    return receipt
 
 
 def warp_raster_to_srs(
@@ -891,25 +1048,27 @@ def warp_raster_to_srs(
       * Default to nearest-neighbour ("near") to preserve sparse valid pixels.
         Downstream smoothing/resampling can be applied where appropriate.
     """
-    gdalwarp = shutil.which("gdalwarp")
-    if gdalwarp is None:
-        log.error("gdalwarp not found; cannot reproject %s", in_raster)
-        return None
-
     # Avoid pointless same-CRS reprojection and duplicated filenames like
     # *_epsg4269_epsg4269.tif. Returning the original path is safer than
     # creating a second derived copy with identical spatial reference.
     try:
         import rasterio
-        from pyproj import CRS as _PyProjCRS
+        from rasterio.crs import CRS as _RasterioCRS
         with rasterio.open(in_raster) as src:
             src_crs = src.crs
-        if src_crs is not None and _PyProjCRS.from_user_input(src_crs) == _PyProjCRS.from_user_input(dst_srs):
-            if write_depth_metadata:
-                apply_depth_metadata(in_raster)
+        dst_crs = _RasterioCRS.from_user_input(dst_srs)
+        if src_crs is not None and dst_crs is not None and src_crs == dst_crs:
+            # Same-CRS short-circuit must not mutate metadata in place. The caller owns
+            # the output semantics and will apply the appropriate tags after deciding
+            # whether the raster is a depth or elevation deliverable.
             return Path(in_raster)
     except Exception:
         log.debug("same-CRS warp short-circuit check failed", exc_info=True)
+
+    gdalwarp = shutil.which("gdalwarp")
+    if gdalwarp is None:
+        log.error("gdalwarp not found; cannot reproject %s", in_raster)
+        return None
 
     if out_raster.exists() and out_raster.stat().st_size > 0:
         if reuse_existing and _raster_has_valid_pixels(out_raster):
@@ -957,8 +1116,10 @@ def warp_raster_to_srs(
     try:
         log.info("%s -> %s (%s)", in_raster.name, out_raster.name, dst_srs)
         run_cmd(cmd, check=True)
-        if out_raster.exists() and write_depth_metadata:
-            apply_depth_metadata(out_raster)
+        if out_raster.exists():
+            validate_gdal_output(out_raster, operation='geo.raster_ops.reproject_raster_gdal', expected_crs=dst_srs, expected_nodata=nodata, source_path=in_raster, min_allowed=-1000.0, max_allowed=1000.0)
+            if write_depth_metadata:
+                apply_depth_metadata(out_raster)
         return out_raster if out_raster.exists() else None
     except Exception as e:
         log.warning("gdalwarp failed: %s", e)

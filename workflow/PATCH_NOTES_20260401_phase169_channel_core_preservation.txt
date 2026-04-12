@@ -1,0 +1,7 @@
+Phase 169
+
+- Added deterministic channel-core preservation behavior in the active terrain stage.
+- Channel-core preserve cells now pull the conditioned surface back toward the primary river surface based on bank pressure, structure-only fraction, measured-anchor fraction, and prediction support confidence.
+- Guidance influence is raised to a preserve floor in that zone, and support classes are upgraded from generic low-confidence fill to river/scaffold classes where appropriate.
+- Added focused unit tests for the new preservation helper and terrain-stage behavior.
+- Verified with full repo py_compile and targeted pytest suite.

@@ -82,7 +82,7 @@ def find_sdb_depth_raster(sdb_dir: Path) -> Optional[Path]:
     except Exception:
         log.debug("find_sdb_depth_raster: suppressed exception", exc_info=True)
         return None
-    rel = data.get("depth_raster")
+    rel = data.get("sdb_guidance_active") or data.get("depth_raster")
     if not isinstance(rel, str) or not rel.strip():
         return None
     p = (sdb_dir / rel).resolve() if not Path(rel).is_absolute() else Path(rel).resolve()

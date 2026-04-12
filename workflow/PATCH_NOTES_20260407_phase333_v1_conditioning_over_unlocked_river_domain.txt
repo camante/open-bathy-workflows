@@ -1,0 +1,4 @@
+workflow_v333
+- Allow direct v1 primary river guidance to condition unlocked finite anchor cells within the river guidance domain.
+- Keep authoritative locked cells protected.
+- This addresses v331/v332 behavior where river_primary_surface reached conditioning but eligible_pixels stayed zero because only pure auth-gap cells were considered eligible.

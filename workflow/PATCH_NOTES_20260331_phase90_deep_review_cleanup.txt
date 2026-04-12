@@ -1,0 +1,4 @@
+phase90: deep review cleanup
+ - removed debug_bundle legacy run-log probing noise
+ - fixed relative river guidance manifest path resolution
+ - hardened presentation guidance figure CRS alignment and plotting

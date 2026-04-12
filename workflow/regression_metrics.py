@@ -34,6 +34,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from nodata_utils import sanitize_array, valid_mask
+
 
 def _try_import(name: str):
     try:
@@ -74,10 +76,7 @@ def _read_mask(mask_path: Path) -> Tuple[Any, Dict[str, Any]]:
     with rasterio.open(mask_path) as ds:
         arr = ds.read(1)
         nodata = ds.nodata
-        if nodata is not None:
-            valid = arr != nodata
-        else:
-            valid = np.ones(arr.shape, dtype=bool)
+        valid = valid_mask(arr, nodata)
         # channel mask is assumed 0/1 or 0/nonzero
         m = (arr != 0) & valid
         meta = {
@@ -94,12 +93,8 @@ def _raster_stats(raster_path: Path, mask: Optional[Any] = None) -> RasterStats:
     if rasterio is None or np is None:
         raise RuntimeError("rasterio and numpy are required for raster metrics")
     with rasterio.open(raster_path) as ds:
-        arr = ds.read(1).astype("float64", copy=False)
-        nodata = ds.nodata
-        if nodata is not None:
-            valid = arr != nodata
-        else:
-            valid = np.isfinite(arr)
+        arr = sanitize_array(ds.read(1), ds.nodata, dtype="float64")
+        valid = np.isfinite(arr)
         if mask is not None:
             valid = valid & mask
         vals = arr[valid]
@@ -126,11 +121,8 @@ def _boundary_gradient_std(raster_path: Path, mask: Any) -> Optional[float]:
     if rasterio is None or np is None:
         return None
     with rasterio.open(raster_path) as ds:
-        arr = ds.read(1).astype("float64", copy=False)
-        nodata = ds.nodata
+        arr = sanitize_array(ds.read(1), ds.nodata, dtype="float64")
         valid = np.isfinite(arr)
-        if nodata is not None:
-            valid = valid & (arr != nodata)
         valid = valid & mask
         if valid.sum() < 10:
             return None
@@ -238,11 +230,8 @@ def _skeleton_max_slope(
                 pts = [ln.interpolate(float(d)) for d in dists]
                 coords = [(p.x, p.y) for p in pts]
                 zs = np.array([v[0] for v in ds.sample(coords)], dtype="float64")
-                # drop nodata/nans
-                if ds.nodata is not None:
-                    ok = (zs != ds.nodata) & np.isfinite(zs)
-                else:
-                    ok = np.isfinite(zs)
+                zs = sanitize_array(zs, ds.nodata, dtype="float64")
+                ok = np.isfinite(zs)
                 if ok.sum() < 3:
                     continue
                 zs = zs[ok]

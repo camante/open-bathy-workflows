@@ -136,3 +136,66 @@ def test_summarize_written_precedence_audit_flags_locked_change_and_guidance_on_
         assert audit["authoritative_lock"]["changed_locked_cell_count"] == 1
         assert audit["authoritative_lock"]["guidance_nonzero_on_locked_count"] == 1
         assert "Changed locked authoritative cells" in audit["validation_error"]
+
+
+def test_validate_written_final_dem_lineage_accepts_v2_locked_surface(tmp_path):
+    from final_dem_contract_validator import validate_written_final_dem_lineage
+
+    final_p = _write_tif(tmp_path / "final.tif", np.array([[1.0]], dtype=np.float32))
+    locked = tmp_path / "river_primary_surface_authoritative_applied.tif"
+    locked.write_text("x", encoding="utf-8")
+    report = {
+        "river": {
+            "outputs": {
+                "primary_river_guidance_surface": str(locked),
+                "river_primary_surface_authoritative_applied": str(locked),
+            },
+        },
+        "final_dem_contract": {
+            "final_route_contract": {
+                "river_v2_final_route_contract": {
+                    "active": True,
+                    "active_stage": "river_primary_surface_authoritative_applied",
+                    "active_river_guidance_surface": str(locked),
+                    "legacy_river_final_route_participation_blocked": True,
+                    "runtime_enforced": True,
+                }
+            }
+        },
+    }
+    payload = validate_written_final_dem_lineage(report=report, final_depth=final_p)
+    assert payload["validated"] is True
+    assert payload["all_ok"] is True
+
+
+def test_validate_written_final_dem_lineage_flags_mismatch(tmp_path):
+    from final_dem_contract_validator import validate_written_final_dem_lineage
+
+    final_p = _write_tif(tmp_path / "final.tif", np.array([[1.0]], dtype=np.float32))
+    locked = tmp_path / "river_primary_surface_authoritative_applied.tif"
+    locked.write_text("x", encoding="utf-8")
+    other = tmp_path / "legacy_surface.tif"
+    other.write_text("x", encoding="utf-8")
+    report = {
+        "river": {
+            "outputs": {
+                "primary_river_guidance_surface": str(other),
+                "river_primary_surface_authoritative_applied": str(locked),
+            },
+        },
+        "final_dem_contract": {
+            "final_route_contract": {
+                "river_v2_final_route_contract": {
+                    "active": True,
+                    "active_stage": "river_primary_surface_authoritative_applied",
+                    "active_river_guidance_surface": str(locked),
+                    "legacy_river_final_route_participation_blocked": True,
+                    "runtime_enforced": True,
+                }
+            }
+        },
+    }
+    payload = validate_written_final_dem_lineage(report=report, final_depth=final_p)
+    assert payload["validated"] is True
+    assert payload["all_ok"] is False
+    assert payload["primary_surface_matches_active"] is False

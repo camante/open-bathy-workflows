@@ -1,0 +1,27 @@
+Phase 173: stronger longitudinal bank/bed control
+
+Summary
+- Strengthened the active longitudinal tendency pass so weak-support structural reaches are pulled more strongly toward the profile backbone and then guarded against adverse downstream step noise.
+- Added explicit receipts for backbone targeting and low-support monotonic guard activity.
+- Preserved broad XS participation accounting in the channel-surface audit so XS-derived graph nodes still register as XS participation even when source attribution remains strict.
+
+Key changes
+- river_longitudinal_tendency.py
+  - Increased support-aware smoothing weights in low-support structural reaches.
+  - Added profile backbone target weighting using profile_network_backbone_z_m when present.
+  - Added low-support longitudinal guard to cap adverse downstream step noise in weak-support stations.
+  - Added new output fields/receipts:
+    - longitudinal_tendency_backbone_weight
+    - longitudinal_tendency_backbone_target_z_m
+    - longitudinal_tendency_low_support_guard_active
+    - backbone_targeted_node_count
+    - low_support_guarded_node_count
+    - adverse_step_before_m / adverse_step_after_m
+- river_channel_surface.py
+  - Restored broad XS participation accounting for XS-derived graph nodes in final raster participation audit.
+- tests/test_river_longitudinal_tendency.py
+  - Added receipt coverage for backbone-targeted and low-support-guarded longitudinal outputs.
+
+Verification
+- python -m py_compile passed for modified modules
+- targeted river tests passed

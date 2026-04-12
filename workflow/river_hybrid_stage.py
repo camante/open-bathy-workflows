@@ -11,7 +11,7 @@ import numpy as np
 import rasterio
 from rasterio.errors import RasterioIOError
 
-from hybrid_merge import merge_hybrid_river_bed
+from hybrid_merge import merge_hybrid_river_bed, reconstruct_xs_mainstem_relative
 from river_mask_stage import RiverMaskStageResult, run_river_mask_stage
 
 
@@ -36,6 +36,7 @@ class HybridRiverStageResult:
     river_run_receipt_json: Path
     merge_receipt: Dict[str, Any]
     river_run_receipt: Dict[str, Any]
+    xs_reconstruction_receipt_json: Optional[Path] = None
     estuary_clip_mask: Optional[Path] = None
     river_mask_stage_receipt_json: Optional[Path] = None
     river_mask_receipt: Optional[Dict[str, Any]] = None
@@ -53,6 +54,8 @@ class HybridRiverStageResult:
             "xs_mainstem_constraint_meta": str(self.xs_mainstem_meta_json),
             "xs_mainstem_constraint_accounting": str(self.xs_mainstem_acct_json),
         }
+        if self.xs_reconstruction_receipt_json is not None:
+            out["xs_mainstem_reconstruction_receipt"] = str(self.xs_reconstruction_receipt_json)
         if self.estuary_clip_mask is not None:
             out["estuary_clip_mask"] = str(self.estuary_clip_mask)
         if self.river_mask_stage_receipt_json is not None:
@@ -225,6 +228,11 @@ def run_hybrid_river_stage(
         f"--overlap-reducer={cfg.river_overlap_reducer}",
         f"--xs-profile-shape={cfg.river_xs_profile_shape}",
     ]
+    if bool(getattr(cfg, "river_channel_template_enabled", False)):
+        cmd.append("--channel-template-enabled")
+    else:
+        cmd.append("--no-channel-template")
+        logger.info("[RIVER] Forwarding explicit channel-template disable to XS child (hybrid stage).")
     if getattr(cfg, "river_enable_1d_energy_solver", False):
         energy_inputs = work_dir / "xs_mainstem_1d_solver_inputs.json"
         energy_outputs = work_dir / "xs_mainstem_1d_solver_outputs.json"
@@ -424,6 +432,13 @@ def run_hybrid_river_stage(
 
     logger.info("[RIVER] Step 3c: Inferring bathymetry from skeleton (full network)...")
     bed_skel_tif = work_dir / "river_bed_elev_skeleton_full.tif"
+    # Channel template from XS run (Step 3b) — if it was built, pass to skeleton
+    _hybrid_template_json = work_dir / "channel_template" / "channel_template.json"
+    _hybrid_template_json = (
+        _hybrid_template_json
+        if bool(getattr(cfg, "river_channel_template_enabled", False)) and _hybrid_template_json.exists()
+        else None
+    )
     cmd = build_river_skeleton_command_fn(
         cfg,
         network_gpkg=network_gpkg,
@@ -432,6 +447,7 @@ def run_hybrid_river_stage(
         channel_mask=channel_mask_tif,
         out_bed=bed_skel_tif,
         authoritative_passthrough_args=authoritative_passthrough_args_fn(cfg, for_river=True),
+        channel_template_json=_hybrid_template_json,
     )
     record_authoritative_child_passthrough_fn(report, "river_full_network", cmd)
     amode = cfg.river_skeleton_asymmetry_mode.strip().lower()
@@ -456,10 +472,14 @@ def run_hybrid_river_stage(
     }
     if rc != 0 or not Path(bed_skel_tif).exists():
         raise RuntimeError("Skeleton bathymetry failed (hybrid).")
+    skeleton_stage_support_tif = bed_skel_tif.with_name(bed_skel_tif.stem + "_stage_support_class.tif")
+    skeleton_stage_support_receipt_json = bed_skel_tif.with_name(bed_skel_tif.stem + "_stage_support_receipt.json")
     skeleton_receipt = {
         "path": str(bed_skel_tif),
         "valid_pixels": int(_count_valid_pixels(Path(bed_skel_tif), cfg.river_nodata)),
         "command": " ".join(str(c) for c in cmd),
+        "stage_support_class": str(skeleton_stage_support_tif) if skeleton_stage_support_tif.exists() else None,
+        "stage_support_receipt": str(skeleton_stage_support_receipt_json) if skeleton_stage_support_receipt_json.exists() else None,
     }
     skeleton_receipt_json = _write_json(work_dir / "skeleton_inference_receipt.json", skeleton_receipt)
 
@@ -467,7 +487,21 @@ def run_hybrid_river_stage(
     bed_tif = cache_dir / "river_bed_elev_cached.tif"
     nod = cfg.river_nodata
     hybrid_receipt_json = work_dir / "hybrid_merge_receipt.json"
+    xs_reconstruction_receipt_json = None
     if xs_available and Path(bed_xs_tif).exists():
+        xs_raw_tif = work_dir / "river_bed_elev_xs_mainstem_raw.tif"
+        if not xs_raw_tif.exists():
+            shutil.copyfile(Path(bed_xs_tif), xs_raw_tif)
+        xs_reconstruction_receipt_json = work_dir / "xs_mainstem_reconstruction_receipt.json"
+        reconstruct_xs_mainstem_relative(
+            Path(xs_raw_tif),
+            Path(bed_skel_tif),
+            Path(mainstem_mask_tif),
+            Path(bed_xs_tif),
+            Path(cfg.river_dem),
+            nod,
+            receipt_json=xs_reconstruction_receipt_json,
+        )
         merge_receipt = merge_hybrid_river_bed(
             Path(bed_xs_tif),
             Path(bed_skel_tif),
@@ -521,6 +555,7 @@ def run_hybrid_river_stage(
         "xs_mainstem_constraint_accounting": str(xs_mainstem_acct_json) if xs_mainstem_acct_json.exists() else None,
         "skeleton_receipt": str(skeleton_receipt_json),
         "hybrid_merge_receipt": str(hybrid_receipt_json),
+        "xs_mainstem_reconstruction_receipt": str(xs_reconstruction_receipt_json) if xs_reconstruction_receipt_json is not None else None,
         "summary": {
             "xs_valid_pixels": int(_count_valid_pixels(Path(bed_xs_tif), nod)) if Path(bed_xs_tif).exists() else 0,
             "skeleton_valid_pixels": int(skel_valid),
@@ -555,6 +590,7 @@ def run_hybrid_river_stage(
         skeleton_receipt_json=Path(skeleton_receipt_json),
         merged_bed_tif=Path(bed_tif),
         hybrid_merge_receipt_json=Path(hybrid_receipt_json),
+        xs_reconstruction_receipt_json=Path(xs_reconstruction_receipt_json) if xs_reconstruction_receipt_json is not None else None,
         river_run_receipt_json=Path(river_run_receipt_json),
         merge_receipt=merge_receipt,
         river_run_receipt=river_run_receipt,

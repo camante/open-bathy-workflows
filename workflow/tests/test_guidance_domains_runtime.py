@@ -63,3 +63,28 @@ def test_positive_bank_margin_erodes_channel_edges(tmp_path):
     assert diag["output_pixels"] < diag["input_pixels"]
     assert arr[1, 1] == 0
     assert arr[4, 4] == 1
+
+
+def test_canonical_with_nhd_mask_allows_zero_added_inland_pixels(tmp_path):
+    import json
+    import geopandas as gpd
+    from shapely.geometry import box
+    from guidance_domains import _build_canonical_with_nhd_mask
+
+    ocean = np.zeros((6, 6), dtype=np.uint8)
+    ocean[:, :] = 0
+    ocean_path = tmp_path / "ocean_mask.tif"
+    _write_mask(ocean_path, ocean)
+
+    gdf = gpd.GeoDataFrame({"geometry": [box(1, 1, 3, 3)]}, crs="EPSG:32619")
+    river_gpkg = tmp_path / "river.gpkg"
+    gdf.to_file(river_gpkg, layer="nhdarea_clip", driver="GPKG")
+
+    out = tmp_path / "with_nhd.tif"
+    _build_canonical_with_nhd_mask(ocean_path, river_gpkg, out, logger=__import__("logging").getLogger("test"))
+    with rasterio.open(out) as ds:
+        arr = ds.read(1)
+    assert np.array_equal(arr, ocean)
+    diag = json.loads(out.with_name(out.stem + "_diagnostics.json").read_text())
+    assert diag["added_inland_pixels"] == 0
+    assert diag["passthrough_ocean_only"] is True

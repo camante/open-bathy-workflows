@@ -4,6 +4,23 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+def _postrun_outputs_requested(args, cfg) -> bool:
+    seam_ios = list(getattr(args, "seam_compare_with_io", []) or [])
+    seam_list = getattr(args, "seam_compare_with_io_list", None)
+    nested_ios = list(getattr(args, "nested_aoi_compare_with_final_outputs", []) or [])
+    nested_list = getattr(args, "nested_aoi_compare_with_final_outputs_list", None)
+    return bool(
+        getattr(cfg, "save_intermediates", False)
+        or seam_ios
+        or seam_list
+        or nested_ios
+        or nested_list
+    )
+
+from final_postrun_contract import build_final_postrun_context
+from postrun_output_stage import run_postrun_output_checks, write_final_output_bundle
+
+
 def execute_final_run_stage(*, cfg, args, report: Dict[str, Any], log, fatal_errors: List[str],
                             sdb_raster, river_raster, river_for_fuse, river_excluded,
                             fuse_fn, condition_fn, reproject_fn, write_bundle_fn,
@@ -82,15 +99,35 @@ def execute_final_run_stage(*, cfg, args, report: Dict[str, Any], log, fatal_err
         "runtime_engine": runtime_engine,
     })
     final_for_user = reproject_fn(cfg, final, report, sdb_raster, river_raster, fatal_errors)
-    report_path = write_bundle_fn(cfg, report, final_native=final_native_path, final_for_user=final_for_user, final_provenance=final_provenance)
+    postrun_context = build_final_postrun_context(
+        cfg=cfg,
+        args=args,
+        report=report,
+        run_id=report.get("run", {}).get("run_id") or "unknown",
+        final_native=final_native_path,
+        final_for_user=final_for_user,
+        final_provenance=final_provenance,
+        fatal_errors=fatal_errors,
+    )
+    if _postrun_outputs_requested(args, cfg):
+        report_path = write_final_output_bundle(
+            context=postrun_context,
+            logger=log,
+            write_bundle_fn=write_bundle_fn,
+            write_io_manifest_fn=write_io_manifest_fn,
+            emit_artifacts_fn=emit_artifacts_fn,
+        )
 
-    try:
-        io_json, io_md = write_io_manifest_fn(cfg.out_dir, report)
-    except (FileNotFoundError, OSError, ValueError) as e:
-        log.debug("Optional IO manifest write failed: %s", e)
-        io_json, io_md = None, None
-    emit_artifacts_fn(report_path, io_json, io_md, report, log)
-    log.info("Report written: %s", report_path)
-
-    run_seam_comparisons_fn(args, cfg, report, final, final_for_user, report_path)
+        run_postrun_output_checks(
+            context=postrun_context,
+            run_seam_comparisons_fn=run_seam_comparisons_fn,
+        )
+    else:
+        report_path = write_final_output_bundle(
+            context=postrun_context,
+            logger=log,
+            write_bundle_fn=write_bundle_fn,
+            write_io_manifest_fn=write_io_manifest_fn,
+            emit_artifacts_fn=lambda *_args, **_kwargs: None,
+        )
     return finalize_run_fn(cfg, report, args, final, final_for_user, final_provenance, fatal_errors)

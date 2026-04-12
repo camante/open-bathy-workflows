@@ -1,0 +1,17 @@
+Phase 167 - Postrun orchestration extraction (Phase 1)
+
+What changed
+- Added final_postrun_contract.py with explicit postrun context/artifact dataclasses used by later stages.
+- Added postrun_output_stage.py so final report bundle writing, IO manifest emission, and seam/invariance postrun checks are orchestrated through a dedicated stage boundary instead of hand-wired inside final_run_stage.py.
+- Added postrun_benchmark_stage.py so benchmark execution is requested and routed through an explicit postrun stage boundary instead of growing bathy_main.py.
+- Updated final_run_stage.py to build a postrun context and route report/seam orchestration through the new stage module.
+- Updated bathy_main.py to route workflow benchmark execution through the new benchmark stage using the same postrun context contract.
+- Added focused tests for the new postrun contracts and stage wiring.
+
+Intent
+- This is a structural refactor only. It does not change terrain generation, final DEM science behavior, or benchmark math.
+- The goal is to shrink the monolithic orchestration boundary and make the next terrain-preservation and nested-AOI regression phases attach to explicit contracts rather than loose local variables.
+
+Verified
+- Full repo compileall passed.
+- Focused postrun stage tests passed.

@@ -1,0 +1,24 @@
+Phase 88: adjacent-channel depth-surface recovery before bank fallback
+
+Summary
+- Reduced another avoidable bank-derived WSE fallback case in the active structured river route.
+- Components with DEM gaps but no in-component DEM support now try adjacent in-channel component surface support before falling back to bank-ring-derived WSE.
+
+What changed
+- geo/raster_ops.py
+  - compute_depth_from_bed_and_dem() now adds an intermediate recovery mode:
+    - adjacent_channel_surface
+  - New receipt fields:
+    - components_using_adjacent_channel_surface_propagation
+    - per-component adjacent_channel_valid_pixels
+    - per-component adjacent_component_ids
+    - used_adjacent_channel_surface_propagation
+  - Recovery order is now:
+    1. same_component_surface
+    2. adjacent_channel_surface
+    3. bank_ring_surface
+    4. unresolved
+
+Tests
+- Updated per-component recovery-mode test to reflect adjacent-channel recovery.
+- Added regression proving adjacent channel support is used before bank fallback when a no-support component is close to another valid channel component.

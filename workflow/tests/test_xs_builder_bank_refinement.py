@@ -74,7 +74,7 @@ def test_pick_banks_prefers_corridor_edge_refinement_over_endpoint_peak():
     assert abs(profile.loc[idx_r, "dist_m"] - 80.0) <= 2.0
 
 
-def test_pick_banks_requires_bank_domain_expectations_when_no_expected_edges_available():
+def test_pick_banks_uses_end_window_fallback_when_no_expected_edges_available():
     dist = np.arange(0.0, 51.0, 1.0)
     z = np.zeros(dist.shape, dtype=float)
     z[5] = 4.0
@@ -85,6 +85,33 @@ def test_pick_banks_requires_bank_domain_expectations_when_no_expected_edges_ava
         "z_topo": np.full(dist.shape, np.nan, dtype=float),
     })
     idx_l, idx_r, meta = pick_banks(profile, bank_search_m=10.0)
-    assert meta["method"] == "missing_bank_domain_expectations"
-    assert idx_l is None
-    assert idx_r is None
+    assert meta["method"] == "end_window_refined"
+    assert abs(profile.loc[idx_l, "dist_m"] - 5.0) <= 1.0
+    assert abs(profile.loc[idx_r, "dist_m"] - 45.0) <= 1.0
+
+
+def test_pick_banks_falls_back_to_end_windows_when_expected_refinement_fails():
+    dist = np.arange(0.0, 101.0, 1.0)
+    z = np.zeros(dist.shape, dtype=float)
+    z[8] = 5.0
+    z[92] = 6.0
+    z[28:33] = np.nan
+    z[68:73] = np.nan
+    profile = pd.DataFrame({
+        "dist_m": dist,
+        "z_dem": z,
+        "z_topo": np.full(dist.shape, np.nan, dtype=float),
+    })
+    idx_l, idx_r, meta = pick_banks(
+        profile,
+        bank_search_m=12.0,
+        prefer_topo=True,
+        expected_left_dist_m=30.0,
+        expected_right_dist_m=70.0,
+        bank_edge_refine_m=2.0,
+        bank_quantile=0.8,
+        bank_smooth_window_m=3.0,
+    )
+    assert meta["method"] == "end_window_refined"
+    assert abs(profile.loc[idx_l, "dist_m"] - 8.0) <= 1.0
+    assert abs(profile.loc[idx_r, "dist_m"] - 92.0) <= 1.0

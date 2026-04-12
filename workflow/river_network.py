@@ -617,55 +617,71 @@ def clip_polys_to_aoi(gdf_polys: gpd.GeoDataFrame, aoi_poly_proj: gpd.GeoDataFra
     gdf = _clean_polys(gdf)
     return gdf
 
+def filter_nhdarea_by_ftype(gdf_in: gpd.GeoDataFrame, *, allow_ftypes: tuple = (460,)) -> gpd.GeoDataFrame:
+    """Filter NHDArea polygons to specific FType values.
+
+    Default keeps only StreamRiver (FType=460) for river domain construction.
+    Sea/Ocean (FType=445 / FCode=44500) and other coastal types are excluded by default.
+    """
+    if gdf_in is None or gdf_in.empty:
+        return gpd.GeoDataFrame(columns=["geometry"], crs=gdf_in.crs if gdf_in is not None else None)
+
+    gdf_in = gdf_in.copy()
+
+    # Find a plausible feature-type field
+    ftype_field = None
+    for c in ["FType", "FTYPE", "ftype", "FTypeName", "FTYPENAME", "ftypename", "FeatureType", "FEATURETYPE"]:
+        if c in gdf_in.columns:
+            ftype_field = c
+            break
+
+    if ftype_field is None:
+        # No reliable classification field; treat as unusable (forces corridor fallback)
+        return gpd.GeoDataFrame(columns=["geometry"], crs=gdf_in.crs)
+
+    vals = gdf_in[ftype_field]
+    allow_set = set(int(x) for x in allow_ftypes)
+
+    # Numeric coding (common: StreamRiver=460, Sea/Ocean=445/FCode 44500)
+    keep = None
+    try:
+        vnum = vals.astype("float64")
+        keep = vnum.isin(allow_set)
+    except Exception:
+        log.debug("filter_nhdarea_by_ftype: suppressed exception", exc_info=True)
+        # String coding fallback
+        vstr = vals.astype(str).str.lower()
+        keep = vstr.apply(lambda _: False)
+        if 460 in allow_set:
+            keep = keep | vstr.str.contains("streamriver") | vstr.str.contains("stream river")
+        if 445 in allow_set:
+            keep = keep | vstr.str.contains("sea") | vstr.str.contains("ocean")
+
+    gdf_out = gdf_in.loc[keep].copy()
+    gdf_out = _clean_polys(gdf_out)
+    return gdf_out
+
+
 def try_arcgis_nhdarea_polygons(
     aoi: Tuple[float, float, float, float],
     out_crs: Optional[str],
     timeout_s: int = 120,
 ) -> gpd.GeoDataFrame:
-    """Fetch polygonal river areas via ArcGIS REST (best-effort).
+    """Fetch ALL NHDArea polygons via ArcGIS REST (best-effort).
 
-    Important: we want *river/stream* polygons (NHD "Area" features), NOT lakes/waterbodies.
-    In the TNM NHD MapServer, these typically live in the generic Area layers (e.g. 9/7),
-    and the river class is commonly encoded as StreamRiver (often FType=460).
+    Returns ALL water-type polygons (StreamRiver=460, Sea/Ocean=445/FCode 44500, etc.)
+    from the NHD MapServer Area layers. Downstream consumers apply their own
+    FType filter:
+
+    - ``nhdarea_clip`` in the scaffold is filtered to StreamRiver (460) for
+      river domain construction via :func:`filter_nhdarea_by_ftype`.
+    - ``nhdarea_aoi`` preserves ALL types so that guidance_domains can find
+      Sea/Ocean (FType=445 / FCode=44500) for the shared estuary/coastal handoff.
 
     Returns GeoDataFrame in projected CRS (out_crs or auto-UTM). Empty on failure.
     """
     lonc, latc = _aoi_center(aoi)
     crs_out = CRS.from_user_input(out_crs) if out_crs else CRS.from_epsg(_auto_utm_epsg_from_lonlat(lonc, latc))
-
-    def _filter_streamriver_polys(gdf_in: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-        if gdf_in is None or gdf_in.empty:
-            return gpd.GeoDataFrame(columns=["geometry"], crs=gdf_in.crs if gdf_in is not None else crs_out)
-
-        gdf_in = gdf_in.copy()
-
-        # Find a plausible feature-type field
-        ftype_field = None
-        for c in ["FType", "FTYPE", "ftype", "FTypeName", "FTYPENAME", "ftypename", "FeatureType", "FEATURETYPE"]:
-            if c in gdf_in.columns:
-                ftype_field = c
-                break
-
-        if ftype_field is None:
-            # No reliable classification field; treat as unusable (forces corridor fallback)
-            return gpd.GeoDataFrame(columns=["geometry"], crs=gdf_in.crs)
-
-        vals = gdf_in[ftype_field]
-
-        # Numeric coding (common: StreamRiver=460)
-        keep = None
-        try:
-            vnum = vals.astype("float64")
-            keep = (vnum == 460)
-        except Exception:
-            log.debug("_filter_streamriver_polys: suppressed exception", exc_info=True)
-            # String coding (common: "StreamRiver")
-            vstr = vals.astype(str).str.lower()
-            keep = vstr.str.contains("streamriver") | vstr.str.contains("stream river")
-
-        gdf_out = gdf_in.loc[keep].copy()
-        gdf_out = _clean_polys(gdf_out)
-        return gdf_out
 
     # Prefer the NHD MapServer "Area" layers (these are polygonal channel areas).
     # Layer IDs observed in the TNM NHD service:
@@ -678,14 +694,15 @@ def try_arcgis_nhdarea_polygons(
             if gdf_ll is None or gdf_ll.empty:
                 continue
             gdfp = gdf_ll.to_crs(crs_out)
-            gdfp = _filter_streamriver_polys(gdfp)
+            gdfp = _clean_polys(gdfp)
             if gdfp is not None and not gdfp.empty:
                 gdfp["source"] = f"arcgis_{label}"
+                log.info("Fetched %d NHDArea polygon(s) from layer %d (all FTypes).", len(gdfp), layer_id)
                 return gdfp
         except Exception as e:
             log.warning("Area polygon query failed (layer=%d): %s", layer_id, str(e))
 
-    # If we couldn't get StreamRiver polygons, return empty to trigger downstream corridor fallback.
+    # If we couldn't get any NHDArea polygons, return empty to trigger downstream corridor fallback.
     return gpd.GeoDataFrame(columns=["geometry"], crs=crs_out)
 
 
@@ -1773,8 +1790,19 @@ def main() -> None:
         try:
             nhdarea_aoi = try_arcgis_nhdarea_polygons(aoi=aoi, out_crs=str(crs_out), timeout_s=int(getattr(args, "arcgis_timeout", 120)))
             if nhdarea_aoi is not None and not nhdarea_aoi.empty:
-                nhdarea_clip = clip_polys_to_aoi(nhdarea_aoi, aoi_poly_proj)
-                log.info("Loaded %d NHDArea polygon(s) via ArcGIS REST (%s).", len(nhdarea_clip), str(nhdarea_aoi.get("source", ["arcgis"]).iloc[0]) if "source" in nhdarea_aoi.columns else "arcgis")
+                # nhdarea_aoi stores ALL NHDArea types (StreamRiver=460, Sea/Ocean=445/FCode 44500, etc.)
+                # nhdarea_clip is filtered to StreamRiver only for river domain construction.
+                # Sea/Ocean polygons are preserved in nhdarea_aoi for the shared estuary/coastal
+                # handoff in guidance_domains.py.
+                all_clipped = clip_polys_to_aoi(nhdarea_aoi, aoi_poly_proj)
+                nhdarea_clip = filter_nhdarea_by_ftype(all_clipped, allow_ftypes=(460,))
+                n_sea_ocean = len(all_clipped) - len(nhdarea_clip) if all_clipped is not None else 0
+                log.info("Loaded %d NHDArea polygon(s) via ArcGIS REST (%d StreamRiver, %d other including Sea/Ocean).",
+                         len(all_clipped) if all_clipped is not None else 0,
+                         len(nhdarea_clip),
+                         n_sea_ocean)
+                # Store the full unfiltered clipped set in nhdarea_aoi for downstream Sea/Ocean detection
+                nhdarea_aoi = all_clipped
             else:
                 log.info("No NHDArea polygons found in AOI (continuing).")
         except Exception as e:

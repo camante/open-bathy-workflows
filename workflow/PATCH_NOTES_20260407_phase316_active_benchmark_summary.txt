@@ -1,0 +1,13 @@
+workflow v316 simplification pass
+
+This pass makes the benchmark side match the simplified river contract more closely.
+
+Main changes:
+- adds benchmark_river_active_evaluation_summary.json as the single primary river benchmark receipt
+- demotes benchmark_river_mode_summary.json, benchmark_river_receipt_triage_summary.json, and benchmark_river_primary_focus_summary.json to diagnostic drilldowns in the reports hub
+- updates benchmark markdown/reporting to point first to the active river evaluation summary
+- updates the active contract doc with the v316 evaluation note
+
+Why this matters:
+- one active river guidance product was already explicit in v315
+- v316 makes the evaluation side follow the same simplification principle: one primary evaluation story, then drilldowns

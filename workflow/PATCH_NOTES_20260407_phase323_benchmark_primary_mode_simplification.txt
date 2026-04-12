@@ -1,0 +1,12 @@
+workflow_v323 benchmark simplification
+
+This pass narrows the active river benchmark path in canonical workflow:
+- support-aware evaluation remains the default active benchmark mode
+- withheld-support becomes the active mode only when explicitly applied
+- generic hard-problem holdout coverage remains available only as a diagnostic drilldown
+
+Files changed:
+- benchmark_workflow_stage.py
+- workflow_reports_hub.py
+- docs/river_workflow_active_contract.md
+- tests/test_benchmark_workflow_stage.py

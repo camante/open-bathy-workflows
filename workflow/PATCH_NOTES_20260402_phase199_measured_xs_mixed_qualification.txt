@@ -1,0 +1,24 @@
+Phase 199: measured XS mixed-support qualification fix
+
+Root cause from v198 run
+- The measured-support-distance propagation worked, but the run still showed:
+  - authoritative_xs_anchor_count = 1009
+  - xs_candidate_station_count = 5
+  - xs_qualified_station_count = 1
+  - measured_xs_nodes = 3
+- The first wrong construction-stage artifact was the channel-frame measured-XS qualification.
+- In river_channel_frame.py, station-level authoritative XS support was summarized by the modal support class.
+  Stations with true inner/core bed samples plus many bank samples were often labeled as bank-dominant and then rejected.
+- That let bank/backbone semantics drive rebuilds even near the few real measured XS stations.
+
+What changed
+- Added station-level authoritative XS class summarization that preserves mixed support:
+  - authoritative_bed_mixed when a station has both bank-edge and inner/core authoritative XS samples.
+- Updated measured XS qualification so mixed inner+bank stations remain eligible true measured XS support.
+- Kept the bank-only contract intact: stations with bank-only authoritative support are still forbidden from activating measured XS nodes.
+- Added a regression test covering the mixed bank+inner authoritative XS case.
+
+Expected effect on the next run
+- More of the existing authoritative XS support should survive the handoff from channel frame -> scaffold.
+- That should increase measured XS station/node protection near the supported reaches.
+- The most likely observable improvement is reduced roughening in the 0-100 m near-anchor longitudinal roughness bin while preserving the far-upstream smoothing gains from phase 198.

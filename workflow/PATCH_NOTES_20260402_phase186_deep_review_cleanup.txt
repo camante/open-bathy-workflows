@@ -1,0 +1,10 @@
+Phase 186 deep review cleanup
+
+- Fixed river_science_effect_summary to read longitudinal_support_regime_counts from the real longitudinal summary key.
+- Fixed primary_surface_rebuild component receipts so changed_channel_core_node_count is computed from updated work rows, not stale pre-update component slices.
+- Added top-level rebuild_mode_counts to primary_surface_rebuild_summary so downstream science-effect reporting reflects actual rebuild modes.
+- Removed .pytest_cache from artifact to reduce slop.
+
+Verification:
+- python -m compileall -q .
+- pytest -q tests/test_river_primary_surface_rebuild.py tests/test_river_effectiveness_receipts.py tests/test_river_channel_surface.py tests/test_benchmark_workflow_stage.py (35 passed)

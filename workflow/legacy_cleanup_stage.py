@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict
+import os
 
 from final_route_receipts import write_json_receipt
 import logging
@@ -12,9 +13,16 @@ log = logging.getLogger(__name__)
 def _as_path(value: Any) -> str | None:
     if not value:
         return None
+    if isinstance(value, (list, tuple, set, dict)):
+        return None
+    if not isinstance(value, (str, os.PathLike)):
+        return None
     try:
-        return str(Path(str(value)))
-    except Exception:
+        path_text = os.fspath(value).strip()
+        if not path_text:
+            return None
+        return str(Path(path_text))
+    except (TypeError, ValueError, OSError):
         log.debug("_as_path: suppressed exception", exc_info=True)
         return None
 

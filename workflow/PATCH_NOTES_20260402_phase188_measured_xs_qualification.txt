@@ -1,0 +1,15 @@
+Phase 188 review + measured XS qualification/association pass
+
+Reviewed previous Phase 187 audit wiring and cleaned up two concrete issues:
+1. Frame-stage audit was treating any finite xs_support_z_m station as an equivalent candidate.
+2. Scaffold-stage audit only counted z_source=xs_profile_resampled, which undercounted qualified stations with xs-supported inner/thalweg modes.
+
+This pass adds:
+- station-level association of authoritative XS support samples to nearest frame stations with metric distances
+- explicit station counts for nearby authoritative XS samples
+- true_measured_xs_candidate vs true_measured_xs_qualified station fields
+- qualification rejection reasons (weight too low vs unsupported support class)
+- scaffold handoff receipts that separately report candidate vs qualified stations
+- broader pre-filter measured-node detection for xs_supported inner/thalweg nodes
+
+No downstream science behavior beyond qualification/association receipts was changed.

@@ -1,0 +1,16 @@
+Phase 176: provenance split and receipts
+
+Changes:
+- Split XS provenance into true measured XS, indirect XS, and residual XS in river_longitudinal_tendency.py.
+- Added station-level provenance fractions and classes to active longitudinal tendency receipts.
+- Added river_xs_provenance_station_summary.csv and river_xs_provenance_receipt.json.
+- Propagated the same provenance split into river_xs_realism.py station summaries.
+- Added river_xs_realism_provenance_station_summary.csv.
+- Added targeted tests for the provenance split in longitudinal tendency and XS realism.
+
+Verification:
+- Targeted pytest: tests/test_river_longitudinal_tendency.py tests/test_river_xs_realism.py
+- Full repo compile check via python -m py_compile
+
+Note:
+- This pass adds provenance clarity and receipts only. It does not yet change the protection/rebuild behavior.

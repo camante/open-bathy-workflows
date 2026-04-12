@@ -4,8 +4,14 @@ from typing import Any, Dict, Mapping
 
 import numpy as np
 
-from provenance_schema import PROVENANCE_CLASS_CODE_TO_NAME
-from support_classes import SUPPORT_CLASS_CODE_TO_NAME
+from provenance_schema import (
+    PROVENANCE_CLASS_CODE_TO_NAME,
+    provenance_class_family_or_raise,
+)
+from support_classes import (
+    SUPPORT_CLASS_CODE_TO_NAME,
+    support_class_family_or_raise,
+)
 
 
 def _finite_domain(pred: np.ndarray, truth: np.ndarray) -> np.ndarray:
@@ -40,7 +46,7 @@ def compute_support_class_metrics(*, pred: np.ndarray, truth: np.ndarray, suppor
         if block["count"] <= 0:
             continue
         out["by_class"][str(int(code))] = {"label": label, **block}
-        family = label if "guidance_conditioned" not in label else "guidance_conditioned"
+        family = support_class_family_or_raise(int(code))
         fam = out["by_family"].setdefault(family, [])
         fam.append(errors[mask])
     out["by_family"] = {fam: _metric_block(np.concatenate(vals) if vals else np.array([], dtype=np.float32)) for fam, vals in out["by_family"].items()}
@@ -55,13 +61,17 @@ def compute_provenance_class_metrics(*, pred: np.ndarray, truth: np.ndarray, pro
         raise ValueError("pred, truth, and provenance_class must have matching shapes")
     domain = _finite_domain(pred, truth)
     errors = pred - truth
-    out: Dict[str, Any] = {"overall": _metric_block(errors[domain]), "by_class": {}}
+    out: Dict[str, Any] = {"overall": _metric_block(errors[domain]), "by_class": {}, "by_family": {}}
     for code, label in PROVENANCE_CLASS_CODE_TO_NAME.items():
         mask = domain & (provenance_class == int(code))
         block = _metric_block(errors[mask])
         if block["count"] <= 0:
             continue
         out["by_class"][str(int(code))] = {"label": label, **block}
+        family = provenance_class_family_or_raise(int(code))
+        fam = out["by_family"].setdefault(family, [])
+        fam.append(errors[mask])
+    out["by_family"] = {fam: _metric_block(np.concatenate(vals) if vals else np.array([], dtype=np.float32)) for fam, vals in out["by_family"].items()}
     return out
 
 

@@ -1,0 +1,6 @@
+Phase 101 - Domain stage pass 3
+
+- Removed late WAFFLES-only re-gating from run_sdb().
+- SDB runner now trusts shared-domain activation from domain_summary.json.
+- SDB runner validates the exact shared SDB mask/path and pixel count used for activation.
+- Added explicit failure for shared-domain activation mismatch instead of silently re-skipping.

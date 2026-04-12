@@ -1,0 +1,24 @@
+Phase 212: bank-anchor-conditioned fluvial core-bed fit
+
+Summary
+- Reviewed phase211 and fixed the next active-path gap: active_core_support was still monotone-projecting the network backbone instead of solving the unsupported fluvial core bed from the fitted bank-pair reference plus the stationized authoritative bed-anchor curve.
+- Added audit fields showing the bank reference, fitted bank-to-bed offset, model elevation, model weight, and offset-source used by the active core-support solve.
+
+Key changes
+- river_longitudinal_profile.py
+  - _apply_active_core_support() now:
+    - builds a fluvial bank reference from bank_pair_fit_z_m -> bank_profile_monotone_m -> raw bank fallback
+    - derives a smooth bank-to-bed offset from the stationized authoritative bed-anchor curve
+    - falls back to a bank-backbone offset only when authoritative anchor offsets are unavailable
+    - solves a bank-anchor-conditioned core-bed model in unsupported fluvial reaches
+    - then applies weighted monotone downstream projection while preserving authoritative anchors exactly
+  - writes new diagnostics fields:
+    - active_core_support_bank_reference_m
+    - active_core_support_bank_offset_m
+    - active_core_support_model_elevation_m
+    - active_core_support_model_weight
+    - active_core_support_offset_source
+  - hydraulic backbone CSV now exports these new audit fields.
+
+Tests
+- Added regression coverage showing active_core_support becomes a smooth downstream-falling bank-anchor-conditioned fit rather than following a noisy backbone.

@@ -1,0 +1,37 @@
+Phase 206: explicit monotone fluvial active core support
+
+Summary
+- Reviewed phase205 and fixed the next planned pass: create an explicit monotone fluvial active channel-core support path and route the active river frame to prefer it over the legacy longitudinal-profile raster.
+
+Main changes
+- river_longitudinal_profile.py
+  - added weighted isotonic support for PAVA
+  - added _apply_active_core_support()
+  - exports active_core_support_elevation_m / uncertainty / source / monotone adjustment
+  - assigns active core support to longitudinal profile points
+  - rasterizes active core support for downstream use
+  - writes explicit active-core support rasters:
+    - river_active_core_support_elevation.tif
+    - river_active_core_support_uncertainty.tif
+    - river_active_core_support_influence.tif
+  - adds active-core diagnostics to summary
+- river_channel_frame.py
+  - samples active_core_support_z_m
+  - prefers active core support over legacy longitudinal profile for resolved backbone and backbone mode
+  - includes active_core_support in provenance fallbacks
+- river_guidance.py
+  - passes active core support artifacts into the frame stage
+  - includes active-core support artifacts in the longitudinal profile contract outputs
+  - registers active-core support artifacts in manifest maps
+- river_longitudinal_profile_contract.py
+  - adds active core support rasters as optional profile artifacts
+- final_route_contract.py
+  - allows active core support artifacts in river guidance manifests
+  - also aligns allowed artifact set with xs bank QC artifacts already emitted by the workflow
+- tests
+  - added regression tests for explicit monotone active core support export
+  - added regression test proving frame prefers active core support over the legacy profile raster
+
+Verification
+- full compileall passed
+- targeted suites passed: 37 tests

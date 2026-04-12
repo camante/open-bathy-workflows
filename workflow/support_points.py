@@ -38,7 +38,9 @@ def load_extra_xyz_points(xyz_files: List[str], crs: str, aoi_str: str) -> pd.Da
     Load external XYZ bathymetry data from multiple files.
 
     Supports CSV, TXT, Parquet, and vector formats. Reprojects from ``crs`` to EPSG:4326
-    and clips to ``aoi_str`` (W/E/S/N). All rows are labelled source="extra_xyz".
+    and clips to ``aoi_str`` (W/E/S/N). If an input already carries a meaningful
+    ``source`` column, that provenance is preserved; otherwise rows are labelled as
+    ``extra_xyz:<stem>``.
 
     Args:
         xyz_files: List of file paths

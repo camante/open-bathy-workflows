@@ -46,6 +46,7 @@ import numpy as np
 
 import rasterio
 
+from nodata_utils import prepare_array_for_reproject, sanitize_array, resolve_nodata_value, resolve_reproject_nodata_value
 from sign_semantics import raster_value_semantics, should_expect_negative_depth
 from rasterio.windows import Window
 from pyproj import CRS, Geod
@@ -83,9 +84,10 @@ def _sample_raster_values(path: Path, max_samples: int = 50000) -> np.ndarray:
                 win = Window(col_off=x0, row_off=y0, width=min(128, w - x0), height=min(128, h - y0))
                 arr = ds.read(1, window=win, masked=True).astype("float64")
                 if np.ma.isMaskedArray(arr):
-                    a = arr.compressed()
+                    a = arr.filled(np.nan)
                 else:
-                    a = arr.ravel()
+                    a = arr
+                a = sanitize_array(a, ds.nodata, dtype="float64").ravel()
                 if a.size:
                     a = a[np.isfinite(a)]
                     if a.size:
@@ -100,9 +102,10 @@ def _sample_raster_values(path: Path, max_samples: int = 50000) -> np.ndarray:
             for _, win in ds.block_windows(1):
                 arr = ds.read(1, window=win, masked=True).astype("float64")
                 if np.ma.isMaskedArray(arr):
-                    a = arr.compressed()
+                    a = arr.filled(np.nan)
                 else:
-                    a = arr.ravel()
+                    a = arr
+                a = sanitize_array(a, ds.nodata, dtype="float64").ravel()
                 if a.size:
                     a = a[np.isfinite(a)]
                     if a.size:
@@ -402,18 +405,19 @@ def _reproject_to_template(
         dtype=np.float32,
     )
     
+    src_prepped, src_nodata = prepare_array_for_reproject(src_data, np.nan, dtype='float32', default_nodata=-9999.0)
     reproject(
-        source=src_data,
+        source=src_prepped,
         destination=dst_data,
         src_transform=src_profile["transform"],
         src_crs=src_profile["crs"],
         dst_transform=template_profile["transform"],
         dst_crs=template_profile["crs"],
         resampling=Resampling.nearest,
-        src_nodata=np.nan,
+        src_nodata=src_nodata,
         dst_nodata=np.nan,
     )
-    
+    dst_data = sanitize_array(dst_data, np.nan, dtype='float32', extra=(src_nodata,))
     return dst_data
 
 
@@ -568,6 +572,7 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
             dst_path.parent.mkdir(parents=True, exist_ok=True)
 
             with rasterio.open(dst_path, "w", **dst_prof) as dst:
+                src_nodata = resolve_reproject_nodata_value(src.nodata, default=nodata_out)
                 reproject(
                     source=rasterio.band(src, 1),
                     destination=rasterio.band(dst, 1),
@@ -576,7 +581,7 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
                     dst_transform=template_transform,
                     dst_crs=template_crs,
                     resampling=resampling,
-                    src_nodata=src.nodata,
+                    src_nodata=src_nodata,
                     dst_nodata=nodata_out,
                 )
         return dst_path

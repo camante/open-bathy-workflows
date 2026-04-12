@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
+import pandas as pd
 
 
 def compute_bank_edge_mask(corridor_mask: np.ndarray) -> np.ndarray:
@@ -109,6 +110,199 @@ def _clamp_distance(line, dist_m: float) -> float:
 
 
 
+
+
+
+
+def compute_lower_bank_wse_proxy_from_edge_guidance(
+    bank_elevation: np.ndarray,
+    bank_influence: np.ndarray,
+    *,
+    centerline_points_path: str | Path,
+    transform,
+    source_crs=None,
+    proxy_radius_m: float,
+    quantile: float = 0.25,
+    adaptive_radius_steps: tuple[float, ...] = (1.0, 2.0, 4.0, 6.0),
+) -> tuple[np.ndarray, pd.DataFrame]:
+    """Build a simple continuous lower-bank WSE proxy from edge-band bank samples.
+
+    One path:
+    1. sample lower-bank values near centerline stations from the edge band,
+    2. interpolate missing stations along each component,
+    3. smooth and enforce nonincreasing downstream,
+    4. project the final station profile back onto the edge band only.
+    """
+    import geopandas as gpd
+    import rasterio.transform
+    from scipy.spatial import cKDTree
+
+    bank = np.asarray(bank_elevation, dtype=np.float32)
+    infl = np.asarray(bank_influence, dtype=np.float32)
+    edge_band = np.isfinite(bank) & np.isfinite(infl) & (infl > 0.0)
+    proxy = np.full(bank.shape, np.nan, dtype=np.float32)
+    empty_cols = [
+        "component_id", "station_m", "bank_wse_proxy_raw_m",
+        "bank_wse_proxy_interp_m", "bank_wse_proxy_monotone_m",
+        "bank_wse_proxy_adjustment_m",
+        "bank_wse_proxy_search_radius_m",
+        "bank_wse_proxy_search_attempt_count",
+    ]
+    if not np.any(edge_band):
+        return proxy, pd.DataFrame(columns=empty_cols)
+
+    cl_path = Path(centerline_points_path)
+    if not cl_path.exists():
+        raise FileNotFoundError(cl_path)
+    cl = gpd.read_file(cl_path)
+    if cl.empty:
+        raise RuntimeError("river_bank_wse_proxy_missing_centerline_points")
+    if source_crs is not None and cl.crs is not None and str(cl.crs) != str(source_crs):
+        try:
+            cl = cl.to_crs(source_crs)
+        except Exception as exc:
+            raise RuntimeError("river_bank_wse_proxy_centerline_reprojection_failed") from exc
+    if "station_m" not in cl.columns:
+        raise RuntimeError("river_bank_wse_proxy_missing_station_m")
+    if "component_id" not in cl.columns:
+        cl["component_id"] = "main"
+    cl = cl[cl.geometry.notnull() & ~cl.geometry.is_empty].copy()
+    if cl.empty:
+        raise RuntimeError("river_bank_wse_proxy_empty_centerline_points")
+
+    station_m = pd.to_numeric(cl["station_m"], errors="coerce").to_numpy(dtype=float)
+    component_id = cl["component_id"].astype(str).to_numpy()
+    clx = cl.geometry.x.to_numpy(dtype=np.float64)
+    cly = cl.geometry.y.to_numpy(dtype=np.float64)
+    clxy = np.column_stack([clx, cly])
+
+    rows, cols = np.where(edge_band)
+    xs, ys = rasterio.transform.xy(transform, rows, cols, offset="center")
+    edge_xy = np.column_stack([np.asarray(xs, dtype=np.float64), np.asarray(ys, dtype=np.float64)])
+    edge_z = bank[rows, cols].astype(np.float32)
+
+    safe_radius = max(float(proxy_radius_m or 0.0), 1.0)
+    metric_clxy = clxy
+    metric_edge_xy = edge_xy
+    if source_crs is not None:
+        try:
+            from pyproj import CRS, Transformer
+            src_crs = CRS.from_user_input(source_crs)
+            if src_crs.is_geographic:
+                metric_crs = CRS.from_epsg(3857)
+                tx = Transformer.from_crs(src_crs, metric_crs, always_xy=True)
+                clmx, clmy = tx.transform(clxy[:, 0], clxy[:, 1])
+                edmx, edmy = tx.transform(edge_xy[:, 0], edge_xy[:, 1])
+                metric_clxy = np.column_stack([np.asarray(clmx, dtype=np.float64), np.asarray(clmy, dtype=np.float64)])
+                metric_edge_xy = np.column_stack([np.asarray(edmx, dtype=np.float64), np.asarray(edmy, dtype=np.float64)])
+        except Exception:
+            pass
+    edge_tree = cKDTree(metric_edge_xy)
+
+    raw_proxy = np.full((len(cl),), np.nan, dtype=np.float32)
+    interp_proxy = np.full((len(cl),), np.nan, dtype=np.float32)
+    mono_proxy = np.full((len(cl),), np.nan, dtype=np.float32)
+
+    search_radii_used = np.full((len(cl),), np.nan, dtype=np.float32)
+    search_attempt_count = np.zeros((len(cl),), dtype=np.int32)
+    for i, q in enumerate(metric_clxy):
+        chosen = None
+        chosen_radius = np.nan
+        attempts = 0
+        for step in tuple(float(s) for s in (adaptive_radius_steps or (1.0,))):
+            attempts += 1
+            trial_radius = max(safe_radius * max(step, 1.0), safe_radius)
+            idx = edge_tree.query_ball_point(q, r=trial_radius)
+            if not idx:
+                continue
+            vals = edge_z[np.asarray(idx, dtype=int)]
+            vals = vals[np.isfinite(vals)]
+            if vals.size:
+                chosen = vals
+                chosen_radius = float(trial_radius)
+                break
+        search_attempt_count[i] = attempts
+        if chosen is None:
+            continue
+        search_radii_used[i] = np.float32(chosen_radius)
+        raw_proxy[i] = np.float32(np.nanquantile(chosen, quantile))
+
+    def _interp_component(sta: np.ndarray, vals: np.ndarray) -> np.ndarray:
+        out = vals.astype(np.float32).copy()
+        finite = np.isfinite(out) & np.isfinite(sta)
+        if np.count_nonzero(finite) == 0:
+            return out
+        if np.count_nonzero(finite) == 1:
+            out[:] = out[finite][0]
+            return out
+        out[:] = np.interp(sta, sta[finite], out[finite]).astype(np.float32)
+        return out
+
+    for comp in pd.unique(component_id):
+        comp_idx = np.flatnonzero(component_id == comp)
+        if comp_idx.size == 0:
+            continue
+        order = np.argsort(station_m[comp_idx])
+        ordered_idx = comp_idx[order]
+        ordered_sta = station_m[ordered_idx].astype(np.float32)
+        ordered_raw = raw_proxy[ordered_idx].astype(np.float32)
+        ordered_interp = _interp_component(ordered_sta, ordered_raw)
+        ordered_smooth = _nan_rolling_quantile(ordered_interp, half_window=2, quantile=quantile)
+        ordered_mono = _weighted_pava_nondecreasing(
+            ordered_smooth.astype(np.float32),
+            np.ones(ordered_smooth.size, dtype=np.float32),
+        )
+        interp_proxy[ordered_idx] = ordered_interp
+        mono_proxy[ordered_idx] = ordered_mono
+
+    valid_cl = np.isfinite(mono_proxy)
+    if np.any(valid_cl):
+        cl_tree = cKDTree(metric_clxy[valid_cl])
+        _, nn = cl_tree.query(metric_edge_xy, k=1)
+        nn = np.asarray(nn, dtype=int)
+        proxy_vals = mono_proxy[valid_cl][nn].astype(np.float32)
+        proxy[rows, cols] = proxy_vals
+
+    cl["bank_wse_proxy_raw_m"] = raw_proxy.astype(np.float32)
+    cl["bank_wse_proxy_interp_m"] = interp_proxy.astype(np.float32)
+    cl["bank_wse_proxy_monotone_m"] = mono_proxy.astype(np.float32)
+    cl["bank_wse_proxy_adjustment_m"] = (mono_proxy - interp_proxy).astype(np.float32)
+    cl["bank_wse_proxy_search_radius_m"] = search_radii_used.astype(np.float32)
+    cl["bank_wse_proxy_search_attempt_count"] = search_attempt_count.astype(np.int32)
+    return proxy.astype(np.float32), pd.DataFrame(cl[empty_cols])
+def compute_bank_edge_guidance_from_authoritative(
+    auth: np.ndarray,
+    corridor_mask: np.ndarray,
+    *,
+    pixel_size_m: float,
+    edge_guidance_distance_m: float,
+    max_bank_distance_m: Optional[float] = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return a narrow edge-only bank guidance product.
+
+    This is intentionally *not* a wall-to-wall cross-channel bank surface. It
+    samples bank elevations from authoritative cells outside the corridor, then
+    keeps them only within a narrow interior edge band so bank guidance acts as
+    a boundary tendency rather than as a surrogate channel bed.
+    """
+    edge, bank_distance_m, bank_influence = compute_bank_distance_influence(
+        corridor_mask,
+        pixel_size_m=pixel_size_m,
+        full_influence_m=0.0,
+        zero_influence_m=max(float(max_bank_distance_m or 0.0), float(edge_guidance_distance_m or 0.0), max(float(pixel_size_m or 0.0), 1.0)),
+    )
+    bank_surface = compute_bank_elevation_surface_from_authoritative(
+        auth,
+        corridor_mask,
+        max_bank_distance_m=max_bank_distance_m,
+        bank_distance_m=bank_distance_m,
+    ).astype(np.float32)
+    safe_edge_distance = max(float(edge_guidance_distance_m or 0.0), max(float(pixel_size_m or 0.0), 1.0))
+    edge_band = np.asarray(corridor_mask, dtype=bool) & np.isfinite(bank_surface) & (bank_distance_m <= safe_edge_distance)
+    bank_surface = np.where(edge_band, bank_surface, np.nan).astype(np.float32)
+    bank_influence = np.where(edge_band, bank_influence, np.float32(0.0)).astype(np.float32)
+    return edge.astype(np.uint8), bank_distance_m.astype(np.float32), bank_influence.astype(np.float32), bank_surface.astype(np.float32)
+
 def load_xs_bank_points(xs_gpkg: str | Path, *, target_crs: object | None = None):
     """Load left/right bank points from xs_builder output.
 
@@ -126,7 +320,11 @@ def load_xs_bank_points(xs_gpkg: str | Path, *, target_crs: object | None = None
     xs = gpd.read_file(xs_gpkg, layer="xs_lines")
     if xs.empty:
         return gpd.GeoDataFrame(
-            columns=["xs_id", "river_id", "component_id", "side", "side_sign", "bank_z_m", "s_center_m", "geometry"],
+            columns=[
+                "xs_id", "river_id", "component_id", "side", "side_sign", "bank_z_m", "bank_z_raw_m",
+                "bank_z_inner_min_m", "bank_z_local_q25_m", "bank_z_local_median_m", "bank_selected_source",
+                "s_center_m", "geometry",
+            ],
             geometry="geometry",
             crs=target_crs,
         )
@@ -158,13 +356,21 @@ def load_xs_bank_points(xs_gpkg: str | Path, *, target_crs: object | None = None
                 "side": side,
                 "side_sign": float(side_sign),
                 "bank_z_m": float(z_val),
-                "bank_z_raw_m": float(z_val),
+                "bank_z_raw_m": float(getattr(rec, f"bank_{side}_raw_z_m", z_val)),
+                "bank_z_inner_min_m": float(getattr(rec, f"bank_{side}_inner_min_z_m", np.nan)),
+                "bank_z_local_q25_m": float(getattr(rec, f"bank_{side}_local_q25_z_m", np.nan)),
+                "bank_z_local_median_m": float(getattr(rec, f"bank_{side}_local_median_z_m", np.nan)),
+                "bank_selected_source": str(getattr(rec, f"bank_{side}_selected_source", "missing") or "missing"),
                 "s_center_m": s_center_m,
                 "geometry": pt,
             })
     if not rows:
         return gpd.GeoDataFrame(
-            columns=["xs_id", "river_id", "component_id", "side", "side_sign", "bank_z_m", "bank_z_raw_m", "s_center_m", "geometry"],
+            columns=[
+                "xs_id", "river_id", "component_id", "side", "side_sign", "bank_z_m", "bank_z_raw_m",
+                "bank_z_inner_min_m", "bank_z_local_q25_m", "bank_z_local_median_m", "bank_selected_source",
+                "s_center_m", "geometry",
+            ],
             geometry="geometry",
             crs=xs.crs,
         )
@@ -190,6 +396,139 @@ def _nan_rolling_median(values: np.ndarray, half_window: int) -> np.ndarray:
     return out.astype(np.float32)
 
 
+def _nan_rolling_quantile(values: np.ndarray, half_window: int, quantile: float) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32)
+    if values.size == 0:
+        return values.copy()
+    hw = max(int(half_window), 0)
+    if hw == 0:
+        return values.copy()
+    out = values.copy()
+    for i in range(values.size):
+        lo = max(0, i - hw)
+        hi = min(values.size, i + hw + 1)
+        win = values[lo:hi]
+        finite = np.isfinite(win)
+        out[i] = np.nanquantile(win[finite], quantile).astype(np.float32) if np.any(finite) else values[i]
+    return out.astype(np.float32)
+
+
+def _other_side(side: str) -> str:
+    return "right" if str(side).lower().startswith("l") else "left"
+
+
+def _pair_lookup(bank_points: pd.DataFrame) -> dict[tuple[object, str], float]:
+    lookup: dict[tuple[object, str], float] = {}
+    if bank_points.empty or "xs_id" not in bank_points.columns:
+        return lookup
+    for rec in bank_points.itertuples():
+        lookup[(getattr(rec, "xs_id", None), getattr(rec, "side", None))] = float(getattr(rec, "bank_z_raw_m", np.nan))
+    return lookup
+
+
+def _nanmin_finite(values: list[float]) -> float:
+    arr = np.asarray(values, dtype=np.float32)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return float("nan")
+    return float(np.nanmin(finite))
+
+
+def _nanmedian_finite(values: list[float]) -> float:
+    arr = np.asarray(values, dtype=np.float32)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return float("nan")
+    return float(np.nanmedian(finite))
+
+
+def _weighted_pava_nonincreasing(values: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    vals = np.asarray(values, dtype=np.float32).copy()
+    wts = np.asarray(weights, dtype=np.float32).copy()
+    if vals.size == 0:
+        return vals
+    wts = np.where(np.isfinite(wts) & (wts > 0.0), wts, np.float32(1.0)).astype(np.float32)
+    blocks = []
+    for i, (v, w) in enumerate(zip(vals, wts)):
+        blocks.append([i, i, float(v), float(w)])
+        while len(blocks) >= 2 and blocks[-2][2] < blocks[-1][2]:
+            s0, e0, m0, w0 = blocks[-2]
+            s1, e1, m1, w1 = blocks[-1]
+            w = w0 + w1
+            m = ((m0 * w0) + (m1 * w1)) / max(w, 1.0e-6)
+            blocks[-2:] = [[s0, e1, m, w]]
+    out = np.empty_like(vals, dtype=np.float32)
+    for s, e, m, _ in blocks:
+        out[s:e+1] = np.float32(m)
+    return out
+
+
+def _weighted_pava_nondecreasing(values: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    vals = np.asarray(values, dtype=np.float32)
+    if vals.size == 0:
+        return vals.astype(np.float32)
+    return (-_weighted_pava_nonincreasing(-vals, weights)).astype(np.float32)
+
+
+def summarize_bank_qc(bank_points: pd.DataFrame) -> pd.DataFrame:
+    if bank_points is None or bank_points.empty:
+        return pd.DataFrame([{
+            "bank_point_count": 0,
+            "bank_replaced_count": 0,
+            "bank_replaced_fraction": 0.0,
+            "high_bank_suspect_count": 0,
+            "strong_contamination_count": 0,
+            "component_floor_suspect_count": 0,
+            "neighbor_spike_suspect_count": 0,
+            "local_relief_suspect_count": 0,
+            "cross_bank_asymmetry_suspect_count": 0,
+            "percentile_suspect_count": 0,
+            "bank_keep_count": 0,
+            "bank_downgrade_count": 0,
+            "bank_clamp_count": 0,
+            "bank_replace_with_local_envelope_count": 0,
+            "bank_reject_count": 0,
+            "selected_from_inner_min_count": 0,
+            "selected_from_local_q25_count": 0,
+        }])
+    df = bank_points.copy()
+    total = int(len(df))
+    adjustments = pd.to_numeric(df.get("bank_adjustment_m"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    selected_source = df.get("bank_selected_source", pd.Series("missing", index=df.index)).fillna("missing").astype(str)
+    qc_action = df.get("bank_qc_action", pd.Series("keep", index=df.index)).fillna("keep").astype(str)
+    return pd.DataFrame([{
+        "bank_point_count": total,
+        "bank_replaced_count": int(np.count_nonzero(adjustments < -0.01)),
+        "bank_replaced_fraction": float(np.count_nonzero(adjustments < -0.01) / total) if total else 0.0,
+        "high_bank_suspect_count": int(np.count_nonzero(df.get("bank_high_contamination_suspect", pd.Series(False, index=df.index)).fillna(False).to_numpy(dtype=bool))),
+        "strong_contamination_count": int(np.count_nonzero(df.get("bank_strong_contamination", pd.Series(False, index=df.index)).fillna(False).to_numpy(dtype=bool))),
+        "component_floor_suspect_count": int(np.count_nonzero(df.get("bank_component_floor_suspect", pd.Series(False, index=df.index)).fillna(False).to_numpy(dtype=bool))),
+        "neighbor_spike_suspect_count": int(np.count_nonzero(df.get("bank_neighbor_spike_suspect", pd.Series(False, index=df.index)).fillna(False).to_numpy(dtype=bool))),
+        "local_relief_suspect_count": int(np.count_nonzero(df.get("bank_local_relief_suspect", pd.Series(False, index=df.index)).fillna(False).to_numpy(dtype=bool))),
+        "cross_bank_asymmetry_suspect_count": int(np.count_nonzero(df.get("bank_cross_bank_asymmetry_suspect", pd.Series(False, index=df.index)).fillna(False).to_numpy(dtype=bool))),
+        "percentile_suspect_count": int(np.count_nonzero(df.get("bank_percentile_suspect", pd.Series(False, index=df.index)).fillna(False).to_numpy(dtype=bool))),
+        "bank_keep_count": int(np.count_nonzero(qc_action.eq("keep"))),
+        "bank_downgrade_count": int(np.count_nonzero(qc_action.eq("downgrade"))),
+        "bank_clamp_count": int(np.count_nonzero(qc_action.eq("clamp"))),
+        "bank_replace_with_local_envelope_count": int(np.count_nonzero(qc_action.eq("replace_with_local_envelope"))),
+        "bank_reject_count": int(np.count_nonzero(qc_action.eq("reject"))),
+        "bank_monotone_applied_count": int(np.count_nonzero(pd.to_numeric(df.get("bank_monotone_adjustment_m", pd.Series(0.0, index=df.index)), errors="coerce").fillna(0.0).to_numpy(dtype=float) != 0.0)),
+        "bank_monotone_adjustment_max_m": float(np.nanmax(np.abs(pd.to_numeric(df.get("bank_monotone_adjustment_m", pd.Series(0.0, index=df.index)), errors="coerce").to_numpy(dtype=float)))) if total else 0.0,
+        "selected_from_inner_min_count": int(np.count_nonzero(selected_source.eq("inner_min"))),
+        "selected_from_local_q25_count": int(np.count_nonzero(selected_source.eq("local_q25"))),
+    }])
+
+
+
+def _neighbor_peak_limit(values: np.ndarray, index: int) -> float:
+    prev_val = float(values[index - 1]) if index > 0 and np.isfinite(values[index - 1]) else float("nan")
+    next_val = float(values[index + 1]) if index + 1 < len(values) and np.isfinite(values[index + 1]) else float("nan")
+    finite = [v for v in (prev_val, next_val) if np.isfinite(v)]
+    if not finite:
+        return float("nan")
+    return float(max(finite))
+
+
 
 def build_persistent_bank_network_points(
     xs_gpkg: str | Path,
@@ -197,6 +536,14 @@ def build_persistent_bank_network_points(
     target_crs: object | None = None,
     smoothing_half_window: int = 2,
     max_gap_factor: float = 3.0,
+    local_spike_threshold_m: float = 1.25,
+    opposite_bank_threshold_m: float = 2.0,
+    candidate_relaxation_m: float = 0.5,
+    component_floor_relaxation_m: float = 0.75,
+    neighbor_spike_threshold_m: float = 0.9,
+    local_relief_threshold_m: float = 1.1,
+    cross_bank_asymmetry_threshold_m: float = 1.4,
+    percentile_relaxation_m: float = 0.7,
 ):
     """Build side-specific persistent bank points with longitudinal continuity metadata.
 
@@ -217,7 +564,30 @@ def build_persistent_bank_network_points(
     bank_points = bank_points.copy()
     bank_points["bank_z_raw_m"] = bank_points["bank_z_raw_m"].astype(np.float32)
     bank_points["bank_z_m"] = bank_points["bank_z_m"].astype(np.float32)
+    bank_points["bank_z_final_m"] = bank_points["bank_z_m"].astype(np.float32)
     bank_points["continuity_weight"] = np.float32(0.0)
+    bank_points["bank_longitudinal_ref_m"] = np.float32(np.nan)
+    bank_points["bank_local_lower_ref_m"] = np.float32(np.nan)
+    bank_points["bank_component_floor_ref_m"] = np.float32(np.nan)
+    bank_points["bank_neighbor_upper_ref_m"] = np.float32(np.nan)
+    bank_points["bank_percentile_ref_m"] = np.float32(np.nan)
+    bank_points["bank_opposite_raw_z_m"] = np.float32(np.nan)
+    bank_points["bank_high_contamination_suspect"] = False
+    bank_points["bank_strong_contamination"] = False
+    bank_points["bank_component_floor_suspect"] = False
+    bank_points["bank_neighbor_spike_suspect"] = False
+    bank_points["bank_local_relief_suspect"] = False
+    bank_points["bank_cross_bank_asymmetry_suspect"] = False
+    bank_points["bank_percentile_suspect"] = False
+    bank_points["bank_contamination_score"] = np.float32(0.0)
+    bank_points["bank_qc_action"] = "keep"
+    bank_points["bank_qc_weight"] = np.float32(1.0)
+    bank_points["bank_adjustment_m"] = np.float32(0.0)
+    bank_points["bank_adjustment_reason"] = "none"
+    bank_points["bank_monotone_downstream_m"] = np.float32(np.nan)
+    bank_points["bank_monotone_adjustment_m"] = np.float32(0.0)
+
+    pair_lookup = _pair_lookup(bank_points)
 
     group_cols = ["component_id", "river_id", "side"]
     for _, idx in bank_points.groupby(group_cols, dropna=False).groups.items():
@@ -227,8 +597,132 @@ def build_persistent_bank_network_points(
         if z.size == 0:
             continue
         z_sm = _nan_rolling_median(z, half_window=smoothing_half_window)
+        z_low = _nan_rolling_quantile(z, half_window=smoothing_half_window, quantile=0.25)
         if z_sm.size >= 3:
             z_sm[1:-1] = (0.25 * z_sm[:-2] + 0.5 * z_sm[1:-1] + 0.25 * z_sm[2:]).astype(np.float32)
+        candidate_floor = np.nanmin(
+            np.vstack([
+                sub.get("bank_z_inner_min_m", pd.Series(np.nan, index=sub.index)).to_numpy(dtype=np.float32),
+                sub.get("bank_z_local_q25_m", pd.Series(np.nan, index=sub.index)).to_numpy(dtype=np.float32),
+                sub.get("bank_z_local_median_m", pd.Series(np.nan, index=sub.index)).to_numpy(dtype=np.float32),
+                z_low,
+            ]),
+            axis=0,
+        ).astype(np.float32)
+        component_half_window = max(int(smoothing_half_window) + 2, 4)
+        component_floor = _nan_rolling_quantile(candidate_floor, half_window=component_half_window, quantile=0.20)
+        component_floor = _nan_rolling_median(component_floor, half_window=max(1, smoothing_half_window))
+        percentile_env = _nan_rolling_quantile(z, half_window=max(component_half_window + 2, 6), quantile=0.35)
+        percentile_env = _nan_rolling_median(percentile_env, half_window=max(1, smoothing_half_window))
+        neighbor_upper = np.full(len(sub), np.nan, dtype=np.float32)
+        for j in range(len(sub)):
+            neighbor_upper[j] = _neighbor_peak_limit(candidate_floor, j)
+        z_final = z.copy()
+        opposite = np.full(len(sub), np.nan, dtype=np.float32)
+        contamination = np.zeros(len(sub), dtype=bool)
+        strong = np.zeros(len(sub), dtype=bool)
+        component_floor_suspect = np.zeros(len(sub), dtype=bool)
+        neighbor_spike_suspect = np.zeros(len(sub), dtype=bool)
+        local_relief_suspect = np.zeros(len(sub), dtype=bool)
+        cross_bank_asymmetry_suspect = np.zeros(len(sub), dtype=bool)
+        percentile_suspect = np.zeros(len(sub), dtype=bool)
+        contamination_score = np.zeros(len(sub), dtype=np.float32)
+        qc_weight = np.ones(len(sub), dtype=np.float32)
+        qc_action = np.array(["keep"] * len(sub), dtype=object)
+        reasons = np.array(["none"] * len(sub), dtype=object)
+        selected_source = sub.get("bank_selected_source", pd.Series("missing", index=sub.index)).fillna("missing").astype(str).to_numpy(dtype=object)
+        for j, rec in enumerate(sub.itertuples()):
+            opp = pair_lookup.get((getattr(rec, "xs_id", None), _other_side(getattr(rec, "side", ""))), np.nan)
+            opposite[j] = float(opp) if np.isfinite(opp) else np.nan
+            raw = float(getattr(rec, "bank_z_raw_m", np.nan))
+            local_ref = float(z_sm[j]) if np.isfinite(z_sm[j]) else np.nan
+            lower_ref = float(candidate_floor[j]) if np.isfinite(candidate_floor[j]) else np.nan
+            component_ref = float(component_floor[j]) if np.isfinite(component_floor[j]) else np.nan
+            percentile_ref = float(percentile_env[j]) if np.isfinite(percentile_env[j]) else np.nan
+            neighbor_ref = float(neighbor_upper[j]) if np.isfinite(neighbor_upper[j]) else np.nan
+            source_penalty = 0.35 if str(selected_source[j]).lower() in {"picked", "local_median"} else 0.0
+            component_limit = component_ref + max(float(component_floor_relaxation_m) - source_penalty, 0.2) if np.isfinite(component_ref) else np.nan
+            neighbor_limit = neighbor_ref + max(float(neighbor_spike_threshold_m) - source_penalty, 0.2) if np.isfinite(neighbor_ref) else np.nan
+            percentile_limit = percentile_ref + max(float(percentile_relaxation_m) - source_penalty, 0.2) if np.isfinite(percentile_ref) else np.nan
+            local_relief_limit = lower_ref + max(float(local_relief_threshold_m) - source_penalty, 0.25) if np.isfinite(lower_ref) else np.nan
+            cross_bank_limit = float(opposite[j]) + max(float(cross_bank_asymmetry_threshold_m) - source_penalty, 0.25) if np.isfinite(opposite[j]) else np.nan
+            component_floor_suspect[j] = bool(np.isfinite(component_limit) and raw > component_limit + 1.0e-6)
+            neighbor_spike_suspect[j] = bool(np.isfinite(neighbor_limit) and raw > neighbor_limit + 1.0e-6)
+            local_relief_suspect[j] = bool(np.isfinite(local_relief_limit) and raw > local_relief_limit + 1.0e-6)
+            cross_bank_asymmetry_suspect[j] = bool(np.isfinite(cross_bank_limit) and raw > cross_bank_limit + 1.0e-6)
+            percentile_suspect[j] = bool(np.isfinite(percentile_limit) and raw > percentile_limit + 1.0e-6)
+            contamination_score[j] = float(
+                component_floor_suspect[j]
+                + neighbor_spike_suspect[j]
+                + local_relief_suspect[j]
+                + cross_bank_asymmetry_suspect[j]
+                + 0.75 * percentile_suspect[j]
+            )
+            limits = [raw]
+            if np.isfinite(local_ref):
+                limits.append(local_ref + float(local_spike_threshold_m))
+            if np.isfinite(lower_ref):
+                limits.append(lower_ref + float(candidate_relaxation_m))
+            if np.isfinite(opposite[j]):
+                limits.append(float(opposite[j]) + float(opposite_bank_threshold_m))
+            if np.isfinite(component_limit):
+                limits.append(component_limit)
+            if np.isfinite(neighbor_limit):
+                limits.append(neighbor_limit)
+            if np.isfinite(local_relief_limit):
+                limits.append(local_relief_limit)
+            if np.isfinite(cross_bank_limit):
+                limits.append(cross_bank_limit)
+            if np.isfinite(percentile_limit):
+                limits.append(percentile_limit)
+            bank_limit = _nanmin_finite(limits)
+            envelope_ref = _nanmedian_finite([lower_ref, component_ref, percentile_ref, local_ref])
+            if np.isfinite(raw) and np.isfinite(bank_limit) and raw > bank_limit + 1.0e-6:
+                contamination[j] = True
+                strong[j] = bool(raw > (bank_limit + max(1.25, float(local_spike_threshold_m))) or contamination_score[j] >= 3.0)
+                severe_low_quality = str(selected_source[j]).lower() in {"picked", "local_median"} and strong[j]
+                if severe_low_quality and contamination_score[j] >= 2.75:
+                    qc_action[j] = "reject"
+                    qc_weight[j] = np.float32(0.0)
+                    z_final[j] = np.float32(np.nan)
+                    reasons[j] = "multi_signal_reject"
+                elif contamination_score[j] >= 1.75 and np.isfinite(envelope_ref):
+                    qc_action[j] = "replace_with_local_envelope"
+                    qc_weight[j] = np.float32(0.3)
+                    z_final[j] = np.float32(envelope_ref)
+                    reasons[j] = "local_envelope_replace"
+                else:
+                    qc_action[j] = "clamp"
+                    qc_weight[j] = np.float32(0.45)
+                    z_final[j] = np.float32(bank_limit)
+                    if component_floor_suspect[j] and raw > bank_limit + 1.0e-6:
+                        reasons[j] = "component_floor_clamp"
+                    elif neighbor_spike_suspect[j] and raw > bank_limit + 1.0e-6:
+                        reasons[j] = "neighbor_spike_clamp"
+                    elif cross_bank_asymmetry_suspect[j] and np.isfinite(opposite[j]):
+                        reasons[j] = "cross_bank_asymmetry_clamp"
+                    elif local_relief_suspect[j] and np.isfinite(lower_ref):
+                        reasons[j] = "local_relief_clamp"
+                    elif percentile_suspect[j] and np.isfinite(percentile_ref):
+                        reasons[j] = "percentile_clamp"
+                    elif np.isfinite(opposite[j]) and raw > opposite[j] + float(opposite_bank_threshold_m):
+                        reasons[j] = "opposite_bank_clamp"
+                    elif np.isfinite(lower_ref) and raw > lower_ref + float(candidate_relaxation_m):
+                        reasons[j] = "local_candidate_clamp"
+                    else:
+                        reasons[j] = "longitudinal_spike_clamp"
+            elif contamination_score[j] >= 1.0:
+                qc_action[j] = "downgrade"
+                qc_weight[j] = np.float32(0.7 if contamination_score[j] < 2.0 else 0.55)
+                reasons[j] = "multi_signal_downgrade"
+        z_final = _nan_rolling_median(z_final, half_window=max(1, smoothing_half_window))
+        monotone = z_final.copy()
+        finite_final = np.isfinite(monotone)
+        if np.count_nonzero(finite_final) >= 2:
+            mono_weights = np.clip(qc_weight[finite_final], 0.05, 1.0).astype(np.float32)
+            monotone_vals = _weighted_pava_nonincreasing(monotone[finite_final].astype(np.float32), mono_weights)
+            monotone[finite_final] = monotone_vals.astype(np.float32)
+        z_final = monotone.astype(np.float32)
         spacing = np.diff(s) if s.size > 1 else np.array([], dtype=np.float32)
         typical_spacing = float(np.nanmedian(spacing[np.isfinite(spacing)])) if spacing.size and np.any(np.isfinite(spacing)) else np.nan
         if not np.isfinite(typical_spacing) or typical_spacing <= 0.0:
@@ -244,8 +738,29 @@ def build_persistent_bank_network_points(
             continuity = np.clip(continuity, 0.0, 1.0).astype(np.float32)
             if z_sm.size == 1:
                 continuity[:] = 0.5
-        bank_points.loc[sub.index, "bank_z_m"] = z_sm.astype(np.float32)
+        bank_points.loc[sub.index, "bank_z_m"] = z_final.astype(np.float32)
+        bank_points.loc[sub.index, "bank_z_final_m"] = z_final.astype(np.float32)
         bank_points.loc[sub.index, "continuity_weight"] = continuity.astype(np.float32)
+        bank_points.loc[sub.index, "bank_longitudinal_ref_m"] = z_sm.astype(np.float32)
+        bank_points.loc[sub.index, "bank_local_lower_ref_m"] = candidate_floor.astype(np.float32)
+        bank_points.loc[sub.index, "bank_component_floor_ref_m"] = component_floor.astype(np.float32)
+        bank_points.loc[sub.index, "bank_neighbor_upper_ref_m"] = neighbor_upper.astype(np.float32)
+        bank_points.loc[sub.index, "bank_percentile_ref_m"] = percentile_env.astype(np.float32)
+        bank_points.loc[sub.index, "bank_opposite_raw_z_m"] = opposite.astype(np.float32)
+        bank_points.loc[sub.index, "bank_high_contamination_suspect"] = contamination
+        bank_points.loc[sub.index, "bank_strong_contamination"] = strong
+        bank_points.loc[sub.index, "bank_component_floor_suspect"] = component_floor_suspect
+        bank_points.loc[sub.index, "bank_neighbor_spike_suspect"] = neighbor_spike_suspect
+        bank_points.loc[sub.index, "bank_local_relief_suspect"] = local_relief_suspect
+        bank_points.loc[sub.index, "bank_cross_bank_asymmetry_suspect"] = cross_bank_asymmetry_suspect
+        bank_points.loc[sub.index, "bank_percentile_suspect"] = percentile_suspect
+        bank_points.loc[sub.index, "bank_contamination_score"] = contamination_score.astype(np.float32)
+        bank_points.loc[sub.index, "bank_qc_action"] = qc_action
+        bank_points.loc[sub.index, "bank_qc_weight"] = qc_weight.astype(np.float32)
+        bank_points.loc[sub.index, "bank_adjustment_m"] = (z_final - z).astype(np.float32)
+        bank_points.loc[sub.index, "bank_adjustment_reason"] = reasons
+        bank_points.loc[sub.index, "bank_monotone_downstream_m"] = z_final.astype(np.float32)
+        bank_points.loc[sub.index, "bank_monotone_adjustment_m"] = (z_final - z_sm).astype(np.float32)
 
     return bank_points
 
@@ -351,9 +866,18 @@ def compute_xs_bank_guidance_surfaces(
     if np.any(both):
         wl = 1.0 / np.maximum(left_dist[both], safe_px)
         wr = 1.0 / np.maximum(right_dist[both], safe_px)
-        blend[both] = ((wl * left_surface[both]) + (wr * right_surface[both])) / (wl + wr)
+        z_low = np.minimum(left_surface[both], right_surface[both])
+        z_high = np.maximum(left_surface[both], right_surface[both])
+        z_avg = ((wl * left_surface[both]) + (wr * right_surface[both])) / (wl + wr)
+        asym = z_high - z_low
+        # Strongly prefer the lower plausible bank when side asymmetry grows;
+        # in unsupported reaches the high side is much more likely to be a
+        # terrace/roadfill/high-edge artifact than true stage control.
+        guard = np.float32(1.0)
+        low_bias = np.clip((asym - 0.25) / max(float(guard - 0.25), 0.25), 0.0, 1.0).astype(np.float32)
+        blend[both] = np.where(asym >= guard, z_low, (low_bias * z_low + (1.0 - low_bias) * z_avg)).astype(np.float32)
         ratio = np.minimum(wl, wr) / np.maximum(wl, wr)
-        pair_weight[both] = np.clip(ratio.astype(np.float32), 0.0, 1.0)
+        pair_weight[both] = np.clip((ratio * (1.0 - 0.65 * low_bias)).astype(np.float32), 0.0, 1.0)
         continuity_weight[both] = np.minimum(left_cont[both], right_cont[both]).astype(np.float32)
     left_only = has_left & ~has_right
     right_only = has_right & ~has_left
@@ -497,6 +1021,7 @@ __all__ = [
     "compute_bank_elevation_surface_from_authoritative",
     "load_xs_bank_points",
     "build_persistent_bank_network_points",
+    "summarize_bank_qc",
     "compute_xs_bank_guidance_surfaces",
     "compute_graph_informed_bank_context_surfaces",
 ]

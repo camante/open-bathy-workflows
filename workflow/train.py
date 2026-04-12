@@ -2115,14 +2115,20 @@ def train_sdb_model(
 
     m_env = m_land & m_cw
 
-    # extra_xyz (hydronos, ehydro, etc.) bypasses land and clear-water filters:
-    # these are high-quality soundings that may be in turbid/masked zones.
+    # High-quality sounding-style support bypasses land and clear-water filters:
+    # extra_xyz (hydronos, ehydro, etc.) and explicit authoritative SDB support
+    # are trusted survey/control inputs that may legitimately occur in turbid/masked zones.
     if "source_norm" in df.columns:
-        m_is_xyz = df["source_norm"].astype(str).str.startswith("extra_xyz")
+        src_norm = df["source_norm"].astype(str).str.lower()
+        m_is_xyz = src_norm.str.startswith("extra_xyz")
+        m_is_auth_sdb = src_norm.str.startswith("authoritative_sdb_support")
         n_xyz_before = int(m_is_xyz.sum())
-        m_env |= m_is_xyz
+        n_auth_before = int(m_is_auth_sdb.sum())
+        m_env |= (m_is_xyz | m_is_auth_sdb)
         if n_xyz_before > 0:
             log.info("Bypassed env filter for %s extra_xyz points (high-quality survey data)", n_xyz_before)
+        if n_auth_before > 0:
+            log.info("Bypassed env filter for %s authoritative_sdb_support points (authoritative control)", n_auth_before)
 
     df = df[m_env].reset_index(drop=True)
     _count(df, f"after env filter (LAND<= {land_max}, CLEAR_WATER>= {cw_min})")
@@ -2600,16 +2606,25 @@ def train_sdb_model(
     df_validation = df.copy()
     if "source_norm" in df_validation.columns:
         src_series = df_validation["source_norm"].astype(str).str.lower()
-        val_mask = src_series.str.startswith("extra_xyz") | src_series.str.contains("authoritative_base", regex=False) | src_series.isin(atl_like)
+        m_auth_sdb = src_series.str.startswith("authoritative_sdb_support")
+        val_mask = (
+            src_series.str.startswith("extra_xyz")
+            | src_series.str.contains("authoritative_base", regex=False)
+            | m_auth_sdb
+            | src_series.isin(atl_like)
+        )
         if bool(val_mask.any()):
             df_validation = df_validation.loc[val_mask].copy()
     if df_validation.empty:
         log.info("Validation candidate set is empty after source filtering. Falling back to full training dataframe.")
         df_validation = df.copy()
     metadata.setdefault("validation_support", {})
+    _val_src = df_validation["source_norm"].astype(str).str.lower() if "source_norm" in df_validation.columns else pd.Series([], dtype=str)
     metadata["validation_support"].update({
-        "uses_authoritative_extra_xyz": bool("source_norm" in df_validation.columns and df_validation["source_norm"].astype(str).str.lower().str.startswith("extra_xyz").any()),
-        "uses_atl": bool("source_norm" in df_validation.columns and df_validation["source_norm"].astype(str).str.lower().isin(atl_like).any()),
+        "uses_authoritative_extra_xyz": bool(len(_val_src) and _val_src.str.startswith("extra_xyz").any()),
+        "uses_authoritative_sdb_support": bool(len(_val_src) and _val_src.str.startswith("authoritative_sdb_support").any()),
+        "uses_atl": bool(len(_val_src) and _val_src.isin(atl_like).any()),
+        "authoritative_sdb_support_candidates": int((_val_src.str.startswith("authoritative_sdb_support")).sum()) if len(_val_src) else 0,
         "n_candidates": int(len(df_validation)),
     })
 
@@ -3310,6 +3325,9 @@ def train_sdb_model(
     if 'source' in df_tr_fit.columns or 'source_norm' in df_tr_fit.columns:
         source_col = 'source_norm' if 'source_norm' in df_tr_fit.columns else 'source'
         source_counts = df_tr_fit[source_col].value_counts()
+        metadata.setdefault('training_support', {})
+        metadata['training_support']['source_counts'] = {str(k): int(v) for k, v in source_counts.to_dict().items()}
+        metadata['training_support']['authoritative_sdb_support_rows'] = int(source_counts[[idx for idx in source_counts.index if str(idx).startswith('authoritative_sdb_support')]].sum()) if len(source_counts) else 0
         total_samples = len(df_tr_fit)
         total_weighted = df_tr_fit['sample_weight'].sum() if w_train is not None else 0.0
         log.info("Training data composition (%d samples):", total_samples)

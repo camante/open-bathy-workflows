@@ -1,0 +1,27 @@
+Phase 180: longitudinal gating fix
+
+Main change
+- Fixed the active longitudinal tendency path so broad XS-like provenance no longer suppresses smoothing and backbone targeting the way true measured XS does.
+
+What changed
+- Added explicit longitudinal support regimes:
+  - longitudinal_measured_protected
+  - longitudinal_channel_anchored
+  - longitudinal_weak_support
+- Replaced broad station_xs gating in longitudinal blend/backbone/junction weighting with regime logic driven by:
+  - true measured XS
+  - channel-authoritative support
+  - weak-support fractions / indirect-residual XS provenance
+- Added new station/node receipts:
+  - longitudinal_support_regime
+  - longitudinal_tendency_suppression_reason
+  - longitudinal_tendency_smoothing_strength
+- Added output summary:
+  - river_longitudinal_support_regime_summary.csv
+
+Why
+- Recent reviews showed the longitudinal stage was still over-protecting broad XS-like structure, which could keep weak-support reaches rough before later generic/rebuild corrections got a chance to act.
+
+Verification
+- pytest -q tests/test_river_longitudinal_tendency.py
+- python -m compileall -q .

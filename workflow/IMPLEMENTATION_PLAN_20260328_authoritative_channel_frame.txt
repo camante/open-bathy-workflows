@@ -1,0 +1,25 @@
+Phase 0 — Contracts
+- Formalize river_channel_surface, confidence, support-count, source-class outputs.
+- Preserve authoritative-first rule: authoritative in-channel cells remain hard locks.
+
+Phase 1 — Authoritative channel-frame anchors
+- Export authoritative in-channel DEM cells as structured centerline and XS anchors.
+- Build river_channel_frame_points.gpkg and river_channel_frame_contract.json.
+- Store support-class and per-component spacing diagnostics.
+
+Phase 2 — Regularized scaffold
+- Resample centerline into regular stations.
+- Resample XS in longitudinal and transverse directions in channel coordinates.
+- Keep bank values as stage/margin priors, not direct bed truth.
+
+Phase 3 — Channel-fitted solver
+- Solve longitudinal bed backbone from authoritative anchors first.
+- Solve transverse section shape from authoritative XS segments plus neighboring stations.
+- Interpolate the channel surface in (s, n) coordinates.
+
+Phase 4 — Final integration
+- Feed river_channel_surface + confidence into the final terrain interpolator.
+- Demote corridor-spread rasters to diagnostics.
+
+Phase 5 — Validation
+- Support-class RMSE, authoritative lock invariants, nested-AOI identity, spacing sensitivity, and ablation by prior type.

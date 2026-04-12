@@ -1,0 +1,12 @@
+Phase 185 review + hard river benchmark pass
+
+Review of previous phase:
+- Kept Phase 184 science-effect summary wiring as-is; no active-path bug found.
+- While verifying the next benchmark pass, fixed a real lingering benchmark auto-holdout compatibility issue:
+  benchmark_workflow_stage.py had CRS helper assumptions that failed for some CRS object types.
+  Added robust CRS projection/string helpers and verified the full benchmark test suite again.
+
+New phase work:
+- Added hard-river benchmark summary and group CSV outputs.
+- Summarizes weak/hard river problem regimes inside river holdout instead of relying mainly on locked-cell aggregates.
+- Added markdown summary section and benchmark log line for hard river problem group.

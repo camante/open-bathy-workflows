@@ -95,6 +95,8 @@ def print_human_run_summary(stats: Dict[str, Any], log_fn: Optional[Callable[[st
     sdb = get(stats, "sdb", default={}) or {}
     river = get(stats, "river", default={}) or {}
     fusion = get(stats, "fusion", default={}) or {}
+    river_method = get(river, "river_method_executed", "river_method_requested", "river_method", "method", "execution_mode", default=None)
+    is_v1_river = str(river_method or "").startswith("v1")
 
     lines = []
     lines.append("=" * 72)
@@ -193,14 +195,22 @@ def print_human_run_summary(stats: Dict[str, Any], log_fn: Optional[Callable[[st
             shown_any = True
 
     if not outputs or not shown_any:
-        lines.append("• (No verified output paths recorded in stats.)")
+        if is_v1_river:
+            lines.append("• (No verified final combined raster recorded yet; for v1 runs, verify the river primary surface and conditioned output receipts.)")
+        else:
+            lines.append("• (No verified output paths recorded in stats.)")
 
     lines.append("")
     lines.append("What to sanity-check in GIS")
     lines.append("-" * 72)
-    lines.append("• The combined bathy raster should include both nearshore (SDB) and channel (river) where available.")
-    lines.append("• In overlap areas, the pipeline should lean toward the priority method (C1 weighted overlap).")
-    lines.append("• If the combined raster looks empty, check the land/water mask semantics and training counts in the report JSON.")
+    if is_v1_river:
+        lines.append("• For river-method=v1, confirm the river primary surface is present and spatially aligned with the river guidance domain.")
+        lines.append("• Confirm the conditioned DEM shows finite river guidance uptake in the terrain receipt and uptake receipt.")
+        lines.append("• Then inspect river_primary_surface_conditioning_effect_receipt.json to see whether the direct river surface actually changed the conditioned DEM over the river domain.")
+    else:
+        lines.append("• The combined bathy raster should include both nearshore (SDB) and channel (river) where available.")
+        lines.append("• In overlap areas, the pipeline should lean toward the priority method (C1 weighted overlap).")
+        lines.append("• If the combined raster looks empty, check the land/water mask semantics and training counts in the report JSON.")
     lines.append("=" * 72)
 
     summary = "\n".join(lines)
@@ -542,8 +552,13 @@ def build_human_like_summary(stats: Dict[str, Any], fr_summary: Dict[str, Any]) 
     return "\n".join(lines) + "\n"
 
 
-def write_run_summary_files(out_dir: Union[str, Path], run_id: str, stats: Optional[Dict[str, Any]] = None, fr_path: Optional[Union[str, Path]] = None) -> Dict[str, Path]:
-    """Write machine + technical + scientific + human summaries into <out_dir>/run_logs/."""
+def write_run_summary_files(out_dir: Union[str, Path], run_id: str, stats: Optional[Dict[str, Any]] = None, fr_path: Optional[Union[str, Path]] = None, *, write_machine_json: bool = True, write_legacy_text_summaries: bool = False) -> Dict[str, Path]:
+    """Write optional legacy run summaries into <out_dir>/run_logs/.
+
+    The connected workflow diagnostics are now the primary default reporting
+    system. The legacy machine JSON and text summaries are retained only for
+    compatibility and are therefore individually optional.
+    """
     out_dir = Path(out_dir)
     log_dir = out_dir / "run_logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -563,20 +578,22 @@ def write_run_summary_files(out_dir: Union[str, Path], run_id: str, stats: Optio
     }
 
     paths: Dict[str, Path] = {}
-    p_machine = log_dir / f"run_summary_{run_id}.json"
-    p_machine.write_text(json.dumps(machine, indent=2, sort_keys=True), encoding="utf-8")
-    paths["machine_json"] = p_machine
+    if write_machine_json:
+        p_machine = log_dir / f"run_summary_{run_id}.json"
+        p_machine.write_text(json.dumps(machine, indent=2, sort_keys=True), encoding="utf-8")
+        paths["machine_json"] = p_machine
 
-    p_tech = log_dir / f"run_summary_technical_{run_id}.md"
-    p_tech.write_text(build_technical_summary(stats, fr_summary), encoding="utf-8")
-    paths["technical_md"] = p_tech
+    if write_legacy_text_summaries:
+        p_tech = log_dir / f"run_summary_technical_{run_id}.md"
+        p_tech.write_text(build_technical_summary(stats, fr_summary), encoding="utf-8")
+        paths["technical_md"] = p_tech
 
-    p_sci = log_dir / f"run_summary_scientific_{run_id}.md"
-    p_sci.write_text(build_scientific_summary(stats, fr_summary), encoding="utf-8")
-    paths["scientific_md"] = p_sci
+        p_sci = log_dir / f"run_summary_scientific_{run_id}.md"
+        p_sci.write_text(build_scientific_summary(stats, fr_summary), encoding="utf-8")
+        paths["scientific_md"] = p_sci
 
-    p_human = log_dir / f"run_summary_human_{run_id}.txt"
-    p_human.write_text(build_human_like_summary(stats, fr_summary), encoding="utf-8")
-    paths["human_txt"] = p_human
+        p_human = log_dir / f"run_summary_human_{run_id}.txt"
+        p_human.write_text(build_human_like_summary(stats, fr_summary), encoding="utf-8")
+        paths["human_txt"] = p_human
 
     return paths

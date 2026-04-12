@@ -300,7 +300,7 @@ def start_flight_recorder(out_dir: Union[str, Path], run_id: str) -> Optional[Pa
 
             def _write_summaries():
                 try:
-                    write_run_summary_files(out_dir, run_id=run_id, stats=None, fr_path=fr_path)
+                    write_run_summary_files(out_dir, run_id=run_id, stats=None, fr_path=fr_path, write_machine_json=False, write_legacy_text_summaries=False)
                 except Exception:
                     return
 

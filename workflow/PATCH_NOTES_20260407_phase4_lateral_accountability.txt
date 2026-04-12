@@ -1,0 +1,12 @@
+Phase 4: River lateral accountability diagnostics
+
+What changed
+- Added explicit role-agreement classification so receipts now say whether the remaining dominant discrepancy is thalweg fit, inner-shape width propagation, or bank-vs-inner behavior.
+- Added weakest-role and lateral-failure fields to river_channel_surface role agreement summaries.
+- Added weakest section-target role-class fields to section-target summaries.
+- Extended benchmark river receipt triage to surface a lateral_accountability block and route suggested actions through that diagnosis.
+- Extended benchmark markdown summary so the first report now surfaces weakest role, dominant lateral issue, and the role p95 values directly.
+
+Why
+- The workflow already produced several receipts, but they still required manual comparison to know whether the remaining problem was mainly thalweg, inner-shape, or bank-edge.
+- This phase makes that distinction explicit in the receipts and benchmark summary so the next river-shape pass can target the correct failure mode.

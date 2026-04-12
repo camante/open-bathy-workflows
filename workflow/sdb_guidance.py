@@ -5,7 +5,15 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from final_dem_policy import default_final_dem_policy
+from simple_river_stage_contract import (
+    ROUTE_MODE_LEGACY_STRUCTURED_TRANSITION,
+    ROUTE_MODE_SIMPLE_RIVER_PLAN_V1,
+)
+
 import numpy as np
+
+from memory_diag import memory_checkpoint
 
 log = logging.getLogger(__name__)
 
@@ -93,8 +101,11 @@ def rasterize_sdb_guide_points_to_template(guide_points_path: str | Path, templa
 
     gp = Path(guide_points_path)
     tmpl = Path(template_raster)
+    active_log = logger or log
     if (not gp.exists()) or (not tmpl.exists()):
         return None
+    mem_start = memory_checkpoint("sdb_guide_rasterize_start", guide_points=str(gp), template=str(tmpl))
+    active_log.info("[MEMORY][SDB] %s", mem_start)
 
     try:
         gdf = gpd.read_file(gp)
@@ -136,12 +147,130 @@ def rasterize_sdb_guide_points_to_template(guide_points_path: str | Path, templa
         if not np.any(valid):
             return None
         arr[valid] = (sums[valid] / counts[valid]).astype(np.float32)
-    (logger or log).info('Rasterized SDB guide points onto template grid: %s -> %s populated cells', gp, int(np.sum(np.isfinite(arr))))
+    populated = int(np.sum(np.isfinite(arr)))
+    mem_end = memory_checkpoint(
+        "sdb_guide_rasterize_end",
+        guide_points=str(gp),
+        template=str(tmpl),
+        populated_cells=populated,
+        point_rows=int(len(gdf)),
+    )
+    active_log.info('Rasterized SDB guide points onto template grid: %s -> %s populated cells', gp, populated)
+    active_log.info('[MEMORY][SDB] %s', mem_end)
     return arr
+
+
+
+def write_sdb_authoritative_locked_guidance(
+    depth_path: str | Path,
+    *,
+    support_mask_path: str | Path | None,
+    support_values_path: str | Path | None,
+    logger: Optional[logging.Logger] = None,
+) -> Dict[str, Any]:
+    import rasterio
+    from rasterio.warp import reproject, Resampling
+
+    depth_path = Path(depth_path)
+    support_mask_path = Path(support_mask_path) if support_mask_path else None
+    support_values_path = Path(support_values_path) if support_values_path else None
+    active_log = logger or log
+    paths = guidance_artifact_paths(depth_path)
+    locked_path = depth_path.with_name(depth_path.stem + "_authoritative_locked" + depth_path.suffix)
+    diff_path = depth_path.with_name(depth_path.stem + "_lock_diff_before_overwrite" + depth_path.suffix)
+    contract_path = depth_path.with_name(depth_path.stem + "_lock_contract.json")
+
+    result: Dict[str, Any] = {
+        "locked_guidance_raster": None,
+        "lock_diff_before_overwrite_raster": None,
+        "lock_contract": None,
+        "authoritative_support_active": False,
+        "authoritative_supported_cell_count": 0,
+        "unlocked_predicted_cell_count": 0,
+        "authoritative_supported_cells_changed_before_lock_count": 0,
+        "authoritative_supported_cells_after_lock_mismatch_count": 0,
+    }
+    if (not depth_path.exists()) or support_mask_path is None or support_values_path is None or (not support_mask_path.exists()) or (not support_values_path.exists()):
+        contract_path.write_text(json.dumps(result, indent=2), encoding='utf-8')
+        result['lock_contract'] = str(contract_path)
+        return result
+
+    with rasterio.open(depth_path) as ds_depth:
+        depth = ds_depth.read(1).astype(np.float32)
+        prof = ds_depth.profile.copy()
+        depth_nodata = ds_depth.nodata if ds_depth.nodata is not None else -9999.0
+        depth_valid = np.isfinite(depth) & (depth != depth_nodata)
+        target_shape = depth.shape
+        target_transform = ds_depth.transform
+        target_crs = ds_depth.crs
+
+        def _read_aligned(src_path: Path, *, is_mask: bool) -> np.ndarray:
+            with rasterio.open(src_path) as ds_src:
+                src_arr = ds_src.read(1)
+                if ds_src.shape == target_shape and ds_src.transform == target_transform and str(ds_src.crs) == str(target_crs):
+                    arr = src_arr.astype(np.float32 if not is_mask else np.uint8, copy=False)
+                else:
+                    dst = np.zeros(target_shape, dtype=np.float32 if not is_mask else np.uint8)
+                    reproject(
+                        source=src_arr,
+                        destination=dst,
+                        src_transform=ds_src.transform,
+                        src_crs=ds_src.crs,
+                        dst_transform=target_transform,
+                        dst_crs=target_crs,
+                        src_nodata=ds_src.nodata,
+                        dst_nodata=0 if is_mask else depth_nodata,
+                        resampling=Resampling.nearest,
+                    )
+                    arr = dst
+                return arr
+
+        support_mask = _read_aligned(support_mask_path, is_mask=True)
+        support_values = _read_aligned(support_values_path, is_mask=False)
+        support_valid = (support_mask > 0) & np.isfinite(support_values) & (support_values != depth_nodata)
+
+        locked = depth.copy()
+        diff = np.full(target_shape, depth_nodata, dtype=np.float32)
+        changed = support_valid & depth_valid & (np.abs(depth - support_values) > 1.0e-6)
+        diff[support_valid] = np.where(depth_valid[support_valid], depth[support_valid] - support_values[support_valid], depth_nodata).astype(np.float32)
+        locked[support_valid] = support_values[support_valid].astype(np.float32)
+        mismatch_after = support_valid & np.isfinite(locked) & (locked != depth_nodata) & (np.abs(locked - support_values) > 1.0e-6)
+
+        prof.update(dtype='float32', count=1, compress='deflate', nodata=depth_nodata)
+        with rasterio.open(locked_path, 'w', **prof) as dst:
+            dst.write(locked.astype(np.float32), 1)
+        with rasterio.open(diff_path, 'w', **prof) as dst:
+            dst.write(diff.astype(np.float32), 1)
+
+    result.update({
+        "locked_guidance_raster": str(locked_path),
+        "lock_diff_before_overwrite_raster": str(diff_path),
+        "authoritative_support_active": bool(np.any(support_valid)),
+        "authoritative_supported_cell_count": int(np.sum(support_valid)),
+        "unlocked_predicted_cell_count": int(np.sum(np.isfinite(locked) & (locked != depth_nodata) & (~support_valid))),
+        "authoritative_supported_cells_changed_before_lock_count": int(np.sum(changed)),
+        "authoritative_supported_cells_after_lock_mismatch_count": int(np.sum(mismatch_after)),
+        "support_mask_path": str(support_mask_path),
+        "support_values_path": str(support_values_path),
+        "raw_prediction_raster": str(depth_path),
+    })
+    contract_path.write_text(json.dumps(result, indent=2), encoding='utf-8')
+    result['lock_contract'] = str(contract_path)
+    active_log.info(
+        "SDB authoritative lock written: %s (supported=%d changed_before_lock=%d)",
+        locked_path,
+        int(result['authoritative_supported_cell_count']),
+        int(result['authoritative_supported_cells_changed_before_lock_count']),
+    )
+    return result
 
 def build_sdb_guidance_manifest(*, out_root: str | Path, depth_raster: str | Path, args: Any) -> Dict[str, Any]:
     out_root = Path(out_root)
+    depth_raster = Path(depth_raster)
     paths = guidance_artifact_paths(depth_raster)
+    locked_path = depth_raster.with_name(depth_raster.stem + "_authoritative_locked" + depth_raster.suffix)
+    diff_path = depth_raster.with_name(depth_raster.stem + "_lock_diff_before_overwrite" + depth_raster.suffix)
+    contract_path = depth_raster.with_name(depth_raster.stem + "_lock_contract.json")
 
     def _rel_or_abs(p: Path) -> Optional[str]:
         if not p.exists():
@@ -159,21 +288,58 @@ def build_sdb_guidance_manifest(*, out_root: str | Path, depth_raster: str | Pat
         if rel:
             artifacts[key] = rel
 
-    artifacts["guidance_mode"] = "guidance_first"
-    artifacts["depth_raster_role"] = "diagnostic_only"
+    locked_rel = _rel_or_abs(locked_path)
+    diff_rel = _rel_or_abs(diff_path)
+    contract_rel = _rel_or_abs(contract_path)
+    if locked_rel:
+        artifacts["depth_raster"] = locked_rel
+        artifacts["sdb_guidance_active"] = locked_rel
+        artifacts["raw_prediction_raster"] = _rel_or_abs(depth_raster)
+        artifacts["sdb_locked_guidance_raster"] = locked_rel
+    else:
+        artifacts["depth_raster"] = _rel_or_abs(depth_raster)
+        artifacts["sdb_guidance_active"] = _rel_or_abs(depth_raster)
+    if diff_rel:
+        artifacts["lock_diff_before_overwrite_raster"] = diff_rel
+    if contract_rel:
+        artifacts["sdb_lock_contract"] = contract_rel
+
+    artifacts["guidance_mode"] = "authoritative_locked_guidance" if locked_rel else "guidance_first"
+    artifacts["depth_raster_role"] = "active_guidance" if locked_rel else "diagnostic_only"
     auth_base = getattr(args, "authoritative_base", None)
     if auth_base:
         artifacts["authoritative_base"] = str(auth_base)
+    for attr, key in [
+        ("sdb_authoritative_support_mask", "authoritative_support_mask"),
+        ("sdb_authoritative_support_values", "authoritative_support_values"),
+        ("sdb_authoritative_support_points", "authoritative_support_points"),
+        ("sdb_authoritative_support_contract", "authoritative_support_contract"),
+    ]:
+        val = getattr(args, attr, None)
+        if val:
+            artifacts[key] = str(val)
     if hasattr(args, "_authoritative_base_auto_report"):
         artifacts["authoritative_base_auto"] = getattr(args, "_authoritative_base_auto_report")
 
+    policy = default_final_dem_policy()
     manifest = {
         "schema_version": 2,
         "artifact_family": "sdb_guidance",
         "guidance_only": True,
+        "current_route_mode": ROUTE_MODE_LEGACY_STRUCTURED_TRANSITION,
+        "target_route_mode": ROUTE_MODE_SIMPLE_RIVER_PLAN_V1,
         "artifacts": artifacts,
+        "final_dem_policy": {
+            "final_dem_filename": policy.final_dem_filename,
+            "internal_final_dem_filename": policy.internal_final_dem_filename,
+            "write_final_dem_once": bool(policy.write_final_dem_once),
+            "verify_only_postwrite": bool(policy.verify_only_postwrite),
+        },
         "artifact_roles": {
-            "depth_raster": "diagnostic_only",
+            "depth_raster": "active_guidance" if locked_rel else "diagnostic_only",
+            "sdb_guidance_active": "active_guidance",
+            "raw_prediction_raster": "diagnostic_only",
+            "sdb_locked_guidance_raster": "active_guidance",
             "confidence_raster": "confidence",
             "provenance_raster": "provenance",
             "guidance_weight_raster": "soft_guidance_weight",
@@ -183,12 +349,19 @@ def build_sdb_guidance_manifest(*, out_root: str | Path, depth_raster: str | Pat
             "guide_points": "sparse_guidance_points",
             "lower_bound_raster": "plausible_lower_bound",
             "upper_bound_raster": "plausible_upper_bound",
+            "lock_diff_before_overwrite_raster": "diagnostic_only",
+            "sdb_lock_contract": "contract",
+            "authoritative_support_mask": "authoritative_support",
+            "authoritative_support_values": "authoritative_support",
+            "authoritative_support_points": "authoritative_support",
+            "authoritative_support_contract": "contract",
         },
         "final_route_contract": {
             "route_role": "subordinate_guidance_artifacts_only",
             "allowed_structural_artifacts": [
                 "admissibility_raster",
                 "confidence_raster",
+                "sdb_guidance_active",
                 "guide_points",
                 "guidance_weight_raster",
                 "lower_bound_raster",
@@ -197,7 +370,7 @@ def build_sdb_guidance_manifest(*, out_root: str | Path, depth_raster: str | Pat
                 "trusted_interior_raster",
                 "upper_bound_raster",
             ],
-            "diagnostic_only_artifacts": ["depth_raster"],
+            "diagnostic_only_artifacts": ["raw_prediction_raster", "lock_diff_before_overwrite_raster"],
             "forbidden_structural_inputs": [
                 "legacy_fused_candidate_raster",
                 "dense_river_depth_raster_as_peer_surface",
@@ -206,10 +379,12 @@ def build_sdb_guidance_manifest(*, out_root: str | Path, depth_raster: str | Pat
             ],
         },
         "notes": {
-            "depth_raster": "Dense SDB surface is diagnostic and should not be treated as peer authoritative terrain.",
+            "depth_raster": "Legacy canonical SDB guidance path retained for compatibility; points to the active guidance product.",
+            "sdb_guidance_active": "Canonical workflow SDB guidance product used downstream. Authoritative-supported cells are hard-locked when available; unsupported cells remain predictive.",
+            "raw_prediction_raster": "Raw dense SDB prediction retained for diagnostics and QA only.",
             "guide_points": "Spatially thinned pseudo-soundings for confidence-weighted interpolation guidance.",
             "bounds": "Lower/upper bounds are uncertainty-derived plausible guidance envelopes, not hard truth.",
-            "final_route_contract": "Only the listed subordinate guidance artifacts may structurally enter the final DEM route; dense SDB depth remains diagnostic-only.",
+            "final_route_contract": "Only the listed subordinate guidance artifacts may structurally enter the final DEM route; raw dense SDB depth remains diagnostic-only.",
         },
     }
     return manifest

@@ -119,3 +119,14 @@ def test_infer_bathy_recovers_bank_dists_from_point_flags(tmp_path: Path, monkey
     info = json.loads((tmp_path / "xs_bank_contract_receipt.json").read_text())
     assert info["xs_with_valid_param_rows"] == 1
     assert info["n_xs_bank_flag_recovered"] == 1
+
+
+def test_bank_pair_sanitization_prefers_lower_plausible_bank():
+    left, right, stage = xs_infer_bathy_raster._sanitize_bank_pair(
+        bank_left_z=2.0,
+        bank_right_z=8.0,
+        channel_floor_z=0.0,
+    )
+    assert left == 2.0
+    assert right is not None and right < 8.0
+    assert stage == 2.0

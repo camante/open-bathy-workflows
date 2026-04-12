@@ -1,0 +1,27 @@
+Phase 208 — bank-only / non-measured XS core damping
+
+Summary
+- Review fix: bank-margin-only stations were still treated like protected authoritative stations in river_xs_realism blend gating.
+- Review fix: primary-surface core-geometry damping initially fell back to station_support_regime='missing' instead of xs_support_template_class on some station rows.
+- New pass: reduce bank-only and non-measured XS influence on channel-core step formation while keeping thalweg/backbone control active.
+
+Main changes
+- river_xs_realism.py
+  - distinguish station_core_authoritative from generic authoritative presence
+  - bank-margin-only stations no longer zero out XS realism smoothing
+  - add support-aware core influence scaling
+  - damp generic template targets and blend floors in bank-only / weak-support / non-measured XS reaches
+  - write xs_realism_core_influence_scale to profile/provenance outputs
+- river_primary_surface_rebuild.py
+  - add support-aware channel-core geometry controls
+  - shrink inner-node template ratios in bank-only / weak-support / non-measured XS reaches
+  - reduce inner-node rebuild weights relative to thalweg in those reaches
+  - write core_geometry_scale and inner_weight_scale into rebuild profile and summary receipts
+- tests
+  - verify bank-only authoritative stations remain rebuildable but no longer count as core authoritative in XS realism
+  - verify bank-only support damps inner-core influence relative to thalweg in primary-surface rebuild
+
+Verification
+- python -m py_compile on edited modules and tests: passed
+- pytest -q tests/test_river_xs_realism.py tests/test_river_primary_surface_rebuild.py : passed
+- pytest -q tests/test_river_channel_surface.py tests/test_river_channel_scaffold.py tests/test_benchmark_workflow_stage.py tests/test_river_effectiveness_receipts.py : passed

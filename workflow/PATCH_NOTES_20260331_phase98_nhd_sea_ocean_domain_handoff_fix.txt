@@ -1,0 +1,84 @@
+PATCH: phase98 — Fix NHD Sea/Ocean (FType 398) domain handoff for river/SDB unification
+=========================================================================================
+
+Root cause
+----------
+Three interconnected bugs prevented the NHD Sea/Ocean (FType 398) estuary/coastal
+handoff from working:
+
+1. river_network.py: try_arcgis_nhdarea_polygons() hard-filtered to FType=460
+   (StreamRiver) BEFORE writing to the GPKG. This discarded FType=398 (Sea/Ocean)
+   polygons entirely, so they were never available for the guidance domain handoff.
+   Both nhdarea_aoi and nhdarea_clip layers contained only StreamRiver features.
+
+2. bathy_main.py: The SDB reactivation fallback pixel count (line ~10791) used
+   np.count_nonzero(_sdb_arr > 0) — which counts LAND pixels (value=1) in the
+   SDB domain mask (convention: water=0, land=1). Even when the shared domain
+   planning found ocean water, this inverted check could never detect it.
+
+3. Cascading failure: Because no FType=398 polygons existed in the GPKG, the
+   NHD Sea/Ocean mask was always empty → ocean_connectivity_mask had no ocean
+   water → inland_only=True → empty SDB domain → SDB skipped entirely.
+
+What changed
+------------
+### river_network.py
+- Extracted `filter_nhdarea_by_ftype()` as a public function with configurable
+  `allow_ftypes` parameter (default: StreamRiver=460 only).
+- `try_arcgis_nhdarea_polygons()` now returns ALL NHDArea water polygons
+  (StreamRiver=460, Sea/Ocean=398, etc.) without pre-filtering.
+- Scaffold build code:
+  - nhdarea_aoi now stores ALL NHDArea types (preserves FType 398)
+  - nhdarea_clip is filtered to StreamRiver=460 only via filter_nhdarea_by_ftype()
+  - Downstream river domain construction (river_domain_mask.py --nhdarea-allow-ftype=460)
+    still sees only StreamRiver — no behavior change for river channels.
+
+### guidance_domains.py
+- _write_nhd_sea_ocean_mask() now searches nhdarea_aoi first (where FType 398 lives)
+  instead of nhdarea_clip first. This is the layer that now contains all NHDArea types.
+
+### bathy_main.py
+- Fixed SDB reactivation fallback: changed np.count_nonzero(_sdb_arr > 0) to
+  np.count_nonzero(_sdb_arr == 0) to correctly count water pixels (value=0) in
+  the SDB domain mask.
+
+How the fixed flow works
+------------------------
+1. Scaffold: NHD fetch returns all FTypes → nhdarea_aoi has Sea/Ocean polygons
+2. Guidance domains: _write_nhd_sea_ocean_mask finds FType=398 in nhdarea_aoi →
+   NHD Sea/Ocean mask has pixels
+3. Ocean connectivity mask = WAFFLES ocean + NHD Sea/Ocean → has water even if
+   WAFFLES alone is empty
+4. inland_only = False (because ocean_connectivity_mask has water)
+5. Estuary clip runs → estuary_clip_mask includes Sea/Ocean area
+6. SDB domain = ocean_connectivity water + estuary clip → has water pixels
+7. River domain = channel mask minus Sea/Ocean and estuary clip
+8. WAFFLES gate may still skip SDB initially, but SDB reactivation logic
+   (now with correct pixel count) detects shared-domain water and re-enables SDB
+
+What this means
+---------------
+- The NHD Sea/Ocean FType 398 now serves as a bridge between river and SDB domains
+  exactly as designed: river gives up the area, SDB inherits it.
+- This eliminates the need for pixel-buffering workarounds to connect river/ocean masks.
+- The domain handoff is defined once (shared estuary/coastal mask) and used by both
+  river and SDB — not computed separately.
+
+IMPORTANT: Cache invalidation required
+---------------------------------------
+The river scaffold GPKG is cached. Your existing cache has the old nhdarea_aoi layer
+(filtered to FType=460 only). You MUST regenerate the scaffold to pick up Sea/Ocean
+polygons:
+
+  Option A: Delete the scaffold cache directory
+    rm -rf cache/river_scaffold/
+
+  Option B: (if available) Use --force-river-scaffold
+
+The guidance domain cache will auto-invalidate because guidance_domains.py mtime changed.
+
+Files changed
+-------------
+- river_network.py  (NHD fetch returns all FTypes; filter_nhdarea_by_ftype extracted)
+- guidance_domains.py  (Sea/Ocean mask search order: nhdarea_aoi first)
+- bathy_main.py  (SDB reactivation pixel count fix)

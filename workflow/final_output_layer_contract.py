@@ -8,6 +8,8 @@ import numpy as np
 import rasterio
 from rasterio.transform import Affine
 
+from nodata_utils import valid_mask
+
 
 def _existing_path(value: Any) -> Optional[Path]:
     if value is None:
@@ -24,11 +26,8 @@ def _transform_matches(a: Affine, b: Affine, tol: float = 1e-9) -> bool:
 
 
 def _finite_data(ds, arr: np.ndarray) -> np.ndarray:
-    nodata = ds.nodata
     data = np.asarray(arr)
-    mask = np.isfinite(data)
-    if nodata is not None:
-        mask &= ~np.isclose(data, nodata)
+    mask = valid_mask(data, ds.nodata)
     return data[mask]
 
 

@@ -1,0 +1,25 @@
+Phase 193 measured activation hardening
+
+Summary
+- Reviewed Phase 192 measured bed-vs-bank activation path.
+- Fixed float-key glue in scaffold station lookups by normalizing station keys.
+- Added stricter measured activation contracts for bank-only authoritative stations and qualified stations that fail to produce measured nodes.
+- Surfaced measured activation counts/contracts in the top-level science-effect summary.
+
+Key changes
+- river_channel_scaffold.py
+  - Added normalized station keys for frame->scaffold lookup.
+  - Added bank_only_authoritative_measured_node_count.
+  - Added qualified_station_without_measured_nodes_count.
+  - Added measured_xs_activation_from_bank_only_forbidden contract flag.
+- river_channel_frame.py
+  - Added bank_only_authoritative_station_qualified_count.
+  - Added measured_xs_activation_from_bank_only_forbidden contract flag to frame receipt.
+- river_effectiveness_receipts.py
+  - Added measured-XS activation counts/flags to river_science_effect_summary.json.
+- river_channel_surface.py
+  - Loads measured XS handoff receipts and passes them into the science summary writer.
+
+Validation
+- python -m compileall -q .
+- pytest -q tests/test_river_channel_frame.py tests/test_river_channel_scaffold.py tests/test_river_effectiveness_receipts.py tests/test_river_channel_surface.py

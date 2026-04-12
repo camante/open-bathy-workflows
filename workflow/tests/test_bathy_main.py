@@ -449,3 +449,172 @@ class TestAuthoritativeCacheReceipt(unittest.TestCase):
             self.assertEqual(payload["cache_key"], "abc123")
             self.assertTrue(payload["cache_hit"])
             self.assertIn("sdb", payload["downstream_child_passthrough"])
+
+
+class TestConcatStructuredGuideLayers(unittest.TestCase):
+
+    def setUp(self):
+        import bathy_main
+        self.fn = bathy_main._concat_structured_guide_layers
+
+    def test_accepts_equivalent_crs_representations(self):
+        gpd = __import__("geopandas")
+        from shapely.geometry import Point
+        from pyproj import CRS
+        a = gpd.GeoDataFrame({"xs_z_m": [1.0]}, geometry=[Point(0, 0)], crs=CRS.from_epsg(32619))
+        b = gpd.GeoDataFrame({"xs_z_m": [2.0]}, geometry=[Point(1, 1)], crs="EPSG:32619")
+        out = self.fn([a, b], expected_crs=a.crs)
+        self.assertEqual(len(out), 2)
+
+    def test_rejects_crs_mismatch(self):
+        gpd = __import__("geopandas")
+        from shapely.geometry import Point
+        a = gpd.GeoDataFrame({"xs_z_m": [1.0]}, geometry=[Point(0, 0)], crs="EPSG:32619")
+        b = gpd.GeoDataFrame({"xs_z_m": [2.0]}, geometry=[Point(1, 1)], crs="EPSG:4326")
+        with self.assertRaises(RuntimeError):
+            self.fn([a, b], expected_crs=a.crs)
+
+    def test_drops_empty_geometries_and_keeps_valid_rows(self):
+        gpd = __import__("geopandas")
+        from shapely.geometry import Point
+        layer = gpd.GeoDataFrame(
+            {"xs_z_m": [1.0, 2.0]},
+            geometry=[Point(0, 0), None],
+            crs="EPSG:32619",
+        )
+        out = self.fn([layer], expected_crs=layer.crs)
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out.geometry.iloc[0].equals(Point(0, 0)))
+
+    def test_rejects_layer_with_only_nonfinite_values(self):
+        gpd = __import__("geopandas")
+        from shapely.geometry import Point
+        layer = gpd.GeoDataFrame({"xs_z_m": [float("nan")]}, geometry=[Point(0, 0)], crs="EPSG:32619")
+        with self.assertRaises(RuntimeError):
+            self.fn([layer], expected_crs=layer.crs)
+
+
+class TestRiverGuidanceRuntimeContext(unittest.TestCase):
+
+    def test_runtime_context_paths_are_explicit_and_consistent(self):
+        import bathy_main
+        river_dir = Path("/tmp/example_river")
+        ctx = bathy_main._river_guidance_runtime_context(river_dir)
+        self.assertEqual(ctx["river_dir"], river_dir)
+        self.assertEqual(ctx["work_dir"], river_dir / "work")
+        self.assertEqual(ctx["channel_template_dir"], river_dir / "channel_template")
+
+
+class TestRiverMethodDefaults(unittest.TestCase):
+
+    def test_bathy_config_defaults_to_structured(self):
+        import bathy_main
+        cfg = bathy_main.BathyConfig(
+            aoi="-71/-70.75/42.75/43",
+            start_date="2025-01-01",
+            end_date="2026-01-01",
+            out_dir=Path("/tmp/out"),
+            methods=["river"],
+            priority="sdb",
+            cloud=10.0,
+            icesat=False,
+            sdb_mode="sentinel2",
+            cache_root=Path("/tmp/cache"),
+            align_mode="grid",
+            glint_correct=False,
+            glint_nir_band="B08",
+            glint_vis_bands="B02,B03,B04",
+            glint_nir_min_percentile=5.0,
+            glint_deepwater_b02_max=0.05,
+            glint_min_samples=100,
+            glint_max_samples=5000,
+            glint_clip_min=0.0,
+            working_srs="EPSG:32619",
+        )
+        self.assertEqual(cfg.river_method, "structured")
+
+    def test_bathy_config_accepts_river_withheld_support_csv(self):
+        import bathy_main
+        withheld = Path("/tmp/withheld.csv")
+        cfg = bathy_main.BathyConfig(
+            aoi="-71/-70.75/42.75/43",
+            start_date="2025-01-01",
+            end_date="2026-01-01",
+            out_dir=Path("/tmp/out"),
+            methods=["river"],
+            river_withheld_support_csv=withheld,
+        )
+        self.assertEqual(cfg.river_withheld_support_csv, withheld)
+
+
+    def test_parse_args_accepts_river_method_v1(self):
+        import bathy_main
+        import sys
+        argv = sys.argv
+        try:
+            sys.argv = [
+                "bathy_main.py",
+                "--aoi=-71/-70.75/42.75/43",
+                "--start=2025-01-01",
+                "--end=2026-01-01",
+                "--out-dir=/tmp/out",
+                "--river-method=v1",
+            ]
+            args = bathy_main.parse_args()
+        finally:
+            sys.argv = argv
+        self.assertEqual(args.river_method, "v1")
+
+
+    def test_parse_args_accepts_river_method_v2(self):
+        import bathy_main
+        import sys
+        argv = sys.argv
+        try:
+            sys.argv = [
+                "bathy_main.py",
+                "--aoi=-71/-70.75/42.75/43",
+                "--start=2025-01-01",
+                "--end=2026-01-01",
+                "--out-dir=/tmp/out",
+                "--river-method=v2",
+            ]
+            args = bathy_main.parse_args()
+        finally:
+            sys.argv = argv
+        self.assertEqual(args.river_method, "v2")
+
+    def test_parse_args_accepts_river_method_simple_v2(self):
+        import bathy_main
+        import sys
+        argv = sys.argv
+        try:
+            sys.argv = [
+                "bathy_main.py",
+                "--aoi=-71/-70.75/42.75/43",
+                "--start=2025-01-01",
+                "--end=2026-01-01",
+                "--out-dir=/tmp/out",
+                "--river-method=simple_v2",
+            ]
+            args = bathy_main.parse_args()
+        finally:
+            sys.argv = argv
+        self.assertEqual(args.river_method, "simple_v2")
+
+    def test_parse_args_defaults_river_method_to_structured(self):
+        import bathy_main
+        import sys
+        argv = sys.argv
+        try:
+            sys.argv = [
+                "bathy_main.py",
+                "--aoi=-71/-70.75/42.75/43",
+                "--start=2025-01-01",
+                "--end=2026-01-01",
+                "--out-dir=/tmp/out",
+            ]
+            args = bathy_main.parse_args()
+        finally:
+            sys.argv = argv
+        self.assertEqual(args.river_method, "structured")

@@ -1,0 +1,21 @@
+workflow_v313 phase notes
+
+This pass is targeted at three remaining river problems from the analyzed v312-style run:
+1. backbone smoothing existed but could stay inert in weak-support mainstem reaches,
+2. role/section comparison prep could still fail with no finite target comparisons,
+3. withheld-support benchmarking needed clearer runtime exclusion receipts and next-run usage hints.
+
+Code changes:
+- river_primary_surface_rebuild.py
+  - stronger unsupported-mainstem smoothing floor and max-shift ceiling
+  - explicit backbone smoothing reference series with source tracking
+  - grouped unsupported-mainstem counts and support-group summaries
+- river_channel_surface.py
+  - section-target comparisons now accept direct role targets plus active-core/bank-fit fallbacks
+  - comparison prep now reports first failing stage and target-stage counts
+- authoritative_support.py
+  - withheld-support exclusion receipt now reports requested/matched/unmatched/excluded counts and role counts
+- benchmark_workflow_stage.py
+  - benchmark mode summary now emits a direct CLI hint for the withheld-support rerun path
+- workflow_reports_hub.py
+  - manifest is reconciled against actual files present in reports/ before final priority status is written

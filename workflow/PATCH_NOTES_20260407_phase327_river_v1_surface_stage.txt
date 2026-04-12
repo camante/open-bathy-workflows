@@ -1,0 +1,10 @@
+workflow_v327
+===============
+
+This pass adds the first real surface stage to the new minimal river v1 workflow.
+
+What changed:
+- adds `river_v1_surface.py`
+- extends `river_v1_pipeline.py` to build and return one `river_primary_surface.tif`
+- updates `bathy_main.py` so `--river-method=v1` returns that one primary river surface for fusion
+- keeps the v1 path simple: support -> backbone -> surface, with no XS/scaffold/role ladder logic

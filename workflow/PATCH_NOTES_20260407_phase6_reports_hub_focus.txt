@@ -1,0 +1,11 @@
+Phase 6: reports hub focus cleanup
+
+What changed
+- Promoted benchmark_river_mode_summary.json into the curated reports hub output set.
+- Added river_centerline_width_propagation_summary.json to the reports hub so centerline-to-width behavior is visible from the one-folder diagnosis path.
+- Reworked reports/README_FIRST.txt to list the actual priority order for diagnosis, with missing-file status inline.
+- Added priority_status to reports_manifest.json so downstream tools and users can see which key diagnosis files are present versus not reported.
+
+Why
+- The workflow now emits stronger river receipts, but the reports hub was still oriented around generic trace files.
+- This pass makes reports/ a real first-stop diagnosis folder by surfacing the benchmark mode, triage, backbone smoothing, width propagation, and role receipts ahead of the lower-level workflow traces.
