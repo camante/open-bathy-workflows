@@ -1,0 +1,315 @@
+{
+  "active_entrypoint_bridge": {
+    "allowed_to_call": [
+      "pipeline/river_shared_solve/river_pipeline.py"
+    ],
+    "does_not_change_dem_construction": true,
+    "does_not_create_alternate_route": true,
+    "files": [
+      "river_runner.py",
+      "river_runner_contract.py",
+      "river_workflow.py",
+      "river_workflow_entry.py"
+    ],
+    "must_not_call": [
+      "legacy/river/archive_root_scripts/legacy_linear_v1_runner.py",
+      "legacy/river",
+      "legacy/river/archive_root_scripts/river_channel_surface.py",
+      "legacy/river/archive_root_scripts/river_graph_backbone_solver.py",
+      "legacy/river/archive_root_scripts/river_xs_realism.py"
+    ],
+    "purpose": "Small active bridge from bathy_main/active_pipeline into the canonical river parent/export pipeline. It registers products/receipts only and does not implement an alternate river workflow."
+  },
+  "active_invariant": "shared solve domain -> canonical parent river solution -> exact AOI export -> combined/DEM_enhanced.tif written once -> verify-only comparison",
+  "active_parent_export_functions": {
+    "aoi_export": "run_aoi_export_from_canonical_parent(ctx, handoff)",
+    "canonical_build": "run_canonical_river_build(ctx)",
+    "entrypoint": "run_river_workflow_pipeline(ctx) -> run_river_parent_export_workflow(ctx)",
+    "parent_handoff": "resolve_canonical_parent_handoff(ctx)",
+    "workflow": "run_river_parent_export_workflow(ctx)"
+  },
+  "active_parent_export_identity": [
+    "canonical_river_solve_cache.py",
+    "canonical_river_solve_contract.py",
+    "canonical_river_solve_materialization.py",
+    "canonical_river_identity_guard.py",
+    "canonical_river_export_identity.py",
+    "canonical_river_seam_identity.py",
+    "pipeline/aoi.py",
+    "pipeline/aoi_identity.py",
+    "pipeline/final_dem_materialization.py",
+    "pipeline/final_dem_identity.py"
+  ],
+  "active_parent_handoff": [
+    "CanonicalParentHandoff",
+    "resolve_canonical_parent_handoff(ctx)",
+    "_canonical_parent_handoff_from_manifest(ctx, manifest_path, ...)",
+    "run_aoi_export_from_canonical_parent(ctx, handoff)"
+  ],
+  "active_receipt_purpose_manifest": {
+    "path": "runtime path under each run: river_workflow/manifests/receipt_purpose_manifest.json",
+    "policy": {
+      "does_not_drive_routing": true,
+      "does_not_repair_outputs": true,
+      "one_primary_receipt_per_purpose": true,
+      "verify_only": true
+    },
+    "primary_receipt_roles": [
+      "canonical_parent_manifest",
+      "aoi_export_identity",
+      "final_output_receipt",
+      "comparison_report",
+      "human_run_summary",
+      "stage_receipts"
+    ],
+    "writer": "write_receipt_purpose_manifest"
+  },
+  "active_river_core": [
+    "pipeline/river_shared_solve/river_pipeline.py",
+    "pipeline/river_workflow/river_workflow_pipeline.py",
+    "pipeline/river_workflow/river_workflow_context.py",
+    "pipeline/river_workflow/river_workflow_contract.py",
+    "pipeline/river_workflow/river_workflow_execution_contract.py",
+    "pipeline/river_workflow/river_workflow_paths.py",
+    "pipeline/river_workflow/river_workflow_receipts.py",
+    "pipeline/river_workflow/river_workflow_canonical_manifest.py",
+    "pipeline/river_workflow/river_workflow_stage_solve_domain.py",
+    "pipeline/river_workflow/river_workflow_stage_grids.py",
+    "pipeline/river_workflow/river_workflow_stage_authoritative.py",
+    "pipeline/river_workflow/river_workflow_stage_centerline.py",
+    "pipeline/river_workflow/river_workflow_stage_wse_proxy.py",
+    "pipeline/river_workflow/river_workflow_stage_authoritative_bed.py",
+    "pipeline/river_workflow/river_workflow_stage_observed_offset.py",
+    "pipeline/river_workflow/river_workflow_stage_modeled_offset.py",
+    "pipeline/river_workflow/river_workflow_stage_backbone.py",
+    "pipeline/river_workflow/river_workflow_stage_corridor.py",
+    "pipeline/river_workflow/river_workflow_stage_surface.py",
+    "pipeline/river_workflow/river_workflow_stage_lock.py",
+    "pipeline/river_workflow/river_workflow_stage_export.py",
+    "pipeline/river_workflow/river_workflow_stage_final_dem.py"
+  ],
+  "active_route": "canonical_river_parent_export",
+  "active_route_reporting": {
+    "active_route": "canonical_river_parent_export",
+    "construction_chain": "canonical_parent_dem -> aoi_export_dem -> final_user_dem",
+    "does_not_change_outputs": true,
+    "does_not_drive_routing": true,
+    "module": "reporting/run_summary.py",
+    "phase": "phase7",
+    "primary_items": [
+      "canonical_parent_manifest",
+      "aoi_export_identity",
+      "river_workflow_receipt",
+      "final_output_receipt",
+      "final_user_dem"
+    ],
+    "purpose": "Render canonical river runs as a debugging map instead of generic SDB/fusion product text.",
+    "verify_only": true
+  },
+  "active_stage_first_wrong_artifact_guides": {
+    "contract_module": "pipeline/river_workflow/river_workflow_contract.py",
+    "does_not_change_construction": true,
+    "does_not_drive_routing": true,
+    "does_not_repair_outputs": true,
+    "fields": [
+      "primary_input",
+      "primary_output",
+      "critical_invariant",
+      "first_check",
+      "first_wrong_artifact_hint"
+    ],
+    "module": "pipeline/river_workflow/river_workflow_receipts.py",
+    "phase": "phase8",
+    "purpose": "Attach read-only first-wrong-artifact guidance to each active stage receipt and stage trace entry.",
+    "verify_only": true
+  },
+  "active_transitional_utilities": [
+    "river_structured_scaffold.py"
+  ],
+  "active_validation_policy": {
+    "allowed_questions": [
+      "Did AOI export exactly match the canonical parent window?",
+      "Did final DEM equal AOI export?",
+      "Did authoritative lock preserve measured cells?",
+      "Did WSE/backbone behave physically enough to inspect?",
+      "Did north/south use the same parent?",
+      "What was the first failing artifact?"
+    ],
+    "does_not_change_construction": true,
+    "does_not_drive_routing": true,
+    "does_not_repair_outputs": true,
+    "manifest": "validation/manifests/river_validation_policy_manifest.json",
+    "module": "validation/river_validation_policy.py",
+    "phase": "phase9",
+    "purpose": "Suppress optional placeholder validation noise unless explicit validation/benchmark/regression inputs are configured; retain only verify-only river debugging checks.",
+    "suppressed_when_not_configured": [
+      "benchmark",
+      "postrun_regression",
+      "validation_invariance",
+      "scientific_validation"
+    ],
+    "verify_only": true
+  },
+  "active_verify_reporting_boundary_files": [
+    "pipeline/run_summary.py",
+    "reporting/final_reporting.py",
+    "tools/compare_aoi_exports.py",
+    "pipeline/final_dem_identity.py"
+  ],
+  "bundle_a_active_public_workflow": {
+    "active_entry_uses": [
+      "run_active_river_workflow",
+      "finalize_active_river_workflow"
+    ],
+    "compatibility_aliases_retained": [
+      "active_river report mirror only; no active workflow function aliases"
+    ],
+    "does_not_change_dem_construction": true,
+    "does_not_change_on_disk_river_workflow_paths": true,
+    "next_cleanup_target": "rename/split pipeline/river_workflow internals after behavior is locked by tests",
+    "public_entry": "river_workflow.py"
+  },
+  "bundle_c_legacy_containment": {
+    "active_callback_names": [
+      "resolve_river_shared_source_artifacts_fn",
+      "prepare_river_canonical_source_bundle_fn"
+    ],
+    "active_entrypoint_names": [
+      "run_active_river_workflow",
+      "finalize_active_river_workflow",
+      "run_river_workflow_direct"
+    ],
+    "based_on": "workflow_v893.zip reviewed and integrated for workflow_v894",
+    "compatibility_still_retained": [
+      "on-disk river_workflow work directory",
+      "pipeline/river_workflow internal package",
+      "active_river report mirror",
+      "river_workflow_* output keys as deprecated compatibility keys"
+    ],
+    "deprecated_names_confined_to": [
+      "legacy/river/archive_root_scripts/legacy_linear_v1_runner.py",
+      "active_context.py compatibility dataclass aliases"
+    ],
+    "next_cleanup_target": "Rename on-disk/pipeline internals only after full run confirms v892 preserves parent/export/final identity.",
+    "removed_from_active_exports": [],
+    "status": "reviewed_and_retained_in_v894"
+  },
+  "bundle_d_wse_one_path_contract": {
+    "broad_exception_cleanup": "removed broad except Exception from active WSE proxy stage; remaining handlers are typed and local.",
+    "construction_policy": "one_path_no_fallbacks_wse_reference_surface_only",
+    "contract_output": "reports/wse_artifacts/wse_one_path_stage_contract.json",
+    "explicit_wse_steps": [
+      "build_wse_support",
+      "build_wse_trend",
+      "build_wse_pre_smooth",
+      "build_wse_proxy_final"
+    ],
+    "purpose": "Make the active WSE stage diagnose as four explicit steps without changing the parent/export/final DEM route.",
+    "status": "implemented_in_v894",
+    "txt_output": "reports/wse_artifacts/wse_one_path_stage_contract.txt"
+  },
+  "cleanup_policy": {
+    "legacy_removal_allowed_in_phase_6": false,
+    "legacy_removal_allowed_in_this_phase": false,
+    "no_behavior_change": true,
+    "phase_0": "Freeze the current canonical-parent/AOI-export contract with static tests before deleting or moving legacy code.",
+    "phase_1": "Document the active module boundary and statically guard the active core from importing legacy/quarantined river workflow modules.",
+    "phase_2": "Quarantine inactive legacy river code by manifest and static guard while explicitly classifying river_runner.py/river_runner_contract.py as the active entrypoint bridge, not legacy.",
+    "phase_3": "Shrink bathy_main responsibility by moving final DEM identity/touch-log implementation into pipeline/final_dem_identity.py while keeping bathy_main as CLI/config entrypoint and active workflow caller.",
+    "phase_4": "Collapse cached, existing, and adopted canonical parent sources into a single CanonicalParentHandoff before AOI export. Cache remains an implementation detail; AOI export consumes only the handoff manifest and parent DEM.",
+    "phase_5": "Consolidate receipt purpose: one primary receipt per purpose, one stage receipt per active stage, and remaining receipts explicitly labeled diagnostic/verify-only.",
+    "phase_6": "Quarantine old river modules behind a hard static boundary. Do not move/delete modules in this phase; instead guard active construction files from importing hard-quarantine modules and keep river_structured_scaffold.py explicitly documented as a transitional utility until helper extraction.",
+    "phase_7": "Simplify final reporting around the canonical river route so the run summary is a debugging map for canonical parent, AOI export, final DEM, final review products, and comparison results.",
+    "phase_8": "Add read-only first-wrong-artifact guidance to active stage receipts only. Do not change construction, reroute, repair, or add fallbacks.",
+    "phase_9": "Suppress optional placeholder validation/reporting noise that does not answer the active river debugging questions. Keep configured external validation possible, but do not write skipped placeholder products by default.",
+    "transitional_utility_rule": "If an active stage still imports an older utility module, keep it documented as active_transitional_utilities until the used helper functions are extracted into the active package."
+  },
+  "entrypoint_orchestration": [
+    "active_pipeline.py",
+    "bathy_main.py",
+    "river_runner.py",
+    "river_runner_contract.py",
+    "river_workflow_entry.py",
+    "river_workflow.py",
+    "river_workflow_context.py",
+    "river_workflow_paths.py",
+    "river_workflow_receipts.py",
+    "river_workflow_validation.py",
+    "river_workflow_contract.py"
+  ],
+  "final_river_freeze_for_sdb_template": {
+    "backbone_pass_fail_basis": "large_downstream_rise_count_gt_allowed == 0; small positive downstream steps remain diagnostic",
+    "doc": "docs/RIVER_WORKFLOW_FINAL_FREEZE_FOR_SDB_TEMPLATE.md",
+    "does_not_change_construction": true,
+    "does_not_change_science": true,
+    "status": "active_template_freeze",
+    "template_contract": "canonical parent product -> exact AOI export -> named final materialization -> identity receipts -> read-only science summary",
+    "test": "tests/test_final_river_freeze_reporting_static.py"
+  },
+  "legacy_archive_completed": {
+    "active_route_unchanged": true,
+    "archive_dir": "legacy/river/archive_root_scripts",
+    "moved_root_scripts": [
+      "legacy/river/archive_root_scripts/legacy_linear_v1_runner.py",
+      "legacy/river/archive_root_scripts/legacy_linear_v1_runner_contract.py",
+      "legacy/river/archive_root_scripts/river_primary_surface_rebuild.py",
+      "legacy/river/archive_root_scripts/river_channel_scaffold.py",
+      "legacy/river/archive_root_scripts/river_channel_surface.py",
+      "legacy/river/archive_root_scripts/river_channel_template.py",
+      "legacy/river/archive_root_scripts/river_graph_backbone_solver.py",
+      "legacy/river/archive_root_scripts/river_xs_realism.py",
+      "legacy/river/archive_root_scripts/river_bank_guidance.py",
+      "legacy/river/archive_root_scripts/river_bank_longitudinal_fit.py"
+    ],
+    "note": "Root-level legacy/compatibility river scripts were moved after the canonical parent/export route passed v886. Active river construction remains under pipeline/river_workflow plus documented shared helpers.",
+    "phase": "post_v886_final_river_freeze_cleanup"
+  },
+  "legacy_boundary_manifest": "legacy_river_quarantine_manifest.json",
+  "legacy_boundary_reporting_files": "legacy_river_quarantine_manifest.json::active_verify_reporting_boundary_files",
+  "legacy_or_quarantine_candidates": [
+    "legacy/river/archive_root_scripts/legacy_linear_v1_runner.py",
+    "legacy/river/archive_root_scripts/legacy_linear_v1_runner_contract.py",
+    "pipeline/river_shared_solve/river_context.py",
+    "pipeline/river_shared_solve/river_contract.py",
+    "pipeline/river_shared_solve/river_paths.py",
+    "legacy/river/archive_root_scripts/river_primary_surface_rebuild.py",
+    "legacy/river/archive_root_scripts/river_channel_scaffold.py",
+    "legacy/river/archive_root_scripts/river_channel_surface.py",
+    "legacy/river/archive_root_scripts/river_channel_template.py",
+    "legacy/river/archive_root_scripts/river_graph_backbone_solver.py",
+    "legacy/river/archive_root_scripts/river_xs_realism.py",
+    "legacy/river/archive_root_scripts/river_bank_guidance.py",
+    "legacy/river/archive_root_scripts/river_bank_longitudinal_fit.py",
+    "legacy/river"
+  ],
+  "phase_3_boundary": {
+    "bathy_main_role": "parse config, prepare report, call execute_river_workflow_entry, provide explicit callbacks",
+    "does_not_change_construction": true,
+    "does_not_change_final_values": true,
+    "module": "pipeline/final_dem_identity.py",
+    "moved_from": "bathy_main.py",
+    "purpose": "verify-only final DEM identity and touch-log receipts for the parent/export/final chain"
+  },
+  "phase_5_route_contract_tests": {
+    "contract": "canonical_parent_dem -> aoi_export_dem -> final_user_dem",
+    "module": "pipeline/river_workflow/river_workflow_route_contract.py",
+    "rules": [
+      "cache-hit parent exports do not rerun canonical construction",
+      "missing canonical manifest fails clearly in AOI-export-only mode",
+      "stale parent hash fails clearly",
+      "AOI export receipt proves exact parent-window identity",
+      "run summary reads parent science receipts without recomputing construction"
+    ],
+    "status": "active_read_only_contract_tests",
+    "tests": "tests/test_phase5_route_contract_static.py"
+  },
+  "purpose": "Active river workflow boundary for the canonical-parent/AOI-export architecture. This is a documentation and static-guard artifact only; it does not participate in DEM construction.",
+  "schema_version": 1,
+  "verify_only_tools": [
+    "tests/test_active_river_module_boundary_static.py",
+    "tests/test_active_river_phase0_contract_static.py",
+    "tools/compare_aoi_exports.py",
+    "validation/manifests/river_validation_policy_manifest.json",
+    "validation/river_validation_policy.py"
+  ]
+}

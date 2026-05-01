@@ -8,7 +8,7 @@ import numpy as np
 
 from core.json_io import write_json
 from output_products import build_final_output_contract
-from provenance_reporting import _class_summary, _grid_pixel_size_m, _read_raster, _float_array
+from reporting.provenance_reporting import _class_summary, _grid_pixel_size_m, _read_raster, _float_array
 from river_primary_surface_contract import RIVER_PRIMARY_SURFACE_SOURCE_NAMES
 from provenance_schema import provenance_class_code_from_name, provenance_schema_summary
 from support_classes import SupportClass, RegimeClass, support_class_code_from_name, support_schema_summary

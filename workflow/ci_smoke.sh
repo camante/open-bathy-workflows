@@ -40,6 +40,8 @@ check_slop () {
 echo "[ci_smoke] python: $($PYTHON_BIN -V)"
 check_slop
 
+$PYTHON_BIN repo_contract_checks.py --root .
+
 # Run the lightweight smoke checks
 PYTHON="$PYTHON_BIN" bash run_smoke.sh
 
@@ -49,10 +51,11 @@ from pathlib import Path
 import sys
 
 req = [
-    (Path("bathy_main.py"), "input_receipt.json"),
+    (Path("repo_runtime_modes.py"), "ACTIVE_RIVER_METHOD"),
+    (Path("repo_contract_checks.py"), "validate_runtime_contract"),
     (Path("xs_infer_bathy_raster.py"), "energy_solver_receipt.json"),
-    (Path("seam_metrics.py"), "compute_mask_boundary_seam_metrics"),
-    (Path("CHECKLIST_A_GRADE.md"), "workflow checklist"),
+    (Path("validation/seam_metrics.py"), "compute_mask_boundary_seam_metrics"),
+    (Path("archive/design_notes/CHECKLIST_A_GRADE.md"), "workflow checklist"),
 ]
 missing = []
 for p, token in req:

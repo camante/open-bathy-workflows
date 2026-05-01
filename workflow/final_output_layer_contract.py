@@ -8,7 +8,7 @@ import numpy as np
 import rasterio
 from rasterio.transform import Affine
 
-from nodata_utils import valid_mask
+from core.nodata_utils import valid_mask
 
 
 def _existing_path(value: Any) -> Optional[Path]:

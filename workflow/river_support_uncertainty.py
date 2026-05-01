@@ -1,122 +1,109 @@
 from __future__ import annotations
 
-import math
-from typing import Mapping, Any
+from typing import Any
+
+import numpy as np
 
 SUPPORT_CLASS_CODES = {
-    'missing': 0,
-    'authoritative_locked': 1,
-    'authoritative_backbone': 2,
-    'anchored_interpolated': 3,
-    'stage_controlled': 4,
-    'graph_backbone': 5,
-    'resolved_backbone': 5,
-    'xs_residual_only': 6,
-    'xs_only': 6,
-    'unsupported': 7,
+    "missing": 0,
+    "unsupported": 1,
+    "low_support_scaffolded": 2,
+    "stage_controlled": 3,
+    "graph_backbone": 4,
+    "xs_residual_only": 5,
+    "xs_supported": 6,
+    "anchored_interpolated": 7,
+    "authoritative_bank_margin": 8,
+    "authoritative_in_channel": 9,
+    "authoritative_locked": 10,
 }
-
 SOLUTION_MODE_CODES = {
-    'missing': 0,
-    'hard_locked': 1,
-    'prior_driven': 2,
-    'regularization_driven': 3,
-    'junction_constrained': 4,
-    'mixed_graph_solution': 5,
+    "missing": 0,
+    "unsupported": 1,
+    "scaffolded": 2,
+    "interpolated": 3,
+    "graph": 4,
+    "xs": 5,
+    "authoritative": 6,
 }
-
 UNCERTAINTY_CLASS_CODES = {
-    'missing': 0,
-    'very_low': 1,
-    'low': 2,
-    'moderate': 3,
-    'high': 4,
-    'very_high': 5,
+    "missing": 0,
+    "very_high": 1,
+    "high": 2,
+    "moderate": 3,
+    "low": 4,
+    "very_low": 5,
 }
-
-
 UNSUPPORTED_REGIME_CODES = {
-    'missing': 0,
-    'supported': 1,
-    'short_gap_bridge': 2,
-    'medium_gap_regularized': 3,
-    'long_gap_stiffened': 4,
-    'junction_dominated_unsupported': 5,
+    "missing": 0,
+    "unsupported": 1,
+    "low_support": 2,
+    "scaffolded": 3,
+    "supported": 4,
 }
 
 
-def _f(v: Any) -> float:
+def _as_float(value: Any, default: float = 0.0) -> float:
     try:
-        x = float(v)
+        f = float(value)
+        return f if np.isfinite(f) else default
     except Exception:
-        return float('nan')
-    return x if math.isfinite(x) else float('nan')
+        return default
 
 
-def graph_solution_confidence(row: Mapping[str, Any]) -> float:
-    support = str(row.get('graph_solver_support_class', 'unsupported') or 'unsupported')
-    mode = str(row.get('graph_solution_mode', 'missing') or 'missing')
-    hard_lock = bool(row.get('graph_hard_lock', False))
-    prior_w = max(_f(row.get('graph_prior_weight_sum')), 0.0) if math.isfinite(_f(row.get('graph_prior_weight_sum'))) else 0.0
-    reg_w = max(_f(row.get('graph_regularization_weight_sum')), 0.0) if math.isfinite(_f(row.get('graph_regularization_weight_sum'))) else 0.0
-    jun_w = max(_f(row.get('graph_junction_weight_sum')), 0.0) if math.isfinite(_f(row.get('graph_junction_weight_sum'))) else 0.0
-    resid = abs(_f(row.get('graph_residual_to_candidate_z_m')))
-    unsupported_span = max(_f(row.get('graph_unsupported_span_m')), 0.0) if math.isfinite(_f(row.get('graph_unsupported_span_m'))) else 0.0
-    if hard_lock and support == 'authoritative_locked':
-        return 0.99
-    base = {
-        'authoritative_backbone': 0.90,
-        'anchored_interpolated': 0.75,
-        'graph_backbone': 0.62,
-        'stage_controlled': 0.48,
-        'xs_residual_only': 0.40,
-        'unsupported': 0.28,
-    }.get(support, 0.2)
-    total = prior_w + reg_w + jun_w
-    prior_frac = prior_w / total if total > 0 else 0.0
-    reg_frac = reg_w / total if total > 0 else 0.0
-    jun_frac = jun_w / total if total > 0 else 0.0
-    mode_adj = {
-        'hard_locked': 0.08,
-        'prior_driven': 0.06,
-        'regularization_driven': -0.05,
-        'junction_constrained': -0.08,
-        'mixed_graph_solution': -0.02,
-    }.get(mode, -0.05)
-    conf = base + 0.10 * prior_frac - 0.06 * reg_frac - 0.08 * jun_frac + mode_adj
-    if math.isfinite(resid):
-        conf -= min(resid * 0.08, 0.18)
-    if math.isfinite(unsupported_span):
-        conf -= min(unsupported_span / 750.0, 0.20)
-    return max(0.0, min(1.0, conf))
+def graph_solution_confidence(row: Any) -> float:
+    """Estimate a bounded confidence from commonly available support fields."""
+    getter = row.get if hasattr(row, "get") else (lambda k, d=None: d)
+    if bool(getter("authoritative_anchor_present", False)) or str(getter("support_class_canonical", "")).startswith("authoritative"):
+        return 0.95
+    if bool(getter("target_xs_realism_allowed", False)) or "xs" in str(getter("channel_support_class", "")):
+        return 0.75
+    conf = max(
+        _as_float(getter("prediction_support_confidence", 0.0)),
+        _as_float(getter("graph_confidence", 0.0)),
+        _as_float(getter("bank_influence", 0.0)) * 0.45,
+    )
+    return float(np.clip(conf, 0.05, 0.95))
 
 
-def uncertainty_class_from_confidence(conf: float) -> str:
-    if not math.isfinite(conf):
-        return 'missing'
-    if conf >= 0.90:
-        return 'very_low'
-    if conf >= 0.75:
-        return 'low'
-    if conf >= 0.55:
-        return 'moderate'
-    if conf >= 0.35:
-        return 'high'
-    return 'very_high'
+def uncertainty_class_from_confidence(confidence: float) -> str:
+    c = _as_float(confidence, 0.0)
+    if c >= 0.90:
+        return "very_low"
+    if c >= 0.70:
+        return "low"
+    if c >= 0.45:
+        return "moderate"
+    if c >= 0.20:
+        return "high"
+    return "very_high"
 
 
-def support_class_code(name: str) -> int:
+def support_class_code(name: object) -> int:
     return int(SUPPORT_CLASS_CODES.get(str(name), 0))
 
 
-def solution_mode_code(name: str) -> int:
+def solution_mode_code(name: object) -> int:
     return int(SOLUTION_MODE_CODES.get(str(name), 0))
 
 
-def uncertainty_class_code(name: str) -> int:
+def uncertainty_class_code(name: object) -> int:
     return int(UNCERTAINTY_CLASS_CODES.get(str(name), 0))
 
 
-
-def unsupported_regime_code(name: str) -> int:
+def unsupported_regime_code(name: object) -> int:
     return int(UNSUPPORTED_REGIME_CODES.get(str(name), 0))
+
+
+__all__ = [
+    "SUPPORT_CLASS_CODES",
+    "SOLUTION_MODE_CODES",
+    "UNCERTAINTY_CLASS_CODES",
+    "UNSUPPORTED_REGIME_CODES",
+    "graph_solution_confidence",
+    "uncertainty_class_from_confidence",
+    "support_class_code",
+    "solution_mode_code",
+    "uncertainty_class_code",
+    "unsupported_regime_code",
+]

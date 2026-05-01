@@ -24,7 +24,7 @@ def write_json(path: Path, obj: Dict[str, Any]) -> None:
 
     # Flight recorder breadcrumb (best effort)
     try:
-        from flight_recorder import emit_artifact_written
+        from core.flight_recorder import emit_artifact_written
         emit_artifact_written(path, kind="json", role="report_or_metadata")
     except Exception as e:
         log.debug("Optional flight-recorder emit failed: %s", e)

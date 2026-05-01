@@ -7,7 +7,7 @@ import gc
 import numpy as np
 
 from authoritative_conditioning import support_weighted_condition_arrays
-from final_route_receipts import write_json_receipt
+from pipeline.final_route.final_route_receipts import write_json_receipt
 
 
 

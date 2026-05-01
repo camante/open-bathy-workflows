@@ -9,9 +9,9 @@ from typing import Optional
 import rasterio
 from rasterio.warp import reproject, Resampling
 
-from final_route_inputs_stage import find_sdb_depth_raster, find_sdb_guidance_artifact, resolve_existing_output_path, resolve_baseline_cudem_interpolation
-from final_route_receipts import write_json_receipt
-from nodata_utils import prepare_array_for_reproject, sanitize_for_output
+from pipeline.final_route.final_route_inputs_stage import find_sdb_depth_raster, find_sdb_guidance_artifact, resolve_existing_output_path, resolve_baseline_cudem_interpolation
+from pipeline.final_route.final_route_receipts import write_json_receipt
+from core.nodata_utils import prepare_array_for_reproject, sanitize_array, sanitize_for_output
 
 log = logging.getLogger(__name__)
 
@@ -176,9 +176,26 @@ def _require_river_structural_artifacts(*, river_outputs: dict, outputs_base_dir
     if not _river_guidance_requested(river_outputs):
         return {"requested": False, "missing_paths": [], "semantic_errors": []}
 
+    river_v2_direct_guidance = bool(
+        isinstance(river_outputs, dict)
+        and (
+            river_outputs.get("river_v2_summary")
+            or river_outputs.get("river_v2_primary_surface_trusted_export")
+            or river_outputs.get("primary_river_guidance_surface")
+        )
+    )
+
+    required_keys = _REQUIRED_RIVER_STRUCTURAL_KEYS
+    if river_v2_direct_guidance:
+        required_keys = (
+            "admissibility",
+            "guidance_weight",
+            "trusted_interior",
+        )
+
     missing_paths: list[str] = []
     present_optional: dict[str, bool] = {}
-    for key in _REQUIRED_RIVER_STRUCTURAL_KEYS:
+    for key in required_keys:
         if key == "guide_points":
             if river_guide_points_path is None:
                 missing_paths.append(key)
@@ -206,21 +223,29 @@ def _require_river_structural_artifacts(*, river_outputs: dict, outputs_base_dir
     elif river_adm is not None:
         corridor_mask = np.asarray(river_adm) > 0
     if corridor_mask is not None and np.any(corridor_mask):
-        stationing = arrays.get("river_centerline_stationing")
-        if stationing is None or not np.any(np.isfinite(np.asarray(stationing)[corridor_mask])):
-            semantic_errors.append("river_centerline_stationing_has_no_finite_values_in_corridor")
-        centerline_elev = arrays.get("river_centerline_elevation")
-        if centerline_elev is None or not np.any(np.isfinite(np.asarray(centerline_elev)[corridor_mask])):
-            semantic_errors.append("river_centerline_elevation_has_no_finite_values_in_corridor")
-        xs_elev = arrays.get("river_xs_support_elevation")
-        xs_weight = arrays.get("river_xs_support_weight")
-        xs_has_support = _has_finite_in_corridor(xs_elev, corridor_mask) or _has_finite_in_corridor(xs_weight, corridor_mask)
-        if not xs_has_support:
-            present_optional["xs_support_elevation"] = False
-            present_optional["xs_support_weight"] = False
-        bank_infl = arrays.get("river_bank_influence")
-        if bank_infl is None or not np.any(np.isfinite(np.asarray(bank_infl)[corridor_mask])):
-            semantic_errors.append("river_bank_influence_has_no_finite_values_in_corridor")
+        if river_v2_direct_guidance:
+            primary_surface = arrays.get("primary_river_guidance_surface")
+            if primary_surface is None or not np.any(np.isfinite(np.asarray(primary_surface)[corridor_mask])):
+                semantic_errors.append("river_primary_guidance_surface_has_no_finite_values_in_corridor")
+            river_gw = arrays.get("river_gw")
+            if river_gw is None or not np.any(np.isfinite(np.asarray(river_gw)[corridor_mask])):
+                semantic_errors.append("river_guidance_weight_has_no_finite_values_in_corridor")
+        else:
+            stationing = arrays.get("river_centerline_stationing")
+            if stationing is None or not np.any(np.isfinite(np.asarray(stationing)[corridor_mask])):
+                semantic_errors.append("river_centerline_stationing_has_no_finite_values_in_corridor")
+            centerline_elev = arrays.get("river_centerline_elevation")
+            if centerline_elev is None or not np.any(np.isfinite(np.asarray(centerline_elev)[corridor_mask])):
+                semantic_errors.append("river_centerline_elevation_has_no_finite_values_in_corridor")
+            xs_elev = arrays.get("river_xs_support_elevation")
+            xs_weight = arrays.get("river_xs_support_weight")
+            xs_has_support = _has_finite_in_corridor(xs_elev, corridor_mask) or _has_finite_in_corridor(xs_weight, corridor_mask)
+            if not xs_has_support:
+                present_optional["xs_support_elevation"] = False
+                present_optional["xs_support_weight"] = False
+            bank_infl = arrays.get("river_bank_influence")
+            if bank_infl is None or not np.any(np.isfinite(np.asarray(bank_infl)[corridor_mask])):
+                semantic_errors.append("river_bank_influence_has_no_finite_values_in_corridor")
 
     if missing_paths or semantic_errors:
         details=[]
@@ -230,7 +255,7 @@ def _require_river_structural_artifacts(*, river_outputs: dict, outputs_base_dir
             details.append("semantic=" + ",".join(semantic_errors))
         raise RuntimeError("missing_required_river_structural_guidance_artifacts_for_final_route: " + "; ".join(details))
 
-    return {"requested": True, "missing_paths": [], "semantic_errors": [], "present_optional": present_optional}
+    return {"requested": True, "missing_paths": [], "semantic_errors": [], "present_optional": present_optional, "river_v2_direct_guidance": river_v2_direct_guidance}
 
 
 @dataclass
@@ -409,6 +434,37 @@ def _exclude_guidance_from_authoritative_locked_cells(arrays: dict, locked: np.n
     return {"arrays": sanitized, "receipt": receipt}
 
 
+def _disable_empty_direct_primary_handoff(arrays: dict) -> dict:
+    """Disable direct-primary routing when lock exclusion removes every usable pixel.
+
+    River v2 writes several river artifacts, but only an *active* direct-primary
+    surface should participate in final conditioning. After authoritative-lock
+    exclusion, a surface can become semantically empty even if the source raster on
+    disk was non-empty. Clearing it here keeps the route decision tied to the actual
+    arrays entering terrain conditioning, which is simpler and easier to debug.
+    """
+    receipt = {
+        "present_after_authoritative_exclusion": False,
+        "finite_pixels_after_authoritative_exclusion": 0,
+        "disabled": False,
+        "reason": "no_primary_surface",
+    }
+    primary = arrays.get("primary_river_guidance_surface")
+    if primary is None:
+        return receipt
+    primary_arr = np.asarray(primary, dtype=np.float32)
+    finite_after = int(np.count_nonzero(np.isfinite(primary_arr)))
+    receipt.update({
+        "present_after_authoritative_exclusion": True,
+        "finite_pixels_after_authoritative_exclusion": finite_after,
+        "reason": "usable_primary_surface_retained" if finite_after > 0 else "no_unlocked_primary_surface_after_authoritative_exclusion",
+    })
+    if finite_after <= 0:
+        arrays["primary_river_guidance_surface"] = None
+        receipt["disabled"] = True
+    return receipt
+
+
 def grid_pixel_size_m(transform, crs, ref_lat_deg: Optional[float] = None) -> float:
     try:
         dx = abs(float(getattr(transform, "a", 0.0) or 0.0))
@@ -552,7 +608,7 @@ def assemble_guidance_inputs(*, cfg, paths, candidate_path: Optional[Path], prov
             "river_gw": _align(resolve_existing_output_path(river_outputs, "guidance_weight", base_dir=outputs_base_dir), dtype="float32", nodata_value=np.nan, resampling=Resampling.bilinear),
             "river_ti": _align(resolve_existing_output_path(river_outputs, "trusted_interior", base_dir=outputs_base_dir), dtype="uint8", nodata_value=0, resampling=Resampling.nearest),
             "river_estuary_transition": _align(resolve_existing_output_path(river_outputs, "estuary_transition", base_dir=outputs_base_dir), dtype="uint8", nodata_value=0, resampling=Resampling.nearest),
-            "river_support": _align(resolve_existing_output_path(river_outputs, "authoritative_support", base_dir=outputs_base_dir), dtype="uint8", nodata_value=0, resampling=Resampling.nearest),
+            "river_support": _align(resolve_existing_output_path(river_outputs, "authoritative_support", base_dir=outputs_base_dir), dtype="float32", nodata_value=np.nan, resampling=Resampling.nearest),
             "river_support_depth": _align(resolve_existing_output_path(river_outputs, "authoritative_support_depth", base_dir=outputs_base_dir), dtype="float32", nodata_value=np.nan, resampling=Resampling.bilinear),
             "river_corridor": _align(resolve_existing_output_path(river_outputs, "corridor_mask", base_dir=outputs_base_dir), dtype="uint8", nodata_value=0, resampling=Resampling.nearest),
             "river_bank_influence": _align(resolve_existing_output_path(river_outputs, "bank_influence", base_dir=outputs_base_dir), dtype="float32", nodata_value=np.nan, resampling=Resampling.bilinear),
@@ -628,6 +684,23 @@ def assemble_guidance_inputs(*, cfg, paths, candidate_path: Optional[Path], prov
         pixel_size_m = grid_pixel_size_m(cand_ds.transform, cand_ds.crs, ref_lat_deg=(cfg.tile_bbox[1] + cfg.tile_bbox[3]) / 2.0 if getattr(cfg, "tile_bbox", None) else None)
 
     authoritative_locked = np.isfinite(auth)
+    river_corridor = arrays.get("river_corridor")
+    river_support = arrays.get("river_support")
+    authoritative_lock_semantics = {
+        "base_policy": "finite_authoritative_base_cells_locked",
+        "river_corridor_policy": "authoritative_base_only",
+    }
+    if river_corridor is not None and river_support is not None:
+        river_corridor_mask = np.asarray(river_corridor) > 0
+        river_support_mask = np.isfinite(np.asarray(river_support, dtype=np.float32))
+        if river_corridor_mask.shape == authoritative_locked.shape and river_support_mask.shape == authoritative_locked.shape:
+            authoritative_locked = authoritative_locked.copy()
+            authoritative_locked[river_corridor_mask] = river_support_mask[river_corridor_mask]
+            authoritative_lock_semantics.update({
+                "river_corridor_policy": "explicit_river_authoritative_support_overrides_finite_authoritative_base",
+                "river_corridor_pixels": int(np.count_nonzero(river_corridor_mask)),
+                "river_support_locked_pixels_in_corridor": int(np.count_nonzero(river_support_mask & river_corridor_mask)),
+            })
 
     # Validate structural guidance semantics *before* authoritative-lock masking.
     # In authoritative-dense AOIs the final-route stage intentionally blanks
@@ -652,6 +725,14 @@ def assemble_guidance_inputs(*, cfg, paths, candidate_path: Optional[Path], prov
 
     locked_guidance_exclusion = _exclude_guidance_from_authoritative_locked_cells(arrays, authoritative_locked)
     arrays = locked_guidance_exclusion["arrays"]
+    direct_primary_handoff = _disable_empty_direct_primary_handoff(arrays)
+
+    workflow_name = str(
+        getattr(cfg, "river_workflow", None)
+        or getattr(cfg, "workflow_name", None)
+        or ""
+    ).strip().lower()
+    require_explicit_bank_guidance = workflow_name in {"river_workflow", "shared_solve"}
 
     support_params = {
         "pixel_size_m": pixel_size_m,
@@ -660,7 +741,7 @@ def assemble_guidance_inputs(*, cfg, paths, candidate_path: Optional[Path], prov
         "coastal_sdb_support_transition_m": float(getattr(cfg, "coastal_sdb_support_transition_m", 600.0) or 600.0),
         "river_anchor_density_radius_m": float(getattr(cfg, "river_anchor_density_radius_m", 200.0) or 200.0),
         "river_scaffold_transition_m": float(getattr(cfg, "river_scaffold_transition_m", 800.0) or 800.0),
-        "require_explicit_bank_guidance": bool(str(getattr(cfg, "river_method", "") or "").lower() == "v1"),
+        "require_explicit_bank_guidance": require_explicit_bank_guidance,
     }
 
     structural_artifacts = {
@@ -711,8 +792,10 @@ def assemble_guidance_inputs(*, cfg, paths, candidate_path: Optional[Path], prov
         "structural_alignment": alignment_notes,
         "authoritative_locked_guidance_exclusion": {
             "locked_pixels": int(np.count_nonzero(authoritative_locked)),
+            "lock_semantics": authoritative_lock_semantics,
             "arrays": locked_guidance_exclusion["receipt"],
         },
+        "river_direct_primary_handoff": direct_primary_handoff,
     })
     return GuidanceAssembly(
         profile=profile,

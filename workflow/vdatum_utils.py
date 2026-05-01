@@ -1,82 +1,15 @@
-"""Vertical datum conversion utilities.
+"""Vertical-datum conversion utilities.
 
-Kept in one place to prevent drift between bathy_main and sdb_main.
+The full VDatum conversion path is not part of the active river workflow in
+this package.  Calls fail explicitly rather than silently returning an
+unconverted raster.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Optional, Tuple
-import logging
-import shutil
 
-from process_utils import run_cmd
+def convert_sdb_msl_to_navd88(*args, **kwargs):
+    raise RuntimeError("convert_sdb_msl_to_navd88_unavailable_in_uploaded_phase0_package")
 
 
-def convert_raster_vertical_datum(
-    input_tif: Path,
-    output_tif: Path,
-    source_vdatum: str,
-    target_vdatum: str,
-    logger: Optional[logging.Logger] = None,
-) -> Tuple[bool, str]:
-    """Convert a raster vertically using CUDEM dlim."""
-    log = logger or logging.getLogger(__name__)
-    dlim_exe = shutil.which("dlim")
-    if dlim_exe is None:
-        msg = "dlim not found on PATH; cannot perform vertical datum transformation"
-        log.warning("%s", msg)
-        return False, msg
-
-    input_tif = Path(input_tif)
-    output_tif = Path(output_tif)
-    if not input_tif.exists():
-        msg = f"Input raster not found: {input_tif}"
-        log.error("%s", msg)
-        return False, msg
-
-    output_tif.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        dlim_exe,
-        "-i", str(input_tif),
-        "-J", str(source_vdatum),
-        "-P", str(target_vdatum),
-        "-O", str(output_tif),
-    ]
-    res = run_cmd(cmd, timeout=600)
-    if res.returncode != 0:
-        msg = f"dlim failed with code {res.returncode}: {res.stderr_tail[:500]}"
-        log.error("%s", msg)
-        return False, msg
-    if not output_tif.exists():
-        msg = f"dlim completed but output not found: {output_tif}"
-        log.error("%s", msg)
-        return False, msg
-    return True, f"Converted {input_tif.name} from {source_vdatum} to {target_vdatum}: {output_tif}"
-
-def convert_sdb_msl_to_navd88(
-    input_tif: Path,
-    output_tif: Path,
-    source_vdatum: str = "epsg:4269+5714",  # NAD83 + MSL
-    target_vdatum: str = "epsg:4269+5703",  # NAD83 + NAVD88
-    logger: Optional[logging.Logger] = None,
-) -> Tuple[bool, str]:
-    """Convert an SDB *elevation* raster from MSL to NAVD88 using CUDEM `dlim`.
-
-    SCIENTIFIC NOTE:
-    - SDB outputs are elevations relative to MSL (Mean Sea Level = 0).
-      A pixel value of -5.0m means seabed elevation is -5.0m MSL.
-    - This is *not* depth below instantaneous water surface.
-
-    The vertical datum transform is applied as:
-        elev_NAVD88 = elev_MSL + (NAVD88 - MSL separation)
-    """
-    log = logger or logging.getLogger(__name__)
-    log.info("Converting SDB from MSL to NAVD88")
-    return convert_raster_vertical_datum(
-        input_tif=input_tif,
-        output_tif=output_tif,
-        source_vdatum=source_vdatum,
-        target_vdatum=target_vdatum,
-        logger=log,
-    )
+__all__ = ["convert_sdb_msl_to_navd88"]

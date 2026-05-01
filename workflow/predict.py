@@ -19,7 +19,7 @@ import logging
 import argparse
 import subprocess
 from raster_contract import validate_gdal_output
-from process_utils import run_cmd
+from core.process_utils import run_cmd
 import shlex
 from pathlib import Path
 from contextlib import ExitStack
@@ -121,7 +121,7 @@ except (AttributeError, OSError, SyntaxError) as e:
 
 # Import standardized constants
 try:
-    from constants import NODATA_DEPTH, DEFAULT_TILE_SIZE, NUMERICAL_EPS
+    from core.constants import NODATA_DEPTH, DEFAULT_TILE_SIZE, NUMERICAL_EPS
     NODATA_VAL: float = float(NODATA_DEPTH)
 except ImportError:
     NODATA_VAL = -9999.0
@@ -1857,7 +1857,7 @@ def main(argv=None):
 
 if __name__ == "__main__":
     try:
-        from logging_config import setup_logging
+        from core.logging_config import setup_logging
         setup_logging()
     except (ImportError, OSError, ValueError):
         import logging

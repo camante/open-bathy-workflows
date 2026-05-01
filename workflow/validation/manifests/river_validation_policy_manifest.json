@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "phase": "phase9",
+  "purpose": "Keep river validation/reporting focused on checks that answer real river debugging questions; suppress optional placeholder validation when no case/truth inputs are configured.",
+  "policy": {
+    "verify_only": true,
+    "does_not_change_construction": true,
+    "does_not_drive_routing": true,
+    "does_not_repair_outputs": true,
+    "does_not_select_dem_source": true,
+    "suppress_unconfigured_placeholder_validation": true
+  },
+  "allowed_questions": [
+    "Did AOI export exactly match the canonical parent window?",
+    "Did final DEM equal AOI export?",
+    "Did authoritative lock preserve measured cells?",
+    "Did WSE/backbone behave physically enough to inspect?",
+    "Did north/south use the same parent?",
+    "What was the first failing artifact?"
+  ],
+  "suppressed_when_not_configured": [
+    "benchmark",
+    "postrun_regression",
+    "validation_invariance",
+    "scientific_validation"
+  ],
+  "primary_existing_checks": [
+    "aoi_export_identity",
+    "final_output_receipt",
+    "compare_aoi_exports",
+    "stage_first_wrong_artifact_guides",
+    "read_only_science_support_checks"
+  ]
+}

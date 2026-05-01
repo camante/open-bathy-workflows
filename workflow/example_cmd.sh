@@ -6,7 +6,6 @@
   --cache-root=cache/merrimack_coast \
   --extra-xyz-cudem=hydronos,ehydro \
   --river-soundings-mode=bed_elev \
-  --river-method=skeleton \
   --river-channel-buffer-m=400 \
   --river-max-channel-width-m=600 \
   --river-mainstem-min-order=5 \
@@ -48,7 +47,6 @@
   --cache-root=cache/merrimack_inland \
   --extra-xyz-cudem=hydronos,ehydro \
   --river-soundings-mode=bed_elev \
-  --river-method=skeleton \
   --river-channel-buffer-m=400 \
   --river-max-channel-width-m=600 \
   --river-mainstem-min-order=5 \

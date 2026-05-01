@@ -46,7 +46,7 @@ import numpy as np
 
 import rasterio
 
-from nodata_utils import prepare_array_for_reproject, sanitize_array, resolve_nodata_value, resolve_reproject_nodata_value
+from core.nodata_utils import prepare_array_for_reproject, sanitize_array, resolve_nodata_value, resolve_reproject_nodata_value
 from sign_semantics import raster_value_semantics, should_expect_negative_depth
 from rasterio.windows import Window
 from pyproj import CRS, Geod
@@ -643,7 +643,7 @@ def fuse_bathymetry(cfg: FusionConfig) -> FusionResult:
     # Decide chunking
     # -------------------------
     try:
-        from chunked_processing import should_use_chunked_processing, generate_tiles, count_tiles, TQDM_AVAILABLE
+        from core.chunked_processing import should_use_chunked_processing, generate_tiles, count_tiles, TQDM_AVAILABLE
         use_chunked = should_use_chunked_processing(height, width)
     except Exception:
         log.debug("bathy_fusion: suppressed exception", exc_info=True)

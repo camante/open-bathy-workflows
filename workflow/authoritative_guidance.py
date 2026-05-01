@@ -17,7 +17,7 @@ import rasterio
 from rasterio import features
 from pyproj import Transformer
 
-from nodata_utils import nodata_mask, sanitize_array, valid_mask, resolve_reproject_nodata_value, resolve_nodata_value
+from core.nodata_utils import nodata_mask, sanitize_array, valid_mask, resolve_reproject_nodata_value, resolve_nodata_value
 from sign_semantics import raster_value_semantics
 from authoritative_river_roles import build_authoritative_river_role_arrays, role_to_code
 from raster_contract import validate_gdal_output

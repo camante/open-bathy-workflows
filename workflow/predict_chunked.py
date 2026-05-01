@@ -37,7 +37,7 @@ def estimate_memory_requirement_gb(width: int, height: int, n_features: int = 14
     ``sdb_main.py``.
     """
     try:
-        from chunked_processing import estimate_memory_requirement_gb as _canonical
+        from core.chunked_processing import estimate_memory_requirement_gb as _canonical
         import numpy as np
         return _canonical(
             height=int(height),

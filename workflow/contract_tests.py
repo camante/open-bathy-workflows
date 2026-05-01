@@ -10,9 +10,9 @@ from typing import Dict, Any, List, Tuple
 log = logging.getLogger(__name__)
 
 
-from final_dem_contract import build_final_dem_contract_summary
-from final_dem_policy import default_final_dem_policy
-from simple_river_stage_contract import simple_river_stage_status_placeholder, STAGE_RIVER_CENTERLINE, mark_stage_implemented
+from pipeline.final_dem.final_dem_contract import build_final_dem_contract_summary
+from pipeline.final_dem.final_dem_policy import default_final_dem_policy
+from legacy.river.simple_river_stage_contract import simple_river_stage_status_placeholder, STAGE_RIVER_CENTERLINE, mark_stage_implemented
 
 
 class ContractTest:

@@ -3,9 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from final_dem_contract import build_final_dem_contract_summary
-from final_dem_contract_validator import summarize_written_precedence_audit, validate_written_final_dem_contract, validate_written_final_dem_lineage
-from final_route_contract import allowed_final_route_inputs, forbidden_structural_inputs, validate_final_route_contract
+from pipeline.final_dem.final_dem_contract import build_final_dem_contract_summary
+from pipeline.final_dem.final_dem_contract_validator import summarize_written_precedence_audit, validate_written_final_dem_contract, validate_written_final_dem_lineage
+from pipeline.final_route.final_route_contract import allowed_final_route_inputs, forbidden_structural_inputs, validate_final_route_contract
 
 
 def _runtime_state(report: Dict[str, Any]) -> Dict[str, Any]:

@@ -7,12 +7,10 @@ from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
 
-from river_workflow_debug_report import prune_consolidated_river_debug_outputs_from_report
-
 
 def write_review_only_run_summary_files(*, cfg: Any, report: dict, run_id: str, logger) -> None:
-    from run_summary import write_run_summary_files
-    from flight_recorder import current_flight_path
+    from reporting.run_summary import write_run_summary_files
+    from core.flight_recorder import current_flight_path
 
     frp = current_flight_path()
     write_run_summary_files(
@@ -27,7 +25,7 @@ def write_review_only_run_summary_files(*, cfg: Any, report: dict, run_id: str, 
 
 
 def build_and_log_human_summary(*, cfg: Any, report: dict, logger) -> None:
-    from run_summary import print_human_run_summary
+    from reporting.run_summary import print_human_run_summary
 
     summary_stats = {
         "command": " ".join(sys.argv),
@@ -36,13 +34,23 @@ def build_and_log_human_summary(*, cfg: Any, report: dict, logger) -> None:
         "methods": list(cfg.methods),
         "priority": cfg.priority,
         "outputs": report.get("outputs", {}),
+        # Keep the human summary aligned with the route that actually ran.
+        # These are reporting-only fields; they do not alter workflow routing.
+        "sdb": report.get("sdb", {}),
+        "river": report.get("river", {}),
+        "fusion": report.get("fusion", {}),
+        "river_workflow": report.get("river_workflow", {}),
+        "active_river": report.get("active_river", {}),
+        "seamless_dem": report.get("seamless_dem", {}),
+        "route": report.get("route", {}),
+        "guidance_domains": report.get("guidance_domains", {}),
     }
     print_human_run_summary(summary_stats, log_fn=logger.info)
     report["human_summary"] = summary_stats
 
 
 def apply_energy_solver_top_level_summary(*, cfg: Any, report: dict, logger) -> None:
-    from flight_recorder import current_run_id
+    from core.flight_recorder import current_run_id
 
     rid = current_run_id()
     meta_p = Path(cfg.out_dir) / "derived_cache" / str(rid) / "river" / "work" / "xs_mainstem_constraints_meta.json"
@@ -102,8 +110,8 @@ def run_runtime_sign_semantics(*, cfg: Any, report: dict, logger) -> None:
 
 
 def write_detailed_run_summaries(*, cfg: Any, report: dict, logger) -> None:
-    from run_summary import write_run_summary_files
-    from flight_recorder import current_run_id, current_flight_path
+    from reporting.run_summary import write_run_summary_files
+    from core.flight_recorder import current_run_id, current_flight_path
 
     rid = current_run_id()
     frp = current_flight_path()
@@ -118,14 +126,6 @@ def write_detailed_run_summaries(*, cfg: Any, report: dict, logger) -> None:
     logger.info("Run summaries written under: %s", Path(cfg.out_dir) / "run_logs")
 
 
-def assemble_debug_bundle(*, out_dir: str | Path, report: dict, run_id: str, logger) -> tuple[str, str]:
-    from debug_bundle import write_debug_bundle
-
-    write_debug_bundle(out_dir, report=report, run_id=run_id, logger=logger)
-    base = Path(out_dir) / "debug_bundle"
-    return str(base), str(base / "manifest.json")
-
-
 def apply_output_retention_policy_best_effort(*, cfg: Any, logger, report: dict, final_path, final_for_user_path) -> None:
     from bathy_main import _apply_output_retention_policy  # late import to avoid circular startup impact
 
@@ -136,7 +136,7 @@ NONFATAL_FINALIZE_EXCEPTIONS = (ImportError, ModuleNotFoundError, OSError, Value
 
 
 def write_workflow_actual_trace_file(*, out_dir: str | Path, report: dict, logger) -> str:
-    from workflow_actual_trace import write_workflow_actual_trace
+    from tools.debug.workflow_actual_trace import write_workflow_actual_trace
 
     path = write_workflow_actual_trace(out_dir=out_dir, report=report)
     logger.info("Workflow input/output trace written: %s", path)
@@ -144,7 +144,7 @@ def write_workflow_actual_trace_file(*, out_dir: str | Path, report: dict, logge
 
 
 def write_connected_diagnostics_files(*, out_dir: str | Path, report: dict, logger) -> dict[str, str]:
-    from workflow_connected_diagnostics import write_connected_diagnostics
+    from tools.debug.workflow_connected_diagnostics import write_connected_diagnostics
 
     outputs = write_connected_diagnostics(out_dir=out_dir, report=report)
     logger.info("Connected workflow diagnostics written: %s", outputs)
@@ -152,7 +152,7 @@ def write_connected_diagnostics_files(*, out_dir: str | Path, report: dict, logg
 
 
 def write_run_diagnosis_files(*, out_dir: str | Path, report: dict, logger) -> dict[str, str]:
-    from workflow_run_diagnosis import write_run_diagnosis
+    from tools.debug.workflow_run_diagnosis import write_run_diagnosis
 
     outputs = write_run_diagnosis(out_dir=out_dir, report=report)
     logger.info("Workflow run diagnosis written: %s", outputs)
@@ -161,16 +161,35 @@ def write_run_diagnosis_files(*, out_dir: str | Path, report: dict, logger) -> d
 
 
 
-def write_river_workflow_debug_file(*, out_dir: str | Path, report: dict, logger) -> str:
-    from river_workflow_debug_report import write_river_workflow_debug_report
+def write_curated_reports_suite(*, out_dir: str | Path, report: dict, logger) -> dict[str, str]:
+    outputs: dict[str, str] = {}
+    trace_path = write_workflow_actual_trace_file(out_dir=out_dir, report=report, logger=logger)
+    outputs["workflow_input_output_trace"] = str(trace_path)
+    outputs.update(write_connected_diagnostics_files(out_dir=out_dir, report=report, logger=logger))
+    outputs.update(write_run_diagnosis_files(out_dir=out_dir, report=report, logger=logger))
+    outputs.update(write_reports_hub_files(out_dir=out_dir, report=report, logger=logger))
+    report.setdefault("outputs", {}).update(outputs)
+    report.setdefault("final_reporting", {}).setdefault("receipts", {}).update(outputs)
+    return outputs
 
-    path = write_river_workflow_debug_report(out_dir=out_dir, report=report)
-    prune_consolidated_river_debug_outputs_from_report(report)
-    logger.info("River workflow debug report written: %s", path)
-    return str(path)
+
+def refresh_bathy_report_output(*, report: dict, logger) -> str | None:
+    from core.json_io import write_json
+
+    outputs = report.get("outputs", {}) if isinstance(report.get("outputs"), dict) else {}
+    report_path = outputs.get("bathy_report")
+    if not isinstance(report_path, str) or not report_path.strip():
+        return None
+    try:
+        write_json(Path(report_path), report)
+        logger.info("Final report refreshed: %s", report_path)
+        return report_path
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        logger.debug("Final report refresh skipped: %s", exc, exc_info=True)
+        return None
 
 def write_reports_hub_files(*, out_dir: str | Path, report: dict, logger) -> dict[str, str]:
-    from workflow_reports_hub import write_reports_hub
+    from tools.debug.workflow_reports_hub import write_reports_hub
 
     outputs = write_reports_hub(out_dir=out_dir, report=report)
     logger.info("Reports hub written: %s", outputs)

@@ -27,7 +27,7 @@ CLEAN_RIVER_OUTPUTS="${CLEAN_RIVER_OUTPUTS:-1}"
 CLEAN_FUSION_OUTPUTS="${CLEAN_FUSION_OUTPUTS:-1}"
 
 BATHY_MAIN="./bathy_main.py"
-METRICS_PY="./regression_metrics.py"
+METRICS_PY="./validation/regression_metrics.py"
 
 # Prefer ArcGIS REST only (if CLI supports it)
 RIVER_HYDRO_SOURCE="arcgis"
@@ -61,7 +61,6 @@ COMMON_CANDIDATES=(
   "--methods=river"
   "--extra-xyz-cudem=hydronos,ehydro"
   "--river-soundings-mode=bed_elev"
-  "--river-method=skeleton"
 
   "--river-hydrography-source=${RIVER_HYDRO_SOURCE}"
   "--river-channel-source=${RIVER_CHANNEL_SOURCE}"
@@ -240,7 +239,7 @@ echo "============================================================"
 echo "Computing regression metrics + summary CSV..."
 echo "============================================================"
 
-# regression_metrics.py discovers runs by scanning subdirectories under --root.
+# validation/regression_metrics.py discovers runs by scanning subdirectories under --root.
 # Use a *directory-only* glob so we don't accidentally pass files and confuse discovery.
 # (Your earlier **/* pattern can match lots of non-run files and end up with "no run dirs".)
 python "${METRICS_PY}" \

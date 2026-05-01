@@ -1,94 +1,124 @@
 from __future__ import annotations
 
+"""Deterministic support-point key helpers for withheld-support filtering.
+
+This module is intentionally small and side-effect free.  It does not discover
+inputs or change support semantics; it only creates stable row keys so a user
+provided withheld-support table can exclude matching authoritative support rows.
+"""
+
 from pathlib import Path
-from typing import Any
+from typing import Iterable
 
-import numpy as np
+import hashlib
 import pandas as pd
+import numpy as np
 
 
-_DEFAULT_KEY_COLUMN = "support_point_key"
+_KEY_COLUMNS_PRIORITY: tuple[tuple[str, ...], ...] = (
+    ("support_point_key",),
+    ("point_id",),
+    ("source_id",),
+    ("id",),
+    ("lon", "lat", "depth_m"),
+    ("longitude", "latitude", "depth_m"),
+    ("x", "y", "depth_m"),
+    ("easting", "northing", "depth_m"),
+    ("lon", "lat", "z"),
+    ("x", "y", "z"),
+)
+
+_ROLE_COLUMNS = (
+    "authoritative_role",
+    "role",
+    "source_role",
+    "support_role",
+    "source_class",
+    "data_source",
+    "source",
+)
 
 
-def _format_coord(series: pd.Series, decimals: int) -> pd.Series:
-    vals = pd.to_numeric(series, errors="coerce")
-    out = pd.Series([""] * len(vals), index=series.index, dtype=object)
-    finite = np.isfinite(vals.to_numpy(dtype=float, copy=False))
-    if np.any(finite):
-        out.loc[finite] = vals.loc[finite].map(lambda v: f"{float(v):.{decimals}f}")
-    return out
+def _has_columns(df: pd.DataFrame, cols: Iterable[str]) -> bool:
+    return all(str(c) in df.columns for c in cols)
 
 
-
-def _format_role(series: pd.Series) -> pd.Series:
-    return series.fillna("").astype(str).str.strip()
-
-
-
-def build_support_point_keys(
-    df: pd.DataFrame,
-    *,
-    x_col: str = "x",
-    y_col: str = "y",
-    z_col: str = "depth_m",
-    role_col: str = "authoritative_role",
-) -> pd.Series:
-    if df is None or df.empty:
-        return pd.Series(dtype=object)
-    x = _format_coord(df.get(x_col, pd.Series(np.nan, index=df.index)), 10)
-    y = _format_coord(df.get(y_col, pd.Series(np.nan, index=df.index)), 10)
-    z = _format_coord(df.get(z_col, pd.Series(np.nan, index=df.index)), 6)
-    role = _format_role(df.get(role_col, pd.Series("", index=df.index)))
-    return (x + "|" + y + "|" + z + "|" + role).astype(object)
+def _clean_scalar(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    try:
+        f = float(value)
+        if np.isfinite(f):
+            return f"{f:.8g}"
+    except Exception:
+        pass
+    return str(value).strip()
 
 
+def _row_key(row: pd.Series, cols: tuple[str, ...], index_value: object) -> str:
+    if cols == ("support_point_key",):
+        text = _clean_scalar(row.get("support_point_key"))
+        if text:
+            return text
+    parts = [_clean_scalar(row.get(c)) for c in cols]
+    raw = "|".join([str(c) for c in cols] + parts)
+    if not any(parts):
+        raw = f"row_index|{_clean_scalar(index_value)}"
+    return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:24]
 
-def attach_support_point_keys(
-    df: pd.DataFrame,
-    *,
-    key_col: str = _DEFAULT_KEY_COLUMN,
-    x_col: str = "x",
-    y_col: str = "y",
-    z_col: str = "depth_m",
-    role_col: str = "authoritative_role",
-) -> pd.DataFrame:
+
+def attach_support_point_keys(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of *df* with a deterministic ``support_point_key`` column.
+
+    Existing non-empty ``support_point_key`` values are preserved.  Rows missing a
+    key are keyed from the most specific available identifier/coordinate fields;
+    if no useful columns are present, the stable row index is used as a last-resort
+    package key so filtering remains reproducible within the same CSV.
+    """
     out = df.copy()
-    if key_col in out.columns and out[key_col].notna().any():
-        out[key_col] = out[key_col].fillna("").astype(str)
-        return out
-    out[key_col] = build_support_point_keys(out, x_col=x_col, y_col=y_col, z_col=z_col, role_col=role_col)
+    chosen = None
+    for cols in _KEY_COLUMNS_PRIORITY:
+        if _has_columns(out, cols):
+            chosen = cols
+            break
+    if chosen is None:
+        chosen = tuple()
+    keys = []
+    existing = out["support_point_key"] if "support_point_key" in out.columns else pd.Series([""] * len(out), index=out.index)
+    for idx, row in out.iterrows():
+        existing_key = _clean_scalar(existing.loc[idx]) if idx in existing.index else ""
+        if existing_key:
+            keys.append(existing_key)
+            continue
+        key_cols = chosen if chosen else tuple()
+        keys.append(_row_key(row, key_cols, idx))
+    out["support_point_key"] = pd.Series(keys, index=out.index, dtype="object")
     return out
 
 
-
-def load_withheld_support_keys(
-    path: Path | str,
-    *,
-    key_col: str = _DEFAULT_KEY_COLUMN,
-    x_col: str = "x",
-    y_col: str = "y",
-    z_col: str = "depth_m",
-    role_col: str = "authoritative_role",
-) -> set[str]:
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"Withheld-support CSV not found: {p}")
-    df = pd.read_csv(p)
-    df = attach_support_point_keys(df, key_col=key_col, x_col=x_col, y_col=y_col, z_col=z_col, role_col=role_col)
-    keys = {str(v) for v in df[key_col].dropna().astype(str).tolist() if str(v)}
-    return keys
+def load_withheld_support_keys(path: str | Path) -> set[str]:
+    """Load withheld support keys from a CSV-like file."""
+    df = pd.read_csv(path)
+    if df is None or df.empty:
+        return set()
+    keyed = attach_support_point_keys(df)
+    return {str(v).strip() for v in keyed["support_point_key"].tolist() if str(v).strip()}
 
 
-
-def summarize_role_counts(df: pd.DataFrame, *, role_col: str = "authoritative_role") -> dict[str, int]:
-    if df is None or df.empty or role_col not in df.columns:
+def summarize_role_counts(df: pd.DataFrame) -> dict[str, int]:
+    """Return counts by the first available support-role/source column."""
+    if df is None or getattr(df, "empty", True):
         return {}
-    return {str(k): int(v) for k, v in df[role_col].fillna("").astype(str).value_counts(dropna=False).to_dict().items()}
+    for col in _ROLE_COLUMNS:
+        if col in df.columns:
+            vals = df[col].fillna("missing").astype(str).str.strip().replace({"": "missing"})
+            return {str(k): int(v) for k, v in vals.value_counts(dropna=False).to_dict().items()}
+    return {"all": int(len(df))}
 
 
-__all__ = [
-    "attach_support_point_keys",
-    "build_support_point_keys",
-    "load_withheld_support_keys",
-    "summarize_role_counts",
-]
+__all__ = ["attach_support_point_keys", "load_withheld_support_keys", "summarize_role_counts"]

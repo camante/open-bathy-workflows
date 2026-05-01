@@ -1,75 +1,79 @@
-# Open Bathy Workflows
+# Bathymetry Workflow
 
-This repository is the current March 2026 workflow snapshot for unified coastal and river bathymetry production.
-The main entrypoint is `bathy_main.py`, which orchestrates:
+This repository contains the current bathymetry workflow for authoritative-first coastal and river terrain generation.
+The main entrypoint is `bathy_main.py`.
 
-- Satellite-Derived Bathymetry (SDB) from Sentinel-2 plus ICESat-2 and optional external XYZ
-- River bathymetry using a hybrid default that injects cross-section inference on the mainstem and skeleton-based interpolation elsewhere
-- Fusion into a single deliverable raster, with explicit domain clipping and run metadata
+## Active workflow story
 
-## Current workflow state
+The repo supports SDB, river, and fused runs, but the **recommended active river workflow** is the explicit linear path:
 
-The codebase is organized around a few operational invariants:
+`entry bundle -> solve_domain -> grids -> authoritative -> centerline -> wse_proxy -> authoritative_bed -> observed_offset -> modeled_offset -> backbone -> corridor -> surface -> lock -> export -> final_dem`
 
-- `bathy_main.py` defaults to `--methods=sdb,river,fuse`
-- `--river-method` defaults to `hybrid`
-- final deliverable paths are treated as explicit artifacts, not guessed from canonical filenames
-- each run writes `io_manifest.json` and `io_manifest.md` in `--out-dir`
-- the workflow also writes `bathy_report.json`, `unified_bathy_report.json`, and run summaries under `run_logs/`
-- final depth rasters are documented as **negative-down** unless a product explicitly states otherwise
-- final outputs are clipped to the intended coastal and/or river water domain as a last-resort safety guard
+That is the river story this repo should be read through first.
+The active river workflow is one built-in AOI-independent route. Historical river names remain only as compatibility aliases and normalize to the same route; they should not be read as selectable methods. Secondary validation/benchmark helpers live under `validation/`, run/report writers live under `reporting/`, shared runtime infrastructure lives under `core/`, and curated diagnostics helpers live under `tools/debug/`. River processing is controlled by `--aoi`, optional `--solve-domain`, and explicit science/runtime knobs.
 
-## Quick start
+## Recommended run patterns
 
-Run from the workflow directory:
+River-focused run using the active linear path:
 
 ```bash
 python bathy_main.py \
-  --aoi="-71.14/-71.10/42.75/42.78" \
+  --aoi="-71.15/-71.04/42.70/42.75" \
+  --start=2025-01-01 \
+  --end=2026-01-01 \
+  --out-dir=output/example_linear_run
+```
+
+Full run with SDB, river, and fusion:
+
+```bash
+python bathy_main.py \
+  --aoi="-71.15/-71.04/42.70/42.75" \
   --start=2025-01-01 \
   --end=2026-01-01 \
   --methods=sdb,river,fuse \
-  --out-dir=output/example_run \
-  --cache-root=cache \
-  --extra-xyz-cudem=hydronos,ehydro
+  --out-dir=output/example_full_run
 ```
 
-## Where to look after a run
+## Normal run outputs
 
-Treat these as the first files to inspect:
+For a normal run, the first files to inspect are:
 
-- `io_manifest.json` and `io_manifest.md` for the exact inputs and outputs used by the run
-- `bathy_report.json` for step-level status, commands, and recorded outputs
-- `unified_bathy_report.json` for a compact whole-run summary
-- `run_logs/` for flight recorder logs and human/technical/scientific summaries
+- `RUN_OVERVIEW.txt`
+- `bathy_report.json`
+- `io_manifest.json`
+- `run_logs/screen_*.log` if the run failed or looks wrong
+
+A normal run should be read through those files first, not through extra debug trees.
+Additional receipts, manifests, and stage artifacts are for intermediate/debug runs only.
 
 ## Verification
 
-Offline verification:
+Repository verification:
 
 ```bash
 ./verify_repo.sh
 ```
 
-Stricter repository hygiene check:
+Stricter hygiene check:
 
 ```bash
 ./ci_smoke.sh
 ```
 
-These checks are intended to catch syntax, CLI wiring, lightweight unit regressions, and committed cache artifacts before you package or commit changes.
-
 ## Documentation map
 
-- `README_GENERAL_WORKFLOW.md` — operator-focused overview and quickstart
-- `README_WORKFLOW_PLAIN.md` — plain-language explanation of what the workflow is doing
-- `README_WORKFLOW_TECHNICAL.md` — key invariants, domain policies, reports, and troubleshooting
-- `README_WORKFLOW_DETAILED.md` — stage-by-stage walkthrough of the full pipeline
-- `README_SCRIPTS_DETAILED.md` — grouped module and script index
-- `CHECKLIST_A_GRADE.md` — short enforceable repo checklist
-- `seam_stability/` — seam comparison docs, metrics, and gating tools
+Start here, in order:
 
-## Important documentation rule
+1. `docs/ACTIVE_WORKFLOW.md` — the active workflow path and stage contract
+2. `docs/RUN_OUTPUTS.md` — what a normal run writes and what to inspect first
+3. `docs/REPO_MAP.md` — how the repo is organized
+4. `docs/LEGACY_WORKFLOWS.md` — what older paths still exist and how to think about them
 
-Do not rely on historical "canonical" filenames in older notes.
-Use the manifests and run reports written by the current run as the authoritative record of what was actually produced.
+Repo-level runtime/output language is pinned in `repo_runtime_modes.py` and checked by `repo_contract_checks.py`.
+
+Historical README variants, patch notes, and older design notes now live under `archive/` and are no longer part of the top-level workflow story.
+
+## Compatibility note
+
+The repo now uses one built-in river workflow. User control comes from `--aoi`, optional `--solve-domain`, and explicit science/runtime knobs rather than river method selection.

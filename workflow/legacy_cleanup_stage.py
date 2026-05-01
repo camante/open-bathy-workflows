@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Dict
 import os
 
-from final_route_receipts import write_json_receipt
+from pipeline.final_route.final_route_receipts import write_json_receipt
 import logging
 log = logging.getLogger(__name__)
 

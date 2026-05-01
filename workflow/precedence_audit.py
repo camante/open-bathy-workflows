@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
-from nodata_utils import array_valid_mask
+from core.nodata_utils import array_valid_mask
 
 from provenance_schema import PROVENANCE_CLASS_CODE_TO_NAME, PROVENANCE_CLASS_FAMILY
 from support_classes import SUPPORT_CLASS_CODE_TO_NAME, SUPPORT_CLASS_FAMILY

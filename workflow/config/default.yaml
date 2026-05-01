@@ -113,9 +113,9 @@ river_network:
   nhdarea_layer: "nhdarea_clip"
   ocean_keep_dist_m: 0.0
 
-# --- River: method ---
-river_method:
-  method: "hybrid"
+# --- River: workflow ---
+river_workflow:
+  workflow: "river_workflow"
   shape_exp: 0.5
   dmax_min_m: 0.5
   dmax_max_m: 30.0

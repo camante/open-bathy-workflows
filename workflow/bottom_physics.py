@@ -44,7 +44,7 @@ log = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 
 try:
-    from constants import (
+    from core.constants import (
         N_WATER,
         PURE_WATER_ABSORPTION,
         PURE_WATER_BACKSCATTER,

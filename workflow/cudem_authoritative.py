@@ -38,13 +38,15 @@ import pandas as pd
 import rasterio
 import requests
 
-from nodata_utils import nodata_mask, sanitize_array, sanitize_for_output, resolve_nodata_value, nodata_sentinels, WORKFLOW_NODATA
+from core.nodata_utils import nodata_mask, sanitize_array, sanitize_for_output, resolve_nodata_value, nodata_sentinels, WORKFLOW_NODATA
 from rasterio.features import rasterize
+from rasterio.enums import Resampling
 from rasterio.merge import merge
-from rasterio.warp import transform_bounds
+from rasterio.warp import reproject, transform_bounds
+from rasterio.transform import from_origin
 from shapely.geometry import box
 
-from cache_utils import artifact_cache_key, fingerprint_code, meta_payload, write_meta, cache_hit, canonical_json, sha1_hex
+from core.cache_utils import artifact_cache_key, fingerprint_code, meta_payload, write_meta, cache_hit, canonical_json, sha1_hex
 from raster_contract import cached_raster_semantics_valid, validate_gdal_output, validate_raster_mask_values
 
 LOG = logging.getLogger("cudem_authoritative")
@@ -128,7 +130,19 @@ def discover_vector_file(root: Path) -> Path:
     return candidates[0]
 
 
+def normalize_optional_field_name(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.lower() in {"none", "null", "nan"}:
+        return None
+    return text
+
+
 def detect_url_field(gdf: gpd.GeoDataFrame, explicit: Optional[str] = None) -> str:
+    explicit = normalize_optional_field_name(explicit)
     if explicit:
         if explicit in gdf.columns:
             return explicit
@@ -180,6 +194,73 @@ def write_tile_manifest(records: list[TileRecord], out_csv: Path) -> None:
                 "tile_url": rec.tile_url,
                 "meta_path": "" if rec.meta_path is None else str(rec.meta_path),
             })
+
+
+def _prepare_cudem_tile_sources_for_aoi(
+    *,
+    aoi: str,
+    cache_root: Path,
+    tile_index_url: str,
+    spatial_meta_url: str,
+    missing_meta_policy: str = "skip",
+    tile_url_field: Optional[str] = None,
+    logger: Optional[logging.Logger] = None,
+    manifest_csv: Path | None = None,
+) -> dict[str, Any]:
+    logger = logger or LOG
+    west, east, south, north = parse_aoi(aoi)
+    stage_root = Path(cache_root) / "authoritative_base"
+    shared_key = sha1_hex(canonical_json({
+        "tile_index_url": tile_index_url,
+        "spatial_meta_url": spatial_meta_url,
+    }))[:12]
+    shared_root = ensure_dir(stage_root / "_shared" / shared_key)
+    tile_index_zip = shared_root / Path(urlparse(tile_index_url).path).name
+    spatial_meta_zip = shared_root / Path(urlparse(spatial_meta_url).path).name
+    tile_index_dir = shared_root / "tile_index"
+    spatial_meta_dir = shared_root / "spatial_meta"
+    tile_download_dir = ensure_dir(shared_root / "tiles")
+
+    tile_index_reused_existing = tile_index_zip.exists()
+    tile_index_extract_reused_existing = tile_index_dir.exists()
+    spatial_meta_reused_existing = spatial_meta_zip.exists()
+    spatial_meta_extract_reused_existing = spatial_meta_dir.exists()
+
+    download_file(tile_index_url, tile_index_zip, overwrite=False, logger=logger)
+    extract_zip(tile_index_zip, tile_index_dir, overwrite=False, logger=logger)
+    tile_index_vector = discover_vector_file(tile_index_dir)
+    tile_index_gdf = read_tile_index(tile_index_vector)
+    url_field = detect_url_field(tile_index_gdf, explicit=tile_url_field)
+    logger.info("[AUTHORITATIVE] Using tile-index URL field: %s", url_field)
+
+    records = select_tiles(tile_index_gdf, (west, east, south, north), url_field)
+    logger.info("[AUTHORITATIVE] Selected %d intersecting CUDEM tile(s)", len(records))
+
+    download_file(spatial_meta_url, spatial_meta_zip, overwrite=False, logger=logger)
+    extract_zip(spatial_meta_zip, spatial_meta_dir, overwrite=False, logger=logger)
+    records = attach_metadata_paths(records, spatial_meta_dir, missing_meta_policy, logger=logger)
+    if manifest_csv is not None:
+        write_tile_manifest(records, manifest_csv)
+    tile_paths = download_tiles(records, tile_download_dir, overwrite=False, logger=logger)
+    tile_download_stats = {
+        "requested": int(len(records)),
+        "reused_existing": int(sum(1 for p in tile_paths if Path(p).exists())),
+        "downloaded_new": None,
+    }
+    return {
+        "aoi_bounds_4269": (west, east, south, north),
+        "records": records,
+        "tile_paths": tile_paths,
+        "shared_root": str(shared_root),
+        "shared_tile_cache": str(tile_download_dir),
+        "tile_count": int(len(records)),
+        "selected_cudem_tiles_csv": str(manifest_csv) if manifest_csv is not None else None,
+        "tile_index_reused_existing": bool(tile_index_reused_existing),
+        "tile_index_extract_reused_existing": bool(tile_index_extract_reused_existing),
+        "spatial_meta_reused_existing": bool(spatial_meta_reused_existing),
+        "spatial_meta_extract_reused_existing": bool(spatial_meta_extract_reused_existing),
+        "tile_download_stats": tile_download_stats,
+    }
 
 
 def download_tiles(records: list[TileRecord], tile_dir: Path, *, overwrite: bool = False, logger: Optional[logging.Logger] = None) -> list[Path]:
@@ -282,6 +363,8 @@ def build_dem_mosaic(tile_paths: list[Path], aoi_bounds_4269: tuple[float, float
         raise ValueError("No DEM tiles provided to mosaic")
     srcs = [rasterio.open(p) for p in tile_paths]
     try:
+        import math
+
         crs_set = {str(src.crs) for src in srcs}
         if len(crs_set) != 1:
             raise ValueError(f"Expected one DEM CRS, found: {sorted(crs_set)}")
@@ -291,16 +374,22 @@ def build_dem_mosaic(tile_paths: list[Path], aoi_bounds_4269: tuple[float, float
             bounds = (west, south, east, north)
         else:
             bounds = transform_bounds("EPSG:4269", first_crs, west, south, east, north, densify_pts=21)
+        left, bottom, right, top = [float(v) for v in bounds]
+        xres = abs(float(srcs[0].transform.a))
+        yres = abs(float(srcs[0].transform.e))
+        expected_width = int(math.ceil(max(right - left, 0.0) / max(xres, 1.0e-12)))
+        expected_height = int(math.ceil(max(top - bottom, 0.0) / max(yres, 1.0e-12)))
+        expected_pixels = int(expected_width * expected_height)
+        if expected_width > 200000 or expected_height > 200000 or expected_pixels > 60000000:
+            raise RuntimeError(
+                "Refusing to build an oversized DEM mosaic before allocation "
+                f"({expected_width} x {expected_height} pixels; {expected_pixels} total). "
+                "This usually indicates that the requested AOI is too broad for an in-memory mosaic or that the solve AOI was derived incorrectly."
+            )
         source_nodata = [src.nodata for src in srcs if src.nodata is not None]
         merge_nodata = float(source_nodata[0]) if source_nodata else None
         output_nodata = resolve_nodata_value(merge_nodata, default=-9999.0, extra=source_nodata)
         mosaic, transform = merge(srcs, bounds=bounds, nodata=merge_nodata)
-        if mosaic.shape[1] > 200000 or mosaic.shape[2] > 200000:
-            raise RuntimeError(
-                "Refusing to build an implausibly large DEM mosaic "
-                f"({mosaic.shape[2]} x {mosaic.shape[1]} pixels). "
-                "This usually indicates a CRS or bounds-order bug."
-            )
         raw_invalid = nodata_mask(mosaic, merge_nodata, extra=source_nodata)
         mosaic = sanitize_for_output(mosaic, nodata=merge_nodata, dtype="float32", extra=source_nodata)
         invalid_count = int(np.count_nonzero(raw_invalid))
@@ -323,6 +412,9 @@ def build_dem_mosaic(tile_paths: list[Path], aoi_bounds_4269: tuple[float, float
             "output_nodata": float(output_nodata),
             "raw_invalid_cells": invalid_count,
             "sanitized_nan_cells": int(np.count_nonzero(~np.isfinite(mosaic))),
+            "expected_width": int(expected_width),
+            "expected_height": int(expected_height),
+            "expected_pixels": int(expected_pixels),
         }
         return mosaic, transform, profile, stats
     finally:
@@ -450,6 +542,216 @@ def write_raster(path: Path, array: np.ndarray, profile: dict) -> None:
         validate_gdal_output(path, operation='cudem_authoritative.write_raster', expected_crs=prof.get('crs'), expected_nodata=float(prof.get('nodata')) if prof.get('nodata') is not None else None, expected_dtype=dtype or None, min_allowed=-1000.0, max_allowed=10000.0)
 
 
+def _template_profile_from_tiles(
+    *,
+    tile_paths: list[Path],
+    aoi_bounds_4269: tuple[float, float, float, float],
+    nodata_value: float = WORKFLOW_NODATA,
+) -> dict[str, Any]:
+    if not tile_paths:
+        raise ValueError("No DEM tiles provided to build a template profile")
+    with rasterio.open(tile_paths[0]) as ref_ds:
+        ref_crs = ref_ds.crs
+        if ref_crs is None:
+            raise ValueError(f"Reference DEM tile has no CRS: {tile_paths[0]}")
+        west, east, south, north = aoi_bounds_4269
+        if ref_crs.is_geographic:
+            left, bottom, right, top = float(west), float(south), float(east), float(north)
+        else:
+            left, bottom, right, top = [float(v) for v in transform_bounds("EPSG:4269", ref_crs, west, south, east, north, densify_pts=21)]
+        xres = abs(float(ref_ds.transform.a))
+        yres = abs(float(ref_ds.transform.e))
+        width = max(1, int(np.ceil(max(right - left, 0.0) / max(xres, 1.0e-12))))
+        height = max(1, int(np.ceil(max(top - bottom, 0.0) / max(yres, 1.0e-12))))
+        transform = from_origin(left, top, xres, yres)
+        profile = ref_ds.profile.copy()
+        profile.update({
+            "driver": "GTiff",
+            "height": int(height),
+            "width": int(width),
+            "transform": transform,
+            "count": 1,
+            "compress": "deflate",
+            "tiled": True,
+            "BIGTIFF": "IF_SAFER",
+            "dtype": "float32",
+            "nodata": float(nodata_value),
+        })
+        for key in ("blockxsize", "blockysize", "BLOCKXSIZE", "BLOCKYSIZE"):
+            profile.pop(key, None)
+    return profile
+
+
+def _write_template_raster(path: Path, profile: dict[str, Any], *, fill_value: float) -> Path:
+    ensure_dir(path.parent)
+    with rasterio.open(path, "w", **profile) as dst:
+        for _, window in dst.block_windows(1):
+            fill = np.full((window.height, window.width), fill_value, dtype=np.float32)
+            dst.write(fill, 1, window=window)
+    return path
+
+
+def materialize_authoritative_base_to_template(
+    *,
+    aoi: str,
+    template_path: Path,
+    cache_root: Path,
+    tile_index_url: str = DEFAULT_TILE_INDEX_URL,
+    spatial_meta_url: str = DEFAULT_SPATIAL_META_URL,
+    missing_meta_policy: str = "skip",
+    tile_url_field: Optional[str] = None,
+    baseline_out_path: Path,
+    authoritative_out_path: Path,
+    support_mask_out_path: Path,
+    support_gpkg_out_path: Path | None = None,
+    manifest_csv_path: Path | None = None,
+    meta_out_path: Path | None = None,
+    force_rebuild: bool = False,
+    logger: Optional[logging.Logger] = None,
+) -> dict[str, Any]:
+    logger = logger or LOG
+    baseline_out_path = Path(baseline_out_path)
+    authoritative_out_path = Path(authoritative_out_path)
+    support_mask_out_path = Path(support_mask_out_path)
+    support_gpkg_out_path = Path(support_gpkg_out_path) if support_gpkg_out_path is not None else None
+    manifest_csv_path = Path(manifest_csv_path) if manifest_csv_path is not None else None
+    meta_out_path = Path(meta_out_path) if meta_out_path is not None else None
+    tile_url_field = normalize_optional_field_name(tile_url_field)
+
+    if force_rebuild:
+        for path in (baseline_out_path, authoritative_out_path, support_mask_out_path, support_gpkg_out_path, manifest_csv_path, meta_out_path):
+            if path is not None and path.exists():
+                path.unlink()
+
+    outputs_exist = (
+        baseline_out_path.exists()
+        and authoritative_out_path.exists()
+        and support_mask_out_path.exists()
+        and (support_gpkg_out_path is None or support_gpkg_out_path.exists())
+    )
+    if outputs_exist:
+        result = {
+            "baseline_cudem_interpolation": str(baseline_out_path),
+            "authoritative_base": str(authoritative_out_path),
+            "authoritative_coverage_mask": str(support_mask_out_path),
+            "authoritative_support_coverage": (str(support_gpkg_out_path) if support_gpkg_out_path is not None else None),
+            "selected_cudem_tiles_csv": (str(manifest_csv_path) if manifest_csv_path is not None else None),
+            "materialization_mode": "tile_to_template_stream",
+            "cache_hit": True,
+        }
+        if meta_out_path is not None and meta_out_path.exists():
+            try:
+                meta = json.loads(meta_out_path.read_text(encoding="utf-8"))
+                if isinstance(meta, dict):
+                    result.update({k: v for k, v in meta.items() if k not in result})
+            except Exception:
+                logger.debug("[AUTHORITATIVE] Failed to read template materialization metadata", exc_info=True)
+        return result
+
+    prepared = _prepare_cudem_tile_sources_for_aoi(
+        aoi=aoi,
+        cache_root=cache_root,
+        tile_index_url=tile_index_url,
+        spatial_meta_url=spatial_meta_url,
+        missing_meta_policy=missing_meta_policy,
+        tile_url_field=tile_url_field,
+        logger=logger,
+        manifest_csv=manifest_csv_path,
+    )
+    records = prepared["records"]
+    tile_paths = prepared["tile_paths"]
+    west, east, south, north = prepared["aoi_bounds_4269"]
+
+    template_path = Path(template_path)
+    nodata_value = np.float32(WORKFLOW_NODATA)
+
+    with rasterio.open(template_path) as template_ds:
+        template_crs = str(template_ds.crs) if template_ds.crs is not None else None
+        template_width = int(template_ds.width)
+        template_height = int(template_ds.height)
+        base_profile = template_ds.profile.copy()
+        base_profile.update(dtype="float32", count=1, nodata=float(nodata_value), compress="deflate", tiled=True, BIGTIFF="IF_SAFER")
+        for key in ("blockxsize", "blockysize", "BLOCKXSIZE", "BLOCKYSIZE"):
+            base_profile.pop(key, None)
+
+        ensure_dir(baseline_out_path.parent)
+        with rasterio.open(baseline_out_path, "w", **base_profile) as baseline_ds:
+            for _, window in baseline_ds.block_windows(1):
+                fill = np.full((window.height, window.width), nodata_value, dtype=np.float32)
+                baseline_ds.write(fill, 1, window=window)
+            for tile_path in tile_paths:
+                with rasterio.open(tile_path) as src_ds:
+                    src_arr = src_ds.read(1).astype(np.float32, copy=False)
+                    src_arr = sanitize_for_output(src_arr[np.newaxis, :, :], nodata=src_ds.nodata, dtype="float32")[0]
+                    src_arr = np.asarray(src_arr, dtype=np.float32)
+                    src_arr[~np.isfinite(src_arr)] = nodata_value
+                    reproject(
+                        source=src_arr,
+                        destination=rasterio.band(baseline_ds, 1),
+                        src_transform=src_ds.transform,
+                        src_crs=src_ds.crs,
+                        src_nodata=float(nodata_value),
+                        dst_transform=baseline_ds.transform,
+                        dst_crs=baseline_ds.crs,
+                        dst_nodata=float(nodata_value),
+                        resampling=Resampling.nearest,
+                        init_dest_nodata=False,
+                    )
+
+        support_gdf = collect_support_geometries(
+            records,
+            (west, east, south, north),
+            template_crs,
+            missing_meta_policy,
+            logger=logger,
+        )
+        if support_gpkg_out_path is not None:
+            ensure_dir(support_gpkg_out_path.parent)
+            support_gdf.to_file(support_gpkg_out_path, driver="GPKG")
+
+        support_mask = rasterize_support_mask(support_gdf, (template_ds.height, template_ds.width), template_ds.transform)
+        mask_profile = base_profile.copy()
+        mask_profile.update(dtype="uint8", nodata=0, count=1)
+        with rasterio.open(support_mask_out_path, "w", **mask_profile) as mask_ds:
+            mask_ds.write(np.asarray(support_mask, dtype=np.uint8), 1)
+        del support_mask
+
+    with rasterio.open(baseline_out_path) as baseline_ds, rasterio.open(support_mask_out_path) as mask_ds:
+        auth_profile = baseline_ds.profile.copy()
+        auth_profile.update(dtype="float32", count=1, nodata=float(nodata_value), compress="deflate", tiled=True, BIGTIFF="IF_SAFER")
+        for key in ("blockxsize", "blockysize", "BLOCKXSIZE", "BLOCKYSIZE"):
+            auth_profile.pop(key, None)
+        with rasterio.open(authoritative_out_path, "w", **auth_profile) as auth_ds:
+            for _, window in auth_ds.block_windows(1):
+                base = baseline_ds.read(1, window=window).astype(np.float32, copy=False)
+                mask = mask_ds.read(1, window=window)
+                out = np.where(mask == 1, base, nodata_value).astype(np.float32, copy=False)
+                out[~np.isfinite(out)] = nodata_value
+                auth_ds.write(out, 1, window=window)
+
+    result = {
+        "baseline_cudem_interpolation": str(baseline_out_path),
+        "authoritative_base": str(authoritative_out_path),
+        "authoritative_coverage_mask": str(support_mask_out_path),
+        "authoritative_support_coverage": (str(support_gpkg_out_path) if support_gpkg_out_path is not None else None),
+        "selected_cudem_tiles_csv": (str(manifest_csv_path) if manifest_csv_path is not None else None),
+        "materialization_mode": "tile_to_template_stream",
+        "cache_hit": False,
+        "tile_count": int(prepared.get("tile_count", 0)),
+        "shared_root": prepared.get("shared_root"),
+        "shared_tile_cache": prepared.get("shared_tile_cache"),
+        "template_path": str(template_path),
+        "template_crs": template_crs,
+        "template_width": template_width,
+        "template_height": template_height,
+        "support_geometry_count": int(len(support_gdf)),
+    }
+    if meta_out_path is not None:
+        meta_out_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_out_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    return result
+
+
 def materialize_authoritative_base_for_aoi(
     *,
     aoi: str,
@@ -463,17 +765,12 @@ def materialize_authoritative_base_for_aoi(
 ) -> Dict[str, Any]:
     """Build or reuse authoritative_base.tif for an AOI under cache_root.
 
-    Returns a dict with keys including:
-      - cache_key
-      - cache_hit
-      - cache_dir
-      - authoritative_base
-      - authoritative_coverage_mask
-      - authoritative_support_coverage
-      - selected_cudem_tiles_csv
-      - tile_count
+    This phase-B path always materializes through a streamed tile-to-template route
+    rather than a full in-memory merge, so the authoritative source is built once
+    on one explicit grid and then masked in blocks.
     """
     logger = logger or LOG
+    tile_url_field = normalize_optional_field_name(tile_url_field)
     west, east, south, north = parse_aoi(aoi)
     cache_root = Path(cache_root).expanduser().resolve()
     stage_root = ensure_dir(cache_root / "authoritative_base")
@@ -485,17 +782,20 @@ def materialize_authoritative_base_for_aoi(
         "spatial_meta_url": spatial_meta_url,
         "missing_meta_policy": missing_meta_policy,
         "tile_url_field": tile_url_field,
-        "stage_version": 3,
+        "stage_version": 5,
+        "materialization_mode": "tile_to_template_stream",
     }
     code_fp = fingerprint_code(Path(__file__))
     cache_key = artifact_cache_key(stage="authoritative_base_cudem", params=params, inputs={}, code_fp=code_fp)
     entry_dir = stage_root / cache_key
     meta_path = entry_dir / "cache_meta.json"
+    materialization_meta_path = entry_dir / "materialization_meta.json"
     auth_path = entry_dir / "authoritative_base.tif"
     baseline_path = entry_dir / "cudem_baseline_interpolation.tif"
     mask_path = entry_dir / "authoritative_coverage_mask.tif"
     gpkg_path = entry_dir / "authoritative_support_coverage.gpkg"
     manifest_csv = entry_dir / "selected_cudem_tiles.csv"
+    template_path = entry_dir / "authoritative_grid_template.tif"
 
     if force_rebuild and entry_dir.exists():
         shutil.rmtree(entry_dir)
@@ -509,7 +809,6 @@ def materialize_authoritative_base_for_aoi(
             except Exception:
                 logger.warning('[AUTHORITATIVE] Failed to remove invalid cached authoritative-base entry %s; continuing with rebuild in place.', entry_dir, exc_info=True)
             ensure_dir(entry_dir)
-            hit = False
         else:
             logger.info("[AUTHORITATIVE] Cache hit for AOI=%s -> %s", aoi, entry_dir)
             cached_extra: Dict[str, Any] = {}
@@ -541,84 +840,40 @@ def materialize_authoritative_base_for_aoi(
                 **cached_extra,
             }
 
-    shared_key = sha1_hex(canonical_json({
-        "tile_index_url": tile_index_url,
-        "spatial_meta_url": spatial_meta_url,
-    }))[:12]
-    shared_root = ensure_dir(stage_root / "_shared" / shared_key)
-    tile_index_zip = shared_root / Path(urlparse(tile_index_url).path).name
-    spatial_meta_zip = shared_root / Path(urlparse(spatial_meta_url).path).name
-    tile_index_dir = shared_root / "tile_index"
-    spatial_meta_dir = shared_root / "spatial_meta"
-    # Share downloaded CUDEM DEM tiles across AOIs/settings as well, not just the
-    # tile-index and spatial-metadata zips. The per-AOI cache entry still records
-    # its own manifest and outputs, but overlapping AOIs no longer re-download the
-    # same DEM tile TIFFs.
-    tile_download_dir = ensure_dir(shared_root / "tiles")
+    prepared = _prepare_cudem_tile_sources_for_aoi(
+        aoi=aoi,
+        cache_root=cache_root,
+        tile_index_url=tile_index_url,
+        spatial_meta_url=spatial_meta_url,
+        missing_meta_policy=missing_meta_policy,
+        tile_url_field=tile_url_field,
+        logger=logger,
+        manifest_csv=manifest_csv,
+    )
+    template_profile = _template_profile_from_tiles(
+        tile_paths=prepared["tile_paths"],
+        aoi_bounds_4269=prepared["aoi_bounds_4269"],
+        nodata_value=float(WORKFLOW_NODATA),
+    )
+    _write_template_raster(template_path, template_profile, fill_value=float(WORKFLOW_NODATA))
 
-    tile_index_reused_existing = tile_index_zip.exists()
-    download_file(tile_index_url, tile_index_zip, overwrite=False, logger=logger)
-    tile_index_extract_reused_existing = tile_index_dir.exists() and any(tile_index_dir.iterdir())
-    extract_zip(tile_index_zip, tile_index_dir, overwrite=False, logger=logger)
-    tile_index_vector = discover_vector_file(tile_index_dir)
-    tile_index_gdf = read_tile_index(tile_index_vector)
-    url_field = detect_url_field(tile_index_gdf, explicit=tile_url_field)
-    logger.info("[AUTHORITATIVE] Using tile-index URL field: %s", url_field)
-
-    records = select_tiles(tile_index_gdf, (west, east, south, north), url_field)
-    logger.info("[AUTHORITATIVE] Selected %d intersecting CUDEM tile(s)", len(records))
-
-    spatial_meta_reused_existing = spatial_meta_zip.exists()
-    download_file(spatial_meta_url, spatial_meta_zip, overwrite=False, logger=logger)
-    spatial_meta_extract_reused_existing = spatial_meta_dir.exists() and any(spatial_meta_dir.iterdir())
-    extract_zip(spatial_meta_zip, spatial_meta_dir, overwrite=False, logger=logger)
-    records = attach_metadata_paths(records, spatial_meta_dir, missing_meta_policy, logger=logger)
-    write_tile_manifest(records, manifest_csv)
-
-    preexisting_tiles = {rec.tile_name: (tile_download_dir / rec.tile_name).exists() for rec in records}
-    tile_paths = download_tiles(records, tile_download_dir, overwrite=False, logger=logger)
-    tile_download_stats = {
-        "requested": int(len(records)),
-        "reused_existing": int(sum(1 for rec in records if preexisting_tiles.get(rec.tile_name, False))),
-        "downloaded_new": int(sum(1 for rec in records if not preexisting_tiles.get(rec.tile_name, False))),
-    }
-    mosaic_result = build_dem_mosaic(tile_paths, (west, east, south, north))
-    if len(mosaic_result) == 4:
-        mosaic, transform, dem_profile, mosaic_stats = mosaic_result
-    elif len(mosaic_result) == 3:
-        mosaic, transform, dem_profile = mosaic_result
-        mosaic_stats = {}
-    else:
-        raise ValueError(f"Unexpected build_dem_mosaic return shape: {len(mosaic_result)} values")
-    dem_crs = dem_profile.get("crs")
-
-    support_gdf = collect_support_geometries(records, (west, east, south, north), str(dem_crs), missing_meta_policy, logger=logger)
-    support_geometry_count = int(len(support_gdf))
-    ensure_dir(gpkg_path.parent)
-    support_gdf.to_file(gpkg_path, driver="GPKG")
-
-    out_shape = (dem_profile["height"], dem_profile["width"])
-    support_mask = rasterize_support_mask(support_gdf, out_shape, transform)
-
-    nodata_value = resolve_nodata_value(dem_profile.get("nodata"), default=WORKFLOW_NODATA, extra=mosaic_stats.get("source_nodata_values"))
-    dem_profile["nodata"] = nodata_value
-
-    mask_profile = dem_profile.copy()
-    mask_profile.update(dtype="uint8", nodata=0, count=1)
-    write_raster(mask_path, support_mask[np.newaxis, :, :], mask_profile)
-
-    authoritative_base = apply_mask_to_mosaic(mosaic, support_mask, float(nodata_value))
-    base_profile = dem_profile.copy()
-    base_profile.update(dtype="float32", count=1, nodata=float(nodata_value))
-    baseline_out = sanitize_for_output(mosaic, nodata=float(nodata_value), dtype=np.float32, extra=mosaic_stats.get("source_nodata_values"))
-    baseline_out = np.asarray(baseline_out, dtype=np.float32)
-    baseline_out[~np.isfinite(baseline_out)] = float(nodata_value)
-    authoritative_base = sanitize_for_output(authoritative_base, nodata=float(nodata_value), dtype=np.float32, extra=mosaic_stats.get("source_nodata_values"))
-    authoritative_base = np.asarray(authoritative_base, dtype=np.float32)
-    authoritative_base[~np.isfinite(authoritative_base)] = float(nodata_value)
-    write_raster(baseline_path, baseline_out, base_profile)
-    write_raster(auth_path, authoritative_base.astype(np.float32), base_profile)
-
+    materialized = materialize_authoritative_base_to_template(
+        aoi=aoi,
+        template_path=template_path,
+        cache_root=cache_root,
+        tile_index_url=tile_index_url,
+        spatial_meta_url=spatial_meta_url,
+        missing_meta_policy=missing_meta_policy,
+        tile_url_field=tile_url_field,
+        baseline_out_path=baseline_path,
+        authoritative_out_path=auth_path,
+        support_mask_out_path=mask_path,
+        support_gpkg_out_path=gpkg_path,
+        manifest_csv_path=manifest_csv,
+        meta_out_path=materialization_meta_path,
+        force_rebuild=False,
+        logger=logger,
+    )
     extra = {
         "cache_dir": str(entry_dir),
         "authoritative_base": str(auth_path),
@@ -626,25 +881,30 @@ def materialize_authoritative_base_for_aoi(
         "authoritative_coverage_mask": str(mask_path),
         "authoritative_support_coverage": str(gpkg_path),
         "selected_cudem_tiles_csv": str(manifest_csv),
-        "tile_count": len(records),
-        "authoritative_support_geometry_count": int(support_geometry_count),
-        "authoritative_support_empty": bool(support_geometry_count == 0),
+        "tile_count": int(prepared.get("tile_count", 0)),
+        "authoritative_support_geometry_count": int(materialized.get("support_geometry_count", 0) or 0),
+        "authoritative_support_empty": bool(int(materialized.get("support_geometry_count", 0) or 0) == 0),
         "aoi": aoi,
         "source_urls": {
             "tile_index_url": tile_index_url,
             "spatial_meta_url": spatial_meta_url,
         },
         "missing_meta_policy": missing_meta_policy,
-        "shared_root": str(shared_root),
-        "shared_tile_cache": str(tile_download_dir),
+        "shared_root": str(prepared.get("shared_root")),
+        "shared_tile_cache": str(prepared.get("shared_tile_cache")),
         "shared_cache_reuse": {
-            "tile_index_zip_reused_existing": bool(tile_index_reused_existing),
-            "tile_index_extract_reused_existing": bool(tile_index_extract_reused_existing),
-            "spatial_meta_zip_reused_existing": bool(spatial_meta_reused_existing),
-            "spatial_meta_extract_reused_existing": bool(spatial_meta_extract_reused_existing),
-            "tile_downloads": tile_download_stats,
+            "tile_index_zip_reused_existing": bool(prepared.get("tile_index_reused_existing")),
+            "tile_index_extract_reused_existing": bool(prepared.get("tile_index_extract_reused_existing")),
+            "spatial_meta_zip_reused_existing": bool(prepared.get("spatial_meta_reused_existing")),
+            "spatial_meta_extract_reused_existing": bool(prepared.get("spatial_meta_extract_reused_existing")),
+            "tile_downloads": dict(prepared.get("tile_download_stats", {}) or {}),
         },
-        "mosaic_nodata_audit": mosaic_stats,
+        "materialization_mode": "tile_to_template_stream",
+        "template_path": str(template_path),
+        "template_width": int(materialized.get("template_width", template_profile["width"])),
+        "template_height": int(materialized.get("template_height", template_profile["height"])),
+        "template_crs": materialized.get("template_crs"),
+        "materialization_meta_path": str(materialization_meta_path),
     }
     write_meta(meta_path, meta_payload(
         cache_key=cache_key,
@@ -654,7 +914,6 @@ def materialize_authoritative_base_for_aoi(
         code_fp=code_fp,
         extra=extra,
     ))
-
     return {
         "mode": "auto_cudem",
         "cache_key": cache_key,

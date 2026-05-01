@@ -1,137 +1,27 @@
-"""Helpers for building SDB subprocess commands."""
+"""SDB subprocess command builders."""
+
 from __future__ import annotations
 
-import sys
-from typing import Any, Iterable, List, Optional
+from typing import Any
 
 
-def _normalize_multi_path_value(value: Any) -> List[str]:
-    parts: List[str] = []
-    if value is None:
-        return parts
-
-    def _append_one(item: Any) -> None:
-        if item is None:
-            return
-        s = str(item).strip()
-        if not s:
-            return
-        for piece in s.split(","):
-            piece = piece.strip()
-            if not piece:
-                continue
-            piece = piece.strip().strip("[]").strip("\"'").strip()
-            if piece:
-                parts.append(piece)
-
-    if isinstance(value, (list, tuple, set)):
-        for item in value:
-            _append_one(item)
-    else:
-        _append_one(value)
-    return parts
-
-
-def build_sdb_command(cfg: Any, *, out_dir: str, authoritative_passthrough_args: Optional[Iterable[str]] = None) -> List[str]:
-    """Build the common sdb_main.py command used by bathy_main."""
-    cmd: List[str] = [
-        sys.executable, "sdb_main.py",
-        f"--aoi={cfg.aoi}",
-        f"--start={cfg.start_date}",
-        f"--end={cfg.end_date}",
-        f"--out-dir={out_dir}",
-        f"--cloud={cfg.cloud}",
-        f"--icesat={cfg.icesat}",
-        f"--sdb-mode={cfg.sdb_mode}",
-        f"--cache-root={cfg.cache_root}",
-        f"--align-mode={cfg.align_mode}",
-        f"--working-srs={cfg.working_srs}",
-        f"--working-vcrs-epsg={cfg.working_vcrs_epsg}",
-    ]
-    if authoritative_passthrough_args:
-        cmd.extend(str(x) for x in authoritative_passthrough_args)
-    domain_mask = getattr(cfg, 'sdb_guidance_domain_mask', None)
-    if domain_mask:
-        cmd.extend([
-            f"--land-mask={domain_mask}",
-            "--land-mask-type=land_binary",
-            "--land-mask-water-val=0",
-        ])
+def build_sdb_command(cfg: Any, *, out_dir: str, authoritative_passthrough_args: list[str] | None = None) -> list[str]:
+    cmd = ["python", "sdb_main.py", "--out-dir", str(out_dir)]
+    if getattr(cfg, "aoi", None):
+        cmd.extend(["--aoi", str(cfg.aoi)])
+    if getattr(cfg, "start", None):
+        cmd.extend(["--start", str(cfg.start)])
+    if getattr(cfg, "end", None):
+        cmd.extend(["--end", str(cfg.end)])
+    cmd.extend(list(authoritative_passthrough_args or []))
     return cmd
 
 
+def augment_sdb_command(cfg: Any, cmd: list[str], *, sdb_main_path: str, logger=None) -> list[str]:
+    out = list(cmd)
+    if len(out) >= 2 and out[1] == "sdb_main.py":
+        out[1] = str(sdb_main_path)
+    return out
 
-def augment_sdb_command(cfg: Any, cmd: List[str], *, sdb_main_path: Optional[str] = None, logger: Any = None) -> List[str]:
-    log = logger
-    try:
-        if bool(getattr(cfg, 'sdb_model_bank_enabled', False)):
-            cmd.append(f"--model-bank={cfg.sdb_model_bank}")
-            cmd.append(f"--bank-max-samples={int(cfg.sdb_bank_max_samples)}")
-            cmd.append(f"--bank-seed={int(cfg.sdb_bank_seed)}")
-            cmd.append(f"--bank-retrain-min-new={int(cfg.sdb_bank_retrain_min_new)}")
-        else:
-            cmd.append('--no-model-bank')
-    except (AttributeError, TypeError, ValueError) as exc:
-        if log:
-            log.debug('model bank policy args build failed: %s', exc, exc_info=True)
-    try:
-        if bool(getattr(cfg, 'sdb_model_cache_enabled', False)):
-            cmd.append(f"--model-cache-key={cfg.sdb_model_cache_key}")
-        else:
-            cmd.append('--no-model-cache')
-    except (AttributeError, TypeError, ValueError) as exc:
-        if log:
-            log.debug('model cache policy args build failed: %s', exc, exc_info=True)
-    if bool(getattr(cfg, 'glint_correct', False)):
-        supports_glint = False
-        try:
-            from pathlib import Path
-            p = Path(sdb_main_path) if sdb_main_path else None
-            if p and p.exists():
-                txt = p.read_text(encoding='utf-8', errors='ignore')
-                supports_glint = ('--glint-correct' in txt) or ('glint_correct' in txt)
-        except OSError:
-            supports_glint = False
-        if not supports_glint:
-            if log:
-                log.warning('[SDB][GLINT] --glint-correct requested, but sdb_main.py does not appear to support glint flags; skipping glint passthrough.')
-        else:
-            cmd.extend([
-                '--glint-correct',
-                f"--glint-nir-band={cfg.glint_nir_band}",
-                f"--glint-vis-bands={cfg.glint_vis_bands}",
-                f"--glint-nir-min-percentile={cfg.glint_nir_min_percentile}",
-                f"--glint-deepwater-b02-max={cfg.glint_deepwater_b02_max}",
-                f"--glint-min-samples={cfg.glint_min_samples}",
-                f"--glint-max-samples={cfg.glint_max_samples}",
-                f"--glint-clip-min={cfg.glint_clip_min}",
-            ])
-    xyz_list: List[str] = []
-    river_soundings = getattr(cfg, 'river_soundings', None)
-    if river_soundings:
-        xyz_list.extend(_normalize_multi_path_value(river_soundings))
-    auth_xyz = getattr(cfg, 'sdb_authoritative_extra_xyz', None)
-    if auth_xyz:
-        xyz_list.extend(_normalize_multi_path_value(auth_xyz))
-    for attr, flag in [
-        ('sdb_authoritative_support_mask', '--sdb-authoritative-support-mask'),
-        ('sdb_authoritative_support_values', '--sdb-authoritative-support-values'),
-        ('sdb_authoritative_support_points', '--sdb-authoritative-support-points'),
-        ('sdb_authoritative_support_contract', '--sdb-authoritative-support-contract'),
-    ]:
-        val = getattr(cfg, attr, None)
-        if val:
-            cmd.append(f"{flag}={val}")
-    if xyz_list:
-        # de-dup while preserving order
-        seen = set()
-        xyz_list = [pp for pp in xyz_list if not (pp in seen or seen.add(pp))]
-        cmd += ['--extra-xyz'] + xyz_list
-        cmd.append(f"--extra-xyz-crs={cfg.extra_xyz_crs}")
-    enable_sampling = bool(getattr(cfg, 'enable_adaptive_sampling', False))
-    if not enable_sampling:
-        cmd.append('--disable-adaptive-sampling')
-    cmd.append(f"--sampling-target-points={cfg.sampling_target_points}")
-    cmd.append(f"--sampling-min-threshold={cfg.sampling_min_threshold}")
-    cmd.append(f"--sampling-max-gap-m={cfg.sampling_max_gap_m}")
-    return cmd
+
+__all__ = ["augment_sdb_command", "build_sdb_command"]

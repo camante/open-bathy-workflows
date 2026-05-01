@@ -1,0 +1,123 @@
+{
+  "active_construction_boundary_files": [
+    "pipeline/river_shared_solve/river_pipeline.py",
+    "pipeline/river_workflow/river_workflow_pipeline.py",
+    "pipeline/river_workflow/river_workflow_context.py",
+    "pipeline/river_workflow/river_workflow_contract.py",
+    "pipeline/river_workflow/river_workflow_execution_contract.py",
+    "pipeline/river_workflow/river_workflow_paths.py",
+    "pipeline/river_workflow/river_workflow_receipts.py",
+    "pipeline/river_workflow/river_workflow_canonical_manifest.py",
+    "pipeline/river_workflow/river_workflow_stage_solve_domain.py",
+    "pipeline/river_workflow/river_workflow_stage_grids.py",
+    "pipeline/river_workflow/river_workflow_stage_authoritative.py",
+    "pipeline/river_workflow/river_workflow_stage_centerline.py",
+    "pipeline/river_workflow/river_workflow_stage_wse_proxy.py",
+    "pipeline/river_workflow/river_workflow_stage_authoritative_bed.py",
+    "pipeline/river_workflow/river_workflow_stage_observed_offset.py",
+    "pipeline/river_workflow/river_workflow_stage_modeled_offset.py",
+    "pipeline/river_workflow/river_workflow_stage_backbone.py",
+    "pipeline/river_workflow/river_workflow_stage_corridor.py",
+    "pipeline/river_workflow/river_workflow_stage_surface.py",
+    "pipeline/river_workflow/river_workflow_stage_lock.py",
+    "pipeline/river_workflow/river_workflow_stage_export.py",
+    "pipeline/river_workflow/river_workflow_stage_final_dem.py",
+    "canonical_river_solve_cache.py",
+    "canonical_river_solve_contract.py",
+    "canonical_river_solve_materialization.py",
+    "canonical_river_identity_guard.py",
+    "canonical_river_export_identity.py",
+    "canonical_river_seam_identity.py",
+    "pipeline/aoi.py",
+    "pipeline/aoi_identity.py",
+    "pipeline/final_dem_materialization.py"
+  ],
+  "active_entrypoint_bridge": {
+    "allowed_imports": [
+      "pipeline.river_shared_solve.river_pipeline",
+      "pipeline.river_workflow.river_workflow_context",
+      "repo_runtime_modes"
+    ],
+    "files": [
+      "river_runner.py",
+      "river_runner_contract.py"
+    ],
+    "legacy_compatibility_wrappers": [
+      "legacy/river/archive_root_scripts/linear_v1_runner.py",
+      "legacy/river/archive_root_scripts/linear_v1_runner_contract.py"
+    ],
+    "policy": "active bridge only; not a construction stage and not a legacy workflow module"
+  },
+  "active_invariant": "shared solve domain -> canonical parent river solution -> exact AOI export/window -> combined/DEM_enhanced.tif written once -> verify-only comparison",
+  "active_transitional_utilities": [
+    {
+      "allowed_imports": [
+        "build_centerline_points"
+      ],
+      "cleanup_target": "extract build_centerline_points and any strictly required helpers into pipeline/river_workflow before quarantining the remaining historical scaffold module",
+      "imported_by": "pipeline/river_workflow/river_workflow_stage_centerline.py",
+      "path": "river_structured_scaffold.py"
+    }
+  ],
+  "active_verify_reporting_boundary_files": [
+    "pipeline/run_summary.py",
+    "reporting/final_reporting.py",
+    "tools/compare_aoi_exports.py",
+    "pipeline/final_dem_identity.py"
+  ],
+  "archive_root_scripts_dir": "legacy/river/archive_root_scripts",
+  "archive_status": "hard quarantine root scripts moved after v886 pass",
+  "hard_quarantine_modules": [
+    "linear_v1_runner",
+    "linear_v1_runner_contract",
+    "river_primary_surface_rebuild",
+    "river_channel_scaffold",
+    "river_channel_surface",
+    "river_channel_template",
+    "river_graph_backbone_solver",
+    "river_xs_realism",
+    "river_bank_guidance",
+    "river_bank_longitudinal_fit"
+  ],
+  "hard_quarantine_paths": [
+    "legacy/river/archive_root_scripts/linear_v1_runner.py",
+    "legacy/river/archive_root_scripts/linear_v1_runner_contract.py",
+    "legacy/river/archive_root_scripts/river_primary_surface_rebuild.py",
+    "legacy/river/archive_root_scripts/river_channel_scaffold.py",
+    "legacy/river/archive_root_scripts/river_channel_surface.py",
+    "legacy/river/archive_root_scripts/river_channel_template.py",
+    "legacy/river/archive_root_scripts/river_graph_backbone_solver.py",
+    "legacy/river/archive_root_scripts/river_xs_realism.py",
+    "legacy/river/archive_root_scripts/river_bank_guidance.py",
+    "legacy/river/archive_root_scripts/river_bank_longitudinal_fit.py",
+    "legacy/river"
+  ],
+  "notes": [
+    "This phase quarantines by policy and static guard, not by moving files.",
+    "bathy_main.py and river_workflow_entry.py are broad orchestration surfaces and are not used as construction-core import guards in this phase.",
+    "Any active import of a hard-quarantine module is a cleanup failure unless the module is explicitly listed as an active transitional utility.",
+    "Phase 0-9 review split verify/reporting files out of active_construction_boundary_files so the manifest does not describe comparison/reporting tools as construction stages.",
+    "Phase 2 cleanup corrected the boundary: river_runner.py and river_runner_contract.py are active entrypoint bridge files, while linear_v1_runner.py and linear_v1_runner_contract.py remain compatibility wrappers.",
+    "Phase 3 moved final DEM identity/touch-log implementation from bathy_main.py to pipeline/final_dem_identity.py; this is verify-only and does not change DEM construction."
+  ],
+  "policy": {
+    "active_entrypoint_bridge_must_not_be_listed_as_hard_quarantine": true,
+    "active_reporting_files_must_not_import_hard_quarantine_modules": true,
+    "delete_or_move_legacy_modules_in_this_phase": false,
+    "does_not_change_aoi_export": true,
+    "does_not_change_cache_behavior": true,
+    "does_not_change_dem_construction": true,
+    "does_not_change_final_materialization": true,
+    "does_not_change_science": true,
+    "legacy_modules_must_not_be_imported_by_active_construction_core": true,
+    "transitional_utilities_must_be_explicitly_allowlisted": true,
+    "verify_only_static_guard": true
+  },
+  "purpose": "Phase 6 river legacy-boundary manifest. This is a static guard only; it does not move, delete, import, route, repair, or rewrite workflow products.",
+  "schema_version": 1,
+  "shared_solve_legacy_candidate_paths": [
+    "pipeline/river_shared_solve/river_context.py",
+    "pipeline/river_shared_solve/river_contract.py",
+    "pipeline/river_shared_solve/river_paths.py"
+  ]
+}

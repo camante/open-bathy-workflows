@@ -1,9 +1,14 @@
+"""Small helpers for explicit raster/sign/value semantics.
+
+These helpers are intentionally deterministic and metadata-driven.  They do not
+infer a workflow route or mutate products; they only normalize semantic labels
+and summarize sampled values for runtime contracts.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional
-
-import numpy as np
+from typing import Any, Mapping
 
 
 @dataclass(frozen=True)
@@ -11,90 +16,130 @@ class NumericSignSummary:
     valid: int
     frac_neg: float
     frac_pos: float
+    frac_zero: float
     p01: float
     p50: float
     p99: float
 
 
-def summarize_numeric_sign(values: Any) -> NumericSignSummary:
-    arr = np.asarray(values, dtype=np.float64)
-    m = np.isfinite(arr)
-    if not np.any(m):
-        return NumericSignSummary(0, np.nan, np.nan, np.nan, np.nan, np.nan)
-    vals = arr[m]
-    return NumericSignSummary(
-        valid=int(vals.size),
-        frac_neg=float(np.mean(vals < 0.0)),
-        frac_pos=float(np.mean(vals > 0.0)),
-        p01=float(np.percentile(vals, 1.0)),
-        p50=float(np.percentile(vals, 50.0)),
-        p99=float(np.percentile(vals, 99.0)),
-    )
+def _normalize_semantics(value: str | None) -> str:
+    raw = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "elevation": "absolute_elevation",
+        "absolute": "absolute_elevation",
+        "absolute_elevation": "absolute_elevation",
+        "bed_elevation": "absolute_elevation",
+        "bottom_elevation": "absolute_elevation",
+        "navd88_elevation": "absolute_elevation",
+        "depth_positive": "depth_positive_down",
+        "depth_positive_down": "depth_positive_down",
+        "positive_down": "depth_positive_down",
+        "down_positive": "depth_positive_down",
+        "down_is_positive": "depth_positive_down",
+        "depth_pos": "depth_positive_down",
+        "depth_negative": "depth_negative_down",
+        "depth_negative_down": "depth_negative_down",
+        "negative_down": "depth_negative_down",
+        "down_negative": "depth_negative_down",
+        "down_is_negative": "depth_negative_down",
+        "depth_neg": "depth_negative_down",
+        "auto": "auto",
+        "unknown": "unknown",
+    }
+    return aliases.get(raw, raw or "unknown")
 
 
-def raster_value_semantics(tags: Optional[Mapping[str, Any]]) -> str:
+def raster_value_semantics(tags: Mapping[str, Any] | None) -> str:
     tags = tags or {}
-    value_type = str(tags.get("VALUE_TYPE", "") or "").strip().lower()
-    depth_sign = str(tags.get("DEPTH_SIGN", "") or tags.get("SIGN_CONVENTION", "") or "").strip().lower()
-    if value_type in {"elevation", "bed_elevation", "bathymetric_elevation", "bottom_elevation"}:
-        return "absolute_elevation"
-    if value_type == "depth":
-        if depth_sign in {"positive_down", "positive-below-surface", "positive_below_surface", "positive-down"}:
-            return "depth_positive_down"
-        if depth_sign in {"negative_down", "negative-below-surface", "negative_below_surface", "negative-below-datum", "negative_below_datum", "negative-down"}:
-            return "depth_negative_down"
-        return "depth_unknown_sign"
+    for key in (
+        "VALUE_SEMANTICS",
+        "value_semantics",
+        "VALUE_TYPE",
+        "value_type",
+        "SEMANTICS",
+        "semantics",
+        "DEPTH_SIGN",
+        "depth_sign",
+        "POSITIVE_DIRECTION",
+        "positive_direction",
+    ):
+        value = tags.get(key)
+        if value not in (None, ""):
+            norm = _normalize_semantics(str(value))
+            if norm in {"absolute_elevation", "depth_positive_down", "depth_negative_down"}:
+                return norm
+            if norm == "positive_down":
+                return "depth_positive_down"
+            if norm == "negative_down":
+                return "depth_negative_down"
     return "unknown"
 
 
-def should_expect_negative_depth(tags: Optional[Mapping[str, Any]], default: bool = True) -> bool:
+def should_expect_negative_depth(tags: Mapping[str, Any] | None, *, default: bool = True) -> bool:
+    tags = tags or {}
     semantics = raster_value_semantics(tags)
-    if semantics == "absolute_elevation":
-        return False
-    if semantics == "depth_positive_down":
-        return False
     if semantics == "depth_negative_down":
         return True
+    if semantics == "depth_positive_down":
+        return False
+    for key in ("DEPTH_SIGN", "depth_sign", "POSITIVE_DIRECTION", "positive_direction"):
+        value = _normalize_semantics(str(tags.get(key, "")))
+        if value == "depth_negative_down":
+            return True
+        if value == "depth_positive_down":
+            return False
     return bool(default)
 
 
-def maybe_warn_auto_depth_mode(logger, *, label: str, values: Any, mode: str, bed_elev_hint: bool = False) -> None:
-    if logger is None:
-        return
-    if str(mode or "auto").strip().lower() != "auto":
-        return
-    stats = summarize_numeric_sign(values)
-    if stats.valid <= 0:
-        return
-    if np.isfinite(stats.frac_neg) and stats.frac_neg >= 0.70:
-        logger.info("[%s] Auto depth sign inference selected negative-down input (frac_neg=%.3f p50=%.3f p99=%.3f)", label, stats.frac_neg, stats.p50, stats.p99)
-        return
-    if np.isfinite(stats.frac_neg) and stats.frac_neg <= 0.05 and np.isfinite(stats.p50) and stats.p50 > 1.0:
-        msg = (
-            "[%s] Auto depth sign inference selected non-negative values (frac_neg=%.3f p50=%.3f p99=%.3f). "
-            "This is fine for positive-down depth magnitudes, but if these are absolute elevations use the explicit bed-elevation path instead."
-        )
-        if bed_elev_hint:
-            msg += " Consider setting soundings-mode=bed_elev explicitly."
-        logger.warning(msg, label, stats.frac_neg, stats.p50, stats.p99)
-        return
-    logger.info("[%s] Auto depth sign inference kept input sign as-is (frac_neg=%.3f p50=%.3f p99=%.3f)", label, stats.frac_neg, stats.p50, stats.p99)
-
-
-def semantics_from_soundings_mode(mode: str) -> str:
-    mode_l = str(mode or "auto").strip().lower()
-    if mode_l == "bed_elev":
-        return "absolute_elevation"
-    if mode_l == "depth_pos":
-        return "depth_positive_down"
-    if mode_l == "depth_neg":
-        return "depth_negative_down"
-    return "auto"
-
-
-def semantics_from_depth_positive_down_flag(flag: Optional[bool]) -> str:
+def semantics_from_depth_positive_down_flag(flag: bool | None) -> str:
     if flag is True:
         return "depth_positive_down"
     if flag is False:
         return "depth_negative_down"
     return "depth_unknown_sign"
+
+
+def semantics_from_soundings_mode(mode: str | None) -> str:
+    key = str(mode or "auto").strip().lower().replace("-", "_").replace(" ", "_")
+    if key in {"auto", "infer", "inferred", "unknown"}:
+        return "auto"
+    if key in {"bed", "bed_elev", "bed_elevation", "elevation", "absolute", "absolute_elevation", "z", "navd88"}:
+        return "absolute_elevation"
+    if key in {"depth_pos", "depth_positive", "depth_positive_down", "positive_down", "down_positive"}:
+        return "depth_positive_down"
+    if key in {"depth_neg", "depth_negative", "depth_negative_down", "negative_down", "down_negative"}:
+        return "depth_negative_down"
+    return "unknown"
+
+
+def summarize_numeric_sign(values: Any) -> NumericSignSummary:
+    import numpy as np
+
+    arr = np.asarray(values, dtype="float64")
+    arr = arr[np.isfinite(arr)]
+    n = int(arr.size)
+    if n == 0:
+        return NumericSignSummary(0, 0.0, 0.0, 0.0, float("nan"), float("nan"), float("nan"))
+    neg = int(np.count_nonzero(arr < 0.0))
+    pos = int(np.count_nonzero(arr > 0.0))
+    zero = int(np.count_nonzero(arr == 0.0))
+    p01, p50, p99 = np.nanpercentile(arr, [1, 50, 99])
+    return NumericSignSummary(
+        valid=n,
+        frac_neg=float(neg / n),
+        frac_pos=float(pos / n),
+        frac_zero=float(zero / n),
+        p01=float(p01),
+        p50=float(p50),
+        p99=float(p99),
+    )
+
+
+__all__ = [
+    "NumericSignSummary",
+    "raster_value_semantics",
+    "semantics_from_depth_positive_down_flag",
+    "semantics_from_soundings_mode",
+    "should_expect_negative_depth",
+    "summarize_numeric_sign",
+]

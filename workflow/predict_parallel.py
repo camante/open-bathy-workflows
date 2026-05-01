@@ -59,7 +59,7 @@ except ImportError:
 
 # Import constants
 try:
-    from constants import NODATA_DEPTH, DEFAULT_TILE_SIZE
+    from core.constants import NODATA_DEPTH, DEFAULT_TILE_SIZE
 except ImportError:
     NODATA_DEPTH = -9999.0
     DEFAULT_TILE_SIZE = 1024  # Match constants.py value
@@ -695,7 +695,7 @@ def estimate_parallel_benefit(
 
 if __name__ == "__main__":
     try:
-        from logging_config import setup_logging
+        from core.logging_config import setup_logging
         setup_logging()
     except Exception:
         import logging

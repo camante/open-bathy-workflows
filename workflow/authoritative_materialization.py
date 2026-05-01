@@ -93,18 +93,20 @@ def resolve_authoritative_base(cfg: Any, args: argparse.Namespace, *, logger: Op
         auth_path = Path(auth_path)
         if auth_path.exists():
             cfg.authoritative_base = auth_path
+            setattr(cfg, "export_authoritative_base", Path(auth_path))
             explicit_report = {
                 "mode": "explicit_path",
                 "authoritative_base": str(auth_path),
                 "cache_hit": None,
+                "source_role": "export_only",
+                "routing_policy": "non_canonical_export_product",
             }
             try:
                 sibling_baseline = auth_path.with_name('cudem_baseline_interpolation.tif')
                 if sibling_baseline.exists():
                     explicit_report['baseline_cudem_interpolation'] = str(sibling_baseline)
-                    explicit_report.update(_materialize_initial_final_baseline_products(cfg, sibling_baseline, logger=log))
             except Exception:
-                log.debug('[AUTHORITATIVE] Failed to materialize initial final-folder products from explicit authoritative path sibling', exc_info=True)
+                log.debug('[AUTHORITATIVE] Failed resolving explicit authoritative path sibling baseline', exc_info=True)
             setattr(args, "_authoritative_base_auto_report", explicit_report)
             return auth_path
         if not auto:
@@ -132,13 +134,13 @@ def resolve_authoritative_base(cfg: Any, args: argparse.Namespace, *, logger: Op
         force_rebuild=bool(getattr(cfg, "authoritative_base_force_rebuild", False)),
         logger=log,
     )
+    build_info.setdefault('source_role', 'export_only')
+    build_info.setdefault('routing_policy', 'non_canonical_export_product')
     cfg.authoritative_base = Path(build_info["authoritative_base"]).resolve()
-    try:
-        baseline_path = Path(build_info.get('baseline_cudem_interpolation', '') or '')
-        if baseline_path.exists():
-            build_info.update(_materialize_initial_final_baseline_products(cfg, baseline_path, logger=log))
-    except Exception:
-        log.debug('[AUTHORITATIVE] Failed to materialize initial final-folder baseline products from auto build', exc_info=True)
+    setattr(cfg, "export_authoritative_base", Path(cfg.authoritative_base))
+    baseline_path = Path(build_info.get('baseline_cudem_interpolation', '') or '')
+    if baseline_path.exists():
+        build_info['baseline_cudem_interpolation'] = str(baseline_path)
     setattr(args, "_authoritative_base_auto_report", build_info)
     log.info(
         "[AUTHORITATIVE] %s authoritative_base: %s",

@@ -75,13 +75,13 @@ from scipy.spatial import cKDTree
 from pyproj import Transformer
 
 # Ensure GeoPandas remains usable on pandas>=2.0 even if GeoPandas lags.
-import compat_pandas  # noqa: F401
+import core.compat_pandas  # noqa: F401
 
 # -----------------------------------------------------------------------------
 # Optional exact-match caching utilities
 # -----------------------------------------------------------------------------
 try:
-    from cache_utils import (
+    from core.cache_utils import (
         canonical_json,
         fingerprint_file,
         fingerprint_code,

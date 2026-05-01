@@ -19,7 +19,7 @@ from rasterio.features import rasterize
 from rasterio.warp import reproject
 from scipy import ndimage as ndi
 
-from cache_utils import artifact_cache_key, canonical_json, fingerprint_raster_grid
+from core.cache_utils import artifact_cache_key, canonical_json, fingerprint_raster_grid
 from river_masking import clip_channel_mask_for_estuary, ensure_waffles_coastline_mask
 
 LOG = logging.getLogger(__name__)

@@ -68,7 +68,7 @@ def run_command(
     # Flight recorder hooks (best effort)
     _fr = None
     try:
-        from flight_recorder import FlightRecorder
+        from core.flight_recorder import FlightRecorder
 
         _fr = FlightRecorder.global_instance()
     except ImportError:

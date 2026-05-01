@@ -21,6 +21,45 @@ from final_postrun_contract import build_final_postrun_context
 from postrun_output_stage import run_postrun_output_checks, write_final_output_bundle
 
 
+def finalize_existing_output_run_stage(*, cfg, args, report: Dict[str, Any], log, fatal_errors: List[str],
+                                       final_native, final_for_user, final_provenance,
+                                       write_bundle_fn, finalize_run_fn, write_io_manifest_fn, emit_artifacts_fn,
+                                       run_seam_comparisons_fn):
+    postrun_context = build_final_postrun_context(
+        cfg=cfg,
+        args=args,
+        report=report,
+        run_id=report.get("run", {}).get("run_id") or "unknown",
+        final_native=final_native,
+        final_for_user=final_for_user,
+        final_provenance=final_provenance,
+        fatal_errors=fatal_errors,
+    )
+    if _postrun_outputs_requested(args, cfg):
+        write_final_output_bundle(
+            context=postrun_context,
+            logger=log,
+            write_bundle_fn=write_bundle_fn,
+            write_io_manifest_fn=write_io_manifest_fn,
+            emit_artifacts_fn=emit_artifacts_fn,
+        )
+
+        run_postrun_output_checks(
+            context=postrun_context,
+            run_seam_comparisons_fn=run_seam_comparisons_fn,
+        )
+    else:
+        write_final_output_bundle(
+            context=postrun_context,
+            logger=log,
+            write_bundle_fn=write_bundle_fn,
+            write_io_manifest_fn=write_io_manifest_fn,
+            emit_artifacts_fn=lambda *_args, **_kwargs: None,
+        )
+    run_id = report.get("run", {}).get("run_id") or "unknown"
+    return finalize_run_fn(cfg, report, args, final_native, final_for_user, final_provenance, run_id, fatal_errors)
+
+
 def execute_final_run_stage(*, cfg, args, report: Dict[str, Any], log, fatal_errors: List[str],
                             sdb_raster, river_raster, river_for_fuse, river_excluded,
                             fuse_fn, condition_fn, reproject_fn, write_bundle_fn,
@@ -99,35 +138,18 @@ def execute_final_run_stage(*, cfg, args, report: Dict[str, Any], log, fatal_err
         "runtime_engine": runtime_engine,
     })
     final_for_user = reproject_fn(cfg, final, report, sdb_raster, river_raster, fatal_errors)
-    postrun_context = build_final_postrun_context(
+    return finalize_existing_output_run_stage(
         cfg=cfg,
         args=args,
         report=report,
-        run_id=report.get("run", {}).get("run_id") or "unknown",
+        log=log,
+        fatal_errors=fatal_errors,
         final_native=final_native_path,
         final_for_user=final_for_user,
         final_provenance=final_provenance,
-        fatal_errors=fatal_errors,
+        write_bundle_fn=write_bundle_fn,
+        finalize_run_fn=finalize_run_fn,
+        write_io_manifest_fn=write_io_manifest_fn,
+        emit_artifacts_fn=emit_artifacts_fn,
+        run_seam_comparisons_fn=run_seam_comparisons_fn,
     )
-    if _postrun_outputs_requested(args, cfg):
-        report_path = write_final_output_bundle(
-            context=postrun_context,
-            logger=log,
-            write_bundle_fn=write_bundle_fn,
-            write_io_manifest_fn=write_io_manifest_fn,
-            emit_artifacts_fn=emit_artifacts_fn,
-        )
-
-        run_postrun_output_checks(
-            context=postrun_context,
-            run_seam_comparisons_fn=run_seam_comparisons_fn,
-        )
-    else:
-        report_path = write_final_output_bundle(
-            context=postrun_context,
-            logger=log,
-            write_bundle_fn=write_bundle_fn,
-            write_io_manifest_fn=write_io_manifest_fn,
-            emit_artifacts_fn=lambda *_args, **_kwargs: None,
-        )
-    return finalize_run_fn(cfg, report, args, final, final_for_user, final_provenance, fatal_errors)
